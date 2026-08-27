@@ -1418,6 +1418,38 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // A GET_ROWS whose execution was deferred so it can be folded into its consumer
+    // (GATED_DELTA_NET or CONCAT).  Cleared at the top of every graph computation
+    // because it holds tensor pointers.
+    const ggml_tensor * gdn_gather_node  = nullptr;  // the deferred GET_ROWS node
+    const ggml_tensor * gdn_gather_owner = nullptr;  // the node consuming it
+
+    // The row indices are saved at the position the GET_ROWS occupied.  Deferring
+    // execution lets galloc reuse the input tensor's addresses in the meantime, so
+    // reading them at the consumer would be corrupt.
+    int32_t *           gdn_rows_scratch   = nullptr;
+    size_t              gdn_rows_scratch_n = 0;
+    // The tensor the snapshot came from; an identical one is not saved again.
+    const ggml_tensor * gdn_rows_src       = nullptr;
+
+    // Called on every consumption; does not forget gdn_rows_src
+    void gdn_gather_clear() {
+        gdn_gather_node  = nullptr;
+        gdn_gather_owner = nullptr;
+    }
+    void gdn_gather_reset_graph() {
+        gdn_gather_clear();
+        gdn_rows_src = nullptr;
+    }
+    void gdn_gather_free() {
+        if (gdn_rows_scratch != nullptr) {
+            cudaFree(gdn_rows_scratch);
+            gdn_rows_scratch = nullptr;
+        }
+        gdn_rows_scratch_n = 0;
+        gdn_gather_reset_graph();
+    }
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

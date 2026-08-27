@@ -702,6 +702,7 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    a16_cache_free();
     gdn_gather_free();
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -4745,7 +4746,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    // Holds tensor pointers that a later graph may reuse.
+    // The sm_60 activation cache keys on a tensor pointer a later graph may reuse.
+    cuda_ctx->a16_cache_clear();
     cuda_ctx->gdn_gather_reset_graph();
 
     bool use_cuda_graph             = false;

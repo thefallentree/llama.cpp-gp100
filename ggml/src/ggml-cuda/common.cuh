@@ -1429,6 +1429,37 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Single-slot cache of the sm_60 mat-vec's quantized activations.  Gate and up
+    // projections consume the same activation tensor back to back, so the second
+    // mat-vec can reuse the exact half2 values and scales produced for the first,
+    // skipping one quantize launch per pair.  The key holds a tensor pointer that a
+    // later graph may reuse, so it is cleared at the top of every graph compute; the
+    // buffer is a plain device allocation (NOT pool -- the pool is a stack allocator
+    // and holding one across calls breaks its free-order assert) kept across rounds
+    // and never shrunk, so after warmup there are no allocations.
+    char *              a16_cache_mem      = nullptr;
+    size_t              a16_cache_cap      = 0;
+    const ggml_tensor * a16_cache_src1     = nullptr;
+    const void *        a16_cache_data     = nullptr;
+    cudaStream_t        a16_cache_stream   = nullptr;
+    size_t              a16_cache_aq_size  = 0;
+    size_t              a16_cache_ads_size = 0;
+    int64_t             a16_cache_s[3]     = { 0, 0, 0 };
+
+    void a16_cache_clear() {
+        a16_cache_src1   = nullptr;
+        a16_cache_data   = nullptr;
+        a16_cache_stream = nullptr;
+    }
+    void a16_cache_free() {
+        if (a16_cache_mem != nullptr) {
+            cudaFree(a16_cache_mem);
+            a16_cache_mem = nullptr;
+        }
+        a16_cache_cap = 0;
+        a16_cache_clear();
+    }
+
     // A GET_ROWS whose execution was deferred so it can be folded into its consumer
     // (GATED_DELTA_NET or CONCAT).  Cleared at the top of every graph computation
     // because it holds tensor pointers.

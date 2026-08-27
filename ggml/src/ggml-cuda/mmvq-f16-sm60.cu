@@ -177,7 +177,7 @@ static __global__ void quantize_a16(
 // width-4 two-warp shape resolves to 8, i.e. 128 registers and 512 threads per SM (25%
 // occupancy); 10, 12, and 16 trade registers for residency.
 template <int ncols_dst, int nwarps, int nrows_block = A16_ROWS, bool pair_halves = false,
-          bool raw_activations = false, int min_blocks_tpl = 0>
+          bool raw_activations = false, int min_blocks_tpl = 0, bool g64_fmt = false>
 static __global__ void __launch_bounds__(WARP_SIZE*nwarps,
         min_blocks_tpl != 0 ? min_blocks_tpl : (ncols_dst >= 6 ? 2 : 4)*(A16_NWARPS/nwarps))
 mul_mat_vec_q4_1_a16(
@@ -199,16 +199,28 @@ mul_mat_vec_q4_1_a16(
     // block_q4_1 is 20 bytes, so `&x[(row0+i)*stride_row_x + kb]` becomes a per-row 64-bit
     // multiply (a 32-bit index times 20, i.e. an XMAD chain).  Hoisting each row's base out and
     // adding a byte offset built once from kb removes the multiplies.
-    const char * const xbase = (const char *) &x[row0*stride_row_x];
+    // For Q4_1_G64 the host passes stride_row_x in BYTES (36-byte groups do not tile as
+    // block_q4_1), so the row base math must not scale by sizeof(block_q4_1).
+    const char * const xbase = g64_fmt ? (const char *) vx + (size_t) row0*stride_row_x
+                                       : (const char *) &x[row0*stride_row_x];
     int rowoff[nrows_block];
 #pragma unroll
     for (int i = 0; i < nrows_block; ++i) {
-        rowoff[i] = i*stride_row_x*(int) sizeof(block_q4_1);
+        rowoff[i] = g64_fmt ? i*stride_row_x : i*stride_row_x*(int) sizeof(block_q4_1);
     }
 
     for (int t = tid; t < 2*nblocks; t += nthreads) {
         const int kb = t >> 1;
         const int kh = t &  1;
+        // Q4_1_G64 stores two Q4_1-layout 16-byte nibble halves behind one (d, m) pair:
+        // {half2 dm}{16 B half 0}{16 B half 1} = 36 bytes per 64 weights.  The decode below is
+        // unchanged; only where the bytes live and how often dm is fetched differ.
+        [[maybe_unused]] int koff_g = 0, dmoff_g = 0;
+        if constexpr (g64_fmt) {
+            const int g = kb >> 1;
+            koff_g  = g*36 + 4 + (kb & 1)*16;
+            dmoff_g = g*36;
+        }
         const int koff = kb*(int) sizeof(block_q4_1);
 
         half2 a[ncols_dst][8];
@@ -234,9 +246,16 @@ mul_mat_vec_q4_1_a16(
 
 #pragma unroll
         for (int i = 0; i < nrows_block; ++i) {
-            const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
-            const float2 dm = __half22float2(b->dm);
-            const int * wq = (const int *) b->qs;
+            float2 dm;
+            const int * wq;
+            if constexpr (g64_fmt) {
+                dm = __half22float2(*(const half2 *) (xbase + (rowoff[i] + dmoff_g)));
+                wq = (const int *) (xbase + (rowoff[i] + koff_g));
+            } else {
+                const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
+                dm = __half22float2(b->dm);
+                wq = (const int *) b->qs;
+            }
 
             half2 w[8];
 #pragma unroll
@@ -398,13 +417,259 @@ static void launch_a16(
     }
 }
 
+
+// ---- Q4_K on the same HFMA2 pipeline --------------------------------------------------------
+//
+// block_q4_K packs 256 weights as [half2 dm][12 B of 6-bit (sc,min) pairs][128 B nibbles].
+// The nibbles interleave two 32-weight sub-blocks per 32-byte chunk: low nibbles belong to
+// sub-block 2c, high nibbles to 2c+1.  The Q4_1 decode above already splits low and high
+// nibbles into separate half2 lanes (that is what the two LOP3 magic constants do), so the
+// only structural change is keeping two accumulators per iteration and applying each
+// sub-block's (d*sc, dmin*m) pair in the epilogue: w = d*sc*q - dmin*m.
+// The per-32-weight activation sums in `ads` line up with Q4_K sub-blocks as-is.
+//
+// This trades a handful of scale-extraction instructions per 8 weights for 10% fewer streamed
+// bytes (144 vs 160 per 256 weights) on a kernel that is bytes-bound, not instruction-bound.
+
+// Extract the j-th 6-bit (scale, min) pair from the three 32-bit words of block_q4_K.scales.
+// Register-side: the caller loads dm+scales as one 16-byte transaction; byte-granular global
+// loads here measured a 40% kernel slowdown (48 single-byte transactions per iteration).
+static __device__ __forceinline__ void a16_scale_min_k4(uint32_t s0, uint32_t s1, uint32_t s2,
+                                                        int j, float & sc, float & mn) {
+    uint32_t s8, m8;
+    if (j < 4) {
+        s8 = (s0 >> (8*j)) & 63;
+        m8 = (s1 >> (8*j)) & 63;
+    } else {
+        const int  b  = 8*(j - 4);
+        const uint32_t lo = (s2 >> b) & 0xFF;
+        s8 = (lo & 0x0F) | (((s0 >> (b + 6)) & 3) << 4);
+        m8 = (lo >>   4) | (((s1 >> (b + 6)) & 3) << 4);
+    }
+    sc = (float) s8;
+    mn = (float) m8;
+}
+
+template <int ncols_dst, int nwarps, int nrows_block = 8, int min_blocks_tpl = 0>
+static __global__ void __launch_bounds__(WARP_SIZE*nwarps,
+        min_blocks_tpl != 0 ? min_blocks_tpl : (ncols_dst >= 6 ? 2 : 4)*(A16_NWARPS/nwarps))
+mul_mat_vec_q4_K_a16(
+        const void * __restrict__ vx, const half2 * __restrict__ aq, const half2 * __restrict__ ads,
+        float * __restrict__ dst, const int nsuper, const int stride_row_super,
+        const int stride_col_aq, const int stride_col_ads, const int stride_col_dst) {
+#if defined(FP16_AVAILABLE)
+    const int row0     = blockIdx.x*nrows_block;
+    const int tid      = threadIdx.x + threadIdx.y*WARP_SIZE;
+    const int nthreads = WARP_SIZE*nwarps;
+
+    const half2 magic_lo = __float2half2_rn(1024.0f);
+    const half2 magic_hi = __float2half2_rn(  64.0f);
+
+    float sumf[ncols_dst][nrows_block] = {{0.0f}};
+
+    const char * const xbase = (const char *) vx + (size_t) row0*stride_row_super*144;
+    int rowoff[nrows_block];
+#pragma unroll
+    for (int i = 0; i < nrows_block; ++i) {
+        rowoff[i] = i*stride_row_super*144;
+    }
+
+    // one iteration = 8 bytes of one 32-byte chunk = 8 weights of sub-block A (low nibbles)
+    // and 8 of sub-block B (high nibbles).  16 iterations cover a 256-weight super-block.
+    const int niter = nsuper*16;
+    for (int t = tid; t < niter; t += nthreads) {
+        const int sblk = t >> 4;          // super-block
+        const int rem  = t & 15;
+        const int c4   = rem >> 2;        // 32-byte chunk in the super-block (sub pair 2c4, 2c4+1)
+        const int q8   = rem & 3;         // 8-byte quarter of the chunk
+        const int jA   = 2*c4;
+        const int jB   = 2*c4 + 1;
+        const int koff = sblk*144 + 16 + c4*32 + q8*8;
+        const int sb_base = sblk*8;       // global 32-weight sub-block index of j=0
+
+        // Activations for this iteration's two weight quads.  quantize_a16 stores each
+        // 32-weight block as half2 pairs (p, p+2) / (p+1, p+3), with plain positions < 16 in
+        // slots 4m+0 / 4m+2 and positions >= 16 in slots 4m'+1 / 4m'+3 -- the order the Q4_1
+        // LOP3 outputs want.  Q4_K's low and high nibbles sit at the SAME byte positions of
+        // their respective sub-blocks, so the same slot map serves both.
+        const int m0 = 2*q8;                       // weight quad of k=0; k=1 uses m0+1
+        int slot[4];                               // {k0.s0, k0.s1, k1.s0, k1.s1}
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int m = m0 + k;
+            slot[2*k + 0] = m < 4 ? 4*m     : 4*(m - 4) + 1;
+            slot[2*k + 1] = m < 4 ? 4*m + 2 : 4*(m - 4) + 3;
+        }
+        half2 aA[ncols_dst][4], aB[ncols_dst][4];
+        float ydA[ncols_dst], ydB[ncols_dst], ysA[ncols_dst], ysB[ncols_dst];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const half2 * apA = aq + (size_t) j*stride_col_aq + (sb_base + jA)*16;
+            const half2 * apB = aq + (size_t) j*stride_col_aq + (sb_base + jB)*16;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                aA[j][c] = apA[slot[c]];
+                aB[j][c] = apB[slot[c]];
+            }
+            const half2 dsA = ads[j*stride_col_ads + sb_base + jA];
+            const half2 dsB = ads[j*stride_col_ads + sb_base + jB];
+            // each sub-block's activations were quantized with its OWN amax, so the two dot
+            // products carry different scales and must be rescaled separately.  Each iteration
+            // covers a QUARTER of each 32-weight sub-block (8 weights), so the per-sub-block
+            // min-term is scaled by 1/4 (Q4_1's half-block loop uses 1/2).
+            ydA[j] = __low2float(dsA);
+            ydB[j] = __low2float(dsB);
+            ysA[j] = __high2float(dsA)*0.25f;
+            ysB[j] = __high2float(dsB)*0.25f;
+        }
+
+#pragma unroll
+        for (int i = 0; i < nrows_block; ++i) {
+            // dm (half2) + 12 scale bytes = 16 bytes at a 16-aligned offset (144 % 16 == 0):
+            // one int4 transaction, all extraction in registers.
+            const int4 hdr = *(const int4 *) (xbase + (rowoff[i] + sblk*144));
+            const float2 dm = __half22float2(*(const half2 *) &hdr.x);
+            float scA, mnA, scB, mnB;
+            a16_scale_min_k4((uint32_t) hdr.y, (uint32_t) hdr.z, (uint32_t) hdr.w, jA, scA, mnA);
+            a16_scale_min_k4((uint32_t) hdr.y, (uint32_t) hdr.z, (uint32_t) hdr.w, jB, scB, mnB);
+            const float DA = dm.x*scA, MA = dm.y*mnA;
+            const float DB = dm.x*scB, MB = dm.y*mnB;
+
+            const int * wq = (const int *) (xbase + (rowoff[i] + koff));
+            half2 wlo[4], whi[4];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int w32  = wq[k];
+                const int w32s = w32 >> 8;
+                int t0, t1, t2, t3;
+                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t0) : "r"(w32),  "n"(0x000f000f), "n"(0x64006400));
+                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t1) : "r"(w32),  "n"(0x00f000f0), "n"(0x54005400));
+                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t2) : "r"(w32s), "n"(0x000f000f), "n"(0x64006400));
+                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t3) : "r"(w32s), "n"(0x00f000f0), "n"(0x54005400));
+                wlo[2*k + 0] = __hsub2(*((const half2 *) &t0), magic_lo);
+                whi[2*k + 0] = __hsub2(*((const half2 *) &t1), magic_hi);
+                wlo[2*k + 1] = __hsub2(*((const half2 *) &t2), magic_lo);
+                whi[2*k + 1] = __hsub2(*((const half2 *) &t3), magic_hi);
+            }
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                half2 sA = make_half2(0.0f, 0.0f);
+                half2 sB = make_half2(0.0f, 0.0f);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    sA = __hfma2(wlo[c], aA[j][c], sA);
+                    sB = __hfma2(whi[c], aB[j][c], sB);
+                }
+                const float afA = __half2float(__hadd(__low2half(sA), __high2half(sA)));
+                const float afB = __half2float(__hadd(__low2half(sB), __high2half(sB)));
+                sumf[j][i] += ydA[j]*(DA*afA - MA*ysA[j]) + ydB[j]*(DB*afB - MB*ysB[j]);
+            }
+        }
+    }
+
+    if constexpr (nwarps == 1) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows_block; ++i) {
+                const float v = warp_reduce_sum(sumf[j][i]);
+                if (threadIdx.x == (unsigned) (i % WARP_SIZE)) {
+                    dst[j*stride_col_dst + row0 + i] = v;
+                }
+            }
+        }
+    } else {
+        __shared__ float tmp[nwarps][ncols_dst][nrows_block];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows_block; ++i) {
+                const float v = warp_reduce_sum(sumf[j][i]);
+                if (threadIdx.x == 0) {
+                    tmp[threadIdx.y][j][i] = v;
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < nrows_block; ++i) {
+                    float v = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < nwarps; ++w) {
+                        v += tmp[w][j][i];
+                    }
+                    if (threadIdx.x == 0) {
+                        dst[j*stride_col_dst + row0 + i] = v;
+                    }
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vx, aq, ads, dst, nsuper, stride_row_super, stride_col_aq, stride_col_ads, stride_col_dst);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
+template <int ncols_dst>
+static void launch_a16_q4k(
+        const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nsuper,
+        const int nrows, const int stride_row_super, const int stride_col_aq, const int stride_col_ads,
+        const int stride_col_dst, cudaStream_t stream) {
+    const dim3 grid(nrows/8, 1, 1);
+    switch (a16_pick_nwarps(nsuper*8, nrows/8)) {
+        case 1:
+            mul_mat_vec_q4_K_a16<ncols_dst, 1><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+                vx, aq, ads, dst, nsuper, stride_row_super, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        case 2:
+            mul_mat_vec_q4_K_a16<ncols_dst, 2><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+                vx, aq, ads, dst, nsuper, stride_row_super, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        default:
+            mul_mat_vec_q4_K_a16<ncols_dst, A16_NWARPS><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+                vx, aq, ads, dst, nsuper, stride_row_super, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+    }
+}
+
+
+template <int ncols_dst>
+static void launch_a16_g64(
+        const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
+        const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
+        const int stride_col_dst, cudaStream_t stream) {
+    const dim3 grid(nrows/8, 1, 1);
+    switch (a16_pick_nwarps(nblocks, nrows/8)) {
+        case 1:
+            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        case 2:
+            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        default:
+            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+    }
+}
+
 bool ggml_cuda_mmvq_f16_sm60_supported(
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * dst) {
     if (ids) {
         return false;
     }
-    if (src0->type != GGML_TYPE_Q4_1 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    const bool is_g64  = src0->type == GGML_TYPE_Q4_1_G64;
+    const bool is_q4_1 = src0->type == GGML_TYPE_Q4_1 || is_g64;
+    const bool is_q4_k = src0->type == GGML_TYPE_Q4_K;
+    if ((!is_q4_1 && !is_q4_k) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     // No DP4A but full-rate HFMA2 means GP100 only.  Everywhere else the generic kernel wins.
@@ -413,16 +678,33 @@ bool ggml_cuda_mmvq_f16_sm60_supported(
         return false;
     }
     // Channel/sample dims are left to the generic path; Q4_1 weights do not use them.
-    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+    // Exception: for Q4_1_G64, a [k, 1, nseq] activation against a 2-D weight is folded
+    // into an nseq-column mat-vec (the recurrent-layer projections batch per sequence in
+    // ne[2]); the fold is exact because the weight broadcasts over the sequence dim.
+    const bool g64_seq_fold = is_g64 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                              src1->ne[1] == 1 && src1->ne[2] > 1 && src1->ne[2] <= 8 &&
+                              src1->ne[3] == 1 && dst->ne[1] == 1 && dst->ne[2] == src1->ne[2];
+    if (!g64_seq_fold &&
+            (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1)) {
         return false;
     }
     if (src0->ne[0] % A16_QK != 0 || src0->ne[1] % A16_ROWS != 0) {
         return false;
     }
+    // The Q4_K variant iterates 256-weight super-blocks and always uses the 8-row tile.
+    if (is_q4_k && (src0->ne[0] % 256 != 0 || src0->ne[1] % 8 != 0)) {
+        return false;
+    }
     // Width 1 is limited by the DRAM read of the weights, so making the arithmetic free moves it
     // by ~1%, while this path costs twice the activation bytes of int8 -- a measured net loss.
     // Above width 8 the generic batched path takes over.
-    if (src1->ne[1] < 2 || src1->ne[1] > 8) {
+    // Q4_1_G64 has no generic CUDA vec_dot, so this path also serves width 1 for it
+    // (measured ~-7%-class vs an int8 width-1 path on Q4_1; the byte saving offsets it).
+    const int64_t eff_cols = src1->ne[1] == 1 && src1->ne[2] > 1 ? src1->ne[2] : src1->ne[1];
+    if (eff_cols < (is_g64 ? 1 : 2) || eff_cols > 8) {
+        return false;
+    }
+    if (is_g64 && (src0->ne[0] % 64 != 0 || src0->ne[1] % 8 != 0)) {
         return false;
     }
     if (!ggml_is_contiguous(dst)) {
@@ -438,7 +720,10 @@ void ggml_cuda_mmvq_f16_sm60(
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
-    const int64_t ne11 = src1->ne[1];
+    // seq->columns fold (see supported()): [k, 1, nseq] activations become nseq columns.
+    // Only Q4_1_G64 is ever dispatched here with ne[2] > 1.
+    const bool    seq_fold = src1->ne[1] == 1 && src1->ne[2] > 1;
+    const int64_t ne11     = seq_fold ? src1->ne[2] : src1->ne[1];
     const int nblocks  = ne00/A16_QK;
 
     // Activations are quantized to half2 pairs plus a per-block (scale, sum) pair.  The sum lets
@@ -446,7 +731,7 @@ void ggml_cuda_mmvq_f16_sm60(
     const size_t aq_size  = (size_t) ne11*nblocks*(A16_QK/2)*sizeof(half2);
     const size_t ads_size = (size_t) ne11*nblocks*sizeof(half2);
 
-    const int64_t s11 = src1->nb[1]/ggml_type_size(src1->type);
+    const int64_t s11 = (seq_fold ? src1->nb[2] : src1->nb[1])/ggml_type_size(src1->type);
 
     // Gate and up projections consume the same activation tensor back to back; cache the
     // quantized form so the second mat-vec skips the quantize launch (see common.cuh).
@@ -511,10 +796,51 @@ void ggml_cuda_mmvq_f16_sm60(
         }
     }
 
+    if (src0->type == GGML_TYPE_Q4_1_G64) {
+        const int  ne11_eff = (int) ne11;
+        const int stride_row_g  = (int) (src0->nb[1]);       // BYTES per row; kernel offsets are byte-based via rowoff
+        const int stride_col_aqg  = nblocks*(A16_QK/2);
+        const int stride_col_adsg = nblocks;
+        const int stride_col_dstg = seq_fold ? (int) (dst->nb[2]/ggml_type_size(dst->type))
+                                             : (int) (dst->nb[1]/ggml_type_size(dst->type));
+        switch (ne11_eff) {
+#define A16_G64_CASE(N)                                                                            \
+            case N:                                                                                \
+                launch_a16_g64<N>(src0->data, aq, ads, (float *) dst->data, nblocks, ne01,         \
+                        stride_row_g, stride_col_aqg, stride_col_adsg, stride_col_dstg, stream);   \
+                break;
+            A16_G64_CASE(1) A16_G64_CASE(2) A16_G64_CASE(3) A16_G64_CASE(4)
+            A16_G64_CASE(5) A16_G64_CASE(6) A16_G64_CASE(7) A16_G64_CASE(8)
+#undef A16_G64_CASE
+            default:
+                GGML_ABORT("unsupported width for the sm_60 Q4_1_G64 mat-vec");
+        }
+        return;
+    }
+
     const int stride_row_x   = ne00/ggml_blck_size(src0->type);
     const int stride_col_aq  = nblocks*(A16_QK/2);
     const int stride_col_ads = nblocks;
     const int stride_col_dst = dst->nb[1]/ggml_type_size(dst->type);
+
+    if (src0->type == GGML_TYPE_Q4_K) {
+        const int nsuper           = ne00/256;
+        const int stride_row_super = (int) (src0->nb[1]/144);   // super-blocks per row stride
+        switch (ne11) {
+#define A16_K_CASE(N)                                                                             \
+            case N:                                                                               \
+                launch_a16_q4k<N>(src0->data, aq, ads, (float *) dst->data, nsuper,   \
+                        ne01, stride_row_super, stride_col_aq, stride_col_ads, stride_col_dst,    \
+                        stream);                                                                  \
+                break;
+            A16_K_CASE(2) A16_K_CASE(3) A16_K_CASE(4)
+            A16_K_CASE(5) A16_K_CASE(6) A16_K_CASE(7) A16_K_CASE(8)
+#undef A16_K_CASE
+            default:
+                GGML_ABORT("unsupported width for the sm_60 Q4_K mat-vec");
+        }
+        return;
+    }
 
 #define A16_CASE(N)                                                                            \
     case N:                                                                                    \

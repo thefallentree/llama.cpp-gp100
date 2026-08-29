@@ -732,6 +732,15 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
+#elif __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    // VMAD byte selectors combine signed-byte extraction with multiply-add on SM60.
+    int r = c;
+    asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;"
+        : "+r"(r) : "r"(a), "r"(b));
+    return r;
 #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     const int8_t * a8 = (const int8_t *) &a;
     const int8_t * b8 = (const int8_t *) &b;
@@ -1673,4 +1682,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

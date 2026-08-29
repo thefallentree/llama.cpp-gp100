@@ -1426,6 +1426,31 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Cache quantized activations between adjacent sm_60 mat-vecs.
+    char *              mmvq_f16_cache_mem        = nullptr;
+    size_t              mmvq_f16_cache_cap        = 0;
+    const ggml_tensor * mmvq_f16_cache_src        = nullptr;
+    const void *        mmvq_f16_cache_data       = nullptr;
+    cudaStream_t        mmvq_f16_cache_stream     = nullptr;
+    size_t              mmvq_f16_cache_aq_size    = 0;
+    size_t              mmvq_f16_cache_stats_size = 0;
+    int64_t             mmvq_f16_cache_shape[3]   = { 0, 0, 0 };
+
+    void mmvq_f16_cache_clear() {
+        mmvq_f16_cache_src    = nullptr;
+        mmvq_f16_cache_data   = nullptr;
+        mmvq_f16_cache_stream = nullptr;
+    }
+    void mmvq_f16_cache_free() {
+        if (mmvq_f16_cache_mem != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(mmvq_f16_cache_mem));
+            mmvq_f16_cache_mem = nullptr;
+        }
+        mmvq_f16_cache_cap = 0;
+        mmvq_f16_cache_clear();
+    }
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

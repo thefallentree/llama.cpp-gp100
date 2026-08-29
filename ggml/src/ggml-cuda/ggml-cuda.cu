@@ -704,6 +704,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    mmvq_f16_cache_free();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -3020,6 +3022,15 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
     return is_ok;
 }
+static bool ggml_cuda_tensor_data_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
+    const uintptr_t a_data = (uintptr_t) a->data;
+    const uintptr_t b_data = (uintptr_t) b->data;
+
+    if (a_data <= b_data) {
+        return b_data - a_data >= ggml_nbytes(a);
+    }
+    return a_data - b_data >= ggml_nbytes(b);
+}
 
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
@@ -4149,6 +4160,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (cuda_ctx->mmvq_f16_cache_src != nullptr &&
+                        !ggml_cuda_tensor_data_disjoint(node, cuda_ctx->mmvq_f16_cache_src)) {
+                    cuda_ctx->mmvq_f16_cache_clear();
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4158,6 +4174,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    // Fused nodes do not revisit the graph loop. Account for writes by every
+                    // logical output in the fused range before retaining a cached activation.
+                    for (int j = i + 1; cuda_ctx->mmvq_f16_cache_src != nullptr && j <= i + nodes_to_skip; ++j) {
+                        ggml_tensor * fused_node = cgraph->nodes[j];
+                        if (!ggml_cuda_is_view_or_noop(fused_node) &&
+                                !ggml_cuda_tensor_data_disjoint(fused_node, cuda_ctx->mmvq_f16_cache_src)) {
+                            cuda_ctx->mmvq_f16_cache_clear();
+                        }
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4248,6 +4273,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // The sm_60 activation cache keys on a tensor pointer a later graph may reuse.
+    cuda_ctx->mmvq_f16_cache_clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

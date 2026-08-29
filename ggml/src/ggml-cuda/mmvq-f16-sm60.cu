@@ -347,19 +347,65 @@ void ggml_cuda_mmvq_f16_sm60(
 
     const int64_t s11 = src1->nb[1]/ggml_type_size(src1->type);
 
-    ggml_cuda_pool_alloc<half2> aq (ctx.pool(), aq_size /sizeof(half2));
-    ggml_cuda_pool_alloc<half2> ads(ctx.pool(), ads_size/sizeof(half2));
+    // Reuse quantized activations for adjacent projections on one stream.
+    ggml_cuda_pool_alloc<half2> aq_scoped (ctx.pool());
+    ggml_cuda_pool_alloc<half2> ads_scoped(ctx.pool());
+    half2 * aq  = nullptr;
+    half2 * ads = nullptr;
+    const size_t total_size = aq_size + ads_size;
 
-    const int nthreads = nblocks*A16_QG;
-    const dim3 grid((nthreads + A16_QBLOCK - 1)/A16_QBLOCK, ne11, 1);
-    // Use float4 only when every activation row is 16-byte aligned.
-    const bool vec4 = s11 % 4 == 0 && ((uintptr_t) src1->data) % 16 == 0;
-    if (vec4) {
-        quantize_a16<true> <<<grid, A16_QBLOCK, 0, stream>>>(
-            (const float *) src1->data, aq.get(), ads.get(), s11, nblocks);
+    const bool cacheable = ctx.curr_stream_no == 0 &&
+                           (ctx.mmvq_f16_cache_stream == nullptr || ctx.mmvq_f16_cache_stream == stream);
+    const bool hit = cacheable &&
+                     ctx.mmvq_f16_cache_mem        != nullptr &&
+                     ctx.mmvq_f16_cache_src        == src1 &&
+                     ctx.mmvq_f16_cache_data       == src1->data &&
+                     ctx.mmvq_f16_cache_stream     == stream &&
+                     ctx.mmvq_f16_cache_aq_size    == aq_size &&
+                     ctx.mmvq_f16_cache_stats_size == ads_size &&
+                     ctx.mmvq_f16_cache_shape[0]   == nblocks &&
+                     ctx.mmvq_f16_cache_shape[1]   == ne11 &&
+                     ctx.mmvq_f16_cache_shape[2]   == s11;
+
+    if (hit) {
+        aq  = (half2 *) ctx.mmvq_f16_cache_mem;
+        ads = (half2 *) (ctx.mmvq_f16_cache_mem + aq_size);
+    } else if (!cacheable) {
+        aq  = aq_scoped.alloc(aq_size/sizeof(half2));
+        ads = ads_scoped.alloc(ads_size/sizeof(half2));
     } else {
-        quantize_a16<false><<<grid, A16_QBLOCK, 0, stream>>>(
-            (const float *) src1->data, aq.get(), ads.get(), s11, nblocks);
+        if (total_size > ctx.mmvq_f16_cache_cap) {
+            ctx.mmvq_f16_cache_free();
+            ggml_cuda_set_device(ctx.device);
+            CUDA_CHECK(cudaMalloc((void **) &ctx.mmvq_f16_cache_mem, total_size));
+            ctx.mmvq_f16_cache_cap = total_size;
+        }
+        aq  = (half2 *) ctx.mmvq_f16_cache_mem;
+        ads = (half2 *) (ctx.mmvq_f16_cache_mem + aq_size);
+    }
+
+    if (!hit) {
+        const int nthreads = nblocks*A16_QG;
+        const dim3 grid((nthreads + A16_QBLOCK - 1)/A16_QBLOCK, ne11, 1);
+        // Use float4 only when every activation row is 16-byte aligned.
+        const bool vec4 = s11 % 4 == 0 && ((uintptr_t) src1->data) % 16 == 0;
+        if (vec4) {
+            quantize_a16<true> <<<grid, A16_QBLOCK, 0, stream>>>(
+                (const float *) src1->data, aq, ads, s11, nblocks);
+        } else {
+            quantize_a16<false><<<grid, A16_QBLOCK, 0, stream>>>(
+                (const float *) src1->data, aq, ads, s11, nblocks);
+        }
+        if (cacheable) {
+            ctx.mmvq_f16_cache_src        = src1;
+            ctx.mmvq_f16_cache_data       = src1->data;
+            ctx.mmvq_f16_cache_stream     = stream;
+            ctx.mmvq_f16_cache_aq_size    = aq_size;
+            ctx.mmvq_f16_cache_stats_size = ads_size;
+            ctx.mmvq_f16_cache_shape[0]   = nblocks;
+            ctx.mmvq_f16_cache_shape[1]   = ne11;
+            ctx.mmvq_f16_cache_shape[2]   = s11;
+        }
     }
 
     const int stride_row_x   = src0->nb[1]/sizeof(block_q4_1);
@@ -369,7 +415,7 @@ void ggml_cuda_mmvq_f16_sm60(
 
 #define A16_CASE(N)                                                                            \
     case N:                                                                                    \
-        launch_a16<N>(src0->data, aq.get(), ads.get(), (float *) dst->data, nblocks, ne01, \
+        launch_a16<N>(src0->data, aq, ads, (float *) dst->data, nblocks, ne01, \
                       stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst, stream);    \
         break;
     switch (ne11) {

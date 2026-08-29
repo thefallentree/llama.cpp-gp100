@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1672,6 +1673,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
+    // The sm_60 Q4_1_G64 kernel does not support fused gate/up mat-vecs.
+    if (ffn_up->src[0]->type == GGML_TYPE_Q4_1_G64) {
+        return false;
+    }
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1791,6 +1796,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // The sm_60 Q4_1_G64 kernel does not support fusion arguments.
+    if (src0->type == GGML_TYPE_Q4_1_G64) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -1861,8 +1871,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-        return;
+        // Unsupported Q4_1_G64 shapes use dequantization and cuBLAS.
+        if (src0->type != GGML_TYPE_Q4_1_G64 ||
+                ggml_cuda_mmvq_f16_sm60_supported(src0, src1, nullptr, dst)) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
@@ -1882,7 +1896,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
+        // Q4_1_G64 indirect mat-muls use the synchronized cuBLAS fallback.
+        if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_Q4_1_G64) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
@@ -1918,7 +1933,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            // The sm_60 Q4_1_G64 kernel does not support indirect mat-muls.
+            if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_Q4_1_G64) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
@@ -5013,6 +5029,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q4_1_G64:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
@@ -5052,6 +5069,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q4_1_G64:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:

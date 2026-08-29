@@ -1346,8 +1346,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
-    // sm_60 has no DP4A but full-rate HFMA2, so for Q4_1 a dedicated kernel that expands the
-    // nibbles straight to half2 with LOP3 magic constants beats emulating the int8 dot product.
+    // Use HFMA2 instead of emulated DP4A for Q4_1 on sm_60.
     if (!fusion && ggml_cuda_mmvq_f16_sm60_supported(src0, src1, ids, dst)) {
         ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
         return;

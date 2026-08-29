@@ -91,7 +91,7 @@ static __global__ void quantize_a16(
 
 // Load activations before rows so register use does not grow with nrows_block.
 // Keep the cross-block accumulator in float to avoid fp16 accumulation error.
-template <int ncols_dst, int nwarps, int nrows_block = A16_ROWS>
+template <int ncols_dst, int nwarps, int nrows_block = A16_ROWS, bool g64_fmt = false>
 static __global__ void __launch_bounds__(WARP_SIZE*nwarps,
         (ncols_dst >= 6 ? 2 : 4)*(A16_NWARPS/nwarps))
 mul_mat_vec_q4_1_a16(
@@ -111,16 +111,25 @@ mul_mat_vec_q4_1_a16(
     float sumf[ncols_dst][nrows_block] = {{0.0f}};
 
     // Hoist row bases so the 20-byte Q4_1 stride does not add an XMAD chain inside the loop.
-    const char * const xbase = (const char *) &x[(size_t) row0*stride_row_x];
-    int64_t rowoff[nrows_block];
+    // G64 passes byte strides because its 36-byte groups do not tile as block_q4_1.
+    const char * const xbase = g64_fmt ? (const char *) vx + (size_t) row0*stride_row_x
+                                       : (const char *) &x[(size_t) row0*stride_row_x];
+    int rowoff[nrows_block];
 #pragma unroll
     for (int i = 0; i < nrows_block; ++i) {
-        rowoff[i] = (int64_t) i*stride_row_x*sizeof(block_q4_1);
+        rowoff[i] = g64_fmt ? i*stride_row_x : i*stride_row_x*(int) sizeof(block_q4_1);
     }
 
     for (int t = tid; t < 2*nblocks; t += nthreads) {
         const int kb = t >> 1;
         const int kh = t &  1;
+        // G64 group: {half2 dm}{16-byte low half}{16-byte high half}.
+        [[maybe_unused]] int koff_g = 0, dmoff_g = 0;
+        if constexpr (g64_fmt) {
+            const int g = kb >> 1;
+            koff_g  = g*36 + 4 + (kb & 1)*16;
+            dmoff_g = g*36;
+        }
         const int koff = kb*(int) sizeof(block_q4_1);
 
         half2 a[ncols_dst][8];
@@ -144,9 +153,16 @@ mul_mat_vec_q4_1_a16(
 
 #pragma unroll
         for (int i = 0; i < nrows_block; ++i) {
-            const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
-            const float2 dm = __half22float2(b->dm);
-            const int * wq = (const int *) b->qs;
+            float2 dm;
+            const int * wq;
+            if constexpr (g64_fmt) {
+                dm = __half22float2(*(const half2 *) (xbase + (rowoff[i] + dmoff_g)));
+                wq = (const int *) (xbase + (rowoff[i] + koff_g));
+            } else {
+                const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
+                dm = __half22float2(b->dm);
+                wq = (const int *) b->qs;
+            }
 
             half2 w[8];
 #pragma unroll
@@ -284,13 +300,37 @@ static void launch_a16(
 }
 
 
+template <int ncols_dst>
+static void launch_a16_g64(
+        const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
+        const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
+        const int stride_col_dst, cudaStream_t stream) {
+    const dim3 grid(nrows/8, 1, 1);
+    switch (a16_pick_nwarps(nblocks, nrows/8)) {
+        case 1:
+            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        case 2:
+            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        default:
+            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+    }
+}
+
 bool ggml_cuda_mmvq_f16_sm60_supported(
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * dst) {
     if (ids) {
         return false;
     }
-    if (src0->type != GGML_TYPE_Q4_1 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    const bool is_g64  = src0->type == GGML_TYPE_Q4_1_G64;
+    const bool is_q4_1 = src0->type == GGML_TYPE_Q4_1 || is_g64;
+    if (!is_q4_1 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     if (src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != sizeof(float)) {
@@ -304,25 +344,45 @@ bool ggml_cuda_mmvq_f16_sm60_supported(
     if (cc != GGML_CUDA_CC_PASCAL || !fp16_available(cc)) {
         return false;
     }
-    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+    // G64 folds [k, 1, nseq] activations into columns when the weight broadcasts over nseq.
+    const bool g64_seq_fold = is_g64 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                              src1->ne[1] == 1 && src1->ne[2] > 1 && src1->ne[2] <= 8 &&
+                              src1->ne[3] == 1 && dst->ne[1] == 1 && dst->ne[2] == src1->ne[2] &&
+                              dst->ne[3] == 1;
+    if (!g64_seq_fold &&
+            (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1)) {
         return false;
     }
-    if (dst->ne[1] != src1->ne[1] || dst->ne[2] != 1 || dst->ne[3] != 1) {
+    if (!g64_seq_fold &&
+            (dst->ne[1] != src1->ne[1] || dst->ne[2] != 1 || dst->ne[3] != 1)) {
         return false;
     }
     if (src0->ne[0] % A16_QK != 0 || src0->ne[1] % A16_ROWS != 0 ||
             src0->ne[0]/A16_QK > INT_MAX/A16_QG || src0->ne[1] > INT_MAX || src0->nb[1] > INT_MAX) {
         return false;
     }
-    if (src0->nb[1] % sizeof(block_q4_1) != 0 || src0->nb[1]/sizeof(block_q4_1) > INT_MAX) {
+    // The kernel keeps offsets for an eight-row tile in 32-bit registers.  The
+    // global row base remains size_t; only the seven-row local span is bounded.
+    if (src0->nb[1] > INT_MAX/7) {
         return false;
     }
-    // Generic MMVQ is faster at width one and for widths above eight.
-    if (src1->ne[1] < 2 || src1->ne[1] > 8) {
+    const size_t row_stride = is_g64 ? src0->nb[1] : src0->nb[1]/sizeof(block_q4_1);
+    if ((!is_g64 && src0->nb[1] % sizeof(block_q4_1) != 0) || row_stride > INT_MAX) {
         return false;
     }
-    if (src1->nb[1] % sizeof(float) != 0 || src1->nb[1]/sizeof(float) > INT_MAX ||
-            dst->nb[1] % sizeof(float) != 0 || dst->nb[1]/sizeof(float) > INT_MAX) {
+    // Generic MMVQ is faster for Q4_1 width one and for widths above eight.
+    // G64 has no generic CUDA vec_dot, so it also uses this path at width one.
+    const int64_t eff_cols = src1->ne[1] == 1 && src1->ne[2] > 1 ? src1->ne[2] : src1->ne[1];
+    if (eff_cols < (is_g64 ? 1 : 2) || eff_cols > 8) {
+        return false;
+    }
+    if (is_g64 && (src0->ne[0] % 64 != 0 || src0->ne[1] % 8 != 0)) {
+        return false;
+    }
+    const size_t src1_stride = g64_seq_fold ? src1->nb[2] : src1->nb[1];
+    const size_t dst_stride  = g64_seq_fold ? dst->nb[2]  : dst->nb[1];
+    if (src1_stride % sizeof(float) != 0 || src1_stride/sizeof(float) > INT_MAX ||
+            dst_stride % sizeof(float) != 0 || dst_stride/sizeof(float) > INT_MAX) {
         return false;
     }
     if (!ggml_is_contiguous(dst)) {
@@ -338,14 +398,17 @@ void ggml_cuda_mmvq_f16_sm60(
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
-    const int64_t ne11 = src1->ne[1];
+    // seq->columns fold (see supported()): [k, 1, nseq] activations become nseq columns.
+    // Only Q4_1_G64 is ever dispatched here with ne[2] > 1.
+    const bool    seq_fold = src1->ne[1] == 1 && src1->ne[2] > 1;
+    const int64_t ne11     = seq_fold ? src1->ne[2] : src1->ne[1];
     const int nblocks  = ne00/A16_QK;
 
     // Store normalized half2 activations plus per-block scale and sum.
     const size_t aq_size  = (size_t) ne11*nblocks*(A16_QK/2)*sizeof(half2);
     const size_t ads_size = (size_t) ne11*nblocks*sizeof(half2);
 
-    const int64_t s11 = src1->nb[1]/ggml_type_size(src1->type);
+    const int64_t s11 = (seq_fold ? src1->nb[2] : src1->nb[1])/ggml_type_size(src1->type);
 
     // Reuse quantized activations for adjacent projections on one stream.
     ggml_cuda_pool_alloc<half2> aq_scoped (ctx.pool());
@@ -408,6 +471,28 @@ void ggml_cuda_mmvq_f16_sm60(
         }
     }
 
+    if (src0->type == GGML_TYPE_Q4_1_G64) {
+        const int  ne11_eff = (int) ne11;
+        const int stride_row_g  = (int) src0->nb[1];
+        const int stride_col_aqg  = nblocks*(A16_QK/2);
+        const int stride_col_adsg = nblocks;
+        const int stride_col_dstg = seq_fold ? (int) (dst->nb[2]/ggml_type_size(dst->type))
+                                             : (int) (dst->nb[1]/ggml_type_size(dst->type));
+        switch (ne11_eff) {
+#define A16_G64_CASE(N)                                                                            \
+            case N:                                                                                \
+                launch_a16_g64<N>(src0->data, aq, ads, (float *) dst->data, nblocks, ne01,         \
+                        stride_row_g, stride_col_aqg, stride_col_adsg, stride_col_dstg, stream);   \
+                break;
+            A16_G64_CASE(1) A16_G64_CASE(2) A16_G64_CASE(3) A16_G64_CASE(4)
+            A16_G64_CASE(5) A16_G64_CASE(6) A16_G64_CASE(7) A16_G64_CASE(8)
+#undef A16_G64_CASE
+            default:
+                GGML_ABORT("unsupported width for the sm_60 Q4_1_G64 mat-vec");
+        }
+        return;
+    }
+
     const int stride_row_x   = src0->nb[1]/sizeof(block_q4_1);
     const int stride_col_aq  = nblocks*(A16_QK/2);
     const int stride_col_ads = nblocks;
@@ -415,7 +500,7 @@ void ggml_cuda_mmvq_f16_sm60(
 
 #define A16_CASE(N)                                                                            \
     case N:                                                                                    \
-        launch_a16<N>(src0->data, aq, ads, (float *) dst->data, nblocks, ne01, \
+        launch_a16<N>(src0->data, aq, ads, (float *) dst->data, nblocks, ne01,     \
                       stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst, stream);    \
         break;
     switch (ne11) {

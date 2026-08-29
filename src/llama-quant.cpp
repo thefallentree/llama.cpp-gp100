@@ -395,6 +395,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
             case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_Q4_1_G64: return_type = GGML_TYPE_Q4_1;   break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -829,6 +830,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: return GGML_TYPE_Q4_0;
         case LLAMA_FTYPE_MOSTLY_Q4_1: return GGML_TYPE_Q4_1;
+        case LLAMA_FTYPE_MOSTLY_Q4_1_G64: return GGML_TYPE_Q4_1_G64;
         case LLAMA_FTYPE_MOSTLY_Q5_0: return GGML_TYPE_Q5_0;
         case LLAMA_FTYPE_MOSTLY_Q5_1: return GGML_TYPE_Q5_1;
         case LLAMA_FTYPE_MOSTLY_Q8_0: return GGML_TYPE_Q8_0;

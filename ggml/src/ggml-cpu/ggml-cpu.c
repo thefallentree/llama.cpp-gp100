@@ -256,6 +256,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_Q4_1_G64] = {
+        .from_float               = quantize_row_q4_1_g64,
+        .vec_dot                  = ggml_vec_dot_q4_1_g64_q8_1,
+        .vec_dot_type             = GGML_TYPE_Q8_1,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q5_0] = {
         .from_float               = quantize_row_q5_0,
         .vec_dot                  = ggml_vec_dot_q5_0_q8_0,

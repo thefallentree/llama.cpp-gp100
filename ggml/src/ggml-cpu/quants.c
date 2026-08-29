@@ -259,6 +259,41 @@ void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 }
 
 // TODO: add WASM SIMD
+
+void quantize_row_q4_1_g64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_1_g64_ref(x, (block_q4_1_g64 *) y, k);
+}
+
+void ggml_vec_dot_q4_1_g64_q8_1(
+        int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    assert(n % QK4_1_G64 == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    const int nb = n / QK4_1_G64;
+    const block_q4_1_g64 * GGML_RESTRICT x = vx;
+    const block_q8_1     * GGML_RESTRICT y = vy;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+        for (int h = 0; h < 2; ++h) {
+            const block_q8_1 * GGML_RESTRICT q8 = &y[2*i + h];
+            const uint8_t * GGML_RESTRICT qs = x[i].qs + 16*h;
+            int sumi = 0;
+            for (int j = 0; j < 16; ++j) {
+                sumi += (qs[j] & 0x0F) * q8->qs[j];
+                sumi += (qs[j] >>   4) * q8->qs[j + 16];
+            }
+            const float dy = GGML_FP16_TO_FP32(q8->d);
+            const float sy = GGML_FP16_TO_FP32(q8->s);
+            sumf += d*dy*sumi + m*sy;
+        }
+    }
+    *s = sumf;
+}
+
 void ggml_vec_dot_q4_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;

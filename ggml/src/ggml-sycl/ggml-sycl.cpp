@@ -6022,7 +6022,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     return false;
                 }
 
-                if (src0_type == GGML_TYPE_TQ2_0) {
+                if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_Q4_1_G64) {
                     return false;
                 }
 

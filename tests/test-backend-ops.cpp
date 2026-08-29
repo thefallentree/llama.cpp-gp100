@@ -9305,6 +9305,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
+    // Exercise MMVQ row-tail bounds for every narrow mat-vec width. The odd
+    // row count keeps the final block partial even when the width is aligned.
+    for (int64_t n = 2; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q4_1, GGML_TYPE_F32, 17, n, 256, {1, 1}, {1, 1}));
+    }
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));
     }

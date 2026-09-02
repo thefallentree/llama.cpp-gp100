@@ -631,8 +631,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
             // candidates are only needed by callers that inspect probabilities,
-            // which disable backend sampling; keep cur_p consistent when present
-            if (llama_get_sampled_candidates_ith(ctx, idx) != nullptr) {
+            // which disable backend sampling; keep cur_p consistent when present.
+            // llama_get_sampled_candidates_ith() falls back to the full vocabulary when the backend
+            // produced no candidate list, so check the count: set_logits() would otherwise
+            // materialize an n_vocab-sized array for every token (~0.7 ms on a 248k vocabulary)
+            if (llama_get_sampled_candidates_count_ith(ctx, idx) > 0) {
                 gsmpl->set_logits(ctx, idx);
                 for (size_t i = 0; i < cur_p.size; ++i) {
                     if (cur_p.data[i].id == id) {

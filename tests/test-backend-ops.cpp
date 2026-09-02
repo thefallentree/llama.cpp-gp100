@@ -3637,6 +3637,69 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD
+// GGML_OP_ADD -> GGML_OP_RMS_NORM -> GGML_OP_MUL, where the sum is also consumed later (residual stream)
+struct test_add_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const int inplace_src;  // 1: one ADD operand is a dead intermediate (the ADD may be allocated in place over it),
+                            // 2: both are, so the MUL output can be allocated over the other dead operand
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, eps, inplace_src);
+    }
+
+    test_add_rms_norm_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f, int inplace_src = 0)
+        : type(type), ne(ne), eps(eps), inplace_src(inplace_src) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * c = ggml_new_tensor(ctx, type, 4, ne.data());
+
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+        ggml_set_param(c);
+        ggml_set_name(c, "c");
+
+        ggml_tensor * x = inplace_src >= 1 ? ggml_scale(ctx, a, 0.5f) : a;
+        ggml_tensor * y = inplace_src >= 2 ? ggml_scale(ctx, b, 0.5f) : b;
+
+        // the residual add, its normalization and the residual being used again by the next block
+        ggml_tensor * res  = ggml_add(ctx, x, y);
+        ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, res, eps), c);
+        ggml_tensor * out  = ggml_add(ctx, ggml_mul(ctx, norm, b), res);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+
+    float grad_eps() override {
+        return 1.0f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9302,6 +9365,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (uint32_t n : { 64, 1025 }) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+            for (int inplace_src : { 0, 1, 2 }) {
+                test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, inplace_src));
+            }
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));

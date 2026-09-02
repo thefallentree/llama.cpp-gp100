@@ -3261,6 +3261,81 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> add_rms_norm_mul_ops = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+
+    // residual add folded into the prologue of the following norm: ADD -> RMS_NORM -> MUL.
+    // The ADD result is the residual stream and is used again later, so it stays an output.
+    if (is_equal(add_rms_norm_mul_ops, ops)) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+            return false;
+        }
+
+        const ggml_tensor * add      = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+
+        if (rms_norm->src[0] != add || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+            return false;
+        }
+
+        if (add->type         != GGML_TYPE_F32 || add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
+            rms_norm->type    != GGML_TYPE_F32 ||
+            mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // the kernel indexes the ADD operands like the norm input: same shape, no broadcast, contiguous
+        if (!ggml_are_same_shape(add, add->src[0]) || !ggml_are_same_shape(add, add->src[1]) ||
+            !ggml_is_contiguous(add) || !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1])) {
+            return false;
+        }
+
+        //if rms norm is the B operand, then we don't handle broadcast
+        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+            return false;
+        }
+
+        //rms_norm kernel assumes contiguous rows
+        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+            return false;
+        }
+
+        // The fused kernel handles one row per block and, per element, reads both ADD operands before it writes
+        // the sum and the scaled result. Exact aliasing of an output with an input (same data pointer and
+        // layout, the allocator's in-place reuse) is therefore fine; any other overlap is not.
+        const ggml_tensor * mul_w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        const ggml_tensor * outs[2] = { add, mul };
+        const ggml_tensor * ins[3]  = { add->src[0], add->src[1], mul_w };
+        for (const ggml_tensor * out : outs) {
+            for (const ggml_tensor * in : ins) {
+                if (in->data == out->data) {
+                    if (ggml_are_same_shape(in, out) && in->type == out->type && ggml_is_contiguous(in) && ggml_is_contiguous(out)) {
+                        continue;
+                    }
+                    return false;
+                }
+                const int64_t o0 = (int64_t) out->data, o1 = o0 + (int64_t) ggml_nbytes(out);
+                const int64_t i0 = (int64_t) in->data,  i1 = i0 + (int64_t) ggml_nbytes(in);
+                if (o0 < i1 && i0 < o1) {
+                    return false;
+                }
+            }
+        }
+        // the ADD output is live after the fusion, so the MUL output must not touch it
+        if (mul->data == add->data) {
+            return false;
+        }
+        {
+            const int64_t o0 = (int64_t) mul->data, o1 = o0 + (int64_t) ggml_nbytes(mul);
+            const int64_t a0 = (int64_t) add->data, a1 = a0 + (int64_t) ggml_nbytes(add);
+            if (o0 < a1 && a0 < o1) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4125,6 +4200,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_rms_norm_fused_pre_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {

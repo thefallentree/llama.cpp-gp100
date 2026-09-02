@@ -597,6 +597,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // An I64 ARGMAX over an axis-0 split is a packed max/location: every
+        // non-empty shard yields one complete candidate per row and the readback
+        // merges them by score and global column, so the result is mirrored.
+        if (tensor->op == GGML_OP_ARGMAX && tensor->type == GGML_TYPE_I64 &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+
         // A per-row op is still well defined under a nominal axis-0 split when
         // the whole row lives on backend 0 and every other shard is empty, as
         // with an output head that a split model keeps unsharded.  The op runs
@@ -2049,6 +2057,57 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
+
+    // Packed max/location ARGMAX over a vocabulary sharded on axis 0: read the
+    // per-shard I64 keys and reduce them here.  The caller asked for I32 ids,
+    // so `size` counts int32 rows, not the I64 storage.
+    if (tensor->op == GGML_OP_ARGMAX && tensor->type == GGML_TYPE_I64 &&
+            tensor->src[0] != nullptr && ggml_backend_buffer_is_meta(tensor->src[0]->buffer)) {
+        const ggml_backend_meta_split_state src_ss =
+            ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ false);
+        if (src_ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_ASSERT(src_ss.n_segments == 1 && src_ss.nr[0] == 1);
+
+            const size_t n_rows = ggml_nelements(tensor);
+            GGML_ASSERT(size == n_rows*sizeof(int32_t));
+            std::vector<std::vector<uint64_t>> keys(n_backends, std::vector<uint64_t>(n_rows));
+
+            for (size_t j = 0; j < n_backends; ++j) {
+                if (src_ss.ne[j] == 0) {
+                    continue;
+                }
+                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                ggml_backend_synchronize(simple_backend);
+                ggml_backend_tensor_get(simple_tensor, keys[j].data(), 0, n_rows*sizeof(uint64_t));
+            }
+
+            int32_t * ids = (int32_t *) data;
+            for (size_t row = 0; row < n_rows; ++row) {
+                uint32_t best_score = 0;
+                uint32_t best_id    = UINT32_MAX;
+                uint32_t col_offset = 0;
+                for (size_t j = 0; j < n_backends; ++j) {
+                    if (src_ss.ne[j] == 0) {
+                        continue;
+                    }
+                    const uint64_t key      = keys[j][row];
+                    const uint32_t score    = uint32_t(key >> 32);
+                    const uint32_t local_id = ~uint32_t(key);
+                    GGML_ASSERT(local_id < (uint32_t) src_ss.ne[j]);
+                    const uint32_t global_id = col_offset + local_id;
+                    if (score > best_score || (score == best_score && global_id < best_id)) {
+                        best_score = score;
+                        best_id    = global_id;
+                    }
+                    col_offset += src_ss.ne[j];
+                }
+                GGML_ASSERT(best_id != UINT32_MAX);
+                ids[row] = (int32_t) best_id;
+            }
+            return;
+        }
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:

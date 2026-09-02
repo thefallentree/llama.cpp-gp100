@@ -337,7 +337,19 @@ struct common_sampler * common_sampler_init(
         }
     }
 
-    if (params.mirostat == 0) {
+    // Temperature 0 is an argmax however the chain is spelled.  Spelled as one
+    // greedy sampler it is a single terminal op, which lets a backend -- a
+    // tensor-split one included -- reduce it without the truncation samplers in
+    // between, none of which can move the argmax.  Anything that can move it
+    // (penalties, DRY, XTC, adaptive-p) keeps the ordinary chain.
+    const bool greedy_only = params.backend_sampling && params.temp <= 0.0f && params.mirostat == 0 &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
+        params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f &&
+        std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == params.samplers.end();
+
+    if (greedy_only) {
+        samplers.push_back(llama_sampler_init_greedy());
+    } else if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
 
@@ -604,10 +616,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
-    // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
+    // A backend sampler may already have produced the token.  Check before
+    // set_logits(): without backend candidates that call materializes and scans
+    // a full-vocabulary array on the CPU, which is the cost the backend sampler
+    // exists to remove -- for greedy speculative verification it is paid once
+    // per draft row.
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
@@ -617,16 +630,29 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
+            // candidates are only needed by callers that inspect probabilities,
+            // which disable backend sampling; keep cur_p consistent when present
+            if (llama_get_sampled_candidates_ith(ctx, idx) != nullptr) {
+                gsmpl->set_logits(ctx, idx);
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    if (cur_p.data[i].id == id) {
+                        cur_p.selected = i;
+                        break;
+                    }
                 }
+            } else {
+                // leave a valid one-token candidate array behind for callers
+                // that inspect it after sampling
+                gsmpl->cur.resize(1);
+                gsmpl->cur[0] = llama_token_data{ id, 0.0f, 1.0f };
+                cur_p = { gsmpl->cur.data(), 1, 0, true };
             }
 
             return id;
         }
     }
+
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);

@@ -540,7 +540,32 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+        // A per-row op is still well defined under a nominal axis-0 split when
+        // the whole row lives on backend 0 and every other shard is empty, as
+        // with an output head that a split model keeps unsharded.  The op runs
+        // complete on that backend, so any index it returns is already global.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            bool only_backend_0 = src_ss[0].ne[0] > 0;
+            for (size_t s = 0; s < src_ss[0].n_segments; ++s) {
+                for (size_t j = 1; j < n_bufs; ++j) {
+                    only_backend_0 &= src_ss[0].ne[s*n_bufs + j] == 0;
+                }
+            }
+            if (only_backend_0) {
+                return src_ss[0];
+            }
+            std::string shards;
+            for (size_t s = 0; s < src_ss[0].n_segments; ++s) {
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    shards += (s || j ? "," : "") + std::to_string(src_ss[0].ne[s*n_bufs + j]);
+                }
+            }
+            GGML_ABORT("%s: per-row op %s cannot consume a src split on axis 0 "
+                       "(n_bufs=%zu, segments=%zu, ne=[%s])\n",
+                       __func__, ggml_op_name(tensor->op), n_bufs,
+                       (size_t) src_ss[0].n_segments, shards.c_str());
+        }
         return src_ss[0];
     };
 

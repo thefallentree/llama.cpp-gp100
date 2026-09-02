@@ -3745,6 +3745,12 @@ void llm_graph_context::build_sampling() const {
 
     static const std::vector<uint32_t> dummy_row = { 0 };
 
+    bool vocab_sharded = false;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+        vocab_sharded |= dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+    }
+
     for (const auto & [seq_id, sampler] : samplers) {
         const auto it = sampling_rows.find(seq_id);
 
@@ -3765,7 +3771,26 @@ void llm_graph_context::build_sampling() const {
             };
 
             assert(sampler->iface->backend_apply);
+            ggml_tensor * logits_in = data.logits;
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            if (vocab_sharded && data.sampled != nullptr && data.sampled->op == GGML_OP_ARGMAX &&
+                    data.sampled->type == GGML_TYPE_I32 && data.sampled->src[0] != nullptr &&
+                    ggml_nelements(data.sampled) == 1) {
+                // A Meta device shards the vocabulary across backends, so no backend
+                // can reduce the row alone.  Typing a terminal argmax as I64 selects
+                // the packed max/location kernel; each shard yields one candidate and
+                // the Meta readback merges them into a global token id.
+                static bool announced = false;
+                if (!announced) {
+                    LLAMA_LOG_INFO("%s: sharded vocabulary: greedy argmax runs as a packed max/location reduction\n", __func__);
+                    announced = true;
+                }
+                data.sampled->type  = GGML_TYPE_I64;
+                data.sampled->nb[0] = ggml_type_size(GGML_TYPE_I64);
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                    data.sampled->nb[d] = data.sampled->nb[d - 1]*data.sampled->ne[d - 1];
+                }
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {
@@ -3783,7 +3808,10 @@ void llm_graph_context::build_sampling() const {
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
-            if (data.logits != nullptr) {
+            // A chain that never touched its logits (a bare greedy sampler) has
+            // nothing to export: copying the untouched full-vocabulary row back
+            // to the host per output is the cost backend sampling removes.
+            if (data.logits != nullptr && data.logits != logits_in) {
                 if (active) {
                     res->t_sampled_logits[rows[i]] = data.logits;
                 }

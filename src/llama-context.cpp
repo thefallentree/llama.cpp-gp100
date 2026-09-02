@@ -1215,6 +1215,28 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// A tensor-split model shards the vocabulary across devices.  The one backend
+// sampler that can run on a sharded row is a terminal argmax, which the meta
+// backend reduces across shards; any other chain stays on the CPU.
+static bool sampler_is_bare_greedy(llama_sampler * sampler) {
+    // Callers may hand over a chain, or a chain wrapping a chain; descend
+    // while there is exactly one element.
+    llama_sampler * s = sampler;
+    while (llama_sampler_chain_get(s, 0) != nullptr) {
+        if (llama_sampler_chain_n(s) != 1) {
+            return false;
+        }
+        s = llama_sampler_chain_get(s, 0);
+    }
+    // A backend sampler decorates its name with its probe result once
+    // initialized ("+greedy" / "-greedy"); compare past that.
+    const char * name = llama_sampler_name(s);
+    while (*name == '+' || *name == '-') {
+        ++name;
+    }
+    return strcmp(name, "greedy") == 0;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1222,10 +1244,23 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    bool on_meta = false;
+    for (const auto & dev : model.devices) {
+        on_meta |= dev.is_meta;
+    }
+    if (sampler && on_meta && !sampler_is_bare_greedy(sampler)) {
         static bool warned = false;
         if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
+            std::string chain_desc;
+            if (llama_sampler_chain_get(sampler, 0) != nullptr) {
+                for (int i = 0; i < llama_sampler_chain_n(sampler); ++i) {
+                    chain_desc += std::string(i ? " -> " : "") + llama_sampler_name(llama_sampler_chain_get(sampler, i));
+                }
+            } else {
+                chain_desc = llama_sampler_name(sampler);
+            }
+            LLAMA_LOG_WARN("%s: a tensor-split model runs only a bare greedy chain on the backend, got '%s'; using CPU\n",
+                    __func__, chain_desc.c_str());
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
@@ -1233,6 +1268,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         }
         sampling.samplers.erase(seq_id);
         return false;
+    }
+    if (sampler && on_meta) {
+        static bool announced = false;
+        if (!announced) {
+            LLAMA_LOG_INFO("%s: tensor-split model: greedy chain runs on the backend\n", __func__);
+            announced = true;
+        }
     }
 
     const bool can_offload =
@@ -1615,7 +1657,9 @@ static void copy_tensor_async_rows(
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         T * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
+        // Copy element-wise in the destination type rather than ggml_nbytes: a
+        // packed I64 argmax on a sharded vocabulary reads back as I32 token ids.
+        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, n_elements*sizeof(T));
 
         if (counts) {
             GGML_ASSERT(row < counts->size());

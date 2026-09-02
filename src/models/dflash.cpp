@@ -19,6 +19,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_EDGE_SCALE, hparams.dflash_selector_edge_scale, false);
+    // The selector's transition term is calibrated against the target head's
+    // unary logits.  A checkpoint may ship a scale; a serving stack may override
+    // it without touching the file.
+    if (const char * value = std::getenv("LLAMA_DFLASH_SELECTOR_EDGE_SCALE")) {
+        char * end = nullptr;
+        const float parsed = std::strtof(value, &end);
+        if (end != value && *end == '\0' && std::isfinite(parsed) && parsed >= 0.0f) {
+            hparams.dflash_selector_edge_scale = parsed;
+        } else {
+            LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_DFLASH_SELECTOR_EDGE_SCALE='%s'\n", __func__, value);
+        }
+    }
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
@@ -143,9 +156,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         dflash_selector_next   = create_tensor(tn(LLM_TENSOR_DFLASH_SELECTOR_NEXT,   "weight"), { rank, n_vocab }, 0);
         dflash_selector_hidden = create_tensor(tn(LLM_TENSOR_DFLASH_SELECTOR_HIDDEN, "weight"), { n_embd, rank }, 0);
 
-        LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u\n", __func__,
+        LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u, edge scale = %.3f\n", __func__,
                 hparams.dflash_conv_kernel_size, hparams.dflash_conv_group_size,
-                hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
+                hparams.dflash_selector_rank, hparams.dflash_selector_top_k, hparams.dflash_selector_edge_scale);
     }
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
@@ -527,6 +540,9 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
         ggml_tensor * cond  = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
         ggml_tensor * score = ggml_mul_mat(ctx0, successor, cond);
+        if (hparams.dflash_selector_edge_scale != 1.0f) {
+            score = ggml_scale(ctx0, score, hparams.dflash_selector_edge_scale);
+        }
         if (n_pred == 1) {
             score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
         }

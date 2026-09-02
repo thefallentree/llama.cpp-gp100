@@ -238,6 +238,7 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    float    dflash_selector_edge_scale = 1.0f;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

@@ -167,16 +167,26 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
-            for (size_t i = 0; i < n_devs; ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+            if (n_devs == 1) {
+                // Tensor parallelism over a single device splits nothing, but the
+                // Meta wrapper still has to infer a split state for every op.  Use
+                // the device directly so a one-device model (a draft model pinned
+                // with --device-draft, say) is not constrained by that inference.
+                LLAMA_LOG_INFO("%s: single device %s, skipping the Meta device\n",
+                        __func__, ggml_backend_dev_name(params.devices[0]));
+                model->devices.push_back({false, params.devices[0]});
+            } else {
+                LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
+                for (size_t i = 0; i < n_devs; ++i) {
+                    LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+                }
+                model->get_split_state_ud.n_devices = n_devs;
+                model->get_split_state_ud.model = model;
+                model->devices.push_back({
+                    true, ggml_backend_meta_device(
+                    params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                });
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});

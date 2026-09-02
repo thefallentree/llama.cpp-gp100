@@ -167,9 +167,9 @@ static __global__ void ggml_cuda_ar_kernel(
             __builtin_amdgcn_s_sleep(4);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(100);
-#else
-            NO_DEVICE_CODE;
-#endif // GGML_USE_HIP
+#endif
+            // Pascal has no nanosleep instruction. The volatile mapped-host
+            // read is still a valid system-scope poll, so spin tightly.
         }
     }
 
@@ -403,18 +403,6 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         GGML_LOG_DEBUG("%s: internal AllReduce only supports n_devices=2 (got %zu); "
                        "falling back\n", __func__, n_devices);
         return nullptr;
-    }
-
-    // The chunked kernel uses __nanosleep (NVIDIA, sm70+) or
-    // __builtin_amdgcn_s_sleep (AMD).
-    for (size_t i = 0; i < n_devices; ++i) {
-        const int cc = ggml_cuda_info().devices[devices[i]].cc;
-        if (cc < GGML_CUDA_CC_VOLTA) {
-            GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
-                           "(device %d has cc=%d); falling back\n",
-                           __func__, GGML_CUDA_CC_VOLTA, devices[i], cc);
-            return nullptr;
-        }
     }
 
     auto * p = new ggml_cuda_ar_pipeline{};

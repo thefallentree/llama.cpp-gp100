@@ -556,6 +556,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             case 2:
             case 3:
             case 4:
+                // Same reasoning for a few output columns (e.g. the verify batch of speculative decoding,
+                // ncols_dst = n_draft + 1): on a GP100 the Q8_0 output head at ncols_dst = 4 goes from
+                // 2.55 ms to 2.09 ms with 4 rows per block. At ncols_dst >= 5 the per-launch cost
+                // grows too slowly with width for the extra row reuse to pay off, so 2 stays.
+                if (table_id == MMVQ_PARAMETERS_NVIDIA_PRE_TURING) {
+                    return 4;
+                }
+                return 2;
             case 5:
             case 6:
             case 7:

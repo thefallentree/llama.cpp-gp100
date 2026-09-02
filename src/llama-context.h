@@ -258,9 +258,10 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -366,6 +367,27 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // extra graphs kept for reuse (cparams.n_graph_slots > 1), each with its own scheduler so that its
+    // allocation survives while other graphs are built. used for ubatches of up to
+    // LLAMA_GRAPH_SLOT_N_TOKENS_MAX tokens; anything larger goes through the main scheduler.
+    struct graph_slot {
+        llm_graph_result_ptr   res;
+        ggml_backend_sched_ptr sched;
+        bool                   valid    = false;
+        uint64_t               last_use = 0;
+    };
+
+    std::vector<graph_slot> gf_slots;
+
+    static constexpr int LLAMA_GRAPH_SLOT_N_TOKENS_MAX = 16;
+
+    int      gf_slot_cur   = -1; // slot holding the most recently computed graph (-1 = main scheduler)
+    uint64_t gf_slot_clock = 0;
+
+    ggml_backend_sched_t sched_active() const;
+
+    void gf_slots_invalidate();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -2537,6 +2537,10 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // the drafter alternates between injecting target features (embd ubatches) and drafting (token ubatches);
+    // with a single cached graph every call would rebuild it, so keep a few
+    cparams.n_graph_slots = 4;
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;

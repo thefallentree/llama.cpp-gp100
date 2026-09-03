@@ -27,3 +27,22 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// AllReduce fused with the residual ADD -> RMS_NORM -> MUL that follows every
+// tensor-parallel projection in a decoder layer.  Writes the ADD output (the
+// residual stream) and the MUL output; the reduced tensor and the RMS_NORM
+// intermediate are not materialized.  One 1024-thread block per row keeps the
+// arithmetic bit-identical to ggml_cuda_ar_kernel followed by rms_norm_f32<1024>
+// with its fused pre-add and multiply.  Rows are limited by the per-block
+// arrival ring; the caller checks *_supported() at graph-build time.
+bool ggml_cuda_ar_allreduce_add_rms_norm_mul_supported(
+    const ggml_cuda_ar_pipeline * pipeline, int64_t ncols, int64_t nrows);
+
+bool ggml_cuda_ar_allreduce_add_rms_norm_mul(
+    ggml_cuda_ar_pipeline * pipeline,
+    ggml_backend_t        * backends,
+    ggml_tensor           ** tensors,       // partial sums, F32 [ncols, nrows] (only read)
+    ggml_tensor           ** residuals,     // F32 [ncols, nrows]
+    ggml_tensor           ** add_outputs,   // F32 [ncols, nrows] = reduced + residual
+    ggml_tensor           ** norm_weights,  // F32 [ncols]
+    ggml_tensor           ** norm_outputs,  // F32 [ncols, nrows] = rms_norm(add) * weight
+    float                    eps);

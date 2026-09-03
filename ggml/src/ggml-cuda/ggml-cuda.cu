@@ -3600,6 +3600,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Several identically shaped strided copies in a row (recurrent rollback snapshots) become
+    // one launch.  Two are not worth the wider grid, so require at least three.
+    if (node->op == GGML_OP_CPY) {
+        int idx[GGML_CUDA_CPY_BATCH_MAX];
+        int span  = 1;
+        const int n_cpy = ggml_cuda_cpy_batch_plan(cgraph, i, GGML_CUDA_CPY_BATCH_MAX, idx, &span);
+        if (n_cpy >= 3) {
+            ggml_cuda_cpy_batch(*cuda_ctx, cgraph, idx, n_cpy);
+            static std::atomic<bool> logged { false };
+            if (!logged.exchange(true)) {
+                GGML_LOG_DEBUG("%s: batching %d strided copies in one launch\n", __func__, n_cpy);
+            }
+            return span - 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {

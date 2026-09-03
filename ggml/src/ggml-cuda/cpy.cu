@@ -41,6 +41,39 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+struct ggml_cuda_cpy_batch_ptrs {
+    const char * src[GGML_CUDA_CPY_BATCH_MAX];
+    char *       dst[GGML_CUDA_CPY_BATCH_MAX];
+};
+
+// One copy per blockIdx.y; the index math is that of cpy_scalar, which all batched copies share
+// because they have identical shapes and strides.
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_batch(const ggml_cuda_cpy_batch_ptrs p, const int64_t ne,
+                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                  const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                  const int64_t nb12, const int64_t nb13) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+
+    cpy_1(p.src[blockIdx.y] + x_offset, p.dst[blockIdx.y] + dst_offset);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -609,6 +642,148 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
     }
+}
+
+// Would ggml_cuda_cpy() below take the generic strided same-type path for this pair?  Only those
+// copies are batched: the contiguous ones already collapse to a single cudaMemcpyAsync, and the
+// specialised kernels are shape-dependent.
+static bool ggml_cuda_cpy_is_scalar_same_type(const ggml_tensor * src0, const ggml_tensor * src1) {
+    if (src0->type != src1->type) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    if (ggml_nelements(src0) != ggml_nelements(src1)) {
+        return false;
+    }
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        return false; // plain memcpy
+    }
+    size_t w = 0, h = 0, sp = 0, dp = 0;
+    if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, w, h, sp, dp)) {
+        return false; // 2D memcpy
+    }
+    const bool can_be_transposed = src0->nb[1] == (int64_t) ggml_element_size(src0) &&
+        src0->ne[3] == 1 && src0->nb[2] == src0->ne[0] * src0->ne[1] * (int64_t) ggml_element_size(src0);
+    if (can_be_transposed) {
+        return false; // transpose kernel
+    }
+    return true;
+}
+
+static bool ggml_cuda_cpy_same_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->type != b->type) {
+        return false;
+    }
+    for (int k = 0; k < GGML_MAX_DIMS; k++) {
+        if (a->ne[k] != b->ne[k] || a->nb[k] != b->nb[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_cpy_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *) b->data;
+    const char * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+// A copy's source and destination are views, and ggml emits those view nodes between the copies,
+// so the batchable CPY nodes are consecutive only after skipping the no-ops that the compute loop
+// skips as well.
+static bool ggml_cuda_cpy_is_noop_node(const ggml_tensor * t) {
+    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+}
+
+int ggml_cuda_cpy_batch_plan(const ggml_cgraph * cgraph, const int i, const int max_n, int * idx, int * span) {
+    static const bool enabled = getenv("GGML_CUDA_CPY_BATCH") == nullptr ||
+        atoi(getenv("GGML_CUDA_CPY_BATCH")) != 0;
+
+    idx[0] = i;
+    *span  = 1;
+
+    const ggml_tensor * head = cgraph->nodes[i];
+    if (!enabled || head->op != GGML_OP_CPY || !ggml_cuda_cpy_is_scalar_same_type(head->src[0], head->src[1])) {
+        return 1;
+    }
+
+    const int limit = std::min(max_n, GGML_CUDA_CPY_BATCH_MAX);
+    int n = 1;
+    int j = i + 1;
+    while (n < limit && j < cgraph->n_nodes) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_cpy_is_noop_node(node)) {
+            j++;
+            continue;
+        }
+        if (node->op != GGML_OP_CPY ||
+                !ggml_cuda_cpy_same_layout(node->src[0], head->src[0]) ||
+                !ggml_cuda_cpy_same_layout(node->src[1], head->src[1])) {
+            break;
+        }
+        idx[n++] = j;
+        *span = j + 1 - i;
+        j++;
+    }
+
+    // The unfused copies run in stream order; batched they run concurrently, so a destination
+    // must not alias another copy's source or destination.
+    for (int a = 0; a < n; a++) {
+        const ggml_tensor * da = cgraph->nodes[idx[a]]->src[1];
+        for (int b = 0; b < n; b++) {
+            if (a == b) {
+                continue;
+            }
+            if (ggml_cuda_cpy_ranges_overlap(da, cgraph->nodes[idx[b]]->src[1]) ||
+                ggml_cuda_cpy_ranges_overlap(da, cgraph->nodes[idx[b]]->src[0])) {
+                *span = 1;
+                return 1;
+            }
+        }
+    }
+
+    if (n < 2) {
+        *span = 1;
+    }
+    return n;
+}
+
+void ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int * idx, const int n) {
+    GGML_ASSERT(n >= 1 && n <= GGML_CUDA_CPY_BATCH_MAX);
+
+    const ggml_tensor * src0 = cgraph->nodes[idx[0]]->src[0];
+    const ggml_tensor * src1 = cgraph->nodes[idx[0]]->src[1];
+
+    ggml_cuda_cpy_batch_ptrs p = {};
+    for (int k = 0; k < n; k++) {
+        p.src[k] = (const char *) cgraph->nodes[idx[k]]->src[0]->data;
+        p.dst[k] = (char *)       cgraph->nodes[idx[k]]->src[1]->data;
+    }
+
+    const int64_t ne = ggml_nelements(src0);
+    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    const dim3 grid(num_blocks, n, 1);
+    cudaStream_t stream = ctx.stream();
+
+#define LAUNCH_CPY_BATCH(T)                                                                     \
+    cpy_scalar_batch<cpy_1_scalar<T, T>><<<grid, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(             \
+        p, ne, src0->ne[0], src0->ne[1], src0->ne[2], src0->nb[0], src0->nb[1], src0->nb[2],    \
+        src0->nb[3], src1->ne[0], src1->ne[1], src1->ne[2], src1->nb[0], src1->nb[1],           \
+        src1->nb[2], src1->nb[3])
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:  LAUNCH_CPY_BATCH(float);       break;
+        case GGML_TYPE_F16:  LAUNCH_CPY_BATCH(half);        break;
+        case GGML_TYPE_BF16: LAUNCH_CPY_BATCH(nv_bfloat16); break;
+        default: GGML_ABORT("unsupported type for the batched copy");
+    }
+#undef LAUNCH_CPY_BATCH
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

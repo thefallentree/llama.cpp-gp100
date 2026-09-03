@@ -197,6 +197,112 @@ static __global__ void ggml_cuda_ar_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// AllReduce + residual ADD + RMS_NORM + MUL in one launch.
+//
+// One 1024-thread block per row.  Phase 1 publishes the row's local partial
+// sum as T_wire, the arrival handshake is the one of ggml_cuda_ar_kernel with
+// the row index as the ring slot, and the epilogue repeats rms_norm_f32<1024>
+// with its fused pre-add and multiply: the same per-thread column stride, the
+// same block_reduce, the same (scale * x) * w order.  The reduced value is
+// formed exactly as in ggml_cuda_ar_kernel (both sides through T_wire, summed
+// in F32), so the ADD input matches the unfused path bit for bit; xi is kept
+// in registers instead of being re-read from the ADD output.
+template <typename T_wire, int VALUES, bool write_reduced>
+static __global__ void __launch_bounds__(1024, 1)
+ggml_cuda_ar_add_rms_norm_mul_kernel(
+        float        * __restrict__ sendbuf,
+        const float  * __restrict__ residual,
+        float        * __restrict__ add_output,
+        const float  * __restrict__ norm_weight,
+        float        * __restrict__ norm_output,
+        T_wire       * __restrict__ wire_mine,
+        const T_wire * __restrict__ wire_other,
+        const int                   ncols,
+        const float                 eps,
+        int          *              arrival_mine,
+        int          *              arrival_other,
+        const int                   token) {
+    constexpr int BLOCK_SIZE    = 1024;
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int row     = blockIdx.x;
+    const int tid     = threadIdx.x;
+    const int row_off = row * ncols;
+
+    // Phase 1: publish this row's contribution (vector stores like the plain kernel).
+    {
+        const int count_vec = ncols / ELEMS_PER_VEC;
+        const int tail      = count_vec * ELEMS_PER_VEC;
+        for (int i = tid; i < count_vec; i += BLOCK_SIZE) {
+            const int off = row_off + i * ELEMS_PER_VEC;
+            T_wire wire[ELEMS_PER_VEC];
+#pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+            }
+            ggml_cuda_memcpy_1<sizeof(wire)>(&wire_mine[off], wire);
+        }
+        if (tid < ncols - tail) {
+            wire_mine[row_off + tail + tid] = ggml_cuda_cast<T_wire>(sendbuf[row_off + tail + tid]);
+        }
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    if (tid == 0) {
+        int       * my_slot    = arrival_mine  + row * ARRIVAL_INTS;
+        const int * other_slot = arrival_other + row * ARRIVAL_INTS;
+        ggml_cuda_ar_signal_set(my_slot, token);
+        __threadfence_system();
+        while (ggml_cuda_ar_signal_get(other_slot) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+
+    // Phase 3 + epilogue.
+    float xv[VALUES];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < VALUES; ++k) {
+        const int col = tid + k * BLOCK_SIZE;
+        float xi = 0.0f;
+        if (col < ncols) {
+            const int off = row_off + col;
+            const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[off]);
+            // two rounding steps, like the unfused path's kernel boundary between them
+            const float reduced = __fadd_rn(ggml_cuda_cast<float>(d_low), ggml_cuda_cast<float>(wire_other[off]));
+            xi = __fadd_rn(reduced, residual[off]);
+            if constexpr (write_reduced) {
+                sendbuf[off] = reduced;
+            }
+            add_output[off] = xi;
+            tmp += xi * xi;
+        }
+        xv[k] = xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, BLOCK_SIZE>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int k = 0; k < VALUES; ++k) {
+        const int col = tid + k * BLOCK_SIZE;
+        if (col < ncols) {
+            norm_output[row_off + col] = scale * xv[k] * norm_weight[col];
+        }
+    }
+}
+
 // Combined load-convert-add kernel.  The peer's contribution arrives as T_src
 // (which may be a lower-precision type than T_dst when the BF16 round-trip is
 // active).  For bit-equivalence between the two GPUs, dst is first rounded
@@ -1001,6 +1107,105 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
+bool ggml_cuda_ar_allreduce_add_rms_norm_mul_supported(
+        const ggml_cuda_ar_pipeline * p, const int64_t ncols, const int64_t nrows) {
+    if (p == nullptr || p->n_devices != 2) {
+        return false;
+    }
+    // one block per row, rows indexed into the per-block arrival ring; up to 8 columns per thread
+    if (nrows < 1 || nrows > GGML_CUDA_AR_KERNEL_BLOCKS || ncols < 1 || ncols > 8*1024) {
+        return false;
+    }
+    // the epilogue reads the peer's row from one wire slot: BF16 on wire, fits, chunked path
+    const size_t input_nbytes = (size_t) ncols * nrows * sizeof(float);
+    const size_t wire_nbytes  = (size_t) ncols * nrows * sizeof(nv_bfloat16);
+    if (!(p->bf16_threshold > 0 && input_nbytes >= p->bf16_threshold)) {
+        return false;
+    }
+    if (wire_nbytes > p->buf_bytes || (p->copy_threshold > 0 && wire_nbytes >= p->copy_threshold)) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_cuda_ar_allreduce_add_rms_norm_mul(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors,
+        ggml_tensor           ** residuals,
+        ggml_tensor           ** add_outputs,
+        ggml_tensor           ** norm_weights,
+        ggml_tensor           ** norm_outputs,
+        const float              eps) {
+    GGML_ASSERT(p != nullptr);
+    const int n = p->n_devices;
+    GGML_ASSERT(n == 2);
+
+    const int64_t ncols = tensors[0]->ne[0];
+    const int64_t nrows = ggml_nrows(tensors[0]);
+    if (!ggml_cuda_ar_allreduce_add_rms_norm_mul_supported(p, ncols, nrows) || tensors[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const size_t input_nbytes = (size_t) ncols * nrows * sizeof(float);
+
+    // inactive shards contribute zeros, as on the plain path
+    for (int i = 0; i < n; ++i) {
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            ggml_cuda_set_device(p->devices[i]);
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, input_nbytes, cuda_ctx->stream()));
+        }
+    }
+
+    const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+    for (int i = 0; i < n; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+        cudaStream_t stream = cuda_ctx->stream();
+
+        char * wire_mine  = p->p2p ? p->dev_buf[peer] + (size_t) slot * p->buf_bytes
+                                   : reinterpret_cast<char *>(p->host_buf[i].dev) + (size_t) slot * p->buf_bytes;
+        char * wire_other = p->p2p ? p->dev_buf[i]    + (size_t) slot * p->buf_bytes
+                                   : reinterpret_cast<char *>(p->host_buf[peer].dev) + (size_t) slot * p->buf_bytes;
+        int * arr_mine  = p->p2p ? ggml_cuda_ar_dev_arrival_ptr(p, peer, slot, i) : ggml_cuda_ar_arrival_ptr(p, slot, i);
+        int * arr_other = p->p2p ? ggml_cuda_ar_dev_arrival_ptr(p, i, slot, peer) : ggml_cuda_ar_arrival_ptr(p, slot, peer);
+
+        // The reduced tensor has a single consumer, the fused ADD, so it need not be materialized.
+        // The store is kept behind an env toggle for A/B against the unfused path.
+        static const bool write_reduced = getenv("GGML_CUDA_AR_FUSED_WRITE_REDUCED") != nullptr &&
+            atoi(getenv("GGML_CUDA_AR_FUSED_WRITE_REDUCED")) != 0;
+#define LAUNCH_AR_NORM_W(V, W) \
+        ggml_cuda_ar_add_rms_norm_mul_kernel<nv_bfloat16, V, W><<<dim3(nrows), dim3(1024), 32*sizeof(float), stream>>>( \
+            static_cast<float *>(tensors[i]->data),            \
+            static_cast<const float *>(residuals[i]->data),    \
+            static_cast<float *>(add_outputs[i]->data),        \
+            static_cast<const float *>(norm_weights[i]->data), \
+            static_cast<float *>(norm_outputs[i]->data),       \
+            reinterpret_cast<nv_bfloat16 *>(wire_mine),        \
+            reinterpret_cast<const nv_bfloat16 *>(wire_other), \
+            (int) ncols, eps, arr_mine, arr_other, token)
+#define LAUNCH_AR_NORM(V) do { if (write_reduced) { LAUNCH_AR_NORM_W(V, true); } else { LAUNCH_AR_NORM_W(V, false); } } while (0)
+        switch ((ncols + 1023) / 1024) {
+            case 1: LAUNCH_AR_NORM(1); break;
+            case 2: LAUNCH_AR_NORM(2); break;
+            case 3: LAUNCH_AR_NORM(3); break;
+            case 4: LAUNCH_AR_NORM(4); break;
+            case 5: LAUNCH_AR_NORM(5); break;
+            case 6: LAUNCH_AR_NORM(6); break;
+            case 7: LAUNCH_AR_NORM(7); break;
+            case 8: LAUNCH_AR_NORM(8); break;
+            default: GGML_ABORT("fused AllReduce norm: unsupported width");
+        }
+#undef LAUNCH_AR_NORM
+#undef LAUNCH_AR_NORM_W
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+    }
+    return true;
+}
+
 #else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
 // HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
@@ -1014,6 +1219,14 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+bool ggml_cuda_ar_allreduce_add_rms_norm_mul_supported(const ggml_cuda_ar_pipeline *, int64_t, int64_t) {
+    return false;
+}
+bool ggml_cuda_ar_allreduce_add_rms_norm_mul(
+        ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, ggml_tensor **, ggml_tensor **,
+        ggml_tensor **, ggml_tensor **, float) {
     return false;
 }
 

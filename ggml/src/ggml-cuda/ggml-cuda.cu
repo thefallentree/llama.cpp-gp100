@@ -1263,6 +1263,50 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// AllReduce fused with the residual ADD -> RMS_NORM -> MUL chain (internal transport only).
+static bool ggml_backend_cuda_comm_allreduce_add_rms_norm_mul_supported(void * comm_ctx_v, int64_t ncols, int64_t nrows) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal || comm_ctx->ar_pipeline == nullptr) {
+        return false;
+    }
+    return ggml_cuda_ar_allreduce_add_rms_norm_mul_supported(comm_ctx->ar_pipeline, ncols, nrows);
+}
+
+static bool ggml_backend_cuda_comm_allreduce_tensor_add_rms_norm_mul(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, struct ggml_tensor ** residuals,
+        struct ggml_tensor ** add_outputs, struct ggml_tensor ** norm_weights, struct ggml_tensor ** norm_outputs,
+        float eps) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal || comm_ctx->ar_pipeline == nullptr) {
+        return false;
+    }
+    const size_t n_backends = comm_ctx->backends.size();
+    if (n_backends != 2) {
+        return false;
+    }
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_tensor * t[5] = { tensors[i], residuals[i], add_outputs[i], norm_weights[i], norm_outputs[i] };
+        for (ggml_tensor * x : t) {
+            if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || (((uintptr_t) x->data) & 0xF) != 0) {
+                return false;
+            }
+        }
+        if (!ggml_are_same_shape(tensors[i], tensors[0]) || !ggml_are_same_shape(residuals[i], tensors[0]) ||
+            !ggml_are_same_shape(add_outputs[i], tensors[0]) || !ggml_are_same_shape(norm_outputs[i], tensors[0]) ||
+            norm_weights[i]->ne[0] != tensors[0]->ne[0] || ggml_nrows(norm_weights[i]) != 1) {
+            return false;
+        }
+    }
+    return ggml_cuda_ar_allreduce_add_rms_norm_mul(comm_ctx->ar_pipeline, comm_ctx->backends.data(),
+        tensors, residuals, add_outputs, norm_weights, norm_outputs, eps);
+}
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -6060,6 +6104,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_add_rms_norm_mul") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_tensor_add_rms_norm_mul;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_add_rms_norm_mul_supported") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_add_rms_norm_mul_supported;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

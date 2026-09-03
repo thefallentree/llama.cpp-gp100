@@ -1827,22 +1827,34 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         ggml_context * ctx = meta_buf_ctx->stc_static.ctxs[i].get();
         ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
 
-        // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
-        // For those edge cases, allocate a dummy buffer instead.
-        bool any_nonzero_slice = false;
+        // ggml_backend_alloc_ctx_tensors_from_buft returns NULL when it has nothing to allocate:
+        // when this device's slices are all zero-sized, and also when the context holds only
+        // views of tensors that live elsewhere -- a model whose output head aliases the token
+        // embedding puts exactly one such view in a context of its own.  Give those contexts an
+        // empty buffer instead; a genuine allocation failure still trips the assert below.
+        bool needs_storage = false;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (ggml_nelements(t) != 0) {
-                any_nonzero_slice = true;
+            if (ggml_nelements(t) != 0 && t->data == nullptr && t->view_src == nullptr) {
+                needs_storage = true;
                 break;
             }
         }
-        if (any_nonzero_slice) {
+        if (needs_storage) {
             meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, simple_buft));
         } else {
             meta_buf_ctx->bufs[i].reset(ggml_backend_buft_alloc_buffer(simple_buft, 0));
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
+        }
+        if (!meta_buf_ctx->bufs[i]) {
+            size_t n_t = 0, n_bytes = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                n_t++;
+                n_bytes += ggml_nbytes(t);
+            }
+            GGML_LOG_ERROR("%s: failed to allocate %.2f MiB for %zu tensors on %s\n",
+                    __func__, n_bytes/1024.0/1024.0, n_t, ggml_backend_buft_name(simple_buft));
         }
         GGML_ASSERT(meta_buf_ctx->bufs[i]);
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));

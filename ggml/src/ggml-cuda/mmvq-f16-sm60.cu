@@ -1,4 +1,4 @@
-// Q4_1 mat-vec specialised for sm_60 (GP100), built on HFMA2.
+// Q4_1 / Q4_K / Q8_0 mat-vec specialised for sm_60 (GP100), built on HFMA2.
 //
 // GP100 has no DP4A, so the generic mmvq path emulates the 4x int8 dot product with a chain of
 // PTX vmad.  Measured instruction throughput on this card:
@@ -12,7 +12,10 @@
 // activations are quantized to half rather than int8, so the kernel contains no conversions
 // either.  Q4_1's 20-byte block keeps `qs` at offset 4, which is always 4-byte aligned, so the
 // nibbles can be read as `int`; Q4_0's 18-byte block would be 4-byte aligned on only half its
-// blocks, which is why this path is Q4_1-only.
+// blocks, which is why Q4_0 is not handled.  Q8_0's 34-byte block has the same problem, but its
+// bytes are worth reading through an aligned window (see mul_mat_vec_q8_0_a16): the output head
+// of most quantized models is Q8_0 and at verify widths 5-8 the generic kernel runs it at under
+// a third of the card's bandwidth.
 //
 // Measured on a Tesla P100 (llama-bench, Q4_1 weights): see the PR description.
 
@@ -418,6 +421,183 @@ static void launch_a16(
 }
 
 
+// ---- Q8_0 on the same HFMA2 pipeline --------------------------------------------------------
+//
+// block_q8_0 is {half d; int8 qs[32]} = 34 bytes, so `qs` is 4-byte aligned on odd blocks only.
+// Each thread still owns one half-block (kh) of one block (kb) for nrows_block rows, with the same
+// element order the quantizer writes: half kh covers elements 8kh..8kh+7 (chunk A) and
+// 16+8kh..16+8kh+7 (chunk B).  Both 8-byte chunks are read through a 4-byte-aligned window that
+// starts 0 or 2 bytes early; the parity is the same for A and B and is decided by kb alone, so the
+// realignment is one PRMT per word.  The window's third word is only fetched when it is needed
+// (even kb); the last block of a row is odd because rows are required to hold an even number of
+// blocks, so no read passes the end of the tensor.
+//
+// Bytes become halves with one LOP3 (flip the sign bit: b ^ 0x80 = b + 128 mod 256) and one PRMT
+// per half2 that places two bytes under a 0x64 exponent byte: the half 0x64XX is exactly 1024 + XX,
+// so subtracting 1152 leaves the signed weight exactly.  There is no min term, so the epilogue is
+// yd * d * dot.
+template <int ncols_dst, int nwarps, int nrows_block = 8, int min_blocks_tpl = 0>
+static __global__ void __launch_bounds__(WARP_SIZE*nwarps,
+        min_blocks_tpl != 0 ? min_blocks_tpl : (ncols_dst >= 6 ? 2 : 4)*(A16_NWARPS/nwarps))
+mul_mat_vec_q8_0_a16(
+        const void * __restrict__ vx, const half2 * __restrict__ aq, const half2 * __restrict__ ads,
+        float * __restrict__ dst, const int nblocks, const int stride_row_bytes,
+        const int stride_col_aq, const int stride_col_ads, const int stride_col_dst) {
+#if defined(FP16_AVAILABLE)
+    const int row0     = blockIdx.x*nrows_block;
+    const int tid      = threadIdx.x + threadIdx.y*WARP_SIZE;
+    const int nthreads = WARP_SIZE*nwarps;
+
+    const half2 magic = __float2half2_rn(1152.0f);
+
+    float sumf[ncols_dst][nrows_block] = {{0.0f}};
+
+    const char * const xbase = (const char *) vx + (size_t) row0*stride_row_bytes;
+
+    for (int t = tid; t < 2*nblocks; t += nthreads) {
+        const int kb = t >> 1;
+        const int kh = t &  1;
+
+        half2 a[ncols_dst][8];
+        float yd[ncols_dst];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const half2 * ap = aq + (size_t) j*stride_col_aq + kb*(A16_QK/2) + kh*8;
+#pragma unroll
+            for (int c2 = 0; c2 < 2; ++c2) {
+                const int4 av = *((const int4 *) (ap + 4*c2));
+                a[j][4*c2 + 0] = *((const half2 *) &av.x);
+                a[j][4*c2 + 1] = *((const half2 *) &av.y);
+                a[j][4*c2 + 2] = *((const half2 *) &av.z);
+                a[j][4*c2 + 3] = *((const half2 *) &av.w);
+            }
+            yd[j] = __low2float(ads[j*stride_col_ads + kb]);
+        }
+
+        // byte offsets inside the row: block kb starts at 34*kb; chunk A at +2+8kh, chunk B at +18+8kh
+        const int  boff  = kb*(int) sizeof(block_q8_0);
+        const int  shift = (kb & 1) ? 0 : 2;             // (34kb + 2) mod 4
+        const int  sel   = shift ? 0x5432 : 0x3210;      // PRMT selector realigning two words
+        const int  offA  = boff + 2 + 8*kh - shift;      // 4-byte aligned
+        const int  offB  = offA + 16;
+
+#pragma unroll
+        for (int i = 0; i < nrows_block; ++i) {
+            const char * xr = xbase + (size_t) i*stride_row_bytes;
+            const float  d  = __half2float(*(const half *) (xr + boff));
+            const int * pA = (const int *) (xr + offA);
+            const int * pB = (const int *) (xr + offB);
+            const int uA0 = pA[0], uA1 = pA[1];
+            const int uB0 = pB[0], uB1 = pB[1];
+            const int uA2 = shift ? pA[2] : 0;
+            const int uB2 = shift ? pB[2] : 0;
+            const int A0 = __byte_perm(uA0, uA1, sel) ^ 0x80808080;
+            const int A1 = __byte_perm(uA1, uA2, sel) ^ 0x80808080;
+            const int B0 = __byte_perm(uB0, uB1, sel) ^ 0x80808080;
+            const int B1 = __byte_perm(uB1, uB2, sel) ^ 0x80808080;
+
+            // slot order of the quantizer: (e, e+2) then (16+e, 18+e), then (e+1, e+3), (17+e, 19+e)
+            int t0 = __byte_perm(A0, 0x64646464, 0x5240);
+            int t1 = __byte_perm(B0, 0x64646464, 0x5240);
+            int t2 = __byte_perm(A0, 0x64646464, 0x5341);
+            int t3 = __byte_perm(B0, 0x64646464, 0x5341);
+            int t4 = __byte_perm(A1, 0x64646464, 0x5240);
+            int t5 = __byte_perm(B1, 0x64646464, 0x5240);
+            int t6 = __byte_perm(A1, 0x64646464, 0x5341);
+            int t7 = __byte_perm(B1, 0x64646464, 0x5341);
+            half2 w[8];
+            w[0] = __hsub2(*((const half2 *) &t0), magic);
+            w[1] = __hsub2(*((const half2 *) &t1), magic);
+            w[2] = __hsub2(*((const half2 *) &t2), magic);
+            w[3] = __hsub2(*((const half2 *) &t3), magic);
+            w[4] = __hsub2(*((const half2 *) &t4), magic);
+            w[5] = __hsub2(*((const half2 *) &t5), magic);
+            w[6] = __hsub2(*((const half2 *) &t6), magic);
+            w[7] = __hsub2(*((const half2 *) &t7), magic);
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                half2 sacc = make_half2(0.0f, 0.0f);
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    sacc = __hfma2(w[c], a[j][c], sacc);
+                }
+                const float af = __half2float(__hadd(__low2half(sacc), __high2half(sacc)));
+                sumf[j][i] += yd[j]*(d*af);
+            }
+        }
+    }
+
+    if constexpr (nwarps == 1) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows_block; ++i) {
+                const float v = warp_reduce_sum(sumf[j][i]);
+                if (threadIdx.x == i) {
+                    dst[j*stride_col_dst + row0 + i] = v;
+                }
+            }
+        }
+    } else {
+        __shared__ float tmp[nwarps][ncols_dst][nrows_block];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows_block; ++i) {
+                const float v = warp_reduce_sum(sumf[j][i]);
+                if (threadIdx.x == 0) {
+                    tmp[threadIdx.y][j][i] = v;
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y != 0) {
+            return;
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows_block; ++i) {
+                if (threadIdx.x == i) {
+                    float acc = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < nwarps; ++w) {
+                        acc += tmp[w][j][i];
+                    }
+                    dst[j*stride_col_dst + row0 + i] = acc;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vx, aq, ads, dst, nblocks, stride_row_bytes, stride_col_aq, stride_col_ads, stride_col_dst);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
+template <int ncols_dst>
+static void launch_a16_q8(
+        const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
+        const int nrows, const int stride_row_bytes, const int stride_col_aq, const int stride_col_ads,
+        const int stride_col_dst, cudaStream_t stream) {
+    const dim3 grid(nrows/8, 1, 1);
+    switch (a16_pick_nwarps(nblocks, nrows/8)) {
+        case 1:
+            mul_mat_vec_q8_0_a16<ncols_dst, 1><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_bytes, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        case 2:
+            mul_mat_vec_q8_0_a16<ncols_dst, 2><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_bytes, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+        default:
+            mul_mat_vec_q8_0_a16<ncols_dst, A16_NWARPS><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+                vx, aq, ads, dst, nblocks, stride_row_bytes, stride_col_aq, stride_col_ads, stride_col_dst);
+            return;
+    }
+}
+
 // ---- Q4_K on the same HFMA2 pipeline --------------------------------------------------------
 //
 // block_q4_K packs 256 weights as [half2 dm][12 B of 6-bit (sc,min) pairs][128 B nibbles].
@@ -683,7 +863,8 @@ bool ggml_cuda_mmvq_f16_sm60_supported(
     const bool is_g64  = src0->type == GGML_TYPE_Q4_1_G64;
     const bool is_q4_1 = src0->type == GGML_TYPE_Q4_1 || is_g64;
     const bool is_q4_k = src0->type == GGML_TYPE_Q4_K;
-    if ((!is_q4_1 && !is_q4_k) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    const bool is_q8_0 = src0->type == GGML_TYPE_Q8_0;
+    if ((!is_q4_1 && !is_q4_k && !is_q8_0) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     // No DP4A but full-rate HFMA2 means GP100 only.  Everywhere else the generic kernel wins.
@@ -707,6 +888,11 @@ bool ggml_cuda_mmvq_f16_sm60_supported(
     }
     // The Q4_K variant iterates 256-weight super-blocks and always uses the 8-row tile.
     if (is_q4_k && (src0->ne[0] % 256 != 0 || src0->ne[1] % 8 != 0)) {
+        return false;
+    }
+    // The Q8_0 variant reads its 34-byte blocks through an aligned window, which needs an even
+    // number of blocks per row (a 4-byte row stride), and always uses the 8-row tile.
+    if (is_q8_0 && (src0->ne[0] % 64 != 0 || src0->ne[1] % 8 != 0 || !ggml_is_contiguous(src0))) {
         return false;
     }
     // Width 1 is limited by the DRAM read of the weights, so making the arithmetic free moves it
@@ -844,6 +1030,31 @@ void ggml_cuda_mmvq_f16_sm60(
     const int stride_col_aq  = nblocks*(A16_QK/2);
     const int stride_col_ads = nblocks;
     const int stride_col_dst = dst->nb[1]/ggml_type_size(dst->type);
+
+    if (src0->type == GGML_TYPE_Q8_0) {
+        const int stride_row_bytes = (int) src0->nb[1];
+        for (int64_t c0 = 0; c0 < ne11; ) {
+            const int n = a16_next_pass(ne11 - c0);
+            const half2 * aq_c  = aq  + c0*stride_col_aq;
+            const half2 * ads_c = ads + c0*stride_col_ads;
+            float *       dst_c = (float *) dst->data + c0*stride_col_dst;
+            switch (n) {
+#define A16_Q8_CASE(N)                                                                            \
+                case N:                                                                           \
+                    launch_a16_q8<N>(src0->data, aq_c, ads_c, dst_c, nblocks, ne01,               \
+                            stride_row_bytes, stride_col_aq, stride_col_ads, stride_col_dst,      \
+                            stream);                                                              \
+                    break;
+                A16_Q8_CASE(2) A16_Q8_CASE(3) A16_Q8_CASE(4)
+                A16_Q8_CASE(5) A16_Q8_CASE(6) A16_Q8_CASE(7) A16_Q8_CASE(8)
+#undef A16_Q8_CASE
+                default:
+                    GGML_ABORT("unsupported width for the sm_60 Q8_0 mat-vec");
+            }
+            c0 += n;
+        }
+        return;
+    }
 
     if (src0->type == GGML_TYPE_Q4_K) {
         const int nsuper           = ne00/256;

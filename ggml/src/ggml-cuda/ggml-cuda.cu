@@ -4237,6 +4237,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // ADD(x, bias) -> UNARY -> MUL(., scale), e.g. the gated-delta-net gate softplus(alpha + dt_bias) * A:
+    // three launches over a few hundred elements, dominated by launch overhead
+    if (node->op == GGML_OP_ADD && ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }) &&
+        ggml_cuda_op_fused_add_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {

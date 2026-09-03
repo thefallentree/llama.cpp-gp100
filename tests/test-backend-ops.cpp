@@ -3637,6 +3637,51 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD
+// GGML_OP_ADD(x, bias) -> GGML_OP_UNARY -> GGML_OP_MUL(., scale) with row-broadcast bias and scale
+struct test_add_unary_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const ggml_unary_op op;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_UNARY_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, op);
+    }
+
+    test_add_unary_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {32, 4, 1, 1},
+            ggml_unary_op op = GGML_UNARY_OP_SOFTPLUS)
+        : type(type), ne(ne), op(op) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a     = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, type, ne[0]);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, type, ne[0]);
+
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_name(bias, "bias");
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_unary(ctx, ggml_add(ctx, a, bias), op), scale);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -4.f, 4.f);
+        }
+    }
+};
+
 // GGML_OP_ADD -> GGML_OP_RMS_NORM -> GGML_OP_MUL, where the sum is also consumed later (residual stream)
 struct test_add_rms_norm_mul : public test_case {
     const ggml_type type;
@@ -9367,6 +9412,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             for (int inplace_src : { 0, 1, 2 }) {
                 test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, inplace_src));
+            }
+            for (ggml_unary_op op : { GGML_UNARY_OP_SOFTPLUS, GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
+                test_cases.emplace_back(new test_add_unary_mul(GGML_TYPE_F32, { 32, 4, 1, 1 }, op));
+                test_cases.emplace_back(new test_add_unary_mul(GGML_TYPE_F32, { 100, 3, 2, 1 }, op));
             }
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));

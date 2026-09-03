@@ -1724,6 +1724,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+    // speculative decoding alternates verify widths (n-gram drafts, block drafts, plain decode) from
+    // round to round; keep a few small graphs so the target does not rebuild and re-allocate on each switch
+    // speculative decoding alternates the verify width from round to round (n-gram drafts of 1..N
+    // tokens, the block draft's fixed width, plain decode); with one retained graph the context rebuilds
+    // and re-allocates on every switch, so keep enough graphs for all of them by default
+    cparams.n_graph_slots     = params.n_graph_slots > 0 ? params.n_graph_slots : (params.speculative.types.empty() ? 1 : 8);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

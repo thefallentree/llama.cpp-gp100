@@ -660,6 +660,20 @@ static void launch_a16_g64(
     }
 }
 
+// Widest batch served by this path. The kernels are instantiated for 2..8 columns; wider batches run as
+// passes of <= 8 columns over the same quantized activations. Without DP4A the generic MMQ path is ~6x slower
+// per decode than these passes (measured on a P100: width 8 = 63 ms, width 9 via MMQ = 360 ms), so the
+// passes stay ahead well beyond 16 columns even though each re-reads the weights.
+static constexpr int64_t A16_MAX_COLS = 32;
+
+// Split ne11 columns into passes of at most 8, none narrower than 2 (the kernels start at 2 columns).
+static inline int a16_next_pass(int64_t remaining) {
+    if (remaining <= 8) {
+        return (int) remaining;
+    }
+    return remaining == 9 ? 5 : 8;
+}
+
 bool ggml_cuda_mmvq_f16_sm60_supported(
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * dst) {
@@ -701,7 +715,8 @@ bool ggml_cuda_mmvq_f16_sm60_supported(
     // Q4_1_G64 has no generic CUDA vec_dot, so this path also serves width 1 for it
     // (measured ~-7%-class vs an int8 width-1 path on Q4_1; the byte saving offsets it).
     const int64_t eff_cols = src1->ne[1] == 1 && src1->ne[2] > 1 ? src1->ne[2] : src1->ne[1];
-    if (eff_cols < (is_g64 ? 1 : 2) || eff_cols > 8) {
+    const int64_t max_cols = g64_seq_fold ? 8 : A16_MAX_COLS;
+    if (eff_cols < (is_g64 ? 1 : 2) || eff_cols > max_cols) {
         return false;
     }
     if (is_g64 && (src0->ne[0] % 64 != 0 || src0->ne[1] % 8 != 0)) {
@@ -803,17 +818,24 @@ void ggml_cuda_mmvq_f16_sm60(
         const int stride_col_adsg = nblocks;
         const int stride_col_dstg = seq_fold ? (int) (dst->nb[2]/ggml_type_size(dst->type))
                                              : (int) (dst->nb[1]/ggml_type_size(dst->type));
-        switch (ne11_eff) {
+        for (int64_t c0 = 0; c0 < ne11_eff; ) {
+            const int n = ne11_eff == 1 ? 1 : a16_next_pass(ne11_eff - c0);
+            const half2 * aq_c  = aq  + c0*stride_col_aqg;
+            const half2 * ads_c = ads + c0*stride_col_adsg;
+            float *       dst_c = (float *) dst->data + c0*stride_col_dstg;
+            switch (n) {
 #define A16_G64_CASE(N)                                                                            \
-            case N:                                                                                \
-                launch_a16_g64<N>(src0->data, aq, ads, (float *) dst->data, nblocks, ne01,         \
-                        stride_row_g, stride_col_aqg, stride_col_adsg, stride_col_dstg, stream);   \
-                break;
-            A16_G64_CASE(1) A16_G64_CASE(2) A16_G64_CASE(3) A16_G64_CASE(4)
-            A16_G64_CASE(5) A16_G64_CASE(6) A16_G64_CASE(7) A16_G64_CASE(8)
+                case N:                                                                            \
+                    launch_a16_g64<N>(src0->data, aq_c, ads_c, dst_c, nblocks, ne01,               \
+                            stride_row_g, stride_col_aqg, stride_col_adsg, stride_col_dstg, stream); \
+                    break;
+                A16_G64_CASE(1) A16_G64_CASE(2) A16_G64_CASE(3) A16_G64_CASE(4)
+                A16_G64_CASE(5) A16_G64_CASE(6) A16_G64_CASE(7) A16_G64_CASE(8)
 #undef A16_G64_CASE
-            default:
-                GGML_ABORT("unsupported width for the sm_60 Q4_1_G64 mat-vec");
+                default:
+                    GGML_ABORT("unsupported width for the sm_60 Q4_1_G64 mat-vec");
+            }
+            c0 += n;
         }
         return;
     }
@@ -826,32 +848,46 @@ void ggml_cuda_mmvq_f16_sm60(
     if (src0->type == GGML_TYPE_Q4_K) {
         const int nsuper           = ne00/256;
         const int stride_row_super = (int) (src0->nb[1]/144);   // super-blocks per row stride
-        switch (ne11) {
+        for (int64_t c0 = 0; c0 < ne11; ) {
+            const int n = a16_next_pass(ne11 - c0);
+            const half2 * aq_c  = aq  + c0*stride_col_aq;
+            const half2 * ads_c = ads + c0*stride_col_ads;
+            float *       dst_c = (float *) dst->data + c0*stride_col_dst;
+            switch (n) {
 #define A16_K_CASE(N)                                                                             \
-            case N:                                                                               \
-                launch_a16_q4k<N>(src0->data, aq, ads, (float *) dst->data, nsuper,   \
-                        ne01, stride_row_super, stride_col_aq, stride_col_ads, stride_col_dst,    \
-                        stream);                                                                  \
-                break;
-            A16_K_CASE(2) A16_K_CASE(3) A16_K_CASE(4)
-            A16_K_CASE(5) A16_K_CASE(6) A16_K_CASE(7) A16_K_CASE(8)
+                case N:                                                                           \
+                    launch_a16_q4k<N>(src0->data, aq_c, ads_c, dst_c, nsuper,                     \
+                            ne01, stride_row_super, stride_col_aq, stride_col_ads, stride_col_dst, \
+                            stream);                                                              \
+                    break;
+                A16_K_CASE(2) A16_K_CASE(3) A16_K_CASE(4)
+                A16_K_CASE(5) A16_K_CASE(6) A16_K_CASE(7) A16_K_CASE(8)
 #undef A16_K_CASE
-            default:
-                GGML_ABORT("unsupported width for the sm_60 Q4_K mat-vec");
+                default:
+                    GGML_ABORT("unsupported width for the sm_60 Q4_K mat-vec");
+            }
+            c0 += n;
         }
         return;
     }
 
+    for (int64_t c0 = 0; c0 < ne11; ) {
+        const int n = a16_next_pass(ne11 - c0);
+        const half2 * aq_c  = aq  + c0*stride_col_aq;
+        const half2 * ads_c = ads + c0*stride_col_ads;
+        float *       dst_c = (float *) dst->data + c0*stride_col_dst;
 #define A16_CASE(N)                                                                            \
-    case N:                                                                                    \
-        launch_a16<N>(src0->data, aq, ads, (float *) dst->data, nblocks, ne01,     \
-                      stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst, stream);    \
-        break;
-    switch (ne11) {
-        A16_CASE(2) A16_CASE(3) A16_CASE(4)
-        A16_CASE(5) A16_CASE(6) A16_CASE(7) A16_CASE(8)
-        default:
-            GGML_ABORT("unsupported width for the sm_60 Q4_1 mat-vec");
-    }
+        case N:                                                                                \
+            launch_a16<N>(src0->data, aq_c, ads_c, dst_c, nblocks, ne01,                       \
+                          stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst, stream); \
+            break;
+        switch (n) {
+            A16_CASE(2) A16_CASE(3) A16_CASE(4)
+            A16_CASE(5) A16_CASE(6) A16_CASE(7) A16_CASE(8)
+            default:
+                GGML_ABORT("unsupported width for the sm_60 Q4_1 mat-vec");
+        }
 #undef A16_CASE
+        c0 += n;
+    }
 }

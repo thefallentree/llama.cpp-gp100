@@ -1883,6 +1883,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
     }
+    // sm_60 has no DP4A, so MMQ is ~6x slower per decode than the mat-vec kernels; keep batches of up to
+    // 4*MMVQ_MAX_BATCH_SIZE columns on the mat-vec paths as passes of MMVQ_MAX_BATCH_SIZE columns
+    if (ne11 > MMVQ_MAX_BATCH_SIZE && ggml_cuda_mmvq_f16_sm60_supported(src0, src1, nullptr, dst)) {
+        ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
+        return;
+    }
+    if (ne11 > MMVQ_MAX_BATCH_SIZE && ne11 <= 4*MMVQ_MAX_BATCH_SIZE &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_DP4A &&
+        ggml_cuda_should_use_mmvq(src0->type, cc, MMVQ_MAX_BATCH_SIZE) &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src0->type != GGML_TYPE_Q4_1_G64) {
+        for (int64_t c0 = 0; c0 < ne11; c0 += MMVQ_MAX_BATCH_SIZE) {
+            const int64_t n = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ne11 - c0);
+            ggml_tensor src1_c = *src1;
+            src1_c.ne[1] = n;
+            src1_c.data  = (char *) src1->data + c0*src1->nb[1];
+            ggml_tensor dst_c = *dst;
+            dst_c.ne[1] = n;
+            dst_c.data  = (char *) dst->data + c0*dst->nb[1];
+            dst_c.src[1] = &src1_c;
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, nullptr, &dst_c);
+        }
+        return;
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;

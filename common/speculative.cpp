@@ -2492,8 +2492,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
     if (has_block_draft) {
-        // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        // per-seq output positions: every verified draft token plus the anchor. The block drafter contributes
+        // n_max, but an ngram drafter configured next to it may propose longer drafts, and those are verified in
+        // the same batch, so take the longest draft any configured type can produce.
+        const int32_t per_seq = std::max(1, std::max(params_spec.n_max, common_speculative_n_max(&params.speculative)) + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;

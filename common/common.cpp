@@ -1721,7 +1721,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // the recurrent-state rollback must cover the longest draft any configured drafter can produce, not only the
+    // block drafter's: an ngram draft longer than n_rs_seq forces the server onto its checkpoint path every round
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq() > 0
+                                    ? (uint32_t) std::max<int32_t>(1, common_speculative_n_max(&params.speculative))
+                                    : 0u;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     // speculative decoding alternates verify widths (n-gram drafts, block drafts, plain decode) from

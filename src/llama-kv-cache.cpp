@@ -400,6 +400,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        // nothing of this sequence lies in [p0, p1): skip the scan over all cells.  Speculative
+        // decoding calls this once per round with p0 just past the accepted tokens, usually
+        // removing nothing, and the scan costs ~0.3 ms per 128k cells.
+        if (p0 > cells.seq_pos_max(seq_id)) {
+            return true;
+        }
+
         uint32_t new_head = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {

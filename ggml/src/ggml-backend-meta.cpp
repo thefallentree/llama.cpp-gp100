@@ -495,6 +495,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -502,8 +504,40 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
+    if (it != stc.simple_tensors.end() && tensor->view_src != nullptr && buf_ctx->debug >= 2) {
+        // debug: report registrations whose per-device data no longer matches the view source
+        const ggml_tensor * src_j = nullptr;
+        {
+            auto its = buf_ctx->get_simple_tensor_container(tensor->view_src).simple_tensors.find(tensor->view_src);
+            if (its != buf_ctx->get_simple_tensor_container(tensor->view_src).simple_tensors.end()) {
+                src_j = its->second[index];
+            }
+        }
+        if (src_j != nullptr && it->second[index]->view_src != src_j) {
+            GGML_LOG_WARN("meta-debug: stale view registration %s (op %s) src %s\n", tensor->name, ggml_op_name(tensor->op), tensor->view_src->name);
+        }
+    }
     if (it == stc.simple_tensors.end()) {
-        return nullptr;
+        if (buf_ctx->debug >= 2) {
+            GGML_LOG_WARN("meta-debug: lazy re-registration %s (op %s, view_src %s, view_offs %zu)\n",
+                    tensor->name, ggml_op_name(tensor->op), tensor->view_src ? tensor->view_src->name : "-", (size_t) tensor->view_offs);
+        }
+        // Views of this buffer's tensors are registered when they are allocated, into the compute
+        // container that is current at that time.  The compute containers rotate per graph compute of
+        // any graph that touches this buffer, so when several schedulers share a buffer (a context that
+        // keeps several graphs, e.g. one per speculative verify width) a graph that is computed again
+        // without re-allocation can find its views dropped.  Their per-device counterparts are fully
+        // determined by the view source, so rebuild them on demand instead of failing.
+        if (tensor->view_src == nullptr) {
+            return nullptr;
+        }
+        if (ggml_backend_meta_buffer_init_tensor_impl(stc, const_cast<ggml_tensor *>(tensor)) != GGML_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        it = stc.simple_tensors.find(tensor);
+        if (it == stc.simple_tensors.end()) {
+            return nullptr;
+        }
     }
     return it->second[index];
 }
@@ -1280,6 +1314,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         t_ij->view_offs = tensor->view_offs;
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
+            if (t_ij->view_src == nullptr) {
+                GGML_LOG_ERROR("%s: no per-device tensor for the view source %s (op %s) of %s (op %s) on device %zu\n",
+                        __func__, tensor->view_src->name, ggml_op_name(tensor->view_src->op), tensor->name, ggml_op_name(tensor->op), j);
+                return GGML_STATUS_FAILED;
+            }
             if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
                 GGML_ASSERT(tensor->ne[split_dim] != 0);
                 const int split_dim_view_src = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis;
@@ -2016,6 +2055,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    static const int meta_debug = getenv("GGML_META_DEBUG") ? atoi(getenv("GGML_META_DEBUG")) : 0;
+    if (meta_debug >= 2) {
+        GGML_LOG_WARN("meta-debug: graph_compute uid %zu (prev %zu) n_nodes %d rebuild=%d\n",
+                (size_t) cgraph->uid, (size_t) backend_ctx->uid, cgraph->n_nodes, (int) needs_rebuild);
+    }
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2029,6 +2073,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         assert(needs_rebuild);
     }
 
+    const int64_t t_rebuild_start = meta_debug >= 1 && needs_rebuild ? ggml_time_us() : 0;
     if (needs_rebuild) {
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
@@ -2062,6 +2107,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 GGML_ASSERT(bcj.nodes[i]);
+
+                // The per-device src / view_src pointers were resolved when the node was registered.  Another
+                // scheduler's compute may have rotated the containers that held those per-device views since,
+                // so resolve them again for this rebuild (views are re-registered on demand by the lookup).
+                ggml_tensor * nij = bcj.nodes[i];
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    const ggml_tensor * src = node->src[k];
+                    if (src == nullptr) {
+                        continue;
+                    }
+                    if (src == node) {
+                        nij->src[k] = nij;
+                    } else if (ggml_backend_buffer_is_meta(src->buffer)) {
+                        ggml_tensor * sij = ggml_backend_meta_buffer_simple_tensor(src, j);
+                        GGML_ASSERT(sij);
+                        nij->src[k] = sij;
+                    } else {
+                        nij->src[k] = const_cast<ggml_tensor *>(src);
+                    }
+                }
+                if (node->view_src != nullptr && ggml_backend_buffer_is_meta(node->view_src->buffer)) {
+                    ggml_tensor * vij = ggml_backend_meta_buffer_simple_tensor(node->view_src, j);
+                    GGML_ASSERT(vij);
+                    nij->view_src = vij;
+                    nij->data     = (char *) vij->data + nij->view_offs; // view_offs was scaled at registration
+                }
             }
         }
 
@@ -2269,6 +2340,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
+        if (meta_debug >= 1) {
+            static int64_t t_rebuild_total = 0; static int n_rebuilds = 0;
+            t_rebuild_total += ggml_time_us() - t_rebuild_start; n_rebuilds++;
+            if (n_rebuilds % 50 == 0) {
+                GGML_LOG_WARN("meta-debug: %d rebuilds, %.1f us each on average (%d nodes, %zu subgraphs)\n",
+                        n_rebuilds, (double) t_rebuild_total / n_rebuilds, cgraph->n_nodes, n_subgraphs);
+            }
+        }
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
             for (size_t j = 0; j < n_backends; j++) {

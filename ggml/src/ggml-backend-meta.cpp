@@ -1877,6 +1877,19 @@ struct ggml_backend_meta_context {
         int           offset      = 0; // Node offset vs. original graph
 
         std::vector<ggml_cgraph *> cgraphs_aux;
+
+        // Fused AllReduce epilogue: the n_fused original-graph nodes right after this subgraph's
+        // last node (optional RESHAPE, ADD, RMS_NORM, MUL) are computed by the comm layer together
+        // with the AllReduce and excluded from the next subgraph.  0 = not fused.
+        // n_skip_front drops them from the front of the *next* subgraph; the subgraph boundary
+        // itself must not move, or this subgraph's last node would no longer be the reduced one.
+        int   n_skip_front    = 0;
+        int   n_fused         = 0;
+        int   i_fused_add     = -1;
+        int   i_fused_rms     = -1;
+        int   i_fused_mul     = -1;
+        int   fused_residual  = 0;  // src index of the residual in the ADD
+        float fused_eps       = 0.0f;
     };
     struct backend_config {
         ggml_backend_t backend;
@@ -1903,6 +1916,17 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+
+    // Optional: AllReduce fused with the residual ADD -> RMS_NORM -> MUL that follows it.  The
+    // chain is detected once per graph rebuild (see fused_chain below); at compute time the
+    // fused call replaces the AllReduce and the three (or four, with a leading reshape) nodes.
+    using comm_allreduce_add_rms_norm_mul_t = bool (*)(void * comm_ctx, ggml_tensor ** tensors,
+        ggml_tensor ** residuals, ggml_tensor ** add_outputs, ggml_tensor ** norm_weights,
+        ggml_tensor ** norm_outputs, float eps);
+    using comm_allreduce_add_rms_norm_mul_supported_t = bool (*)(void * comm_ctx, int64_t ncols, int64_t nrows);
+    comm_allreduce_add_rms_norm_mul_t           comm_allreduce_add_rms_norm_mul           = nullptr;
+    comm_allreduce_add_rms_norm_mul_supported_t comm_allreduce_add_rms_norm_mul_supported = nullptr;
+    std::vector<ggml_cgraph *>                  cgraphs_fused_fallback; // per device, capacity 4 nodes
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1934,6 +1958,15 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            static const bool fused_allreduce_env = getenv("GGML_META_FUSED_ALLREDUCE") == nullptr ||
+                atoi(getenv("GGML_META_FUSED_ALLREDUCE")) != 0;
+            if (fused_allreduce_env) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+                comm_allreduce_add_rms_norm_mul = (comm_allreduce_add_rms_norm_mul_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor_add_rms_norm_mul");
+                comm_allreduce_add_rms_norm_mul_supported = (comm_allreduce_add_rms_norm_mul_supported_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_add_rms_norm_mul_supported");
+            }
         }
     }
 
@@ -2348,6 +2381,100 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+
+            // Fused AllReduce epilogues: a subgraph's last node is a PARTIAL sum that the next
+            // subgraph immediately consumes as [RESHAPE] -> ADD(residual) -> RMS_NORM -> MUL(weight),
+            // all MIRRORED.  When the comm layer can run that chain inside the AllReduce, the nodes
+            // leave the next subgraph and the fused call produces the ADD and MUL outputs.
+            for (size_t j = 0; j < n_backends; j++) {
+                for (size_t sg = 0; sg < n_subgraphs; sg++) {
+                    backend_ctx->backend_configs[j].cgraphs[sg].n_fused      = 0;
+                    backend_ctx->backend_configs[j].cgraphs[sg].n_skip_front = 0;
+                }
+            }
+            if (n_backends == 2 && backend_ctx->comm_ctx != nullptr &&
+                    backend_ctx->comm_allreduce_add_rms_norm_mul != nullptr &&
+                    backend_ctx->comm_allreduce_add_rms_norm_mul_supported != nullptr) {
+                auto & cg0 = backend_ctx->backend_configs[0].cgraphs;
+                for (size_t sg = 0; sg + 1 < n_subgraphs; sg++) {
+                    const int i_ar   = cg0[sg + 1].offset - 1;              // the reduced node
+                    const int i_end  = sg + 2 < n_subgraphs ? cg0[sg + 2].offset - 1 : cgraph->n_nodes; // next reduced node (exclusive)
+                    ggml_tensor * reduced = cgraph->nodes[i_ar];
+                    if (reduced->type != GGML_TYPE_F32 || !ggml_is_contiguous(reduced) || reduced->ne[2] != 1 || reduced->ne[3] != 1 ||
+                            (reduced->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+                            ggml_node_get_use_count(cgraph, i_ar) != 1) {
+                        continue;
+                    }
+                    int i_next = i_ar + 1;
+                    ggml_tensor * add_input = reduced;
+                    if (i_next < i_end && cgraph->nodes[i_next]->op == GGML_OP_RESHAPE && cgraph->nodes[i_next]->src[0] == reduced &&
+                            ggml_are_same_shape(cgraph->nodes[i_next], reduced) && ggml_node_get_use_count(cgraph, i_next) == 1 &&
+                            (cgraph->nodes[i_next]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                        add_input = cgraph->nodes[i_next];
+                        i_next++;
+                    }
+                    if (i_next + 3 > i_end) {
+                        continue;
+                    }
+                    const int i_add = i_next, i_rms = i_next + 1, i_mul = i_next + 2;
+                    ggml_tensor * add = cgraph->nodes[i_add];
+                    ggml_tensor * rms = cgraph->nodes[i_rms];
+                    ggml_tensor * mul = cgraph->nodes[i_mul];
+                    if (add->op != GGML_OP_ADD || rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+                        continue;
+                    }
+                    int residual_idx = -1;
+                    if (add->src[0] == add_input) {
+                        residual_idx = 1;
+                    } else if (add->src[1] == add_input) {
+                        residual_idx = 0;
+                    }
+                    if (residual_idx < 0) {
+                        continue;
+                    }
+                    ggml_tensor * residual = add->src[residual_idx];
+                    ggml_tensor * weight   = mul->src[1];
+                    if (rms->src[0] != add || mul->src[0] != rms || weight == nullptr ||
+                            ggml_node_get_use_count(cgraph, i_rms) != 1 ||
+                            (rms->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+                            add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+                            residual->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 ||
+                            !ggml_are_same_shape(add, reduced) || !ggml_are_same_shape(rms, reduced) || !ggml_are_same_shape(mul, reduced) ||
+                            !ggml_are_same_shape(residual, reduced) ||
+                            weight->ne[0] != reduced->ne[0] || ggml_nrows(weight) != 1 ||
+                            !ggml_is_contiguous(add) || !ggml_is_contiguous(rms) || !ggml_is_contiguous(mul) ||
+                            !ggml_is_contiguous(residual) || !ggml_is_contiguous(weight)) {
+                        continue;
+                    }
+                    if (ggml_backend_meta_get_split_state(add, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                            ggml_backend_meta_get_split_state(rms, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                            ggml_backend_meta_get_split_state(mul, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        continue;
+                    }
+                    if (!backend_ctx->comm_allreduce_add_rms_norm_mul_supported(backend_ctx->comm_ctx, reduced->ne[0], reduced->ne[1])) {
+                        continue;
+                    }
+                    const int n_fused = i_mul + 1 - (i_ar + 1);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & cg = backend_ctx->backend_configs[j].cgraphs;
+                        cg[sg].n_fused        = n_fused;
+                        cg[sg].i_fused_add    = i_add;
+                        cg[sg].i_fused_rms    = i_rms;
+                        cg[sg].i_fused_mul    = i_mul;
+                        cg[sg].fused_residual = residual_idx;
+                        cg[sg].fused_eps      = ggml_get_op_params_f32(rms, 0);
+                        cg[sg + 1].n_skip_front = n_fused; // the next subgraph starts after the MUL
+                    }
+                }
+                if (meta_debug >= 1) {
+                    int n_chains = 0;
+                    for (size_t sg = 0; sg < n_subgraphs; sg++) {
+                        n_chains += cg0[sg].n_fused > 0;
+                    }
+                    GGML_LOG_WARN("meta-debug: %d of %zu AllReduces fused with ADD -> RMS_NORM -> MUL (%d nodes)\n",
+                            n_chains, n_subgraphs - 1, cgraph->n_nodes);
+                }
+            }
         }
 
         backend_ctx->uid         = cgraph->uid;
@@ -2379,7 +2506,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
             const ggml_init_params params = {
-                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
+                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux
+                                                 + ggml_graph_overhead_custom(4, false)),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
@@ -2398,13 +2526,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
                 backend_ctx->nodes_aux[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
             }
+            backend_ctx->cgraphs_fused_fallback.resize(n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                backend_ctx->cgraphs_fused_fallback[j] = ggml_new_graph_custom(backend_ctx->ctx.get(), 4, false);
+            }
         }
 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
-                const size_t i_node_start = bcj.cgraphs[i_graph].offset;
+                const size_t i_node_start = bcj.cgraphs[i_graph].offset + bcj.cgraphs[i_graph].n_skip_front;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
                 cgraph_ij->n_nodes = i_node_stop - i_node_start;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
@@ -2577,7 +2709,54 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
+            const auto & cg0 = backend_ctx->backend_configs[0].cgraphs[i];
+            if (backend_ctx->comm_ctx && cg0.n_fused > 0) {
+                ggml_tensor * tensors  [GGML_MAX_SRC];
+                ggml_tensor * residuals[GGML_MAX_SRC];
+                ggml_tensor * adds     [GGML_MAX_SRC];
+                ggml_tensor * weights  [GGML_MAX_SRC];
+                ggml_tensor * muls     [GGML_MAX_SRC];
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                    tensors[j]   = cgraph_ij->nodes[cgraph_ij->n_nodes-1];
+                    adds[j]      = bcj.nodes[cg0.i_fused_add];
+                    residuals[j] = adds[j]->src[cg0.fused_residual];
+                    muls[j]      = bcj.nodes[cg0.i_fused_mul];
+                    weights[j]   = muls[j]->src[1];
+                }
+                backend_allreduce_success = backend_ctx->comm_allreduce_add_rms_norm_mul(
+                    backend_ctx->comm_ctx, tensors, residuals, adds, weights, muls, cg0.fused_eps);
+                if (!backend_allreduce_success) {
+                    // plain AllReduce, then the chain as a small graph per device
+                    if (backend_ctx->comm_allreduce(backend_ctx->comm_ctx, tensors) == false) {
+                        const ggml_status status = allreduce_fallback(i);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            return status;
+                        }
+                    }
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        ggml_cgraph * g = backend_ctx->cgraphs_fused_fallback[j];
+                        const int i_first = cg0.i_fused_mul + 1 - cg0.n_fused;
+                        ggml_hash_set_reset(&g->visited_hash_set);
+                        for (int k = 0; k < cg0.n_fused; k++) {
+                            ggml_tensor * node_ij = bcj.nodes[i_first + k];
+                            g->nodes[k] = node_ij;
+                            const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_first + k]);
+                            const size_t hash_pos_ij   = ggml_hash_insert(&g->visited_hash_set, node_ij);
+                            g->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
+                        }
+                        g->n_nodes = cg0.n_fused;
+                        const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, g);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            return status;
+                        }
+                    }
+                    backend_allreduce_success = true;
+                }
+            }
+            if (!backend_allreduce_success && backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
                 nodes.reserve(n_backends);
                 for (size_t j = 0; j < n_backends; j++) {

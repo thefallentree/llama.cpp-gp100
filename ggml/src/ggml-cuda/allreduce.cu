@@ -331,7 +331,20 @@ struct ggml_cuda_ar_pipeline {
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
+
+    // Peer-memory transport (GGML_CUDA_AR_P2P=1, both devices able to access each other): device
+    // staging and arrival rings live in each GPU's own memory; the peer writes into them directly.
+    bool   p2p;
+    char * dev_buf[GGML_CUDA_MAX_DEVICES];      // POOL_SIZE * buf_bytes, on device i, written by the peer
+    int *  dev_arrival[GGML_CUDA_MAX_DEVICES];  // (slot, rank) token ring on device i, written by the peer
 };
+
+// Token block for (slot, rank) inside device `owner`'s arrival ring.
+static int * ggml_cuda_ar_dev_arrival_ptr(const ggml_cuda_ar_pipeline * p, int owner, int slot, int rank) {
+    const size_t offset = ((size_t)slot * p->n_devices + rank) *
+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(reinterpret_cast<char *>(p->dev_arrival[owner]) + offset);
+}
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
@@ -496,6 +509,40 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Peer-memory transport for the chunked kernel: used when peer access works both ways
+    // (GGML_CUDA_AR_P2P=0 forces the mapped-host path).
+    p->p2p = false;
+    if (ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P", 1) != 0) {
+        int can01 = 0, can10 = 0;
+        cudaDeviceCanAccessPeer(&can01, p->devices[0], p->devices[1]);
+        cudaDeviceCanAccessPeer(&can10, p->devices[1], p->devices[0]);
+        bool ok = can01 && can10;
+        for (size_t i = 0; ok && i < n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            cudaError_t rc = cudaDeviceEnablePeerAccess(p->devices[1 - i], 0);
+            if (rc == cudaErrorPeerAccessAlreadyEnabled) {
+                rc = cudaSuccess;
+                (void) cudaGetLastError();
+            }
+            ok = rc == cudaSuccess;
+        }
+        const size_t arrival_bytes_dev =
+            (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+        for (size_t i = 0; ok && i < n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            ok = cudaMalloc(reinterpret_cast<void **>(&p->dev_buf[i]), host_buf_total) == cudaSuccess &&
+                 cudaMalloc(reinterpret_cast<void **>(&p->dev_arrival[i]), arrival_bytes_dev) == cudaSuccess &&
+                 cudaMemset(p->dev_arrival[i], 0, arrival_bytes_dev) == cudaSuccess;
+        }
+        if (ok) {
+            p->p2p = true;
+            GGML_LOG_INFO("%s: AllReduce chunked kernel uses peer memory (P2P push)\n", __func__);
+        } else {
+            (void) cudaGetLastError();
+            GGML_LOG_INFO("%s: peer access unavailable; AllReduce chunked kernel uses mapped host memory\n", __func__);
+        }
+    }
+
     // Copy-engine path: pinned host staging + device scratch, sized for the
     // largest tensor we accept on this path (GGML_CUDA_AR_COPY_MAX_BYTES).
     // dev_tmp is single-buffered; cross-AR safety is enforced by an explicit
@@ -539,6 +586,11 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         p->host_buf[i].free();
         p->host_large[i].free();
+        if (p->dev_buf[i] || p->dev_arrival[i]) {
+            ggml_cuda_set_device(p->devices[i]);
+            if (p->dev_buf[i])     { cudaFree(p->dev_buf[i]); }
+            if (p->dev_arrival[i]) { cudaFree(p->dev_arrival[i]); }
+        }
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
             cudaFree(p->dev_tmp[i]);
@@ -905,15 +957,23 @@ bool ggml_cuda_ar_allreduce(
                     CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, stream));
                 }
 
+                char * wire_mine  = p->p2p ? p->dev_buf[peer] + (size_t) slot * p->buf_bytes   // lands in the peer's memory
+                                           : reinterpret_cast<char *>(p->host_buf[i].dev) + (size_t) slot * p->buf_bytes;
+                char * wire_other = p->p2p ? p->dev_buf[i]    + (size_t) slot * p->buf_bytes   // the peer wrote it here
+                                           : reinterpret_cast<char *>(p->host_buf[peer].dev) + (size_t) slot * p->buf_bytes;
+                int * arr_mine  = p->p2p ? ggml_cuda_ar_dev_arrival_ptr(p, peer, slot, i)     // our token, in the peer's ring
+                                         : ggml_cuda_ar_arrival_ptr(p, slot, i);
+                int * arr_other = p->p2p ? ggml_cuda_ar_dev_arrival_ptr(p, i, slot, peer)     // the peer's token, in our ring
+                                         : ggml_cuda_ar_arrival_ptr(p, slot, peer);
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
                 ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
-                    reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
-                    reinterpret_cast<const T_wire *>(p->host_buf[peer].dev + (size_t) slot * p->buf_bytes), \
+                    reinterpret_cast<T_wire *>(wire_mine), \
+                    reinterpret_cast<const T_wire *>(wire_other), \
                     static_cast<int>(chunk_elems), \
-                    ggml_cuda_ar_arrival_ptr(p, slot, i), \
-                    ggml_cuda_ar_arrival_ptr(p, slot, peer), \
+                    arr_mine, \
+                    arr_other, \
                     token)
 
                 if (use_bf16) {

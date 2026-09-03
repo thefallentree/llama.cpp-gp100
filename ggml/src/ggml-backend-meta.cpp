@@ -397,16 +397,39 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 // Container to hold the tensor slices per simple ggml backend buffer.
 struct ggml_backend_meta_simple_tensor_container {
-    std::vector<ggml_context_ptr> ctxs;
+    ggml_init_params params = {};
+    std::vector<ggml_context_ptr> ctxs;      // current context per simple buffer
+    std::vector<ggml_context_ptr> ctxs_full; // exhausted contexts, kept alive until the next reset
     std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
-    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
+    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) : params(params) {
         ctxs.reserve(n_simple);
         for (int i = 0; i < n_simple; i++) {
             ctxs.emplace_back(ggml_init(params));
         }
     }
     ggml_backend_meta_simple_tensor_container() {}
+
+    // Context for simple buffer j with room for at least one more tensor.
+    // The number of external views created between evals is not known when the buffer is allocated
+    // (e.g. recurrent-state rollback creates one view per snapshot per layer), so grow instead of asserting.
+    ggml_context * ctx_with_room(size_t j) {
+        ggml_context * ctx = ctxs[j].get();
+        if (ggml_get_mem_size(ctx) - ggml_used_mem(ctx) < 2*ggml_tensor_overhead()) {
+            ctxs_full.push_back(std::move(ctxs[j]));
+            ctxs[j].reset(ggml_init(params));
+            ctx = ctxs[j].get();
+        }
+        return ctx;
+    }
+
+    void reset() {
+        for (ggml_context_ptr & ctx : ctxs) {
+            ggml_reset(ctx.get());
+        }
+        ctxs_full.clear();
+        simple_tensors.clear();
+    }
 };
 
 struct ggml_backend_meta_buffer_context {
@@ -1222,7 +1245,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
-        ggml_context          * simple_ctx = stc.ctxs[j].get();
+        ggml_context          * simple_ctx = stc.ctx_with_room(j);
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
         if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
@@ -2021,11 +2044,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
-                ggml_reset(ctx.get());
-            }
-            stc.simple_tensors.clear();
+            buf_ctx->stc_compute[buf_ctx->stc_compute_index_next].reset();
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -2779,6 +2780,59 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
+static bool spec_type_is_ngram(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool spec_type_is_draft_model(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// When ngram wrote the last draft, DFlash process() still llama_decode's the
+// draft on every target verify batch (TAG_SPEC_AVOID_DRAFT_REEVAL). That is
+// wasted CUDA1 work on exact-reuse. LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM=1
+// skips draft-model process() for those rounds. Prefill (impl_last empty) and
+// DFlash-drafted novel rounds still process(). Draft KV goes stale after a
+// ngram streak; the next DFlash miss then sees a hole.
+static bool spec_skip_draft_process_on_ngram(const common_speculative * spec) {
+    const char * env = std::getenv("LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM");
+    if (env == nullptr || env[0] != '1' || env[1] != '\0') {
+        return false;
+    }
+
+    bool any_ngram = false;
+    bool any_draft = false;
+    for (const auto * last : spec->impl_last) {
+        if (last == nullptr) {
+            continue;
+        }
+        if (spec_type_is_ngram(last->type)) {
+            any_ngram = true;
+        } else if (spec_type_is_draft_model(last->type)) {
+            any_draft = true;
+        }
+    }
+    return any_ngram && !any_draft;
+}
+
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
     bool result = true;
 
@@ -2786,7 +2840,19 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         return result;
     }
 
+    const bool skip_draft = spec_skip_draft_process_on_ngram(spec);
+    if (skip_draft) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            SPC_INF("%s", "LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM=1: skipping draft-model process() after ngram drafts\n");
+        }
+    }
+
     for (auto & impl : spec->impls) {
+        if (skip_draft && spec_type_is_draft_model(impl->type)) {
+            continue;
+        }
         result = result && impl->process(batch);
     }
 

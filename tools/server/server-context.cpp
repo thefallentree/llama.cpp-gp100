@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -37,6 +38,24 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// LoopSpec novel (DFlash n_max=3) verifies at width 4; ngram cap 7 verifies at
+// width 8. Mixed widths flip greedy ties on exact reuse. LLAMA_SPEC_VERIFY_PAD=8
+// appends dummy future tokens so every verify batch is 8 columns. Causal, so they
+// do not attend into real rows. Sample/accept ignores them (not in spec_i_batch /
+// spec_draft). KV for the pad span is seq_rm'd after decode. 0 = no padding.
+static int spec_verify_pad_cols() {
+    static const int pad = []() {
+        const char * e = getenv("LLAMA_SPEC_VERIFY_PAD");
+        const int v = (e && e[0]) ? atoi(e) : 0;
+        if (v >= 8) {
+            LOG_INF("%s: LLAMA_SPEC_VERIFY_PAD=%d (verify batches padded to 8)\n", __func__, v);
+            return 8;
+        }
+        return 0;
+    }();
+    return pad;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -257,6 +276,7 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+    llama_pos spec_pad_pos0 = -1;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -383,6 +403,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_pad_pos0 = -1;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -532,6 +553,17 @@ struct server_slot {
             add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
+            }
+
+            spec_pad_pos0 = -1;
+            const int pad_to = spec_verify_pad_cols();
+            const int n_verify = 1 + (int) spec_draft.size();
+            if (pad_to > n_verify) {
+                spec_pad_pos0 = pos0;
+                const llama_token pad_tok = spec_draft.empty() ? sampled : spec_draft.back();
+                for (int i = n_verify; i < pad_to; ++i) {
+                    add_ok &= batch.add(this->id, pad_tok, pos0++, true, false);
+                }
             }
         }
 
@@ -3883,6 +3915,11 @@ private:
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
+            }
+
+            if (slot.spec_pad_pos0 >= 0) {
+                slot.mem.seq_rm(slot.id, slot.spec_pad_pos0, -1);
+                slot.spec_pad_pos0 = -1;
             }
 
             // save the original draft size

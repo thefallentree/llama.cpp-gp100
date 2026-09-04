@@ -43,11 +43,12 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // width 8. Mixed widths flip greedy ties on exact reuse. LLAMA_SPEC_VERIFY_PAD=8
 // appends dummy future tokens so every verify batch is 8 columns. Causal, so they
 // do not attend into real rows. Sample/accept ignores them (not in spec_i_batch /
-// spec_draft). Do not seq_rm the pad before accept: GDN pending rollback is
-// single-use, and a pre-accept pad trim makes the post-accept suffix seq_rm
-// fail. Pad is a suffix of the verify batch, so one target seq_rm from
-// pos_next after accept removes rejected drafts and pad together (always
-// <= 7 tokens when pad_to=8). 0 = no padding.
+// spec_draft). Dummy pad is target-only: DFlash process() must not copy those
+// rows into draft KV (n_rs_seq=0 cannot seq_rm them). Do not seq_rm pad before
+// accept: GDN pending rollback is single-use, and a pre-accept pad trim makes
+// the post-accept suffix seq_rm fail. One target seq_rm from pos_next after
+// accept removes rejected drafts and pad together (always <= 7 tokens when
+// pad_to=8). 0 = no padding.
 static int spec_verify_pad_cols() {
     static const int pad = []() {
         const char * e = getenv("LLAMA_SPEC_VERIFY_PAD");
@@ -3774,9 +3775,23 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
+            // Pad columns pin the target graph at width 8. They must not enter
+            // DFlash KV: draft n_rs_seq=0 cannot seq_rm them, and the next draft
+            // decode then fails the consecutive-position check (Y = X + 1).
+            llama_batch process_batch = batch_view;
+            int32_t pad_n = 0;
+            for (const auto & slot : slots) {
+                if (slot.spec_pad_n > 0) {
+                    pad_n += slot.spec_pad_n;
+                }
+            }
+            if (pad_n > 0 && process_batch.n_tokens >= pad_n) {
+                process_batch.n_tokens -= pad_n;
+            }
+
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
+                ok = common_speculative_process(spec.get(), process_batch);
             });
 
             if (!ok) {

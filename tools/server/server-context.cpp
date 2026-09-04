@@ -3918,7 +3918,14 @@ private:
             }
 
             if (slot.spec_pad_pos0 >= 0) {
-                slot.mem.seq_rm(slot.id, slot.spec_pad_pos0, -1);
+                // Target GDN can roll back the pad suffix (n_rs_seq covers ngram max).
+                // The DFlash draft context hard-codes n_rs_seq=0, so slot.mem.seq_rm
+                // (tgt+dft) aborts. Leave draft pad KV; the next verify overwrites it.
+                auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
+                if (!llama_memory_seq_rm(mem_tgt, slot.id, slot.spec_pad_pos0, -1)) {
+                    GGML_ABORT("failed to seq_rm pad on target seq %d from pos %d\n",
+                            slot.id, (int) slot.spec_pad_pos0);
+                }
                 slot.spec_pad_pos0 = -1;
             }
 

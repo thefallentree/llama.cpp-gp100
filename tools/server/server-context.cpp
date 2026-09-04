@@ -57,6 +57,14 @@ static int spec_verify_pad_cols() {
     return pad;
 }
 
+// DFlash draft contexts hard-code n_rs_seq=0, so common_memory::seq_rm (tgt+dft)
+// aborts on a pad/rejected suffix. Only the target GDN can roll that span back.
+static void spec_seq_rm_tgt(llama_context * ctx, llama_seq_id seq_id, llama_pos p0) {
+    if (!llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, -1)) {
+        GGML_ABORT("failed to seq_rm target seq %d from pos %d\n", seq_id, (int) p0);
+    }
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -3918,14 +3926,7 @@ private:
             }
 
             if (slot.spec_pad_pos0 >= 0) {
-                // Target GDN can roll back the pad suffix (n_rs_seq covers ngram max).
-                // The DFlash draft context hard-codes n_rs_seq=0, so slot.mem.seq_rm
-                // (tgt+dft) aborts. Leave draft pad KV; the next verify overwrites it.
-                auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
-                if (!llama_memory_seq_rm(mem_tgt, slot.id, slot.spec_pad_pos0, -1)) {
-                    GGML_ABORT("failed to seq_rm pad on target seq %d from pos %d\n",
-                            slot.id, (int) slot.spec_pad_pos0);
-                }
+                spec_seq_rm_tgt(slot.ctx_tgt, slot.id, slot.spec_pad_pos0);
                 slot.spec_pad_pos0 = -1;
             }
 
@@ -4023,7 +4024,7 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            spec_seq_rm_tgt(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next());
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

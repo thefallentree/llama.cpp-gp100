@@ -1145,6 +1145,22 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
+// LoopSpec verify mixes widths 4 (DFlash) and 5-8 (ngram). Those pick different
+// fattn-tile instantiations (8-col vs 16-col at GQA ncols2=2), so stream-k
+// occupancy differs and greedy ties flip on replay. GGML_CUDA_FATTN_TILE_PIN_COLS=16
+// keeps every verify-sized batch (Q->ne[1] <= 16/ncols2) on the 16-col kernel.
+// Prefill (ne[1] > 16/ncols2) still takes the 32-col path. 0 = today's dispatch.
+static inline int ggml_cuda_fattn_tile_pin_cols() {
+    static const int pin = []() {
+        const char * e = getenv("GGML_CUDA_FATTN_TILE_PIN_COLS");
+        if (e && atoi(e) >= 16) {
+            return 16;
+        }
+        return 0;
+    }();
+    return pin;
+}
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1185,7 +1201,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] > 8/ncols2) {
+        // After the 32-col early-return, ne[1] <= 16/ncols2. Pin 16 keeps every
+        // remaining verify-sized batch on this instantiation (idle columns masked).
+        if (ggml_cuda_fattn_tile_pin_cols() >= 16 || Q->ne[1] > 8/ncols2) {
             constexpr int cols_per_block = 16;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);

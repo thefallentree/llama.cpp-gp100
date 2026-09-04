@@ -43,7 +43,11 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // width 8. Mixed widths flip greedy ties on exact reuse. LLAMA_SPEC_VERIFY_PAD=8
 // appends dummy future tokens so every verify batch is 8 columns. Causal, so they
 // do not attend into real rows. Sample/accept ignores them (not in spec_i_batch /
-// spec_draft). KV for the pad span is seq_rm'd after decode. 0 = no padding.
+// spec_draft). Do not seq_rm the pad before accept: GDN pending rollback is
+// single-use, and a pre-accept pad trim makes the post-accept suffix seq_rm
+// fail. Pad is a suffix of the verify batch, so one target seq_rm from
+// pos_next after accept removes rejected drafts and pad together (always
+// <= 7 tokens when pad_to=8). 0 = no padding.
 static int spec_verify_pad_cols() {
     static const int pad = []() {
         const char * e = getenv("LLAMA_SPEC_VERIFY_PAD");
@@ -285,6 +289,7 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
     llama_pos spec_pad_pos0 = -1;
+    int spec_pad_n = 0;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -412,6 +417,7 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
             spec_pad_pos0 = -1;
+            spec_pad_n = 0;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -564,10 +570,12 @@ struct server_slot {
             }
 
             spec_pad_pos0 = -1;
+            spec_pad_n = 0;
             const int pad_to = spec_verify_pad_cols();
             const int n_verify = 1 + (int) spec_draft.size();
             if (pad_to > n_verify) {
                 spec_pad_pos0 = pos0;
+                spec_pad_n = pad_to - n_verify;
                 const llama_token pad_tok = spec_draft.empty() ? sampled : spec_draft.back();
                 for (int i = n_verify; i < pad_to; ++i) {
                     add_ok &= batch.add(this->id, pad_tok, pos0++, true, false);
@@ -3925,11 +3933,6 @@ private:
                 return;
             }
 
-            if (slot.spec_pad_pos0 >= 0) {
-                spec_seq_rm_tgt(slot.ctx_tgt, slot.id, slot.spec_pad_pos0);
-                slot.spec_pad_pos0 = -1;
-            }
-
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
@@ -3950,7 +3953,11 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
-                const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                const uint32_t n_pad = slot.spec_pad_n > 0 ? (uint32_t) slot.spec_pad_n : 0;
+                slot.spec_pad_pos0 = -1;
+                slot.spec_pad_n = 0;
+
+                const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size() + n_pad;
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||

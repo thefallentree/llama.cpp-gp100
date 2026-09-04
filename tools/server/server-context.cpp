@@ -3101,9 +3101,12 @@ private:
             }
 
             if (!draft.empty()) {
+                const int pad_to = spec_verify_pad_cols();
+                const bool padded = pad_to > 1 + (int) draft.size();
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)) ||
+                   padded;
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
@@ -3972,11 +3975,16 @@ private:
                 slot.spec_pad_pos0 = -1;
                 slot.spec_pad_n = 0;
 
-                const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size() + n_pad;
+                const uint32_t n_rejected = slot.spec_draft.size() + 1 - accepted.size();
+                const uint32_t n_rollback = n_rejected + n_pad;
 
+                // Pad-only suffix can seq_rm on the target (fits n_rs_seq). Rejected
+                // drafts stay in DFlash KV (accept() is a no-op, n_rs_seq=0), so a
+                // padded partial accept has to restore the pre-verify checkpoint.
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt)) ||
+                    (n_pad > 0 && n_rejected > 0);
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {

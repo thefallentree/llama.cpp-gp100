@@ -1276,6 +1276,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
     GGML_ASSERT(split_state.n_segments <= 16);
 
+    const auto existing = stc.simple_tensors.find(tensor);
+    const bool update_existing = existing != stc.simple_tensors.end();
+    if (update_existing) {
+        GGML_ASSERT(existing->second.size() == n_simple_bufs);
+    }
+
     int split_dim = split_state.axis;
     int64_t ne[GGML_MAX_DIMS];
     size_t  nb[GGML_MAX_DIMS];
@@ -1287,7 +1293,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
-        ggml_context          * simple_ctx = stc.ctx_with_room(j);
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
         if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
@@ -1309,7 +1314,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
-        ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
+        ggml_tensor * t_ij;
+        if (update_existing) {
+            t_ij = existing->second[j];
+            memset(t_ij, 0, sizeof(*t_ij));
+            t_ij->type = tensor->type;
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                t_ij->ne[i] = ne[i];
+                t_ij->nb[i] = nb[i];
+            }
+        } else {
+            ggml_context * simple_ctx = stc.ctx_with_room(j);
+            t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
+        }
         t_ij->op = tensor->op;
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             t_ij->nb[i] = nb[i];
@@ -2193,7 +2210,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
-            buf_ctx->stc_compute[buf_ctx->stc_compute_index_next].reset();
+            // A meta buffer can be shared by more than one scheduler. This is
+            // the case for an MTP context that consumes a target context's KV
+            // cache. Resetting the alternate container here invalidates the
+            // simple tensors retained by the other scheduler's cached graph
+            // (flash-attention then pairs a live K view with a freed V view
+            // and aborts). Keep both containers alive and update entries in
+            // place when an arena reuses the same ggml_tensor address.
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;

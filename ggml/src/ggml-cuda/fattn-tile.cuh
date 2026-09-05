@@ -504,6 +504,19 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 
 #ifdef FAST_FP16_AVAILABLE
     static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
+#if !defined(V_DOT2_F32_F16_AVAILABLE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+    // GP100: ggml_cuda_mad(float&, half2, half2) is HMUL2 + F2F + 2 FADD
+    // (5 issue slots / 2 MACs). The V phase already keeps half2 pairing.
+    // Accumulate 8 half2 products (16 elements) then convert once — the A16
+    // kernel's pattern (pascal-guide-audit 2026-09-03 D.ii.2 / GGML_CUDA_FATTN_KQ_H2ACC).
+    // nbatch_K/2 is 32 on D=256; other heads flush the tail when the tile ends.
+    constexpr int h2acc_ne = 8;
+    half2 KQ_h2[nbatch_fa/(np*warp_size) * cpw];
+#pragma unroll
+    for (int i = 0; i < nbatch_fa/(np*warp_size) * cpw; ++i) {
+        KQ_h2[i] = make_half2(0.0f, 0.0f);
+    }
+#endif
 #pragma unroll
     for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
         __align__(16) half2 K_k[nbatch_fa/(np*warp_size)][cpy_ne];
@@ -541,10 +554,25 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
 #pragma unroll
             for (int jc0 = 0; jc0 < cpw; ++jc0) {
+#if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE) && \
+    defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+                const int idx = i_KQ_0/(np*warp_size)*cpw + jc0;
+#pragma unroll
+                for (int k = 0; k < cpy_ne; ++k) {
+                    KQ_h2[idx] = __hfma2(K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k], KQ_h2[idx]);
+                }
+                const int produced = k_KQ_1 + cpy_ne;
+                if (produced % h2acc_ne == 0 || produced >= nbatch_K/2) {
+                    const float2 tmp = __half22float2(KQ_h2[idx]);
+                    KQ_acc[idx] += tmp.x + tmp.y;
+                    KQ_h2[idx] = make_half2(0.0f, 0.0f);
+                }
+#else
 #pragma unroll
                 for (int k = 0; k < cpy_ne; ++k) {
                     ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
                 }
+#endif
             }
         }
     }
@@ -1154,6 +1182,17 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     const int warp_size = 32;
 
     constexpr size_t nbytes_shared = 0;
+
+#if !defined(GGML_USE_HIP)
+    if (cc < GGML_CUDA_CC_VOLTA) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_FATTN_KQ_H2ACC=8 (Pascal tile: 16-element half2 KQ partials)\n",
+                __func__);
+        }
+    }
+#endif
 
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {

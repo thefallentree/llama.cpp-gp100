@@ -254,6 +254,8 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    // backend-sampled ids from chunked verify (LLAMA_SPEC_VERIFY_WIDTH)
+    llama_tokens spec_sampled;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -382,6 +384,7 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_sampled.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -521,6 +524,7 @@ struct server_slot {
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
             GGML_ASSERT(spec_i_batch.empty());
+            spec_sampled.clear();
 
             spec_i_batch.push_back(batch.size());
             for (size_t i = 0; i < spec_draft.size(); i++) {
@@ -909,6 +913,7 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    int spec_verify_width = 0; // env: LLAMA_SPEC_VERIFY_WIDTH
 
     int n_empty_consecutive = 0;
 
@@ -1337,6 +1342,14 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * e = getenv("LLAMA_SPEC_VERIFY_WIDTH");
+            spec_verify_width = (e && e[0]) ? atoi(e) : 0;
+            if (spec_verify_width > 0) {
+                SRV_WRN("LLAMA_SPEC_VERIFY_WIDTH = %d (chunk spec verify; GDN cannot shrink n_ubatch)\n", spec_verify_width);
             }
         }
 
@@ -2851,6 +2864,25 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+
+        // GDN forbids n_ubatch < n_rs_seq+1 (GGML_ASSERT in split_equal).
+        // Chunk the spec batch into separate llama_decode calls instead, then
+        // accept once from the saved backend-sampled ids.
+        bool chunk_spec = false;
+        if (spec_verify_width > 0 && batch.size() > spec_verify_width) {
+            iterate(slots, [&](server_slot & slot) {
+                if (!slot.spec_draft.empty() && !slot.spec_i_batch.empty()) {
+                    chunk_spec = true;
+                }
+            });
+        }
+        if (chunk_spec) {
+            n_batch = spec_verify_width;
+            iterate(slots, [&](server_slot & slot) {
+                slot.spec_sampled.clear();
+            });
+        }
+
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -2867,8 +2899,26 @@ private:
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
-                    // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
+                    if (chunk_spec) {
+                        for (auto & slot : slots) {
+                            if (slot.spec_i_batch.empty()) {
+                                continue;
+                            }
+                            for (int32_t i : slot.spec_i_batch) {
+                                if (i < off || i >= off + n_tokens) {
+                                    continue;
+                                }
+                                const llama_token id = llama_get_sampled_token_ith(ctx_tgt, i - off);
+                                if (id == LLAMA_TOKEN_NULL) {
+                                    throw std::runtime_error("spec verify chunk missing backend-sampled token");
+                                }
+                                slot.spec_sampled.push_back(id);
+                            }
+                        }
+                    } else {
+                        // on successful decode, restore the original batch size
+                        n_batch = llama_n_batch(ctx_tgt);
+                    }
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -2879,9 +2929,18 @@ private:
                 break; // stop any further processing
             }
 
+            if (chunk_spec && off_next < batch.size()) {
+                continue; // accept after the last chunk so spec_i_batch stays in one view
+            }
+
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off, batch_view);
+                if (chunk_spec) {
+                    llama_batch full_view = batch.get_view(0, batch.size());
+                    post_decode(batch.size(), 0, full_view);
+                } else {
+                    post_decode(n_tokens, off, batch_view);
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3896,12 +3955,32 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                std::vector<llama_token> accepted;
+                if (!synth_probs.empty()) {
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (slot.spec_sampled.size() == slot.spec_i_batch.size()) {
+                    accepted.reserve(slot.spec_sampled.size());
+                    size_t i = 0;
+                    for (; i < slot.spec_draft.size(); i++) {
+                        const llama_token id = slot.spec_sampled[i];
+                        common_sampler_accept(slot.smpl.get(), id, true);
+                        accepted.push_back(id);
+                        if (slot.spec_draft[i] != id) {
+                            break;
+                        }
+                    }
+                    if (i == slot.spec_draft.size()) {
+                        const llama_token id = slot.spec_sampled[i];
+                        common_sampler_accept(slot.smpl.get(), id, true);
+                        accepted.push_back(id);
+                    }
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
+                slot.spec_sampled.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 

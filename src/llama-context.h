@@ -400,11 +400,6 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
-    // env: LLAMA_SPEC_VERIFY_WIDTH — shrink n_ubatch for small all-logits
-    // batches (LoopSpec verify). Draft depth stays 7; G64 stays on width-4
-    // kernels. Prefill and large batches keep cparams.n_ubatch.
-    uint32_t spec_verify_ubatch = 0;
-
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

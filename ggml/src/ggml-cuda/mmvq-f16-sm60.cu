@@ -481,10 +481,10 @@ static void launch_a16(
         const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
         const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
         const int stride_col_dst, cudaStream_t stream) {
-    // Width ≥ 5: one thread per 32-weight block (slice32). 4-row tile at width ≥ 6
-    // so a[ncols][16] fits; width 5 keeps 8 rows if the grid is tall.
-    if constexpr (ncols_dst >= 5) {
-        constexpr int tile = ncols_dst >= 6 ? 4 : 8;
+    // Width ≥ 6: one thread per 32-weight block (slice32), 4-row tile.
+    // Width 5 8-row slice32 spilled 184 B; leave it on the half-block path.
+    if constexpr (ncols_dst >= 6) {
+        constexpr int tile = 4;
         if (nrows >= tile && nrows % tile == 0) {
             const dim3 grid(nrows/tile, 1, 1);
             switch (a16_pick_nwarps_slice32(nblocks, nrows/tile)) {
@@ -945,8 +945,8 @@ static void launch_a16_g64(
         const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
         const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
         const int stride_col_dst, cudaStream_t stream) {
-    if constexpr (ncols_dst >= 5) {
-        constexpr int tile = ncols_dst >= 6 ? 4 : 8;
+    if constexpr (ncols_dst >= 6) {
+        constexpr int tile = 4;
         const dim3 grid(nrows/tile, 1, 1);
         switch (a16_pick_nwarps_slice32(nblocks, nrows/tile)) {
             case 1:

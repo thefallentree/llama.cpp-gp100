@@ -2185,6 +2185,11 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // Skip-process stays armed only until a draft-model is needed. Exact-reuse
+    // never calls DFlash, so skip stays cheap. After the first DFlash attempt,
+    // process() every later ngram streak so draft KV cannot go stale.
+    bool skip_dflash_ok = true;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2721,6 +2726,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .skip_dflash_ok = */ true,
     });
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -2773,6 +2779,8 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    spec->skip_dflash_ok = true;
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
@@ -2809,12 +2817,16 @@ static bool spec_type_is_draft_model(common_speculative_type type) {
 // When ngram wrote the last draft, DFlash process() still llama_decode's the
 // draft on every target verify batch (TAG_SPEC_AVOID_DRAFT_REEVAL). That is
 // wasted CUDA1 work on exact-reuse. LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM=1
-// skips draft-model process() for those rounds. Prefill (impl_last empty) and
-// DFlash-drafted novel rounds still process(). Draft KV goes stale after a
-// ngram streak; the next DFlash miss then sees a hole.
+// skips draft-model process() for those rounds, but only until a draft-model
+// is actually needed (skip_dflash_ok). Prefill (impl_last empty) and
+// DFlash-drafted rounds still process(). After the first DFlash attempt,
+// later ngram streaks process() too so draft KV cannot go stale.
 static bool spec_skip_draft_process_on_ngram(const common_speculative * spec) {
     const char * env = std::getenv("LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM");
     if (env == nullptr || env[0] != '1' || env[1] != '\0') {
+        return false;
+    }
+    if (!spec->skip_dflash_ok) {
         return false;
     }
 
@@ -2883,6 +2895,20 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        if (spec_type_is_draft_model(impl->type)) {
+            bool still_drafting = false;
+            for (const auto & dp : dparams) {
+                if (dp.drafting) {
+                    still_drafting = true;
+                    break;
+                }
+            }
+            if (still_drafting && spec->skip_dflash_ok) {
+                spec->skip_dflash_ok = false;
+                SPC_INF("%s", "DFlash needed; skip-process disarmed for the rest of this request\n");
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);

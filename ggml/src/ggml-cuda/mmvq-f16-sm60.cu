@@ -921,22 +921,40 @@ static void launch_a16_g64(
         const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
         const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
         const int stride_col_dst, cudaStream_t stream) {
-    const dim3 grid(nrows/8, 1, 1);
     // slice64 only at width ≤ 4: that is where a 64-weight epilogue can go byte-bound
-    // on G64. Width ≥ 5 stays on the 16-weight loop (holding 64 activations at width 8
-    // is the slice32 occupancy loss).
-    constexpr bool s64 = ncols_dst <= 4;
+    // on G64. Width ≥ 5 stays on the 16-weight 8-row loop. slice64 uses the 4-row tile:
+    // 8-row kept af_acc[ncols][8] and spilled 48–192 B even after lifting the default
+    // w<6 128-reg cap. 4-row cuts that live set in half. min_blocks 8/5/3 → 256/204/170
+    // regs so the remaining af_acc stays in registers (not a spill-forcing cap).
+    if constexpr (ncols_dst <= 4) {
+        const dim3 grid(nrows/4, 1, 1);
+        switch (a16_pick_nwarps(nblocks, nrows/4)) {
+            case 1:
+                mul_mat_vec_q4_1_a16<ncols_dst, 1, 4, false, false, 8, true, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+                    vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+                return;
+            case 2:
+                mul_mat_vec_q4_1_a16<ncols_dst, 2, 4, false, false, 5, true, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+                    vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+                return;
+            default:
+                mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 4, false, false, 3, true, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+                    vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+                return;
+        }
+    }
+    const dim3 grid(nrows/8, 1, 1);
     switch (a16_pick_nwarps(nblocks, nrows/8)) {
         case 1:
-            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, 0, true, s64><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         case 2:
-            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, 0, true, s64><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         default:
-            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, 0, true, s64><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
     }

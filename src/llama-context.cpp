@@ -1403,6 +1403,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const bool use_slot = !gf_slots.empty() && (int) ubatch.n_tokens <= LLAMA_GRAPH_SLOT_N_TOKENS_MAX;
 
+    // large ubatches (prefill) use the main scheduler. leftover decode-slot
+    // compute buffers from the previous turn would otherwise stay resident and
+    // can OOM the next long context (measured: 505 MiB CUDA1 alloc after 64k
+    // spec-decode then 128k prefill+decode).
+    if (!use_slot) {
+        gf_slots_release_compute(false);
+    }
+
     llm_graph_result *   res  = nullptr;
     ggml_backend_sched_t sch  = nullptr;
     int                  slot = -1;
@@ -1506,6 +1514,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
 
             if (!allocated) {
+                // sibling slots may still hold the previous turn's decode graphs.
+                // free those first, then retry reserve on this slot.
+                bool freed_sibling = false;
+                for (int i = 0; i < (int) gf_slots.size(); ++i) {
+                    if (i == slot || !gf_slots[i].valid) {
+                        continue;
+                    }
+                    gf_slots_recreate_one(gf_slots[i]);
+                    freed_sibling = true;
+                }
+                if (freed_sibling) {
+                    LLAMA_LOG_INFO("%s: released sibling graph slots after alloc failure, retrying slot %d\n", __func__, slot);
+                    ggml_backend_sched_reset(sch);
+                    if (ggml_backend_sched_reserve(sch, gf)) {
+                        ggml_backend_sched_reset(sch);
+                        ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+                        allocated = ggml_backend_sched_alloc_graph(sch, gf);
+                    }
+                }
+            }
+
+            if (!allocated) {
                 // fall back to the main scheduler. reserving there can move the tensors of the previous graph, so it
                 // cannot be reused afterwards
                 LLAMA_LOG_DEBUG("%s: graph slot %d cannot hold this graph, using the main scheduler\n", __func__, slot);
@@ -1523,6 +1553,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (!allocated) {
+            gf_slots_release_compute(true);
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -2629,6 +2660,38 @@ void llama_context::gf_slots_invalidate() {
         slot.valid = false;
     }
 
+    gf_slot_cur = -1;
+}
+
+void llama_context::gf_slots_recreate_one(graph_slot & slot) {
+    const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+    slot.valid    = false;
+    slot.last_use = 0;
+    slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    slot.res.reset(new llm_graph_result(max_nodes));
+}
+
+void llama_context::gf_slots_release_compute(bool force) {
+    if (gf_slots.empty()) {
+        return;
+    }
+
+    size_t n_held = 0;
+    for (const auto & slot : gf_slots) {
+        if (slot.valid) {
+            ++n_held;
+        }
+    }
+    if (!force && n_held == 0) {
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: releasing %zu graph-slot scheduler(s) (%zu cached%s)\n",
+            __func__, gf_slots.size(), n_held, force ? ", force" : "");
+
+    for (auto & slot : gf_slots) {
+        gf_slots_recreate_one(slot);
+    }
     gf_slot_cur = -1;
 }
 

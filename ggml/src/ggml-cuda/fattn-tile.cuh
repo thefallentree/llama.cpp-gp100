@@ -1145,12 +1145,11 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
-// GGML_CUDA_FATTN_TILE_PIN_NCOLS=16: launch the width-8 tile (16 cols when
-// ncols2==2 / GQA-6, else 8) for every 2..8 query batch. Qwen3.8 G64 mixed-width
-// verify is hash-unstable at width 4 (46a51139) but width 1 (VEC) and width 8
-// (this tile) share e1b93635. The dead PIN_COLS env only changed nbatch_fa
-// inside one ncols; this switches the kernel. Extra Q columns are OOB-modulo
-// loads and are not written (existing col_Q_0+j >= ne01 guard).
+// GGML_CUDA_FATTN_TILE_PIN_NCOLS=8: launch the width-8 tile for every 2..7
+// query batch. Qwen3.8 decode census: Q.ne=[256,2,12,1] uses VEC (ne1<=2 on
+// quantized KV), so the tile pin is a no-op unless fattn.cu also steers
+// ne1==2 onto TILE. Width 1 stays VEC. Extra Q columns are OOB-modulo loads
+// and are not written (existing col_Q_0+j >= ne01 guard).
 static int ggml_cuda_fattn_tile_pin_ncols() {
     static const int pin = []() {
         const char * e = getenv("GGML_CUDA_FATTN_TILE_PIN_NCOLS");

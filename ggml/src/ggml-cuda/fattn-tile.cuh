@@ -507,10 +507,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 #if !defined(V_DOT2_F32_F16_AVAILABLE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
     // GP100: ggml_cuda_mad(float&, half2, half2) is HMUL2 + F2F + 2 FADD
     // (5 issue slots / 2 MACs). The V phase already keeps half2 pairing.
-    // Accumulate 8 half2 products (16 elements) then convert once — the A16
-    // kernel's pattern (pascal-guide-audit 2026-09-03 D.ii.2 / GGML_CUDA_FATTN_KQ_H2ACC).
+    // Accumulate 4 half2 products (8 elements) then convert once — the A16
+    // kernel's pattern at the audit's lower bound (D.ii.2 / GGML_CUDA_FATTN_KQ_H2ACC=4).
+    // h2acc_ne=8 (16 elements) broke 16k ngram accept (0.985 → 0.911).
     // nbatch_K/2 is 32 on D=256; other heads flush the tail when the tile ends.
-    constexpr int h2acc_ne = 8;
+    constexpr int h2acc_ne = 4;
     half2 KQ_h2[nbatch_fa/(np*warp_size) * cpw];
 #pragma unroll
     for (int i = 0; i < nbatch_fa/(np*warp_size) * cpw; ++i) {
@@ -1188,7 +1189,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         static bool logged = false;
         if (!logged) {
             logged = true;
-            GGML_LOG_INFO("%s: GGML_CUDA_FATTN_KQ_H2ACC=8 (Pascal tile: 16-element half2 KQ partials)\n",
+            GGML_LOG_INFO("%s: GGML_CUDA_FATTN_KQ_H2ACC=4 (Pascal tile: 8-element half2 KQ partials)\n",
                 __func__);
         }
     }

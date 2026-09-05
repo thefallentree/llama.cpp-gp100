@@ -702,7 +702,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    {
+        // One-time stderr census: Q.ne[1] is the query-token count the tile pin
+        // keys on. Server -lv 3 swallows GGML_LOG_INFO from this backend.
+        static int nlog = 0;
+        if (nlog < 48) {
+            const ggml_tensor * Q = dst->src[0];
+            const char * pin_e = getenv("GGML_CUDA_FATTN_TILE_PIN_NCOLS");
+            const int pin = (pin_e && pin_e[0]) ? atoi(pin_e) : 0;
+            const int ne1_disp = (pin >= 8 && Q->ne[1] > 1 && Q->ne[1] < 8) ? 8 : (int) Q->ne[1];
+            fprintf(stderr, "FATTN_CENSUS n=%d Q.ne=[%ld,%ld,%ld,%ld] kernel=%d pin=%d ne1_disp=%d\n",
+                    nlog, (long) Q->ne[0], (long) Q->ne[1], (long) Q->ne[2], (long) Q->ne[3],
+                    (int) kernel, pin, ne1_disp);
+            nlog++;
+        }
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

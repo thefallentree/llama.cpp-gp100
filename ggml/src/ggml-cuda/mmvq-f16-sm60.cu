@@ -251,9 +251,13 @@ mul_mat_vec_q4_1_a16(
         for (int i = 0; i < nrows_block; ++i) {
             float2 dm;
             const int * wq;
+            int4 wq4;
             if constexpr (g64_fmt) {
-                dm = __half22float2(*(const half2 *) (xbase + (rowoff[i] + dmoff_g)));
-                wq = (const int *) (xbase + (rowoff[i] + koff_g));
+                // 36-byte G64 groups: readonly-cache the (d,m) pair and LDG.128
+                // the 16-byte nibble half. Not L2 prefetch / evict-first / pointer hoist.
+                dm = __half22float2(__ldg((const half2 *) (xbase + (rowoff[i] + dmoff_g))));
+                wq4 = __ldg((const int4 *) (xbase + (rowoff[i] + koff_g)));
+                wq = &wq4.x;
             } else {
                 const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
                 dm = __half22float2(b->dm);

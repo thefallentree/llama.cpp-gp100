@@ -251,13 +251,12 @@ mul_mat_vec_q4_1_a16(
         for (int i = 0; i < nrows_block; ++i) {
             float2 dm;
             const int * wq;
-            int4 wq4;
             if constexpr (g64_fmt) {
-                // 36-byte G64 groups: readonly-cache the (d,m) pair and LDG.128
-                // the 16-byte nibble half. Not L2 prefetch / evict-first / pointer hoist.
+                // 36-byte G64 groups are only 4-byte aligned, so LDG.128 is illegal.
+                // readonly-cache the (d,m) pair and each 4-byte nibble word.
+                // Not L2 prefetch / evict-first / pointer hoist / int4.
                 dm = __half22float2(__ldg((const half2 *) (xbase + (rowoff[i] + dmoff_g))));
-                wq4 = __ldg((const int4 *) (xbase + (rowoff[i] + koff_g)));
-                wq = &wq4.x;
+                wq = (const int *) (xbase + (rowoff[i] + koff_g));
             } else {
                 const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
                 dm = __half22float2(b->dm);
@@ -267,7 +266,7 @@ mul_mat_vec_q4_1_a16(
             half2 w[8];
 #pragma unroll
             for (int k = 0; k < 2; ++k) {
-                const int w32  = wq[2*kh + k];
+                const int w32  = g64_fmt ? __ldg(wq + 2*kh + k) : wq[2*kh + k];
                 const int w32s = w32 >> 8;
                 int t0, t1, t2, t3;
                 asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t0) : "r"(w32),  "n"(0x000f000f), "n"(0x64006400));

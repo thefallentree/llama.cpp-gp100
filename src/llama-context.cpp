@@ -1409,6 +1409,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // spec-decode then 128k prefill+decode).
     if (!use_slot) {
         gf_slots_release_compute(false);
+        main_sched_held_large = true;
+    } else if (main_sched_held_large) {
+        gf_main_sched_recreate();
+        main_sched_held_large = false;
     }
 
     llm_graph_result *   res  = nullptr;
@@ -1554,6 +1558,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!allocated) {
             gf_slots_release_compute(true);
+            gf_main_sched_recreate();
+            main_sched_held_large = false;
+            sch = sched.get();
+            gf_slot_cur = -1;
+            gf_res_prev->reset();
+            ggml_backend_sched_reset(sch);
+            ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+            allocated = ggml_backend_sched_alloc_graph(sch, gf);
+            if (!allocated && ggml_backend_sched_reserve(sch, gf)) {
+                ggml_backend_sched_reset(sch);
+                ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+                allocated = ggml_backend_sched_alloc_graph(sch, gf);
+            }
+            if (allocated) {
+                res = gf_res_prev.get();
+                LLAMA_LOG_INFO("%s: allocated graph after dropping prefill compute buffers\n", __func__);
+            }
+        }
+
+        if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -2669,6 +2693,15 @@ void llama_context::gf_slots_recreate_one(graph_slot & slot) {
     slot.last_use = 0;
     slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     slot.res.reset(new llm_graph_result(max_nodes));
+}
+
+void llama_context::gf_main_sched_recreate() {
+    synchronize();
+    const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    gf_slot_cur = -1;
+    LLAMA_LOG_INFO("%s: recreated main scheduler to free prefill compute buffers\n", __func__);
 }
 
 void llama_context::gf_slots_release_compute(bool force) {

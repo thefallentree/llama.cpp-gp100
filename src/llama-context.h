@@ -396,6 +396,13 @@ private:
 
     void gf_slots_recreate_one(graph_slot & slot);
 
+    // recreate the main scheduler so a prior large (prefill) compute buffer
+    // does not stay resident into decode. Q4_1 110k regrow still OOMd a
+    // 435 MiB CUDA1 alloc while that buffer was held.
+    void gf_main_sched_recreate();
+
+    bool main_sched_held_large = false;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

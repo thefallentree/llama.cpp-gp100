@@ -180,7 +180,8 @@ static __global__ void quantize_a16(
 // width-4 two-warp shape resolves to 8, i.e. 128 registers and 512 threads per SM (25%
 // occupancy); 10, 12, and 16 trade registers for residency.
 template <int ncols_dst, int nwarps, int nrows_block = A16_ROWS, bool pair_halves = false,
-          bool raw_activations = false, int min_blocks_tpl = 0, bool g64_fmt = false>
+          bool raw_activations = false, int min_blocks_tpl = 0, bool g64_fmt = false,
+          bool slice64 = false>
 static __global__ void __launch_bounds__(WARP_SIZE*nwarps,
         min_blocks_tpl != 0 ? min_blocks_tpl : (ncols_dst >= 6 ? 2 : 4)*(A16_NWARPS/nwarps))
 mul_mat_vec_q4_1_a16(
@@ -212,7 +213,104 @@ mul_mat_vec_q4_1_a16(
         rowoff[i] = g64_fmt ? i*stride_row_x : i*stride_row_x*(int) sizeof(block_q4_1);
     }
 
-    for (int t = tid; t < 2*nblocks; t += nthreads) {
+    // G64 width ≤ 4: one thread owns a 64-weight group. Both 32-weight halves share one
+    // (d, m). Activations stay a[ncols][8] and are reloaded per kh so the live set does
+    // not grow to a[ncols][32] (that is the slice32 occupancy loss). Combining kh=0/1
+    // before the epilogue halves epilogue issue vs today's 16-weight slices and makes
+    // the width-4 issue floor drop below G64's HBM floor.
+    if constexpr (g64_fmt && slice64) {
+        const int ng64 = nblocks >> 1;
+        for (int g = tid; g < ng64; g += nthreads) {
+            const int dmoff_g = g * 36;
+#pragma unroll
+            for (int b32 = 0; b32 < 2; ++b32) {
+                const int kb     = 2 * g + b32;
+                const int koff_g = dmoff_g + 4 + b32 * 16;
+
+                float yd[ncols_dst];
+                float ys[ncols_dst];
+                float af_acc[ncols_dst][nrows_block];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                    for (int i = 0; i < nrows_block; ++i) {
+                        af_acc[j][i] = 0.0f;
+                    }
+                }
+
+#pragma unroll
+                for (int kh = 0; kh < 2; ++kh) {
+                    half2 a[ncols_dst][8];
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        const half2 * ap = aq + (size_t) j*stride_col_aq + kb*(A16_QK/2) + kh*8;
+#pragma unroll
+                        for (int c2 = 0; c2 < 2; ++c2) {
+                            const int4 av = *((const int4 *) (ap + 4*c2));
+                            a[j][4*c2 + 0] = *((const half2 *) &av.x);
+                            a[j][4*c2 + 1] = *((const half2 *) &av.y);
+                            a[j][4*c2 + 2] = *((const half2 *) &av.z);
+                            a[j][4*c2 + 3] = *((const half2 *) &av.w);
+                        }
+                        if (kh == 0) {
+                            const half2 ds = ads[j*stride_col_ads + kb];
+                            if constexpr (!raw_activations) {
+                                yd[j] = __low2float(ds);
+                            }
+                            // Both kh halves now contribute to one epilogue, so use the
+                            // full 32-activation sum (today's 16-weight path uses *0.5f).
+                            ys[j] = __high2float(ds);
+                        }
+                    }
+
+#pragma unroll
+                    for (int i = 0; i < nrows_block; ++i) {
+                        const int * wq = (const int *) (xbase + (rowoff[i] + koff_g));
+                        half2 w[8];
+#pragma unroll
+                        for (int k = 0; k < 2; ++k) {
+                            const int w32  = wq[2*kh + k];
+                            const int w32s = w32 >> 8;
+                            int t0, t1, t2, t3;
+                            asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t0) : "r"(w32),  "n"(0x000f000f), "n"(0x64006400));
+                            asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t1) : "r"(w32),  "n"(0x00f000f0), "n"(0x54005400));
+                            asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t2) : "r"(w32s), "n"(0x000f000f), "n"(0x64006400));
+                            asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t3) : "r"(w32s), "n"(0x00f000f0), "n"(0x54005400));
+                            w[4*k + 0] = __hsub2(*((const half2 *) &t0), magic_lo);
+                            w[4*k + 1] = __hsub2(*((const half2 *) &t1), magic_hi);
+                            w[4*k + 2] = __hsub2(*((const half2 *) &t2), magic_lo);
+                            w[4*k + 3] = __hsub2(*((const half2 *) &t3), magic_hi);
+                        }
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            half2 s = make_half2(0.0f, 0.0f);
+#pragma unroll
+                            for (int c2 = 0; c2 < 2; ++c2) {
+#pragma unroll
+                                for (int c = 0; c < 4; ++c) {
+                                    s = __hfma2(w[4*c2 + c], a[j][4*c2 + c], s);
+                                }
+                            }
+                            af_acc[j][i] += __half2float(__hadd(__low2half(s), __high2half(s)));
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int i = 0; i < nrows_block; ++i) {
+                    const float2 dm = __half22float2(*(const half2 *) (xbase + (rowoff[i] + dmoff_g)));
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        if constexpr (raw_activations) {
+                            sumf[j][i] += dm.x*af_acc[j][i] + dm.y*ys[j];
+                        } else {
+                            sumf[j][i] += yd[j]*(dm.x*af_acc[j][i] + dm.y*ys[j]);
+                        }
+                    }
+                }
+            }
+        }
+    } else for (int t = tid; t < 2*nblocks; t += nthreads) {
         const int kb = t >> 1;
         const int kh = t &  1;
         // Q4_1_G64 stores two Q4_1-layout 16-byte nibble halves behind one (d, m) pair:
@@ -824,17 +922,21 @@ static void launch_a16_g64(
         const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
         const int stride_col_dst, cudaStream_t stream) {
     const dim3 grid(nrows/8, 1, 1);
+    // slice64 only at width ≤ 4: that is where a 64-weight epilogue can go byte-bound
+    // on G64. Width ≥ 5 stays on the 16-weight loop (holding 64 activations at width 8
+    // is the slice32 occupancy loss).
+    constexpr bool s64 = ncols_dst <= 4;
     switch (a16_pick_nwarps(nblocks, nrows/8)) {
         case 1:
-            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, 0, true, s64><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         case 2:
-            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, 0, true, s64><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         default:
-            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, 0, true, s64><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
     }

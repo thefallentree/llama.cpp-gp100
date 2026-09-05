@@ -823,18 +823,40 @@ static void launch_a16_g64(
         const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
         const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
         const int stride_col_dst, cudaStream_t stream) {
-    const dim3 grid(nrows/8, 1, 1);
-    switch (a16_pick_nwarps(nblocks, nrows/8)) {
+    // Same tile rule as launch_a16. Tall tensors keep the 8-row tile (the width-8
+    // FFN/QKV path). Smaller tensors use the default 4-row tile. Always-8-row was a
+    // G64-only mismatch: nvprof pp8 on pr-sm60-ds showed G64 <8,4,8> at 26.2 us vs
+    // Q4_1 <8,4,4> at 14.7 us on the same 768 ssm launches, and 256 extra <8,2,8>
+    // launches for attn_k/v that Q4_1 runs as <8,2,4>.
+    if (nrows >= 1024 && nrows % 8 == 0) {
+        const dim3 grid(nrows/8, 1, 1);
+        switch (a16_pick_nwarps(nblocks, nrows/8)) {
+            case 1:
+                mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+                    vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+                return;
+            case 2:
+                mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+                    vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+                return;
+            default:
+                mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+                    vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
+                return;
+        }
+    }
+    const dim3 grid(nrows/A16_ROWS, 1, 1);
+    switch (a16_pick_nwarps(nblocks, nrows/A16_ROWS)) {
         case 1:
-            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 1, A16_ROWS, false, false, 0, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         case 2:
-            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 2, A16_ROWS, false, false, 0, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         default:
-            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, 0, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, A16_ROWS, false, false, 0, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
     }

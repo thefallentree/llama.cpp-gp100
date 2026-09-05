@@ -658,7 +658,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // Quantized KV: ne1<=2 is VEC. PIN_NCOLS lifts 2..7 onto the
+            // width-8 TILE, so ne1==2 must not stay on VEC or the tile pin
+            // never runs. Qwen3.8 decode census (2026-09-05): first rounds
+            // are Q.ne=[256,2,12,1] kernel=VEC.
+            const int pin = ggml_cuda_fattn_tile_pin_ncols();
+            if (Q->ne[1] <= 2 && !(pin >= 8 && Q->ne[1] > 1)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }

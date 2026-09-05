@@ -392,11 +392,19 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
-
-        return needs_rs_seq ? draft.n_max : 0u;
+        // Recurrent/GDN targets snapshot one state per drafted token so verify
+        // can seq_rm a rejected suffix. This used to fire only for block
+        // drafters (MTP/EAGLE/DFlash). Ngram-only then got n_rs_seq=0, which
+        // puts the server on the full-checkpoint path every verify round
+        // (G64 16k reuse ~50 tok/s vs ~90 with draft-dflash in --spec-type).
+        // The actual snapshot depth is common_speculative_n_max(); this is
+        // only the enable flag.
+        for (const auto t : types) {
+            if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+                return 1;
+            }
+        }
+        return 0;
     }
 };
 

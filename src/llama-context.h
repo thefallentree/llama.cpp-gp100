@@ -389,6 +389,13 @@ private:
 
     void gf_slots_invalidate();
 
+    // drop cached decode graphs and recreate their schedulers so leftover compute
+    // buffers (e.g. a previous 64k spec-decode) do not sit on the GPU through a
+    // later long prefill. force=true also recreates empty slots (OOM retry).
+    void gf_slots_release_compute(bool force = false);
+
+    void gf_slots_recreate_one(graph_slot & slot);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

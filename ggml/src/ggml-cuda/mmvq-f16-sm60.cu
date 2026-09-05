@@ -818,39 +818,28 @@ static void launch_a16_q4k(
 }
 
 
-// G64's 8-row instantiations use more registers than Q4_1 (220 vs 197 at
-// width 8) because dm and qs bases differ by a runtime offset. Passing 0 for
-// min_blocks_tpl leaves that uncapped → 4 resident 2-warp blocks/SM vs Q4_1's
-// 5. Cap width ≥ 6 at 204 regs (5×64 threads) and width 5 at 146 (7×64) so
-// G64 does not spill the 56 B seen at the default 128-reg cap.
-template <int ncols_dst, int nwarps>
-static constexpr int a16_g64_min_blocks() {
-    if (ncols_dst >= 6) {
-        return nwarps == 1 ? 10 : (nwarps == 2 ? 5 : 3);
-    }
-    if (ncols_dst == 5) {
-        return nwarps == 1 ? 10 : (nwarps == 2 ? 7 : 3);
-    }
-    return 0;
-}
-
+// G64's 8-row tile at width ≥ 5 needs ~220 registers (dm/qs bases differ by a
+// runtime offset). Capping min_blocks to force 204 regs spills 128 B and is
+// slower. The 4-row tile stays at ~158 regs / 0 stack (same as Q4_1's 4-row
+// w8). Widths 1–4 keep the 8-row tile; they do not spill.
 template <int ncols_dst>
 static void launch_a16_g64(
         const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks,
         const int nrows, const int stride_row_x, const int stride_col_aq, const int stride_col_ads,
         const int stride_col_dst, cudaStream_t stream) {
-    const dim3 grid(nrows/8, 1, 1);
-    switch (a16_pick_nwarps(nblocks, nrows/8)) {
+    constexpr int nrows_tile = ncols_dst >= 5 ? 4 : 8;
+    const dim3 grid(nrows/nrows_tile, 1, 1);
+    switch (a16_pick_nwarps(nblocks, nrows/nrows_tile)) {
         case 1:
-            mul_mat_vec_q4_1_a16<ncols_dst, 1, 8, false, false, a16_g64_min_blocks<ncols_dst, 1>(), true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 1, nrows_tile, false, false, 0, true><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         case 2:
-            mul_mat_vec_q4_1_a16<ncols_dst, 2, 8, false, false, a16_g64_min_blocks<ncols_dst, 2>(), true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, 2, nrows_tile, false, false, 0, true><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
         default:
-            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, 8, false, false, a16_g64_min_blocks<ncols_dst, A16_NWARPS>(), true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
+            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS, nrows_tile, false, false, 0, true><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
                 vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
             return;
     }

@@ -168,6 +168,14 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // Skip-process stashes target features instead of injecting them. Default is a
+    // no-op (same as skipping process()). DFlash overrides this to copy embeddings.
+    virtual bool stash_process(const llama_batch &) { return true; }
+
+    // Inject any stashed features into the draft KV. Called immediately before a
+    // draft-model draft() when ngram left sequences still drafting.
+    virtual bool flush_stash() { return true; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -914,6 +922,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
 
+    // Skip-process copies target features here instead of llama_decode(ctx_dft).
+    // flush_stash() injects them immediately before the next DFlash draft().
+    std::vector<float>        stash_embd;
+    std::vector<llama_pos>    stash_pos;
+    std::vector<llama_seq_id> stash_seq;
+    size_t n_flush_stash  = 0;
+    size_t n_flush_tokens = 0;
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1071,6 +1087,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        stash_embd.clear();
+        stash_pos.clear();
+        stash_seq.clear();
+
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1088,7 +1108,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    bool gather_features(const llama_batch & batch_in, bool stash_only) {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1162,6 +1182,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+
+                if (stash_only) {
+                    const size_t old = stash_pos.size();
+                    stash_embd.resize((old + (size_t) n_chunk) * (size_t) n_embd_enc);
+                    std::memcpy(stash_embd.data() + old * (size_t) n_embd_enc,
+                                batch_inject.embd,
+                                (size_t) n_chunk * (size_t) n_embd_enc * sizeof(float));
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        stash_pos.push_back(batch_inject.pos[i]);
+                        stash_seq.push_back(seq_id);
+                    }
+                    continue;
+                }
+
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
@@ -1171,6 +1205,63 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        return true;
+    }
+
+    bool process(const llama_batch & batch_in) override {
+        if (!flush_stash()) {
+            return false;
+        }
+        return gather_features(batch_in, /*stash_only=*/false);
+    }
+
+    bool stash_process(const llama_batch & batch_in) override {
+        return gather_features(batch_in, /*stash_only=*/true);
+    }
+
+    bool flush_stash() override {
+        const int32_t n = (int32_t) stash_pos.size();
+        if (n <= 0) {
+            return true;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        for (int32_t offset = 0; offset < n; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n - offset);
+            batch_inject.n_tokens = n_chunk;
+            std::memcpy(batch_inject.embd,
+                        stash_embd.data() + (size_t) offset * (size_t) n_embd_enc,
+                        (size_t) n_chunk * (size_t) n_embd_enc * sizeof(float));
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const llama_pos p = stash_pos[offset + i];
+                batch_inject.pos[i] = p;
+                if (is_mrope) {
+                    batch_inject.pos[1 * n_chunk + i] = p;
+                    batch_inject.pos[2 * n_chunk + i] = p;
+                    batch_inject.pos[3 * n_chunk + i] = 0;
+                }
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = stash_seq[offset + i];
+                batch_inject.logits[i]    = false;
+            }
+            const int32_t rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: catch-up llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+        }
+
+        n_flush_stash++;
+        n_flush_tokens += (size_t) n;
+        LOG_INF("%s: DFlash catch-up flushed %d stashed tokens (flushes=%zu, tokens=%zu)\n",
+                __func__, (int) n, n_flush_stash, n_flush_tokens);
+
+        stash_embd.clear();
+        stash_pos.clear();
+        stash_seq.clear();
         return true;
     }
 
@@ -2809,9 +2900,10 @@ static bool spec_type_is_draft_model(common_speculative_type type) {
 // When ngram wrote the last draft, DFlash process() still llama_decode's the
 // draft on every target verify batch (TAG_SPEC_AVOID_DRAFT_REEVAL). That is
 // wasted CUDA1 work on exact-reuse. LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM=1
-// skips draft-model process() for those rounds. Prefill (impl_last empty) and
-// DFlash-drafted novel rounds still process(). Draft KV goes stale after a
-// ngram streak; the next DFlash miss then sees a hole.
+// stashes target features instead of injecting them. Prefill (impl_last empty)
+// and DFlash-drafted novel rounds still process(). flush_stash() injects the
+// skipped window immediately before the next DFlash draft(), so draft KV is
+// contiguous again after an ngram streak.
 static bool spec_skip_draft_process_on_ngram(const common_speculative * spec) {
     const char * env = std::getenv("LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM");
     if (env == nullptr || env[0] != '1' || env[1] != '\0') {
@@ -2851,6 +2943,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     for (auto & impl : spec->impls) {
         if (skip_draft && spec_type_is_draft_model(impl->type)) {
+            result = result && impl->stash_process(batch);
             continue;
         }
         result = result && impl->process(batch);
@@ -2883,6 +2976,19 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        if (spec_type_is_draft_model(impl->type)) {
+            bool still_drafting = false;
+            for (const auto & dp : dparams) {
+                if (dp.drafting) {
+                    still_drafting = true;
+                    break;
+                }
+            }
+            if (still_drafting && !impl->flush_stash()) {
+                SPC_WRN("%s", "DFlash catch-up flush failed; draft KV may have a hole\n");
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);

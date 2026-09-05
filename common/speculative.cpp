@@ -915,6 +915,21 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// LLAMA_SPEC_DFLASH_PROCESS_COALESCE=K: stash ngram DFlash process() until K
+// tokens, then inject as one llama_decode. Draft n_ubatch is 128, so K<=128 is
+// a single CUDA1 graph. Unlimited skip (K=0 + SKIP=1) left a 504-token hole
+// that flushed in one stall (16k 89.87). Always-process is 67× decode(8)
+// (16k 91.77). Coalesce is the unused middle: ~16× decode(32), KV never more
+// than K behind, so 64k stays Edit C-class instead of skip-stale.
+static int spec_dflash_coalesce_k() {
+    const char * env = std::getenv("LLAMA_SPEC_DFLASH_PROCESS_COALESCE");
+    if (env == nullptr || env[0] == '\0') {
+        return 0;
+    }
+    const int k = std::atoi(env);
+    return k > 0 ? k : 0;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -922,8 +937,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
 
-    // Skip-process copies target features here instead of llama_decode(ctx_dft).
-    // flush_stash() injects them immediately before the next DFlash draft().
+    // Skip/coalesce copies target features here instead of llama_decode(ctx_dft).
+    // flush_stash() injects them at the coalesce cap or immediately before the
+    // next DFlash draft().
     std::vector<float>        stash_embd;
     std::vector<llama_pos>    stash_pos;
     std::vector<llama_seq_id> stash_seq;
@@ -1216,7 +1232,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool stash_process(const llama_batch & batch_in) override {
-        return gather_features(batch_in, /*stash_only=*/true);
+        if (!gather_features(batch_in, /*stash_only=*/true)) {
+            return false;
+        }
+        const int32_t k = spec_dflash_coalesce_k();
+        if (k > 0 && (int32_t) stash_pos.size() >= k) {
+            return flush_stash();
+        }
+        return true;
     }
 
     bool flush_stash() override {
@@ -1256,8 +1279,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         n_flush_stash++;
         n_flush_tokens += (size_t) n;
-        LOG_INF("%s: DFlash catch-up flushed %d stashed tokens (flushes=%zu, tokens=%zu)\n",
-                __func__, (int) n, n_flush_stash, n_flush_tokens);
+        const int32_t k = spec_dflash_coalesce_k();
+        const char * why = (k > 0 && n >= k) ? "coalesce" : "catch-up";
+        LOG_INF("%s: DFlash %s flushed %d stashed tokens (cap=%d, flushes=%zu, tokens=%zu)\n",
+                __func__, why, (int) n, (int) k, n_flush_stash, n_flush_tokens);
 
         stash_embd.clear();
         stash_pos.clear();
@@ -2904,9 +2929,16 @@ static bool spec_type_is_draft_model(common_speculative_type type) {
 // and DFlash-drafted novel rounds still process(). flush_stash() injects the
 // skipped window immediately before the next DFlash draft(), so draft KV is
 // contiguous again after an ngram streak.
+//
+// LLAMA_SPEC_DFLASH_PROCESS_COALESCE=K also stashes, but flush_stash() fires
+// once the hole reaches K tokens (and still before any DFlash draft()). That
+// is not unlimited catch-up: the hole stays bounded and each flush is one
+// llama_decode of K tokens instead of K/8 decode(8) calls.
 static bool spec_skip_draft_process_on_ngram(const common_speculative * spec) {
-    const char * env = std::getenv("LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM");
-    if (env == nullptr || env[0] != '1' || env[1] != '\0') {
+    const char * skip = std::getenv("LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM");
+    const bool skip_env = skip != nullptr && skip[0] == '1' && skip[1] == '\0';
+    const bool coalesce = spec_dflash_coalesce_k() > 0;
+    if (!skip_env && !coalesce) {
         return false;
     }
 
@@ -2937,7 +2969,12 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         static bool logged = false;
         if (!logged) {
             logged = true;
-            SPC_INF("%s", "LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM=1: skipping draft-model process() after ngram drafts\n");
+            const int32_t k = spec_dflash_coalesce_k();
+            if (k > 0) {
+                SPC_INF("LLAMA_SPEC_DFLASH_PROCESS_COALESCE=%d: stash ngram DFlash process(); flush at cap or before draft\n", (int) k);
+            } else {
+                SPC_INF("%s", "LLAMA_SPEC_SKIP_DFLASH_PROCESS_ON_NGRAM=1: skipping draft-model process() after ngram drafts\n");
+            }
         }
     }
 

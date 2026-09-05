@@ -86,7 +86,16 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // split_equal asserts n_ubatch > n_keep_tail. A spec verify of
+                // 8 tokens at width 4 cannot keep the last 8 together; drop the
+                // tail constraint so GDN updates across sequential ubatches
+                // like a tiny prefill. Only for small batches (LoopSpec).
+                uint32_t n_keep_tail = n_rs_seq > 0 ? n_rs_seq + 1 : 0;
+                if (n_keep_tail > 0 && n_ubatch <= n_keep_tail && balloc.get_n_tokens() <= 16) {
+                    n_keep_tail = 0;
+                }
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_keep_tail);
             }
 
             if (ubatch.n_tokens == 0) {

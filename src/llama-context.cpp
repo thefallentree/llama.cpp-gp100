@@ -286,6 +286,16 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * e = getenv("LLAMA_SPEC_VERIFY_WIDTH");
+        const int vw = (e && e[0]) ? atoi(e) : 0;
+        spec_verify_ubatch = vw > 0 ? (uint32_t) vw : 0;
+        if (spec_verify_ubatch > 0) {
+            LLAMA_LOG_INFO("%s: spec_verify_ubatch     = %u (small all-logits batches only)\n",
+                    __func__, spec_verify_ubatch);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -1900,8 +1910,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // One llama_decode of draft+1, two width-4 ubatches (prefill-style).
+    // Do not touch prefill (n_tokens >> 16) or single-token decode.
+    uint32_t n_ubatch_use = cparams.n_ubatch;
+    if (spec_verify_ubatch > 0 &&
+            n_tokens_all > spec_verify_ubatch &&
+            n_tokens_all <= 16 &&
+            n_outputs_all == n_tokens_all) {
+        n_ubatch_use = spec_verify_ubatch;
+    }
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_use, output_all);
         if (!mctx) {
             return -2;
         }

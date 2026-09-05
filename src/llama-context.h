@@ -400,6 +400,11 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // env: LLAMA_SPEC_VERIFY_WIDTH — shrink n_ubatch for small all-logits
+    // decodes (LoopSpec verify). Prefill is unchanged. GDN n_keep_tail is
+    // relaxed in llama_memory_hybrid when this ubatch cannot honor it.
+    uint32_t spec_verify_ubatch = 0;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

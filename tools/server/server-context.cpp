@@ -2908,9 +2908,14 @@ private:
                                 if (i < off || i >= off + n_tokens) {
                                     continue;
                                 }
-                                const llama_token id = llama_get_sampled_token_ith(ctx_tgt, i - off);
+                                // Same index space as sample_and_accept_n on this llama_decode
+                                // view. Backend-sampled ids can be NULL on a chunked view;
+                                // common_sampler_sample falls back to logits.
+                                const llama_token id = common_sampler_sample(slot.smpl.get(), ctx_tgt, i - off);
                                 if (id == LLAMA_TOKEN_NULL) {
-                                    throw std::runtime_error("spec verify chunk missing backend-sampled token");
+                                    throw std::runtime_error(string_format(
+                                            "spec verify chunk sample failed at view idx %d (batch %d)",
+                                            i - off, i));
                                 }
                                 slot.spec_sampled.push_back(id);
                             }

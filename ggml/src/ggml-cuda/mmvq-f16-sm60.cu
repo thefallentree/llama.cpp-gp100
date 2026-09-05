@@ -202,14 +202,17 @@ mul_mat_vec_q4_1_a16(
     // block_q4_1 is 20 bytes, so `&x[(row0+i)*stride_row_x + kb]` becomes a per-row 64-bit
     // multiply (a 32-bit index times 20, i.e. an XMAD chain).  Hoisting each row's base out and
     // adding a byte offset built once from kb removes the multiplies.
-    // For Q4_1_G64 the host passes stride_row_x in BYTES (36-byte groups do not tile as
-    // block_q4_1), so the row base math must not scale by sizeof(block_q4_1).
-    const char * const xbase = g64_fmt ? (const char *) vx + (size_t) row0*stride_row_x
-                                       : (const char *) &x[row0*stride_row_x];
+    // G64 uses the same hoist: the host now passes stride_row_x in 36-byte groups, so the
+    // live set is one pointer per row plus one kb-derived byte offset (not two runtime
+    // pointers from `g*36` and `g*36+4+(kb&1)*16`, which cost +23 regs at width 8).
+    const char * const xbase = g64_fmt
+        ? (const char *) &((const block_q4_1_g64 *) vx)[row0*stride_row_x]
+        : (const char *) &x[row0*stride_row_x];
     int rowoff[nrows_block];
 #pragma unroll
     for (int i = 0; i < nrows_block; ++i) {
-        rowoff[i] = g64_fmt ? i*stride_row_x : i*stride_row_x*(int) sizeof(block_q4_1);
+        rowoff[i] = i*stride_row_x*(g64_fmt ? (int) sizeof(block_q4_1_g64)
+                                           : (int) sizeof(block_q4_1));
     }
 
     for (int t = tid; t < 2*nblocks; t += nthreads) {
@@ -218,13 +221,8 @@ mul_mat_vec_q4_1_a16(
         // Q4_1_G64 stores two Q4_1-layout 16-byte nibble halves behind one (d, m) pair:
         // {half2 dm}{16 B half 0}{16 B half 1} = 36 bytes per 64 weights.  The decode below is
         // unchanged; only where the bytes live and how often dm is fetched differ.
-        [[maybe_unused]] int koff_g = 0, dmoff_g = 0;
-        if constexpr (g64_fmt) {
-            const int g = kb >> 1;
-            koff_g  = g*36 + 4 + (kb & 1)*16;
-            dmoff_g = g*36;
-        }
-        const int koff = kb*(int) sizeof(block_q4_1);
+        const int koff = g64_fmt ? (kb >> 1)*(int) sizeof(block_q4_1_g64)
+                                 : kb*(int) sizeof(block_q4_1);
 
         half2 a[ncols_dst][8];
         float yd[ncols_dst];
@@ -252,8 +250,9 @@ mul_mat_vec_q4_1_a16(
             float2 dm;
             const int * wq;
             if constexpr (g64_fmt) {
-                dm = __half22float2(*(const half2 *) (xbase + (rowoff[i] + dmoff_g)));
-                wq = (const int *) (xbase + (rowoff[i] + koff_g));
+                const block_q4_1_g64 * b = (const block_q4_1_g64 *) (xbase + (rowoff[i] + koff));
+                dm = __half22float2(b->dm);
+                wq = (const int *) (b->qs + (kb & 1)*16);
             } else {
                 const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
                 dm = __half22float2(b->dm);
@@ -999,7 +998,8 @@ void ggml_cuda_mmvq_f16_sm60(
 
     if (src0->type == GGML_TYPE_Q4_1_G64) {
         const int  ne11_eff = (int) ne11;
-        const int stride_row_g  = (int) (src0->nb[1]);       // BYTES per row; kernel offsets are byte-based via rowoff
+        GGML_ASSERT(src0->nb[1] % sizeof(block_q4_1_g64) == 0);
+        const int stride_row_g  = (int) (src0->nb[1] / sizeof(block_q4_1_g64));
         const int stride_col_aqg  = nblocks*(A16_QK/2);
         const int stride_col_adsg = nblocks;
         const int stride_col_dstg = seq_fold ? (int) (dst->nb[2]/ggml_type_size(dst->type))

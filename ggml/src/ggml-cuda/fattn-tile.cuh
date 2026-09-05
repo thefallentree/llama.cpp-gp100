@@ -1145,6 +1145,20 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
+// GGML_CUDA_FATTN_TILE_PIN_NCOLS=16: launch the width-8 tile (16 cols when
+// ncols2==2 / GQA-6, else 8) for every 2..8 query batch. Qwen3.8 G64 mixed-width
+// verify is hash-unstable at width 4 (46a51139) but width 1 (VEC) and width 8
+// (this tile) share e1b93635. The dead PIN_COLS env only changed nbatch_fa
+// inside one ncols; this switches the kernel. Extra Q columns are OOB-modulo
+// loads and are not written (existing col_Q_0+j >= ne01 guard).
+static int ggml_cuda_fattn_tile_pin_ncols() {
+    static const int pin = []() {
+        const char * e = getenv("GGML_CUDA_FATTN_TILE_PIN_NCOLS");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+    return pin;
+}
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1155,9 +1169,23 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     constexpr size_t nbytes_shared = 0;
 
+    // When pinned, dispatch 2..7 query batches as if they were width 8 so they
+    // share the width-8 tile (OOB columns are not written). Width 8 itself is
+    // unchanged. Width 1 stays on the VEC kernel (ne1==1 is not lifted).
+    const int pin_ncols = ggml_cuda_fattn_tile_pin_ncols();
+    const int ne1_disp = (pin_ncols >= 8 && Q->ne[1] > 1 && Q->ne[1] < 8) ? 8 : (int) Q->ne[1];
+    if (ne1_disp != (int) Q->ne[1]) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_FATTN_TILE_PIN_NCOLS=%d: dispatch Q.ne1=%ld as 8 (ncols2=%d)\n",
+                __func__, pin_ncols, (long) Q->ne[1], ncols2);
+        }
+    }
+
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
-        if (Q->ne[1] > 32/ncols2) {
+        if (ne1_disp > 32/ncols2) {
             constexpr int cols_per_block = 64;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1173,7 +1201,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (DKQ <= 256)
 #endif // GGML_USE_HIP
     {
-        if (Q->ne[1] > 16/ncols2) {
+        if (ne1_disp > 16/ncols2) {
             constexpr int cols_per_block = 32;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1185,7 +1213,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] > 8/ncols2) {
+        if (ne1_disp > 8/ncols2) {
             constexpr int cols_per_block = 16;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1197,7 +1225,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (ncols2 <= 8) {
-        if (Q->ne[1] > 4/ncols2) {
+        if (ne1_disp > 4/ncols2) {
             constexpr int cols_per_block = 8;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1209,7 +1237,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (ncols2 <= 4) {
-        if (Q->ne[1] > 2/ncols2) {
+        if (ne1_disp > 2/ncols2) {
             constexpr int cols_per_block = 4;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);

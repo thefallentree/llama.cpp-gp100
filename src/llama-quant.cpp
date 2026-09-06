@@ -398,6 +398,10 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            // Q4_1_G64 is 64-wide. Tensors whose K is only 32-aligned (common
+            // on non-Qwen heads, some MoE experts, odd vocab) must not abort
+            // the whole file — demote to Q4_1 (same affine nibbles, 32-block).
+            case GGML_TYPE_Q4_1_G64: return_type = GGML_TYPE_Q4_1;  break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
@@ -698,11 +702,11 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
             }
         }
         if (!named) {
-            return params->token_embedding_type;
+            return tensor_type_fallback(qs, tensor, params->token_embedding_type);
         }
     }
     if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
-        return params->output_tensor_type;
+        return tensor_type_fallback(qs, tensor, params->output_tensor_type);
     }
 
     ggml_type new_type = default_type;

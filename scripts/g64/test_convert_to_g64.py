@@ -84,7 +84,29 @@ def test_serve_argv() -> None:
     assert "--model-draft draft.gguf" in joined
     assert "--spec-ngram-mod-n-min 7" in joined
     assert "--device-draft CUDA1" in joined
+    assert "--backend-sampling" in joined
     assert "Q4_K" not in joined
+
+
+def test_serve_argv_gemma_mtp() -> None:
+    cmd = g64.serve_argv(
+        Path("gemma-g64.gguf"),
+        draft=Path("mtp-gemma-4-26B-A4B-it.gguf"),
+        mmproj=Path("mmproj.gguf"),
+        ctx=131072,
+        ngram=True,
+        graph_slots=8,
+        checkpoints=8,
+    )
+    joined = " ".join(cmd)
+    assert "--spec-type draft-mtp" in joined
+    assert "--device-draft CUDA0,CUDA1" in joined
+    assert "--cache-type-k-draft q8_0" in joined
+    assert "--backend-sampling" not in joined
+    assert "draft-dflash" not in joined
+    assert "--spec-draft-n-max 2" in joined
+    assert g64.draft_is_gemma_mtp(Path("mtp-gemma-4-26B-A4B-it.gguf"))
+    assert not g64.draft_is_gemma_mtp(Path("draft.gguf"))
 
 
 def main() -> int:
@@ -92,6 +114,7 @@ def main() -> int:
     test_q4_1_then_g64_roundtrip()
     test_attn_output_is_g64_not_skipped()
     test_serve_argv()
+    test_serve_argv_gemma_mtp()
     print("ok")
     return 0
 

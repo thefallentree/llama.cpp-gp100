@@ -48,6 +48,19 @@ After you have created a high-quality GGUF version of the model, you use `llama-
 ./build/bin/llama-quantize gemma-4-E2B-it-bf16.gguf gemma-4-E2B-it-Q4_K_M.gguf Q4_K_M
 ```
 
+On **Tesla P100 (sm_60)** this fork also has `Q4_1_G64` (4.5 bpw, type 43).
+Stock llama.cpp cannot load it. Use the wrapper — it sets Q8_0 head / Q4_1
+embeddings, falls back tensors whose K is not a multiple of 64, and prints a
+serve command:
+
+```bash
+python scripts/g64/convert_to_g64.py inspect model-f16.gguf
+python scripts/g64/convert_to_g64.py convert model-f16.gguf model-g64.gguf \
+    --quantize ./build/bin/llama-quantize
+```
+
+Full convert + serve notes: [docs/backend/gp100-g64.md](../../docs/backend/gp100-g64.md).
+
 Various quantization methods are described [later in this document](#quantize).
 
 Options:

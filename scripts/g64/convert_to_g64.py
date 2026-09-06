@@ -368,6 +368,25 @@ def run_refit(src: Path, dst: Path, imatrix: Path | None) -> None:
     )
 
 
+def draft_is_gemma_mtp(draft: Path | None) -> bool:
+    """True for a Gemma 4 assistant / shared-KV MTP GGUF.
+
+    Filename heuristics first (offline tests, missing files). If the path
+    exists, the GGUF architecture is authoritative.
+    """
+    if draft is None:
+        return False
+    name = draft.name.lower()
+    if "gemma4-assistant" in name or name.startswith("mtp-gemma") or "-mtp-gemma" in name:
+        return True
+    if draft.is_file():
+        try:
+            return _arch(gguf.GGUFReader(str(draft))) == "gemma4-assistant"
+        except Exception:  # noqa: BLE001
+            return False
+    return "mtp" in name and "gemma" in name
+
+
 def serve_argv(
     model: Path,
     *,
@@ -377,12 +396,20 @@ def serve_argv(
     ngram: bool,
     graph_slots: int,
     checkpoints: int,
+    spec: str = "auto",
 ) -> list[str]:
+    # Gemma 4 MTP shares the target KV across two schedulers. GPU sampling
+    # 500s on tensor-split Gemma (vector underflow). LoopSpec flags are
+    # wrong here: the assistant is not a DFlash drafter.
+    use_mtp = spec == "mtp" or (spec == "auto" and draft_is_gemma_mtp(draft))
     cmd = [
         "./build/bin/llama-server",
         "--model", str(model),
         "--jinja",
-        "--backend-sampling",
+    ]
+    if not use_mtp:
+        cmd += ["--backend-sampling"]
+    cmd += [
         "--graph-slots", str(graph_slots),
         "--ctx-checkpoints", str(checkpoints),
         "--checkpoint-min-step", "0",
@@ -396,20 +423,32 @@ def serve_argv(
         "--flash-attn", "on",
     ]
     if draft:
-        cmd += [
-            "--model-draft", str(draft),
-            "--device-draft", "CUDA1",
-            "--cache-type-k-draft", "q4_0",
-            "--cache-type-v-draft", "q4_0",
-            "--spec-type", "ngram-mod,draft-dflash" if ngram else "draft-dflash",
-            "--spec-draft-n-max", "7",
-            "--spec-draft-n-min", "0",
-        ]
-        if ngram:
+        if use_mtp:
             cmd += [
-                "--spec-ngram-mod-n-min", "7",
-                "--spec-ngram-mod-n-max", "7",
+                "--model-draft", str(draft),
+                "--device-draft", "CUDA0,CUDA1",
+                "--cache-type-k-draft", "q8_0",
+                "--cache-type-v-draft", "q8_0",
+                "--spec-type", "draft-mtp",
+                "--spec-draft-n-max", "2",
+                "--spec-draft-n-min", "0",
+                "--spec-draft-p-min", "0",
             ]
+        else:
+            cmd += [
+                "--model-draft", str(draft),
+                "--device-draft", "CUDA1",
+                "--cache-type-k-draft", "q4_0",
+                "--cache-type-v-draft", "q4_0",
+                "--spec-type", "ngram-mod,draft-dflash" if ngram else "draft-dflash",
+                "--spec-draft-n-max", "7",
+                "--spec-draft-n-min", "0",
+            ]
+            if ngram:
+                cmd += [
+                    "--spec-ngram-mod-n-min", "7",
+                    "--spec-ngram-mod-n-max", "7",
+                ]
     if mmproj:
         cmd += ["--mmproj", str(mmproj)]
     return cmd
@@ -491,6 +530,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
             ngram=not args.no_ngram,
             graph_slots=args.graph_slots,
             checkpoints=args.ctx_checkpoints,
+            spec=args.spec,
         )))
     return 0
 
@@ -504,6 +544,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         ngram=not args.no_ngram,
         graph_slots=args.graph_slots,
         checkpoints=args.ctx_checkpoints,
+        spec=args.spec,
     )
     print(" ".join(cmd))
     return 0
@@ -537,6 +578,12 @@ def build_parser() -> argparse.ArgumentParser:
     conv.add_argument("--graph-slots", type=int, default=8)
     conv.add_argument("--ctx-checkpoints", type=int, default=8)
     conv.add_argument("--no-ngram", action="store_true")
+    conv.add_argument(
+        "--spec",
+        choices=("auto", "loopspec", "mtp"),
+        default="auto",
+        help="auto: gemma4-assistant draft → draft-mtp, else LoopSpec",
+    )
     conv.set_defaults(func=cmd_convert)
 
     srv = sub.add_parser("serve", help="print a generic llama-server command")
@@ -547,6 +594,12 @@ def build_parser() -> argparse.ArgumentParser:
     srv.add_argument("--graph-slots", type=int, default=8)
     srv.add_argument("--ctx-checkpoints", type=int, default=8)
     srv.add_argument("--no-ngram", action="store_true")
+    srv.add_argument(
+        "--spec",
+        choices=("auto", "loopspec", "mtp"),
+        default="auto",
+        help="auto: gemma4-assistant draft → draft-mtp, else LoopSpec",
+    )
     srv.set_defaults(func=cmd_serve)
     return p
 

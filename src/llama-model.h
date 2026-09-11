@@ -627,6 +627,12 @@ struct llama_layer {
     struct ggml_tensor * wqkv_z              = nullptr; // [wqkv | wqkv_gate] in one weight
     struct ggml_tensor * ssm_beta_alpha_cat  = nullptr; // [ssm_beta | ssm_alpha] in one weight, unlike the grouped ssm_beta_alpha
 
+    // Engram (n-gram keyed lookup table) for DeepSeek-V4.1
+    struct ggml_tensor * engram_embd    = nullptr;
+    struct ggml_tensor * engram_k       = nullptr;
+    struct ggml_tensor * engram_q       = nullptr;
+    struct ggml_tensor * engram_wkv     = nullptr;
+
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;
     struct ggml_tensor * ple_norm_key   = nullptr;

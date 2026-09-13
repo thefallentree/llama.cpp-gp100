@@ -267,6 +267,9 @@ struct llama_hparams {
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
     float    dflash_selector_edge_scale = 1.0f;
+    // DSV4 draft with the V4.1 rules: hyper-connection mixes lag by one sublayer, the last FFN mix
+    // collapses the copies (no output_hc_* head), and only the low-rank q is normalized
+    bool     dflash_dsv41            = false;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

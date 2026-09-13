@@ -2329,13 +2329,35 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // Hybrid/recurrent (GDN) restore requires a checkpoint with
+            // pos_min < pos_min_thold or pos_min == 0. Evicting front()
+            // threw away that only usable restore point; later checkpoints
+            // have high pos_min and force a full prefill. Keep the lowest
+            // pos_min checkpoint and drop the oldest of the rest.
+            auto keep = slot.prompt.checkpoints.begin();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min < keep->pos_min) {
+                    keep = it;
+                }
+            }
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            auto victim = slot.prompt.checkpoints.end();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it == keep) {
+                    continue;
+                }
+                if (victim == slot.prompt.checkpoints.end() || it->n_tokens < victim->n_tokens) {
+                    victim = it;
+                }
+            }
+            if (victim == slot.prompt.checkpoints.end()) {
+                victim = keep;
+            }
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, keeping pos_min = %d)\n",
+                    victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024, keep->pos_min);
+
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate

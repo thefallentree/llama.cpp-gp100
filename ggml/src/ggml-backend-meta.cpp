@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -579,7 +580,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
-            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor ||
+                    ggml_nelements(tensor->src[i]) == 0 ||
+                    src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
                 continue;
             }
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
@@ -591,6 +594,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
+            // No usable sources (all empty / dummy). Backend sampling pads a
+            // row onto 0-output logits; inherit mirrored so alloc can proceed.
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -752,6 +760,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
                 return src_ss[0];
             }
+            case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
+            case GGML_BACKEND_SPLIT_AXIS_NONE: {
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            }
             default: {
                 GGML_ABORT("fatal error");
                 //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -767,6 +779,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN ||
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
         }
@@ -861,6 +877,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_pad = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Backend sampling pads a dummy row onto logits so the graph stays
+        // static when a sampler is inactive. That source can be empty (0
+        // output rows) and therefore UNKNOWN; the dummy dest is mirrored.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN ||
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
             GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 0] == 0);
             GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 1] == 0);

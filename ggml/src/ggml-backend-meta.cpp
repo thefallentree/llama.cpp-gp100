@@ -597,11 +597,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        // An I64 ARGMAX over an axis-0 split is a packed max/location: every
+        // An I64 ARGMAX over a vocab-sharded row is a packed max/location: every
         // non-empty shard yields one complete candidate per row and the readback
         // merges them by score and global column, so the result is mirrored.
+        // handle_reshape can move a complete dim-0 vocab split onto axis 1 when
+        // the row was viewed/reshaped to [n_vocab] (ne[1] == 1).
         if (tensor->op == GGML_OP_ARGMAX && tensor->type == GGML_TYPE_I64 &&
-                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 ||
+                 (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && tensor->src[0] != nullptr &&
+                  tensor->src[0]->ne[1] == 1))) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
 
@@ -944,12 +948,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
         std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
-            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor ||
+                    ggml_nelements(tensor->src[i]) == 0) {
                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
-            GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+                GGML_ABORT("%s: src[%zu] '%s' (%s) ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                           "has UNKNOWN split; dst '%s' (%s)",
+                           __func__, i,
+                           tensor->src[i]->name, ggml_op_name(tensor->src[i]->op),
+                           tensor->src[i]->ne[0], tensor->src[i]->ne[1],
+                           tensor->src[i]->ne[2], tensor->src[i]->ne[3],
+                           tensor->name, ggml_op_name(tensor->op));
+            }
         }
 
         ggml_backend_meta_split_state split_state;

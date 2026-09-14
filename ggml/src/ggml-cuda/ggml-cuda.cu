@@ -1677,7 +1677,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         if (GGML_CUDA_CC_IS_AMD(cc) && src1->ne[1] > 32) {
             compute_type = GGML_TYPE_F32;
         }
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && src1->ne[1] > (cc >= GGML_CUDA_CC_VOLTA ? 8 : 128)) {
+        // Ampere+ has BF16 tensor cores. Pre-Ampere NVIDIA (P100/V100) does not.
+        // Upstream only falls back when ne1 is large (8 on Volta, 128 on Pascal),
+        // so decode (ne1==1) stayed on software BF16 cublas — the slow P100 path.
+        if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
             compute_type = GGML_TYPE_F32;
         }
     }

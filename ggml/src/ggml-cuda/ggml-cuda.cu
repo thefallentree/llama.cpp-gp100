@@ -1737,6 +1737,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     if (ffn_up->src[0]->type == GGML_TYPE_Q4_1_G64) {
         return false;
     }
+    // the generic fused kernels cannot address cold experts
+    if (ggml_cuda_mmid_cold(ffn_up) || ggml_cuda_mmid_cold(ffn_gate)) {
+        return false;
+    }
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1825,6 +1829,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+    if (ggml_cuda_mmid_cold(tensor)) {
+        return false;
+    }
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1852,6 +1859,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+    if (ggml_cuda_mmid_cold(tensor)) {
+        return false;
+    }
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2025,6 +2035,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (ggml_cuda_mmid_cold(dst)) {
+        return false;
+    }
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -2060,6 +2074,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    if (ggml_cuda_mmid_cold(dst)) {
+        // experts beyond src0->ne[2] are only known to the sm_60 Q2_0 kernels
+        if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_mmid_vec_f16_sm60_supported(src0, src1, ids, dst)) {
+            ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst);
+            return;
+        }
+        GGML_ASSERT(ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst) && "cold experts need the sm_60 Q2_0 MUL_MAT_ID kernels");
+        ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -3806,7 +3831,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+    if (node->op == GGML_OP_MUL_MAT_ID && !ggml_cuda_mmid_cold(node) && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
         const int outputs[] = { i + 2, i + 5 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {

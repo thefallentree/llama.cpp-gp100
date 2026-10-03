@@ -126,7 +126,8 @@ mmid16_q2_0_gemm(
         const char * __restrict__ w, const half2 * __restrict__ xh, const float * __restrict__ xs,
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
         const int32_t * __restrict__ tile_expert, const int32_t * __restrict__ tile_col0,
-        float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02, const int64_t stride_dst) {
+        float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02, const int64_t stride_dst,
+        const char * __restrict__ w_cold, const int n_hot) {
 #if defined(FP16_AVAILABLE)
     constexpr int TN = 16*NJ;
 
@@ -149,7 +150,8 @@ mmid16_q2_0_gemm(
 
     const int lr = tid / 4; // weight row loaded by this thread
     const int lq = tid % 4; // 16-value group loaded by this thread
-    const char * wrow = w + (int64_t) e*nb02 + (int64_t) (row0 + lr)*nb01;
+    const char * wexp = e < n_hot ? w + (int64_t) e*nb02 : w_cold + (int64_t) (e - n_hot)*nb02;
+    const char * wrow = wexp + (int64_t) (row0 + lr)*nb01;
 
     float acc[4][NJ];
 #pragma unroll
@@ -249,7 +251,7 @@ mmid16_q2_0_gemm(
         }
     }
 #else
-    GGML_UNUSED_VARS(w, xh, xs, ids_dst, expert_bounds, tile_expert, tile_col0, dst, nkb, nb01, nb02, stride_dst);
+    GGML_UNUSED_VARS(w, xh, xs, ids_dst, expert_bounds, tile_expert, tile_col0, dst, nkb, nb01, nb02, stride_dst, w_cold, n_hot);
     NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
 }
@@ -263,7 +265,8 @@ static __global__ void __launch_bounds__(128, 4)
 mmid16_q2_0_vec(
         const char * __restrict__ w, const half2 * __restrict__ xh, const float * __restrict__ xs,
         const int32_t * __restrict__ ids, float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02,
-        const int ne11, const int n_used, const int si1, const int64_t stride_dst) {
+        const int ne11, const int n_used, const int si1, const int64_t stride_dst,
+        const char * __restrict__ w_cold, const int n_hot) {
 #if defined(FP16_AVAILABLE)
     const int c = blockIdx.y;
     const int t = c / n_used;
@@ -275,7 +278,8 @@ mmid16_q2_0_vec(
     const float * xsr  = xs + (int64_t) r*nkb;
     const int     lane = threadIdx.x;
     const int     row0 = blockIdx.x*MMID16V_ROWS + threadIdx.y*MMID16V_RW;
-    const char *  wr   = w + (int64_t) e*nb02 + (int64_t) row0*nb01;
+    const char *  wexp = e < n_hot ? w + (int64_t) e*nb02 : w_cold + (int64_t) c*nb02; // w_cold: per-slot staging
+    const char *  wr   = wexp + (int64_t) row0*nb01;
 
     float acc[MMID16V_RW];
 #pragma unroll
@@ -326,9 +330,59 @@ mmid16_q2_0_vec(
         }
     }
 #else
-    GGML_UNUSED_VARS(w, xh, xs, ids, dst, nkb, nb01, nb02, ne11, n_used, si1, stride_dst);
+    GGML_UNUSED_VARS(w, xh, xs, ids, dst, nkb, nb01, nb02, ne11, n_used, si1, stride_dst, w_cold, n_hot);
     NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
+}
+
+// Cold experts live in pinned host memory. Reading them in place from the mat-vec/GEMM kernels uses 2-byte loads
+// spread over 18-byte blocks, which wastes most of each PCIe transaction (~2-3 GB/s measured), so the experts an op
+// needs are first copied to VRAM with 16-byte loads. Per token slot for the mat-vec, per used cold expert for the GEMM.
+// PCIe reads of pinned memory need many requests in flight: 4 independent 16-byte loads per thread before the stores
+static __device__ __forceinline__ void mmid16_copy_pcie(const uint4 * __restrict__ src, uint4 * __restrict__ dst, const int64_t n16) {
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x;
+    for (int64_t i0 = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i0 < n16; i0 += 4*stride) {
+        uint4 v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int64_t i = i0 + k*stride;
+            if (i < n16) {
+                v[k] = src[i];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int64_t i = i0 + k*stride;
+            if (i < n16) {
+                dst[i] = v[k];
+            }
+        }
+    }
+}
+
+static __global__ void mmid16_stage_cold_slots(
+        const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_hot,
+        const uint4 * __restrict__ w_cold, const int64_t n16, uint4 * __restrict__ stage) {
+    const int c = blockIdx.y;
+    const int e = ids[(c / n_used)*si1 + c % n_used];
+    if (e < n_hot) {
+        return;
+    }
+    const uint4 * src = w_cold + (int64_t) (e - n_hot)*n16;
+    uint4 *       dst = stage  + (int64_t) c*n16;
+    mmid16_copy_pcie(src, dst, n16);
+}
+
+static __global__ void mmid16_stage_cold_experts(
+        const int32_t * __restrict__ expert_bounds, const int n_hot,
+        const uint4 * __restrict__ w_cold, const int64_t n16, uint4 * __restrict__ stage) {
+    const int ec = blockIdx.y;
+    if (expert_bounds[n_hot + ec + 1] == expert_bounds[n_hot + ec]) {
+        return;
+    }
+    const uint4 * src = w_cold + (int64_t) ec*n16;
+    uint4 *       dst = stage  + (int64_t) ec*n16;
+    mmid16_copy_pcie(src, dst, n16);
 }
 
 bool ggml_cuda_mmid_f16_sm60_supported(
@@ -344,7 +398,9 @@ bool ggml_cuda_mmid_f16_sm60_supported(
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_PASCAL || cc >= GGML_CUDA_CC_DP4A) {
         return false;
     }
-    if (src0->ne[0] % 64 != 0 || src0->ne[1] % MMID16_TM != 0 || src0->ne[2] > 1024 || src0->ne[3] != 1) {
+    int n_cold = 0;
+    ggml_cuda_mmid_cold(dst, nullptr, &n_cold);
+    if (src0->ne[0] % 64 != 0 || src0->ne[1] % MMID16_TM != 0 || src0->ne[2] + n_cold > 1024 || src0->ne[3] != 1) {
         return false;
     }
     if (src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != sizeof(float) || src1->nb[1] % 16 != 0 ||
@@ -364,7 +420,11 @@ void ggml_cuda_mmid_f16_sm60(
 
     const int64_t ne00     = src0->ne[0];
     const int64_t ne01     = src0->ne[1];
-    const int64_t ne02     = src0->ne[2];
+    const char *  w_cold   = nullptr;
+    int           n_cold   = 0;
+    ggml_cuda_mmid_cold(dst, &w_cold, &n_cold);
+    const int     n_hot    = src0->ne[2];
+    const int64_t ne02     = src0->ne[2] + n_cold; // experts addressed by ids
     const int64_t ne11     = src1->ne[1];
     const int64_t ne12     = src1->ne[2];
     const int     n_used   = ids->ne[0];
@@ -379,6 +439,16 @@ void ggml_cuda_mmid_f16_sm60(
     const int sis1 = src1->nb[2]/src1->nb[1];
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
         ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
+
+    ggml_cuda_pool_alloc<char> stage(ctx.pool());
+    if (n_cold > 0) {
+        GGML_ASSERT(src0->nb[2] % 16 == 0);
+        const int64_t n16 = src0->nb[2]/16;
+        stage.alloc((size_t) n_cold*src0->nb[2]);
+        mmid16_stage_cold_experts<<<dim3(16, n_cold, 1), 256, 0, stream>>>(
+            bounds.get(), n_hot, (const uint4 *) w_cold, n16, (uint4 *) stage.get());
+        w_cold = stage.get();
+    }
 
     ggml_cuda_pool_alloc<half2> xh(ctx.pool(), n_assign*nkb*32);
     ggml_cuda_pool_alloc<float> xs(ctx.pool(), n_assign*nkb);
@@ -404,12 +474,12 @@ void ggml_cuda_mmid_f16_sm60(
         mmid16_tiles<32><<<1, nthr, 0, stream>>>(bounds.get(), tile_expert.get(), tile_col0.get(), ne02);
         mmid16_q2_0_gemm<2><<<grid, MMID16_THREADS, 0, stream>>>(
             (const char *) src0->data, xh.get(), xs.get(), ids_dst.get(), bounds.get(), tile_expert.get(), tile_col0.get(),
-            (float *) dst->data, nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float));
+            (float *) dst->data, nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, n_hot);
     } else {
         mmid16_tiles<64><<<1, nthr, 0, stream>>>(bounds.get(), tile_expert.get(), tile_col0.get(), ne02);
         mmid16_q2_0_gemm<4><<<grid, MMID16_THREADS, 0, stream>>>(
             (const char *) src0->data, xh.get(), xs.get(), ids_dst.get(), bounds.get(), tile_expert.get(), tile_col0.get(),
-            (float *) dst->data, nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float));
+            (float *) dst->data, nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, n_hot);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -435,6 +505,17 @@ void ggml_cuda_mmid_vec_f16_sm60(
     const int     n_used = ids->ne[0];
     const int     nkb    = ne00/64;
     const int     si1    = ids->nb[1]/sizeof(int32_t);
+    const char *  w_cold = nullptr;
+    ggml_cuda_pool_alloc<char> stage(ctx.pool());
+    if (ggml_cuda_mmid_cold(dst, &w_cold)) {
+        GGML_ASSERT(src0->nb[2] % 16 == 0);
+        const int64_t n16    = src0->nb[2]/16;
+        const int     nslots = ne12*n_used;
+        stage.alloc((size_t) nslots*src0->nb[2]);
+        mmid16_stage_cold_slots<<<dim3(64, nslots, 1), 256, 0, stream>>>(
+            (const int32_t *) ids->data, si1, n_used, (int) src0->ne[2], (const uint4 *) w_cold, n16, (uint4 *) stage.get());
+        w_cold = stage.get();
+    }
     const int64_t s11    = src1->nb[1]/sizeof(float);
     const int64_t s12    = src1->nb[2]/sizeof(float);
     const int64_t sd     = dst->nb[1]/sizeof(float);
@@ -465,6 +546,6 @@ void ggml_cuda_mmid_vec_f16_sm60(
     const dim3 grid(ne01/MMID16V_ROWS, ne12*n_used, 1);
     mmid16_q2_0_vec<<<grid, dim3(WARP_SIZE, 4, 1), 0, stream>>>(
         (const char *) src0->data, xh, xs, (const int32_t *) ids->data, (float *) dst->data, nkb,
-        src0->nb[1], src0->nb[2], ne11, n_used, si1, sd);
+        src0->nb[1], src0->nb[2], ne11, n_used, si1, sd, w_cold, (int) src0->ne[2]);
     CUDA_CHECK(cudaGetLastError());
 }

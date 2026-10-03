@@ -266,13 +266,16 @@ mmid16_q2_0_vec(
         const char * __restrict__ w, const half2 * __restrict__ xh, const float * __restrict__ xs,
         const int32_t * __restrict__ ids, float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02,
         const int ne11, const int n_used, const int si1, const int64_t stride_dst,
-        const char * __restrict__ w_cold, const int n_hot) {
+        const char * __restrict__ w_cold, const int n_hot, const int skip_cold) {
 #if defined(FP16_AVAILABLE)
     const int c = blockIdx.y;
     const int t = c / n_used;
     const int s = c % n_used;
     const int e = ids[t*si1 + s];
     const int r = t*ne11 + s % ne11;
+    if (skip_cold && e >= n_hot) {
+        return;
+    }
 
     const half2 * xr   = xh + (int64_t) r*nkb*32;
     const float * xsr  = xs + (int64_t) r*nkb;
@@ -330,7 +333,7 @@ mmid16_q2_0_vec(
         }
     }
 #else
-    GGML_UNUSED_VARS(w, xh, xs, ids, dst, nkb, nb01, nb02, ne11, n_used, si1, stride_dst, w_cold, n_hot);
+    GGML_UNUSED_VARS(w, xh, xs, ids, dst, nkb, nb01, nb02, ne11, n_used, si1, stride_dst, w_cold, n_hot, skip_cold);
     NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
 }
@@ -495,7 +498,7 @@ bool ggml_cuda_mmid_vec_f16_sm60_supported(
 
 void ggml_cuda_mmid_vec_f16_sm60(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-        ggml_tensor * dst) {
+        ggml_tensor * dst, const bool skip_cold) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t ne00   = src0->ne[0];
@@ -507,7 +510,7 @@ void ggml_cuda_mmid_vec_f16_sm60(
     const int     si1    = ids->nb[1]/sizeof(int32_t);
     const char *  w_cold = nullptr;
     ggml_cuda_pool_alloc<char> stage(ctx.pool());
-    if (ggml_cuda_mmid_cold(dst, &w_cold)) {
+    if (ggml_cuda_mmid_cold(dst, &w_cold) && !skip_cold) {
         GGML_ASSERT(src0->nb[2] % 16 == 0);
         const int64_t n16    = src0->nb[2]/16;
         const int     nslots = ne12*n_used;
@@ -546,6 +549,6 @@ void ggml_cuda_mmid_vec_f16_sm60(
     const dim3 grid(ne01/MMID16V_ROWS, ne12*n_used, 1);
     mmid16_q2_0_vec<<<grid, dim3(WARP_SIZE, 4, 1), 0, stream>>>(
         (const char *) src0->data, xh, xs, (const int32_t *) ids->data, (float *) dst->data, nkb,
-        src0->nb[1], src0->nb[2], ne11, n_used, si1, sd, w_cold, (int) src0->ne[2]);
+        src0->nb[1], src0->nb[2], ne11, n_used, si1, sd, w_cold, (int) src0->ne[2], (int) skip_cold);
     CUDA_CHECK(cudaGetLastError());
 }

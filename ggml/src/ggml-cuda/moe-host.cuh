@@ -30,3 +30,8 @@ bool ggml_cuda_moe_host_active(const ggml_backend_cuda_context & ctx, const ggml
 void ggml_cuda_moe_host_end(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
 
 void ggml_cuda_moe_host_free(ggml_backend_cuda_context & ctx);
+
+// graph_optimize pass: moves work that only depends on a host triple's input (the shared expert) between the
+// triple's first node and its down projection, so the GPU computes it while the host threads compute the cold
+// experts instead of waiting for them.
+void ggml_cuda_moe_host_reorder(ggml_cgraph * cgraph);

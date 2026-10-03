@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/moe-host.cuh"
+#include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -3836,6 +3837,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // qwen4exp hyper-connection read: norm, down, scale, silu, up, gated mean -> three kernels
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_hc_mix_args hc_args;
+        if (ggml_cuda_hc_mix_match(cgraph, i, hc_args)) {
+            ggml_cuda_hc_mix(*cuda_ctx, hc_args);
+            return 9;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && !ggml_cuda_mmid_cold(node) && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {

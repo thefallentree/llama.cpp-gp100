@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/mmid-f16-sm60.cuh"
+#include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -699,6 +700,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     a16_cache_free();
     gdn_gather_free();
     mmid16_cache_free();
+    ggml_cuda_moe_host_free(*this);
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2108,6 +2110,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (ggml_cuda_mmid_cold(dst)) {
         // experts beyond src0->ne[2] are only known to the sm_60 Q2_0 kernels
+        if (ggml_cuda_moe_host_active(ctx, dst)) {
+            ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
+            return;
+        }
         if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_mmid_vec_f16_sm60_supported(src0, src1, ids, dst)) {
             ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst);
             return;
@@ -4942,7 +4948,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, allow_defer);
+                // cold experts of a hot/cold MoE layer on the host: rings the doorbell before the triple's first node
+                const bool moe_host = ggml_cuda_moe_host_begin(*cuda_ctx, cgraph, i);
+
+                int nodes_to_skip = moe_host ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i, allow_defer);
 
                 if (nodes_to_skip == GGML_CUDA_FUSE_DEFERRED) {
                     // This node is executed folded into a later node (or has been already)
@@ -4981,6 +4990,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (moe_host) {
+                    ggml_cuda_moe_host_end(*cuda_ctx, node);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5053,6 +5065,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->a16_cache_clear();
     cuda_ctx->gdn_gather_reset_graph();
     cuda_ctx->mmid16_cache_clear();
+    cuda_ctx->moe_host = {};
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

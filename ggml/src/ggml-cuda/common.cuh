@@ -1454,10 +1454,25 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct mh_mailbox;
+
+// the gate/up/down MUL_MAT_IDs of a hot/cold MoE layer whose cold experts the host computes (moe-host.cuh)
+struct ggml_cuda_moe_host_triple {
+    const ggml_tensor * ids  = nullptr;
+    const ggml_tensor * up   = nullptr;
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * down = nullptr;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // cold experts on the host: the open triple, the mapped mailbox and the request state on the device
+    ggml_cuda_moe_host_triple moe_host;
+    mh_mailbox *              moe_host_mb     = nullptr;
+    uint32_t *                moe_host_dstate = nullptr;
 
     // Single-slot cache of the sm_60 mat-vec's quantized activations.  Gate and up
     // projections consume the same activation tensor back to back, so the second

@@ -1559,6 +1559,17 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
+    if (exps_cold) {
+        const auto it = exps_cold->find(w);
+        if (it != exps_cold->end()) {
+            // ids >= w->ne[2] select experts of the cold tensor; a backend that does not read this tag must not run the op
+            const ggml_tensor * cold = it->second;
+            const int32_t tag[2] = { (int32_t) LLAMA_EXPS_COLD_MAGIC, (int32_t) cold->ne[2] };
+            memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM, tag, sizeof(tag));
+            memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM + 2, &cold->data, sizeof(void *));
+        }
+    }
+
     if (prec_policy) {
         prec_policy->apply(res);
     }

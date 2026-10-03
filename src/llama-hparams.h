@@ -71,6 +71,7 @@ struct llama_hparams {
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;
     uint32_t n_expert = 0;
+    uint32_t n_expert_hot = 0; // > 0: experts [n_expert_hot, n_expert) are stored in the *_exps_cold tensors
     uint32_t n_rel_attn_bkts = 0;
 
     // TODO: this needs to be reworked

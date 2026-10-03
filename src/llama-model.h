@@ -339,6 +339,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold   = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
@@ -634,6 +637,9 @@ struct llama_prec_policy {
 };
 
 struct llama_model {
+    // hot expert tensor -> tensor holding the remaining (cold) experts of the same weight
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> exps_cold;
+
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 

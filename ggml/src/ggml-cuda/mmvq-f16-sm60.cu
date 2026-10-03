@@ -570,6 +570,7 @@ mul_mat_vec_q8_0_a16(
             }
         }
     }
+
 #else
     GGML_UNUSED_VARS(vx, aq, ads, dst, nblocks, stride_row_bytes, stride_col_aq, stride_col_ads, stride_col_dst);
     NO_DEVICE_CODE;
@@ -924,7 +925,8 @@ bool ggml_cuda_mmvq_f16_sm60_supported(
     // (measured ~-7%-class vs an int8 width-1 path on Q4_1; the byte saving offsets it).
     const int64_t eff_cols = src1->ne[1] == 1 && src1->ne[2] > 1 ? src1->ne[2] : src1->ne[1];
     const int64_t max_cols = g64_seq_fold ? 8 : A16_MAX_COLS;
-    if (eff_cols < (is_g64 ? 1 : 2) || eff_cols > max_cols) {
+    // Q8_0 at width 1: the generic int8 kernel emulates DP4A and reaches only ~240 GB/s on GP100
+    if (eff_cols < (is_g64 || is_q8_0 ? 1 : 2) || eff_cols > max_cols) {
         return false;
     }
     if (is_g64 && (src0->ne[0] % 64 != 0 || src0->ne[1] % 8 != 0)) {
@@ -1067,7 +1069,7 @@ void ggml_cuda_mmvq_f16_sm60(
                             stride_row_bytes, stride_col_aq, stride_col_ads, stride_col_dst,      \
                             stream);                                                              \
                     break;
-                A16_Q8_CASE(2) A16_Q8_CASE(3) A16_Q8_CASE(4)
+                A16_Q8_CASE(1) A16_Q8_CASE(2) A16_Q8_CASE(3) A16_Q8_CASE(4)
                 A16_Q8_CASE(5) A16_Q8_CASE(6) A16_Q8_CASE(7) A16_Q8_CASE(8)
 #undef A16_Q8_CASE
                 default:

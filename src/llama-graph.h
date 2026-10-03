@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <set>
@@ -991,7 +992,15 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+// op_params[12..15] of a MUL_MAT_ID whose experts continue in a cold tensor: { magic, n_cold, data pointer (2 ints) }
+// (the low op_params of MUL_MAT_ID hold precision settings)
+#define LLAMA_EXPS_COLD_MAGIC 0x434f4c44
+#define LLAMA_EXPS_COLD_PARAM 12
+
 struct llm_graph_context {
+    // hot expert tensor -> cold expert tensor (pinned host memory); set by models that split their experts
+    const std::unordered_map<const ggml_tensor *, ggml_tensor *> * exps_cold = nullptr;
+
     const llm_arch arch;
 
     const llama_hparams & hparams;

@@ -26,6 +26,7 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+    ml.get_key(LLM_KV_EXPERT_HOT_COUNT,                  hparams.n_expert_hot, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -272,9 +273,20 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
         }
 
+        // with expert_hot_count the routed experts are ordered hot-first and split into two tensors per weight
+        const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) ? (int64_t) hparams.n_expert_hot : n_expert;
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_hot }, flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_hot, flags);
+        if (n_hot < n_expert) {
+            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", il), { n_ff_exp, n_embd, n_expert - n_hot }, flags);
+            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", il), { n_embd, n_ff_exp, n_expert - n_hot }, flags);
+            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", il), { n_embd, n_ff_exp, n_expert - n_hot }, flags);
+            GGML_ASSERT(layer.ffn_gate_exps && layer.ffn_up_exps && "cold experts need separate gate and up tensors");
+            exps_cold[layer.ffn_down_exps] = layer.ffn_down_exps_cold;
+            exps_cold[layer.ffn_gate_exps] = layer.ffn_gate_exps_cold;
+            exps_cold[layer.ffn_up_exps]   = layer.ffn_up_exps_cold;
+        }
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
@@ -398,6 +410,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
+    if (!model.exps_cold.empty()) {
+        exps_cold = &model.exps_cold;
+    }
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());

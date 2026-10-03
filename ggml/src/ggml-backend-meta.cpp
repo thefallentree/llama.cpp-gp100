@@ -420,7 +420,9 @@ struct ggml_backend_meta_simple_tensor_container {
     // (e.g. recurrent-state rollback creates one view per snapshot per layer), so grow instead of asserting.
     ggml_context * ctx_with_room(size_t j) {
         ggml_context * ctx = ctxs[j].get();
-        if (ggml_get_mem_size(ctx) - ggml_used_mem(ctx) < 2*ggml_tensor_overhead()) {
+        // exactly one tensor's overhead: the static container is sized for its tensors and must never spill,
+        // its buffer only covers the current context
+        if (ggml_get_mem_size(ctx) - ggml_used_mem(ctx) < ggml_tensor_overhead()) {
             ctxs_full.push_back(std::move(ctxs[j]));
             ctxs[j].reset(ggml_init(params));
             ctx = ctxs[j].get();
@@ -1906,6 +1908,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
         t->data = (void *) 0x2000000000000000; // FIXME
     }
+    GGML_ASSERT(meta_buf_ctx->stc_static.ctxs_full.empty());
     for (size_t i = 0; i < n_simple_bufts; i++) {
         ggml_context * ctx = meta_buf_ctx->stc_static.ctxs[i].get();
         ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
@@ -1917,7 +1920,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
         // empty buffer instead; a genuine allocation failure still trips the assert below.
         bool needs_storage = false;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (ggml_nelements(t) != 0 && t->data == nullptr && t->view_src == nullptr) {
+            if (ggml_nelements(t) != 0 && t->view_src == nullptr) {
                 needs_storage = true;
                 break;
             }

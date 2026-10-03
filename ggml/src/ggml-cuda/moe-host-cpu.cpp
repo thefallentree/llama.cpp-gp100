@@ -12,8 +12,10 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -36,18 +38,7 @@ struct q2_block {
 };
 static_assert(sizeof(q2_block) == 18, "unexpected Q2_0 block size");
 
-// A 64-element activation block quantized to int8 for the Q2_0 dot product.
-// q is in lane order: byte 16*L + j holds element 4*j + L, which is where the codes land when the 16 code bytes
-// are broadcast to four 128-bit lanes and lane L is shifted right by 2*L. s holds the scale of each int32 lane of
-// madd(maddubs(codes, q)): lanes 4L+0, 4L+1 sum elements 0..31, lanes 4L+2, 4L+3 elements 32..63.
-// The codes are unsigned (value + 1), so the dot product subtracts corr = sum of the dequantized activations.
-struct act_block {
-    int8_t q[64];
-    float  s[16];
-    float  corr;
-    float  pad[15];
-};
-static_assert(sizeof(act_block) == 192, "unexpected act block size");
+typedef mh_act_block act_block;
 
 // v: the 64 rounded values of the block, d: the scales of its two halves
 static void pack_act(const int32_t * v, const float * d, act_block & o) {
@@ -219,6 +210,14 @@ static void dot2_avx2(const q2_block * w0, const q2_block * w1, const act_block 
 }
 #endif // MH_X86
 
+static inline void mh_prefetch(const void * p) {
+#if MH_X86
+    _mm_prefetch((const char *) p, _MM_HINT_T0);
+#else
+    __builtin_prefetch(p);
+#endif
+}
+
 typedef void (*dot2_fn)(const q2_block *, const q2_block *, const act_block *, int, float *, float *);
 typedef void (*quant_fn)(const float *, int, act_block *);
 
@@ -274,8 +273,10 @@ struct pool {
     mh_mailbox *         jm = nullptr;
     int                  n_groups = 0;
     group                groups[MH_MAX_PAIRS];
-    std::vector<act_block> xq;   // [MH_MAX_TOK][n_embd/64]
-    std::vector<float>     h;    // [MH_MAX_PAIRS][n_ff]
+    const act_block *    jxq = nullptr; // [n_tokens][n_embd/64], in the mailbox
+    std::vector<float>     h;    // [MH_MAX_PAIRS][n_ff]: the swiglu outputs
+    std::vector<act_block> hq;   // [MH_MAX_PAIRS][n_ff/64]: ... quantized
+    std::unique_ptr<std::atomic<int>[]> blk_cnt; // [MH_MAX_PAIRS][MH_MAX_FF/64]: finished CH1-row chunks per block
 
     alignas(64) std::atomic<uint32_t> job_gen { 0 };
     alignas(64) std::atomic<int>      chunk1 { 0 };
@@ -301,42 +302,48 @@ struct pool {
         }
     }
 
-    void work(std::vector<act_block> & hq, std::vector<uint32_t> & hq_stamp, uint32_t gen) {
+    // phase 1: gate/up in chunks of CH1 rows (small, so that the threads finish together); the thread that completes
+    // a block of 64 rows of h = silu(gate) * up quantizes it, so phase 3 reads ready activations.
+    // phase 3: down in chunks of CH3 rows.
+    static constexpr int CH1 = 16;
+    static constexpr int CH3 = 32;
+
+    void work() {
         const mh_slot_desc & s = *js;
-        const int nb_e  = s.n_embd/QK;
-        const int nb_f  = s.n_ff/QK;
-        const int rb1   = s.n_ff/32;      // 32-row chunks of gate/up
-        const int n1    = n_groups*rb1;
+        const int nb_e = s.n_embd/QK;
+        const int nb_f = s.n_ff/QK;
+        const int rb1  = s.n_ff/CH1;
+        const int n1   = n_groups*rb1;
         for (int c; (c = chunk1.fetch_add(1, std::memory_order_relaxed)) < n1; ) {
             const group & g  = groups[c/rb1];
-            const int     r0 = (c % rb1)*32;
+            const int     r0 = (c % rb1)*CH1;
             const uint8_t * gate = s.gate + (size_t) g.c*s.gate_nb2;
             const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
-            for (int r = r0; r < r0 + 32; ++r) {
+            for (int r = r0; r < r0 + CH1; ++r) {
                 const q2_block * wg = (const q2_block *) (gate + (size_t) r*s.gate_nb1);
                 const q2_block * wu = (const q2_block *) (up   + (size_t) r*s.up_nb1);
                 for (int i = 0; i < g.n; ++i) {
                     float vg, vu;
-                    dot2(wg, wu, xq.data() + (size_t) g.tok[i]*nb_e, nb_e, &vg, &vu);
+                    dot2(wg, wu, jxq + (size_t) g.tok[i]*nb_e, nb_e, &vg, &vu);
                     h[(size_t) g.pair[i]*s.n_ff + r] = vg/(1.0f + expf(-vg))*vu;
+                }
+            }
+            const int kb = r0/QK;
+            for (int i = 0; i < g.n; ++i) {
+                const int p = g.pair[i];
+                if (blk_cnt[(size_t) p*(MH_MAX_FF/QK) + kb].fetch_add(1, std::memory_order_acq_rel) == QK/CH1 - 1) {
+                    quant(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hq.data() + (size_t) p*nb_f + kb);
                 }
             }
         }
         barrier();
-        const int rb3 = s.n_embd/64;      // 64-row chunks of down
+        const int rb3 = s.n_embd/CH3;
         const int n3  = n_groups*rb3;
         for (int c; (c = chunk3.fetch_add(1, std::memory_order_relaxed)) < n3; ) {
             const group & g  = groups[c/rb3];
-            const int     r0 = (c % rb3)*64;
+            const int     r0 = (c % rb3)*CH3;
             const uint8_t * down = s.down + (size_t) g.c*s.down_nb2;
-            for (int i = 0; i < g.n; ++i) {
-                const int p = g.pair[i];
-                if (hq_stamp[p] != gen) {
-                    quant(h.data() + (size_t) p*s.n_ff, s.n_ff, hq.data() + (size_t) p*nb_f);
-                    hq_stamp[p] = gen;
-                }
-            }
-            for (int r = r0; r < r0 + 64; r += 2) {
+            for (int r = r0; r < r0 + CH3; r += 2) {
                 const q2_block * w0 = (const q2_block *) (down + (size_t) (r + 0)*s.down_nb1);
                 const q2_block * w1 = (const q2_block *) (down + (size_t) (r + 1)*s.down_nb1);
                 for (int i = 0; i < g.n; ++i) {
@@ -352,8 +359,6 @@ struct pool {
     }
 
     void helper() {
-        std::vector<act_block> hq((size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK));
-        std::vector<uint32_t>  hq_stamp(MH_MAX_PAIRS, 0);
         uint32_t last = job_gen.load(std::memory_order_acquire);
         while (!quit.load(std::memory_order_relaxed)) {
             const uint32_t j = job_gen.load(std::memory_order_acquire);
@@ -371,12 +376,17 @@ struct pool {
                 continue;
             }
             last = j;
-            work(hq, hq_stamp, j);
+            work();
             barrier();
         }
     }
 
+    // GGML_CUDA_MOE_HOST_STATS=N: every N jobs, print the mean job time, cold pairs and distinct experts per job
+    int64_t stat_every = 0, stat_jobs = 0, stat_pairs = 0, stat_groups = 0;
+    double  stat_us = 0.0, stat_quant_us = 0.0;
+
     void run_job(mh_mailbox * m) {
+        const auto t_start = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_acquire);
         const int slot = m->slot;
         if (slot < 0 || slot >= n_slots.load(std::memory_order_acquire)) {
@@ -409,25 +419,39 @@ struct pool {
             g.tok[g.n]  = t;
             ++g.n;
         }
-        for (int t = 0; t < MH_MAX_TOK; ++t) {
-            if (tok_used[t]) {
-                quant(m->x + (size_t) t*js->n_embd, js->n_embd, xq.data() + (size_t) t*nb_e);
+        // the GPU quantized the input rows (mh_publish)
+        jxq = m->xq;
+        for (int p = 0; p < n_pairs; ++p) {
+            for (int kb = 0; kb < js->n_ff/QK; ++kb) {
+                blk_cnt[(size_t) p*(MH_MAX_FF/QK) + kb].store(0, std::memory_order_relaxed);
             }
         }
+        GGML_UNUSED(tok_used);
+        GGML_UNUSED(nb_e);
+        const auto t_quant = std::chrono::steady_clock::now();
         chunk1.store(0, std::memory_order_relaxed);
         chunk3.store(0, std::memory_order_relaxed);
-        const uint32_t gen = job_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
-        work(leader_hq, leader_hq_stamp, gen);
+        job_gen.fetch_add(1, std::memory_order_acq_rel);
+        work();
         barrier();
         std::atomic_thread_fence(std::memory_order_release);
+        if (stat_every > 0) {
+            const auto t_end = std::chrono::steady_clock::now();
+            stat_us       += std::chrono::duration<double, std::micro>(t_end - t_start).count();
+            stat_quant_us += std::chrono::duration<double, std::micro>(t_quant - t_start).count();
+            stat_pairs    += n_pairs;
+            stat_groups   += n_groups;
+            if (++stat_jobs == stat_every) {
+                fprintf(stderr, "moe-host: %lld jobs: %.1f us/job (setup %.1f us), %.2f cold pairs, %.2f experts per job\n",
+                              (long long) stat_jobs, stat_us/stat_jobs, stat_quant_us/stat_jobs,
+                              (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs);
+                stat_jobs = stat_pairs = stat_groups = 0;
+                stat_us = stat_quant_us = 0.0;
+            }
+        }
     }
 
-    std::vector<act_block> leader_hq;
-    std::vector<uint32_t>  leader_hq_stamp;
-
     void leader() {
-        leader_hq.resize((size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK));
-        leader_hq_stamp.assign(MH_MAX_PAIRS, 0);
         auto last_job = std::chrono::steady_clock::now();
         int  nap_us   = 0;
         while (!quit.load(std::memory_order_relaxed)) {
@@ -474,12 +498,14 @@ struct pool {
 
     void start() {
         pick_kernels(dot2, quant, isa);
+        stat_every = getenv("GGML_CUDA_MOE_HOST_STATS") ? atoll(getenv("GGML_CUDA_MOE_HOST_STATS")) : 0;
         const char * env = getenv("GGML_CUDA_MOE_HOST_THREADS");
         const int hw = (int) std::thread::hardware_concurrency();
-        n_threads = env != nullptr ? atoi(env) : std::max(1, std::min(20, hw - 4));
+        n_threads = env != nullptr ? atoi(env) : std::max(1, std::min(16, hw - 4));
         n_threads = std::max(1, n_threads);
-        xq.resize((size_t) MH_MAX_TOK*(MH_MAX_EMBD/QK));
         h.resize((size_t) MH_MAX_PAIRS*MH_MAX_FF);
+        hq.resize((size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK));
+        blk_cnt.reset(new std::atomic<int>[(size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK)]);
         threads.emplace_back(&pool::leader, this);
         for (int t = 1; t < n_threads; ++t) {
             threads.emplace_back(&pool::helper, this);

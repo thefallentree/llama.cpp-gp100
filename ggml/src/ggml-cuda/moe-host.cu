@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <unordered_set>
+#include <vector>
 
 #define MH_DSTATE_SEQ  0 // last request number
 #define MH_DSTATE_NEED 1 // cold pairs of the last request
@@ -65,11 +67,51 @@ static __global__ void mh_publish(
         return;
     }
 
-    const int n4 = n_embd/4;
-    for (int k = i; k < n_tokens*n4; k += blockDim.x) {
-        const int t = k / n4;
-        const int c = k % n4;
-        ((float4 *) mb->x)[(int64_t) t*n4 + c] = ((const float4 *) (x + t*sx_tok))[c];
+    // quantize the rows into the host kernels' activation blocks: one warp per block of 64, staged in shared
+    // memory and copied out with 16-byte stores (mapped memory is written over PCIe)
+    __shared__ mh_act_block s_blk[MH_PUBLISH_THREADS/WARP_SIZE];
+    const int nb_t = n_embd/64;
+    for (int b0 = 0; b0 < n_tokens*nb_t; b0 += MH_PUBLISH_THREADS/WARP_SIZE) {
+        const int bi = b0 + w;
+        if (bi < n_tokens*nb_t) {
+            const int t  = bi / nb_t;
+            const int kb = bi % nb_t;
+            const float2 v = *(const float2 *) (x + t*sx_tok + 64*kb + 2*lane); // elements 2*lane, 2*lane + 1
+            float amax = fmaxf(fabsf(v.x), fabsf(v.y));
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o)); // within each half of the warp
+            }
+            const float d  = amax/127.0f;
+            const float id = d != 0.0f ? 1.0f/d : 0.0f;
+            const int   q0 = __float2int_rn(v.x*id);
+            const int   q1 = __float2int_rn(v.y*id);
+            int sum = q0 + q1;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                sum += __shfl_xor_sync(0xffffffff, sum, o);
+            }
+            mh_act_block & ob = s_blk[w];
+            const int e0 = 2*lane;
+            const int e1 = 2*lane + 1;
+            ob.q[16*(e0 % 4) + e0/4] = (int8_t) q0;
+            ob.q[16*(e1 % 4) + e1/4] = (int8_t) q1;
+            const float d1 = __shfl_sync(0xffffffff, d,   16);
+            const int   s1 = __shfl_sync(0xffffffff, sum, 16);
+            if (lane < 16) {
+                ob.s[lane] = (lane & 2) ? d1 : __shfl_sync(0x0000ffff, d, 0);
+            }
+            if (lane == 0) {
+                ob.corr = d*(float) sum + d1*(float) s1;
+            }
+            __syncwarp();
+            const int4 * src = (const int4 *) &ob;
+            int4 *       dst = (int4 *) (mb->xq + (int64_t) t*nb_t + kb);
+            if (lane < (int) (sizeof(mh_act_block)/16)) {
+                dst[lane] = src[lane];
+            }
+            __syncwarp();
+        }
     }
     __threadfence_system();
     __syncthreads();
@@ -274,4 +316,88 @@ void ggml_cuda_moe_host_end(ggml_backend_cuda_context & ctx, const ggml_tensor *
         (int64_t) (node->nb[1]/sizeof(float)), (int64_t) (node->nb[2]/sizeof(float)), n_used, (int) node->ne[0]);
     CUDA_CHECK(cudaGetLastError());
     ctx.moe_host = {};
+}
+
+static const ggml_tensor * mh_root(const ggml_tensor * t) {
+    while (t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+void ggml_cuda_moe_host_reorder(ggml_cgraph * cgraph) {
+    static const bool enabled = ggml_cuda_moe_host_enabled() &&
+        (getenv("GGML_CUDA_MOE_HOST_REORDER") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_REORDER")) != 0);
+    if (!enabled) {
+        return;
+    }
+    const int n_nodes = cgraph->n_nodes;
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * first = cgraph->nodes[i];
+        if (first->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(first) || first->src[2]->ne[1] > MH_MAX_TOK) {
+            continue;
+        }
+        const ggml_tensor * ids = first->src[2];
+        int d = -1;
+        for (int j = i + 1; j < std::min(n_nodes, i + 32); ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == ids && n->src[1]->op == GGML_OP_GLU) {
+                d = j;
+                break;
+            }
+        }
+        if (d < 0) {
+            continue;
+        }
+        // nodes after the down projection computed from the triple's input and weights alone
+        const ggml_tensor * x = mh_root(first->src[1]);
+        std::vector<int> mv;
+        std::unordered_set<const ggml_tensor *> mvset;
+        for (int j = d + 1; j < std::min(n_nodes, d + 128); ++j) {
+            ggml_tensor * m = cgraph->nodes[j];
+            if (m->op == GGML_OP_MUL_MAT_ID) {
+                break; // the next layer's MoE
+            }
+            switch (m->op) {
+                case GGML_OP_MUL_MAT: case GGML_OP_GLU: case GGML_OP_UNARY: case GGML_OP_MUL:
+                case GGML_OP_SCALE: case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_CONT:
+                    break;
+                default:
+                    continue;
+            }
+            bool ok    = true;
+            bool reads = false;
+            for (int k = 0; k < GGML_MAX_SRC && ok; ++k) {
+                const ggml_tensor * s = m->src[k];
+                if (s == nullptr) {
+                    continue;
+                }
+                if (mh_root(s) == x || mvset.count(s) || mvset.count(mh_root(s))) {
+                    reads = true;
+                } else if (s->buffer == nullptr || ggml_backend_buffer_get_usage(s->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    ok = false;
+                }
+            }
+            if (ok && reads && !(m->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                mv.push_back(j);
+                mvset.insert(m);
+            }
+        }
+        if (mv.empty()) {
+            continue;
+        }
+        // nodes[d .. mv.back()] -> the moved nodes, then the rest in their order
+        std::vector<ggml_tensor *> seg;
+        seg.reserve(mv.back() - d + 1);
+        for (int j : mv) {
+            seg.push_back(cgraph->nodes[j]);
+        }
+        for (int j = d; j <= mv.back(); ++j) {
+            if (!mvset.count(cgraph->nodes[j])) {
+                seg.push_back(cgraph->nodes[j]);
+            }
+        }
+        std::copy(seg.begin(), seg.end(), cgraph->nodes + d);
+        i = d + (int) mv.size();
+    }
 }

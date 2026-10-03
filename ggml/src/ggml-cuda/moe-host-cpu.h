@@ -11,6 +11,19 @@
 #define MH_MAX_EMBD  8192
 #define MH_MAX_FF    4096
 
+// A 64-element activation block quantized to int8 for the Q2_0 dot product, written by the GPU (mh_publish).
+// q is in lane order: byte 16*L + j holds element 4*j + L, which is where the codes land when the 16 code bytes
+// are broadcast to four 128-bit lanes and lane L is shifted right by 2*L. s holds the scale of each int32 lane of
+// madd(maddubs(codes, q)): lanes 4L+0, 4L+1 sum elements 0..31, lanes 4L+2, 4L+3 elements 32..63.
+// The codes are unsigned (value + 1), so the dot product subtracts corr = sum of the dequantized activations.
+struct mh_act_block {
+    int8_t q[64];
+    float  s[16];
+    float  corr;
+    float  pad[15];
+};
+static_assert(sizeof(mh_act_block) == 192, "unexpected act block size");
+
 // One mailbox per device, in mapped pinned memory. The GPU writes the request (x, the cold pairs) and then
 // `req`; the host writes the results (y) and then `done`. Layers run one after another on a device, so one
 // mailbox per device is enough.
@@ -24,7 +37,7 @@ struct alignas(64) mh_mailbox {
     int32_t pad2[12];
     int32_t pair_idx[MH_MAX_PAIRS];         // t*n_used + k
     int32_t pair_exp[MH_MAX_PAIRS];         // cold expert index (id - n_hot)
-    alignas(64) float x[MH_MAX_TOK*MH_MAX_EMBD];    // the tokens' input rows
+    alignas(64) mh_act_block xq[MH_MAX_TOK*MH_MAX_EMBD/64]; // the tokens' input rows, quantized by the GPU
     alignas(64) float y[MH_MAX_PAIRS*MH_MAX_EMBD];  // the cold pairs' down-projection outputs
 };
 

@@ -422,23 +422,15 @@ bool ggml_cuda_hc_mix_match(const ggml_cgraph * cgraph, int i, ggml_cuda_hc_mix_
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    // the kernels write xn, lo and mixed and read them back across blocks: none may share memory with another
-    // or with R (the allocator may place an elided intermediate's successor in its memory)
+    // xn and mixed are written and read back across blocks, so neither may share memory with the other or with R.
+    // lo goes to scratch: the allocator often places mixed in the memory of the elided intermediates.
     auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
         const char * x0 = (const char *) x->data;
         const char * y0 = (const char *) y->data;
         return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
     };
-    const ggml_tensor * wr[] = { a.mul, a.silu, a.pre };
-    for (int u = 0; u < 3; ++u) {
-        if (overlap(wr[u], R)) {
-            return false;
-        }
-        for (int v = u + 1; v < 3; ++v) {
-            if (overlap(wr[u], wr[v])) {
-                return false;
-            }
-        }
+    if (overlap(a.mul, R) || overlap(a.pre, R) || overlap(a.mul, a.pre)) {
+        return false;
     }
     if (hc != HC_MIX_HC || nt > 2*HC_MIX_MAX_T || R->ne[3] != 1 || n_embd % HC_MIX_UP_COLS != 0 || n_embd % 32 != 0 ||
         hc_lr % 64 != 0 || hc_lr % HC_MIX_DOWN_RB != 0 || (2*hc_lr/HC_MIX_QK) % (WARP_SIZE/HC_MIX_UP_COLS) != 0 ||
@@ -446,8 +438,7 @@ bool ggml_cuda_hc_mix_match(const ggml_cgraph * cgraph, int i, ggml_cuda_hc_mix_
         wn->ne[0] != n_embd || wn->ne[1] != hc || ggml_nrows(wn) != hc ||
         wd->type != GGML_TYPE_Q8_0 || wu->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(wd) || !ggml_is_contiguous(wu) ||
         wd->ne[0] != hc*n_embd || wu->ne[0] != hc_lr || wu->ne[1] != hc*n_embd ||
-        !ggml_is_contiguous(a.mul) || !ggml_is_contiguous(a.silu) || !ggml_is_contiguous(a.pre) ||
-        a.silu->type != GGML_TYPE_F32 || a.pre->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(a.mul) || !ggml_is_contiguous(a.pre) || a.pre->type != GGML_TYPE_F32 ||
         hc_mix_up_smem(HC_MIX_MAX_T, (int) hc_lr, wu->nb[1]) > 48*1024 ||
         HC_MIX_HC*HC_MIX_UP_COLS*(int64_t) wu->nb[1]/16 > 8*WARP_SIZE*HC_MIX_HC) {
         return false;
@@ -467,12 +458,12 @@ void ggml_cuda_hc_mix(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_ar
     const int64_t sr_t   = R->nb[2]/sizeof(float);
     const int64_t sxn_c  = a.mul->nb[1]/sizeof(float);
     const int64_t sxn_t  = a.mul->nb[2]/sizeof(float);
-    const int64_t slo_t  = a.silu->nb[1]/sizeof(float);
     const int64_t smx_t  = a.pre->nb[1]/sizeof(float);
 
     const int nblocks = HC_MIX_HC*n_embd/HC_MIX_QK;
     ggml_cuda_pool_alloc<half2> aq (ctx.pool(), (size_t) HC_MIX_MAX_T*nblocks*(HC_MIX_QK/2));
     ggml_cuda_pool_alloc<half2> ads(ctx.pool(), (size_t) HC_MIX_MAX_T*nblocks);
+    ggml_cuda_pool_alloc<float> lo (ctx.pool(), (size_t) nt*hc_lr);
 
     for (int t0 = 0; t0 < nt; t0 += HC_MIX_MAX_T) {
         const int ntg = std::min(HC_MIX_MAX_T, nt - t0);
@@ -480,7 +471,7 @@ void ggml_cuda_hc_mix(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_ar
             (const char *) wd->data, wd->nb[1], (const char *) wu->data, wu->nb[1], n_embd, hc_lr,
             ggml_get_op_params_f32(a.rms, 0), ggml_get_op_params_f32(a.scale, 0), ggml_get_op_params_f32(a.scale, 1),
             ggml_get_op_params_f32(a.pre, 0),
-            (float *) a.mul->data + t0*sxn_t, sxn_c, sxn_t, (float *) a.silu->data + t0*slo_t, slo_t,
+            (float *) a.mul->data + t0*sxn_t, sxn_c, sxn_t, lo.get() + t0*hc_lr, hc_lr,
             (float *) a.pre->data + t0*smx_t, smx_t, aq.get(), ads.get(), ctx.stream());
         CUDA_CHECK(cudaGetLastError());
     }

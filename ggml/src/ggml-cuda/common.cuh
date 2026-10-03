@@ -1476,6 +1476,27 @@ struct ggml_backend_cuda_context {
     size_t              a16_cache_ads_size = 0;
     int64_t             a16_cache_s[3]     = { 0, 0, 0 };
 
+    // converted activations of the sm_60 Q2_0 MUL_MAT_ID mat-vec: gate and up read the same src1 back to back
+    char *              mmid16_cache_mem  = nullptr;
+    size_t              mmid16_cache_cap  = 0;
+    const ggml_tensor * mmid16_cache_src1 = nullptr;
+    const void *        mmid16_cache_data = nullptr;
+    int64_t             mmid16_cache_key  = -1;
+
+    void mmid16_cache_clear() {
+        mmid16_cache_src1 = nullptr;
+        mmid16_cache_data = nullptr;
+        mmid16_cache_key  = -1;
+    }
+    void mmid16_cache_free() {
+        if (mmid16_cache_mem != nullptr) {
+            cudaFree(mmid16_cache_mem);
+            mmid16_cache_mem = nullptr;
+        }
+        mmid16_cache_cap = 0;
+        mmid16_cache_clear();
+    }
+
     void a16_cache_clear() {
         a16_cache_src1   = nullptr;
         a16_cache_data   = nullptr;
@@ -1486,6 +1507,7 @@ struct ggml_backend_cuda_context {
             cudaFree(a16_cache_mem);
             a16_cache_mem = nullptr;
         }
+
         a16_cache_cap = 0;
         a16_cache_clear();
     }

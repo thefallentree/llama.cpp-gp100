@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
+#include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -697,6 +698,7 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     a16_cache_free();
     gdn_gather_free();
+    mmid16_cache_free();
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2070,6 +2072,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
+    if (ggml_cuda_mmid_f16_sm60_supported(src0, src1, dst->src[2], dst)) {
+        return false;
+    }
+
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
@@ -2111,6 +2117,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        if (ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst)) {
+            ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
@@ -4973,6 +4984,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // The sm_60 activation cache keys on a tensor pointer a later graph may reuse.
     cuda_ctx->a16_cache_clear();
     cuda_ctx->gdn_gather_reset_graph();
+    cuda_ctx->mmid16_cache_clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

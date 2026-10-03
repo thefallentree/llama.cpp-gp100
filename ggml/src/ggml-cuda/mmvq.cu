@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "mmvq-f16-sm60.cuh"
+#include "mmid-f16-sm60.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -1481,6 +1482,10 @@ void ggml_cuda_mul_mat_vec_q(
     // nibbles straight to half2 with LOP3 magic constants beats emulating the int8 dot product.
     if (!fusion && ggml_cuda_mmvq_f16_sm60_supported(src0, src1, ids, dst)) {
         ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
+        return;
+    }
+    if (!fusion && ids && ggml_cuda_mmid_vec_f16_sm60_supported(src0, src1, ids, dst)) {
+        ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst);
         return;
     }
 

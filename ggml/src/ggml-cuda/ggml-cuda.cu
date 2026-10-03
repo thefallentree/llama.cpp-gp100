@@ -3501,6 +3501,25 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // SCALE -> SIGMOID -> SCALE computing the post weights of DSV4_HC_POST: the weights are its src[2] and have
+    // another shape, so this needs the subgraph check rather than the linear-chain one below
+    std::initializer_list<enum ggml_op> hc_post_act_ops = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+    if (is_equal(hc_post_act_ops, ops)) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+            return false;
+        }
+        const ggml_tensor * scale   = cgraph->nodes[node_idx];
+        const ggml_tensor * sigmoid = cgraph->nodes[node_idx+1];
+        const ggml_tensor * scale2  = cgraph->nodes[node_idx+2];
+        const ggml_tensor * hc_post = cgraph->nodes[node_idx+3];
+
+        return unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID &&
+               ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+               sigmoid->src[0] == scale && scale2->src[0] == sigmoid && hc_post->src[2] == scale2 &&
+               scale->src[0]->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && scale2->type == GGML_TYPE_F32 &&
+               ggml_are_same_shape(scale->src[0], scale2);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -3673,6 +3692,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
 
         return true;
+    }
+
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+        const ggml_tensor * scale = cgraph->nodes[node_idx];
+        const ggml_tensor * silu  = cgraph->nodes[node_idx+1];
+
+        return ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && scale->src[0]->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32;
     }
 
     return false;
@@ -4660,6 +4687,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID }) &&
+            cgraph->nodes[i + 3]->src[2] == cgraph->nodes[i + 2] &&
+            node->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(node->src[0], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_dsv4_hc_post_scaled_sigmoid(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
+        return 3;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) &&
+            node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1]) &&
+            ggml_are_same_shape(node->src[0], cgraph->nodes[i + 1])) {
+        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 

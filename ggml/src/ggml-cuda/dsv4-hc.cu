@@ -145,7 +145,7 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-template <bool has_comb>
+template <bool has_comb, bool post_act = false>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -167,7 +167,8 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        float4  act = make_float4(1.0f, 0.0f, 1.0f, 0.0f)) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -182,7 +183,12 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+    float pv = post[idst*sp0 + it*sp1];
+    if constexpr (post_act) {
+        // fused SCALE -> SIGMOID -> SCALE that produced the post weights
+        pv = act.z/(1.0f + expf(-(act.x*pv + act.y))) + act.w;
+    }
+    float sum = x[i0*sx0 + it*sx1] * pv;
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -272,10 +278,10 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             scale);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_op_dsv4_hc_post_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * post, const bool post_act, const float4 act) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -303,7 +309,8 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = comb ? dsv4_hc_post_f32<true> : dsv4_hc_post_f32<false>;
+    auto kernel = comb ? (post_act ? dsv4_hc_post_f32<true, true>  : dsv4_hc_post_f32<true, false>)
+                       : (post_act ? dsv4_hc_post_f32<false, true> : dsv4_hc_post_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
@@ -312,5 +319,30 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float), act);
+}
+
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_dsv4_hc_post_impl(ctx, dst, dst->src[2], false, make_float4(1.0f, 0.0f, 1.0f, 0.0f));
+}
+
+void ggml_cuda_op_dsv4_hc_post_scaled_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * scale0, const ggml_tensor * scale1) {
+    const float * p0 = (const float *) scale0->op_params;
+    const float * p1 = (const float *) scale1->op_params;
+    ggml_cuda_op_dsv4_hc_post_impl(ctx, dst, scale0->src[0], true, make_float4(p0[0], p0[1], p1[0], p1[1]));
+}
+
+static __global__ void scale_silu_f32(const float * __restrict__ x, float * __restrict__ dst, const float s, const float b, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = x[i]*s + b;
+        dst[i] = v/(1.0f + expf(-v));
+    }
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale, ggml_tensor * silu) {
+    const float * p = (const float *) scale->op_params;
+    const int64_t n = ggml_nelements(silu);
+    scale_silu_f32<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) scale->src[0]->data, (float *) silu->data, p[0], p[1], n);
 }

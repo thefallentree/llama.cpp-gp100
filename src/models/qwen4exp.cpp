@@ -275,7 +275,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         // with expert_hot_count the routed experts are ordered hot-first and split into two tensors per weight
-        const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) ? (int64_t) hparams.n_expert_hot : n_expert;
+        // (trunk layers only: an MTP block merged into the file keeps its experts in one tensor)
+        const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) && il < n_layer ? (int64_t) hparams.n_expert_hot : n_expert;
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_hot }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_hot, flags);
@@ -311,6 +312,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, mtp_flags | TENSOR_ALLOW_RESHAPE);
         nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mtp_flags);
         nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mtp_flags);
+        // optional LM head of the MTP block (e.g. a smaller quantization than the trunk's output for drafting)
+        nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, mtp_flags | TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -625,7 +628,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (layer.nextn.shared_head_head) {
+        cur = build_lora_mm(layer.nextn.shared_head_head, cur);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

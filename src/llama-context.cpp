@@ -1,4 +1,8 @@
 #include "llama-context.h"
+#include "fn-prof.h"
+FN_PROF_DECL("llama");
+static int64_t fn_prof_t_window[2] = { 0, 0 };
+static int     fn_prof_n_window[2] = { 0, 0 };
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -782,10 +786,25 @@ void llama_context::synchronize() {
         return;
     }
 
+    FN_PROF_T(t_s0);
     ggml_backend_sched_synchronize(sched.get());
 
     for (auto & slot : gf_slots) {
         ggml_backend_sched_synchronize(slot.sched.get());
+    }
+    FN_PROF_ADD("ctx.synchronize", t_s0);
+    {
+        // a decode and the wait for its results
+        const int tag = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1;
+        if (g_fn_prof.on && fn_prof_t_window[tag] != 0) {
+            const int n = fn_prof_n_window[tag];
+            ggml_fn_prof_tag = tag;
+            FN_PROF_ADD(n == 1 ? "window(T=1)" : n == 2 ? "window(T=2)" : n == 3 ? "window(T=3)" :
+                        n == 4 ? "window(T=4)" : n <= 8 ? "window(T=5..8)" : "window(T>8)", fn_prof_t_window[tag]);
+            FN_PROF_ADD(n == 1 ? "window.wait(T=1)" : n == 2 ? "window.wait(T=2)" : n == 3 ? "window.wait(T=3)" :
+                        n == 4 ? "window.wait(T=4)" : n <= 8 ? "window.wait(T=5..8)" : "window.wait(T>8)", t_s0);
+            fn_prof_t_window[tag] = 0;
+        }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1459,7 +1478,23 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
+    FN_PROF_T(t_pu0);
+    if (g_fn_prof.on && ggml_fn_prof_tag == 0) {
+        // the period of the ubatches of one decode: a window with everything around it
+        static int64_t t_last = 0;
+        static int     n_last = 0;
+        const int n = (int) ubatch.n_tokens;
+        if (t_last != 0 && n == n_last && n <= 8 && t_pu0 - t_last < 2000000000) {
+            FN_PROF_ADD(n == 1 ? "ubatch.period(T=1)" : n == 2 ? "ubatch.period(T=2)" : n == 3 ? "ubatch.period(T=3)" :
+                        n == 4 ? "ubatch.period(T=4)" : "ubatch.period(T=5..8)", t_last);
+        }
+        t_last = t_pu0;
+        n_last = n;
+    }
+    const bool mctx_ok = !mctx || mctx->apply();
+    FN_PROF_ADD("pu.mctx_apply", t_pu0);
+    FN_PROF_T(t_pu1);
+    if (!mctx_ok) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1549,6 +1584,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         hit = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
     }
 
+    FN_PROF_ADD(hit ? "pu.lookup(hit)" : "pu.lookup(miss)", t_pu1);
+    FN_PROF_T(t_pu2);
     if (hit) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1682,6 +1719,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    FN_PROF_ADD(hit ? "pu.sync(hit)" : "pu.build+alloc", t_pu2);
+    FN_PROF_T(t_pu3);
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1691,8 +1730,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    FN_PROF_ADD("pu.set_inputs", t_pu3);
+    FN_PROF_T(t_pu4);
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    FN_PROF_ADD("pu.graph_compute", t_pu4);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1965,6 +2007,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
+    ggml_fn_prof_tag = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1;
+    FN_PROF_T(t_d0);
+    fn_prof_t_window[ggml_fn_prof_tag] = t_d0;
+    fn_prof_n_window[ggml_fn_prof_tag] = (int) batch_inp.tokens.size();
+    static int64_t t_last_end = 0;
+    if (t_last_end != 0) { FN_PROF_ADD("decode.between", t_last_end); }
     const int64_t n_vocab = vocab.n_tokens();
 
     // when computing embeddings, all tokens are output
@@ -2037,12 +2085,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    FN_PROF_ADD("decode.balloc", t_d0);
+    FN_PROF_T(t_d1);
     sched_reserve();
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
+    FN_PROF_ADD("decode.reserve+memupd", t_d1);
+    FN_PROF_T(t_d2);
 
     llama_memory_context_ptr mctx;
 
@@ -2089,6 +2141,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    FN_PROF_ADD("decode.init_batch", t_d2);
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -2124,7 +2177,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        FN_PROF_T(t_d4);
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        FN_PROF_ADD("decode.process_ubatch", t_d4);
+        FN_PROF_T(t_d5);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2287,7 +2343,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        FN_PROF_ADD("decode.extract", t_d5);
     } while (mctx->next());
+    FN_PROF_T(t_d6);
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2341,6 +2399,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+    FN_PROF_ADD("decode.tail", t_d6);
+    FN_PROF_ADD("decode.total", t_d0);
+    t_last_end = g_fn_prof.on ? fn_prof_now() : 0;
 
     return 0;
 }

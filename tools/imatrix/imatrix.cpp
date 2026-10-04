@@ -567,6 +567,31 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
     const int32_t chunk_size = m_params.n_ctx / m_params.n_parallel;
 
+    // LLAMA_IMATRIX_IDS_TRACE=<file>: only append the routed expert ids of every layer to the file, as int32 records
+    // [layer, n_tokens, n_used, ids[n_tokens][n_used]] (temporary: input of the expert cache simulation)
+    static const char * trace_path = getenv("LLAMA_IMATRIX_IDS_TRACE");
+    if (trace_path != nullptr) {
+        const bool gate = t->op == GGML_OP_MUL_MAT_ID && strstr(src0->name, "ffn_gate_exps") != nullptr;
+        if (ask || !gate) {
+            return gate;
+        }
+        static FILE * f = fopen(trace_path, "wb");
+        const ggml_tensor * ids = t->src[2];
+        std::vector<char> raw(ggml_nbytes(ids));
+        ggml_backend_tensor_get(ids, raw.data(), 0, raw.size());
+        int layer = -1;
+        sscanf(src0->name, "blk.%d.", &layer);
+        const int32_t hdr[3] = { layer, (int32_t) ids->ne[1], (int32_t) ids->ne[0] };
+        fwrite(hdr, sizeof(int32_t), 3, f);
+        for (int64_t row = 0; row < ids->ne[1]; ++row) {
+            for (int64_t idx = 0; idx < ids->ne[0]; ++idx) {
+                fwrite(raw.data() + row*ids->nb[1] + idx*ids->nb[0], sizeof(int32_t), 1, f);
+            }
+        }
+        fflush(f);
+        return true;
+    }
+
     // when ask is true, the scheduler wants to know if we are interested in data from this tensor
     // if we return true, a follow-up call will be made with ask=false in which we can do the actual collection
     if (ask) {

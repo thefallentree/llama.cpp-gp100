@@ -1,4 +1,7 @@
 #include "llama-graph.h"
+#include "fn-prof.h"
+#include <typeinfo>
+FN_PROF_DECL("graph");
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1389,7 +1392,9 @@ void llm_graph_result::reset() {
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
+        FN_PROF_T(t0);
         input->set_input(ubatch);
+        FN_PROF_ADD(typeid(*input).name(), t0);
     }
 }
 
@@ -1596,10 +1601,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const auto it = exps_cold->find(w);
         if (it != exps_cold->end()) {
             // ids >= w->ne[2] select experts of the cold tensor; a backend that does not read this tag must not run the op
-            const ggml_tensor * cold = it->second;
+            ggml_tensor * cold = it->second;
             const int32_t tag[2] = { (int32_t) LLAMA_EXPS_COLD_MAGIC, (int32_t) cold->ne[2] };
             memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM, tag, sizeof(tag));
             memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM + 2, &cold->data, sizeof(void *));
+            // on a tensor-split device the cold tensor is a source of the node, so that each device gets its own slice
+            if (cold->buffer != nullptr && ggml_backend_buffer_is_meta(cold->buffer)) {
+                res->src[LLAMA_EXPS_COLD_SRC] = cold;
+            }
         }
     }
 

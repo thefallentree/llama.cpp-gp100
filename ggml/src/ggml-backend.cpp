@@ -12,6 +12,8 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "fn-prof.h"
+FN_PROF_DECL("sched");
 
 #include <assert.h>
 #include <limits.h>
@@ -1871,21 +1873,73 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // copy the input tensors to the split backend
-        // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+        FN_PROF_T(t_in0);
+        // The inputs from the user first: they must be copied immediately, to prevent the user overwriting the data
+        // before the copy is done. The backend is synchronized once, the copies are queued on it where it can take
+        // them asynchronously, and it is synchronized again after the last one. Doing them before the inputs that
+        // other backends compute also keeps these synchronizations from waiting for those backends.
+        {
+            bool synced  = false;
+            bool pending = false;
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                struct ggml_tensor * input = split->inputs[input_id];
+                if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    continue;
+                }
+                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                if (!synced) {
+                    FN_PROF_T(t_s0);
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    synced = true;
+                    if (i > 0) { FN_PROF_ADD("sched.in.first_sync", t_s0); }
+                }
+                FN_PROF_T(t_c0);
+                if (split_backend->iface.set_tensor_async != NULL && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+                        input->data != NULL && ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy)) {
+                    split_backend->iface.set_tensor_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    pending = true;
+                    if (i > 0) { FN_PROF_ADD(ggml_nbytes(input) <= 4096 ? "sched.in.copy_async(<=4K)" : "sched.in.copy_async(>4K)", t_c0); }
+                } else {
+                    if (pending) {
+                        ggml_backend_synchronize(split_backend);
+                        pending = false;
+                    }
+                    ggml_backend_tensor_copy(input, input_cpy);
+                    if (i > 0) { FN_PROF_ADD("sched.in.copy_sync", t_c0); }
+                }
             }
-        }
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+            if (pending) {
+                FN_PROF_T(t_f0);
+                ggml_backend_synchronize(split_backend);
+                if (i > 0) { FN_PROF_ADD("sched.in.final_sync", t_f0); }
             }
         }
 
+        // the other inputs: the weights in host memory last, so that the copy callback can read the other inputs of the split
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input = split->inputs[input_id];
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && !ggml_backend_sched_is_host_weight(input)) {
+                ggml_backend_sched_copy_input(sched, split, input);
+            }
+        }
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input = split->inputs[input_id];
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && ggml_backend_sched_is_host_weight(input)) {
+                ggml_backend_sched_copy_input(sched, split, input);
+            }
+        }
+
+        static const char * fn_in_names[4] = { "sched.inputs.s0", "sched.inputs.s1", "sched.inputs.s2", "sched.inputs.s3+" };
+        static const char * fn_gc_names[4] = { "sched.gc.s0", "sched.gc.s1", "sched.gc.s2", "sched.gc.s3+" };
+        FN_PROF_ADD(fn_in_names[split_id < 3 ? split_id : 3], t_in0);
+        FN_PROF_T(t_gc0);
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            FN_PROF_ADD(fn_gc_names[split_id < 3 ? split_id : 3], t_gc0);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }

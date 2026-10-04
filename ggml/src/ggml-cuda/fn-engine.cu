@@ -2,23 +2,67 @@
 #include "convert.cuh"
 
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <unordered_map>
 
 #define FN_QK 32 // weights per Q8_0 block
 
 // Geometry by row width (TPR = columns/16): rows of up to 2560 columns in blocks of 160 threads, several rows per
-// block when they are narrower; 6144 and 10240 columns in blocks of 384 and 640 threads.
+// block when they are narrower; 3072 and 6144 columns in blocks of 192 and 384 threads. Rows of 10240 columns are
+// read as four parts of 2560 (S = 4, see fn_dense_p8).
 // R rows per tile: 8, or 4 where 8 rows of T tokens exceed the registers, the 48 KB of shared memory of a block or
 // the R*T/2 gathering threads a row has. BPS: blocks per SM; minBlocksPerMultiprocessor caps the registers so that
 // nsm*BPS blocks are resident together, and is chosen so that no instantiation spills under that cap
 // (cuobjdump --dump-resource-usage).
-static bool fn_dense_geometry(const int tpr) {
-    return tpr == 20 || tpr == 40 || tpr == 160 || tpr == 384 || tpr == 640;
+//                     T  R20 B20 R40 B40 R160 B160 R192 B192 R384 B384
+#define FN_DENSE_TABLE(X)                                   \
+                    X(1,  8,  7,  8,  7,  8,   8,   8,   6,   8,   3)  \
+                    X(2,  8,  6,  8,  6,  8,   6,   8,   5,   8,   2)  \
+                    X(3,  8,  6,  8,  6,  8,   6,   8,   5,   8,   2)  \
+                    X(4,  8,  4,  8,  4,  8,   4,   8,   3,   8,   2)  \
+                    X(5,  8,  4,  8,  4,  8,   4,   8,   3,   8,   1)  \
+                    X(6,  4,  4,  8,  3,  8,   3,   8,   2,   4,   1)  \
+                    X(7,  4,  3,  4,  3,  4,   3,   4,   2,   4,   1)  \
+                    X(8,  4,  3,  4,  3,  4,   3,   4,   2,   4,   1)
+
+struct fn_dense_geom {
+    int tpr; // threads per row (of a part)
+    int s;   // parts of a row
+    int g;   // row groups of a block
+    int r;   // rows per group and tile
+    int bps;
+};
+
+// the row widths the mat-vec is instantiated for
+static bool fn_dense_geometry(const int64_t cols, fn_dense_geom * gm = nullptr, const int nt = 1) {
+    const int s   = cols/16 == 640 ? 4 : 1;
+    const int tpr = (int) (cols/(16*s));
+    if (cols % (16*s) != 0 || (tpr != 20 && tpr != 40 && tpr != 160 && tpr != 192 && tpr != 384)) {
+        return false;
+    }
+    if (gm != nullptr) {
+        gm->tpr = tpr;
+        gm->s   = s;
+        gm->g   = tpr == 20 ? 8 : tpr == 40 ? 4 : 1;
+        switch (nt) {
+#define FN_ROW(N, R20, B20, R40, B40, R160, B160, R192, B192, R384, B384)                                                  \
+            case N:                                                                                                   \
+                gm->r   = tpr == 20 ? R20 : tpr == 40 ? R40 : tpr == 160 ? R160 : tpr == 192 ? R192 : R384;           \
+                gm->bps = tpr == 20 ? B20 : tpr == 40 ? B40 : tpr == 160 ? B160 : tpr == 192 ? B192 : B384;           \
+                break;
+            FN_DENSE_TABLE(FN_ROW)
+#undef FN_ROW
+            default:
+                return false;
+        }
+    }
+    return true;
 }
 
-static int fn_dense_tile_rows(const int tpr) { // the largest tile, rows must be a multiple of it
-    return tpr == 20 ? 64 : tpr == 40 ? 32 : 8;
+// the largest tile of a row width: the rows of a matrix must be a multiple of it
+static int fn_dense_tile_rows(const int64_t cols) {
+    return cols == 320 ? 64 : cols == 640 ? 32 : 8;
 }
 
 
@@ -77,12 +121,23 @@ void ggml_cuda_fn_planes_release(const void * base, const size_t size) {
 // ---------------------------------------------------------------------------------------------------------------
 // planar weights: the repack
 
+// The repack works in the tensor's own memory with a small temporary: the tensors of a model that fills the device
+// leave no room for a copy of the largest of them.
+
+// the block scales of `src` (Q8_0 blocks) to `d`, one thread per block
+static __global__ void fn_p8_scales(const char * __restrict__ src, const int64_t nblk, half * __restrict__ d) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < nblk) {
+        d[i] = *(const half *) (src + i*(FN_QK + 2));
+    }
+}
+
 // the largest block scale of each row; one warp per row
-static __global__ void fn_p8_rowmax(const char * __restrict__ src, const int nb, float * __restrict__ rowscale) {
-    const char * row = src + (size_t) blockIdx.x*nb*(FN_QK + 2);
+static __global__ void fn_p8_rowmax(const half * __restrict__ d, const int nb, float * __restrict__ rowscale) {
+    const half * row = d + (size_t) blockIdx.x*nb;
     float m = 0.0f;
     for (int b = threadIdx.x; b < nb; b += WARP_SIZE) {
-        m = fmaxf(m, fabsf(__half2float(*(const half *) (row + (size_t) b*(FN_QK + 2)))));
+        m = fmaxf(m, fabsf(__half2float(row[b])));
     }
 #pragma unroll
     for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
@@ -93,24 +148,29 @@ static __global__ void fn_p8_rowmax(const char * __restrict__ src, const int nb,
     }
 }
 
-// one thread per Q8_0 block of `src` (a copy of the tensor): its quants go to the code plane of `dst` (the tensor's
-// own memory), its scale, relative to the row's, to the scale plane behind it
-static __global__ void fn_p8_repack(const char * __restrict__ src, const int nb, const int64_t nrows,
-                                    const float * __restrict__ rowscale, char * __restrict__ dst) {
+// one thread per Q8_0 block of `src` (a copy of n blocks of the tensor): its quants go to the code plane
+static __global__ void fn_p8_repack(const char * __restrict__ src, const int64_t n, char * __restrict__ dst) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= nrows*nb) {
+    if (i >= n) {
         return;
     }
-    const char *  blk = src + i*(FN_QK + 2);
-    const float   d   = __half2float(*(const half *) blk);
-    const float   rs  = rowscale[i / nb];
-    const uint16_t * q  = (const uint16_t *) (blk + 2); // the blocks are 2-byte aligned
+    const uint16_t * q   = (const uint16_t *) (src + i*(FN_QK + 2) + 2); // the blocks are 2-byte aligned
     uint32_t *       out = (uint32_t *) (dst + i*FN_QK);
 #pragma unroll
     for (int k = 0; k < FN_QK/4; ++k) {
         out[k] = ((uint32_t) q[2*k] | ((uint32_t) q[2*k + 1] << 16)) ^ 0x80808080u;
     }
-    ((half *) (dst + nrows*nb*FN_QK))[i] = __float2half(rs > 0.0f ? d/rs : 0.0f);
+}
+
+// the scale plane: the block scales relative to their row's
+static __global__ void fn_p8_repack_scales(const half * __restrict__ d, const int nb, const int64_t nblk,
+                                           const float * __restrict__ rowscale, half * __restrict__ dst) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nblk) {
+        return;
+    }
+    const float rs = rowscale[i / nb];
+    dst[i] = __float2half(rs > 0.0f ? __half2float(d[i])/rs : 0.0f);
 }
 
 static bool fn_planar_eligible(const ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
@@ -118,16 +178,17 @@ static bool fn_planar_eligible(const ggml_backend_cuda_context & ctx, const ggml
         return false;
     }
     const ggml_tensor * w = node->src[0];
+    // only weights in this device's own memory (not host memory, not the tensors of a tensor-split meta device)
     if (w->type != GGML_TYPE_Q8_0 || w->data == nullptr || w->buffer == nullptr || w->view_src != nullptr ||
         ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-        ggml_backend_buffer_is_host(w->buffer) || !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1) {
+        ggml_backend_buffer_get_type(w->buffer) != ggml_backend_cuda_buffer_type(ctx.device) ||
+        !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1) {
         return false;
     }
     const int64_t cols = w->ne[0];
     const int64_t rows = w->ne[1];
     // the row widths and tile heights the mat-vec is instantiated for
-    if (cols % FN_QK != 0 || !fn_dense_geometry((int) (cols/16)) || rows % fn_dense_tile_rows((int) (cols/16)) != 0 ||
-        rows*cols >= ((int64_t) 1 << 31)) {
+    if (cols % FN_QK != 0 || !fn_dense_geometry(cols) || rows % fn_dense_tile_rows(cols) != 0 || rows*cols >= ((int64_t) 1 << 31)) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
@@ -164,16 +225,27 @@ void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph *
 
         fn_plane_entry e;
         e.device = ctx.device;
-        char * tmp = nullptr;
+        const int64_t nblk  = rows*nb;
+        const int64_t chunk = std::min<int64_t>(nblk, 1 << 19); // blocks per pass
+        char * tmp  = nullptr;
+        half * dtmp = nullptr;
         CUDA_CHECK(cudaMalloc((void **) &e.plane.rowscale, rows*sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **) &tmp, nbytes));
-        CUDA_CHECK(cudaMemcpyAsync(tmp, w->data, nbytes, cudaMemcpyDeviceToDevice, stream));
-        fn_p8_rowmax<<<(unsigned) rows, WARP_SIZE, 0, stream>>>(tmp, nb, e.plane.rowscale);
-        const int64_t nblk = rows*nb;
-        fn_p8_repack<<<(unsigned) ((nblk + 255)/256), 256, 0, stream>>>(tmp, nb, rows, e.plane.rowscale, (char *) w->data);
+        CUDA_CHECK(cudaMalloc((void **) &dtmp, nblk*sizeof(half)));
+        CUDA_CHECK(cudaMalloc((void **) &tmp, chunk*(FN_QK + 2)));
+        fn_p8_scales<<<(unsigned) ((nblk + 255)/256), 256, 0, stream>>>((const char *) w->data, nblk, dtmp);
+        fn_p8_rowmax<<<(unsigned) rows, WARP_SIZE, 0, stream>>>(dtmp, nb, e.plane.rowscale);
+        // the codes of a pass land on blocks that earlier passes consumed or that are in the copy
+        for (int64_t b0 = 0; b0 < nblk; b0 += chunk) {
+            const int64_t n = std::min(chunk, nblk - b0);
+            CUDA_CHECK(cudaMemcpyAsync(tmp, (const char *) w->data + b0*(FN_QK + 2), n*(FN_QK + 2), cudaMemcpyDeviceToDevice, stream));
+            fn_p8_repack<<<(unsigned) ((n + 255)/256), 256, 0, stream>>>(tmp, n, (char *) w->data + b0*FN_QK);
+        }
+        fn_p8_repack_scales<<<(unsigned) ((nblk + 255)/256), 256, 0, stream>>>(dtmp, nb, nblk, e.plane.rowscale,
+                                                                               (half *) ((char *) w->data + nblk*FN_QK));
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaFree(tmp));
+        CUDA_CHECK(cudaFree(dtmp));
 
         std::lock_guard<std::mutex> lock(g_fn_mutex);
         g_fn_planes[w->data] = e;
@@ -237,7 +309,11 @@ void ggml_cuda_fn_dequantize(const ggml_tensor * src0, void * dst, const ggml_ty
 // activations: fp32 -> fp16, one scale per token
 //
 // X = x*gain/amax, with gain = 400/n: a row sum of n products of weights up to 127 then stays below 50.8K, inside
-// fp16, whatever the values. One block per token.
+// fp16, whatever the values. amax is the largest magnitude of the token's vector, or any bound of it: the values
+// are floating point, a loose bound costs no precision.
+// A vector is converted once, by the kernel that produces it where that kernel sees the whole vector (the norm of
+// the hyper-connection read) or knows a bound (its gated sum), otherwise by fn_act_h16. Converting in the mat-vec
+// itself costs more than it saves: each of its blocks would convert the whole vector again.
 #define FN_ACT_TPB 256
 
 static __global__ void fn_act_h16(const float * __restrict__ x, const int64_t stride_t, const int n, const float gain,
@@ -275,6 +351,74 @@ static float fn_gain(const int64_t n) {
     return 400.0f/(float) n;
 }
 
+#ifndef FN_STANDALONE
+
+// The fp16 activations of the vectors that mat-vecs read, keyed by the tensor (ggml_backend_cuda_context::fn_act).
+// A slot is [FN_MAX_T*n halves][FN_MAX_T floats]. Slots are an optimization only: a mat-vec that finds none converts
+// its input with fn_act_h16.
+typedef ggml_backend_cuda_context::fn_act_slot fn_act_slot;
+
+static half * fn_act_X(const fn_act_slot & s) {
+    return (half *) s.mem;
+}
+
+static float * fn_act_xs(const fn_act_slot & s) {
+    return (float *) (s.mem + (size_t) FN_MAX_T*s.n*sizeof(half));
+}
+
+static fn_act_slot * fn_act_find(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const int n, const int nt) {
+    for (auto & s : ctx.fn_act) {
+        if (s.mem != nullptr && s.key == key && s.n == n && s.nt == nt) {
+            s.last_use = ++ctx.fn_act_clock;
+            return &s;
+        }
+    }
+    return nullptr;
+}
+
+// the least recently used slot, for the producer of key's vector to fill; full: the activations will be there
+// when the producer has run, otherwise only the scales (the activations follow, see fn_hc_up)
+static fn_act_slot & fn_act_put(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const int n, const int nt, const bool full) {
+    fn_act_slot * s = &ctx.fn_act[0];
+    for (auto & c : ctx.fn_act) {
+        if (c.key == key) {
+            s = &c;
+            break;
+        }
+        if (c.last_use < s->last_use) {
+            s = &c;
+        }
+    }
+    const size_t need = (size_t) FN_MAX_T*n*sizeof(half) + FN_MAX_T*sizeof(float);
+    if (need > s->cap) {
+        ctx.retire_mem(s->mem, s->cap);
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMalloc((void **) &s->mem, need));
+        s->cap = need;
+    }
+    s->key      = key;
+    s->n        = n;
+    s->nt       = nt;
+    s->full     = full;
+    s->last_use = ++ctx.fn_act_clock;
+    return *s;
+}
+
+// the activations of src1 = nt vectors of n floats at x, stride_t apart
+static const fn_act_slot & fn_act_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const float * x,
+                                      const int64_t stride_t, const int n, const int nt) {
+    fn_act_slot * f = fn_act_find(ctx, src1, n, nt);
+    if (f != nullptr && f->full) {
+        return *f;
+    }
+    fn_act_slot & s = fn_act_put(ctx, src1, n, nt, true);
+    fn_act_h16<<<nt, FN_ACT_TPB, 0, ctx.stream()>>>(x, stride_t, n, fn_gain(n), fn_act_X(s), fn_act_xs(s));
+    CUDA_CHECK(cudaGetLastError());
+    return s;
+}
+
+#endif // FN_STANDALONE
+
 // ---------------------------------------------------------------------------------------------------------------
 // the dense mat-vec
 
@@ -293,12 +437,14 @@ static __device__ __forceinline__ void fn_p8_decode(const uint4 v, const half2 m
     w[7] = __hsub2(fn_h2(__byte_perm(v.w, 0x64646464, 0x4342)), magic);
 }
 
-// the 16 columns of one thread for T tokens, as 8 half2 each
+// The 16 columns of one thread for T tokens, as 8 half2 each; the tokens are xstride half2 apart. They are loaded
+// as words: built from floats in registers, the compiler keeps the two halves of a pair apart and packs them again
+// at every use, which takes twice the registers.
 template <int T>
-static __device__ __forceinline__ void fn_load_act(const half2 * __restrict__ X, const int tpr, const int k, half2 a[T][8]) {
+static __device__ __forceinline__ void fn_load_act(const half2 * __restrict__ X, const int xstride, const int k, half2 a[T][8]) {
 #pragma unroll
     for (int t = 0; t < T; ++t) {
-        const int4 * ap = (const int4 *) (X + ((int64_t) t*tpr + k)*8);
+        const int4 * ap = (const int4 *) (X + (int64_t) t*xstride + k*8);
         const int4 a0 = ap[0];
         const int4 a1 = ap[1];
         a[t][0] = fn_h2(a0.x); a[t][1] = fn_h2(a0.y); a[t][2] = fn_h2(a0.z); a[t][3] = fn_h2(a0.w);
@@ -322,19 +468,33 @@ static __device__ __forceinline__ void fn_dot16(const uint4 v, const half d, con
     }
 }
 
-// the sum of the TPR partial pairs of one row
-template <int TPR>
-static __device__ __forceinline__ float2 fn_gather(const int * __restrict__ pp) {
+// The sum of the n partial pairs of one row (n a multiple of 4). A loop: a few threads of the block run this while
+// the others wait, and unrolled it is kilobytes of code that an SM fetches on every launch of the kernel (the fetch
+// of code that only a warp or two execute is not hidden behind other warps: about 0.3 us per KB).
+static __device__ __forceinline__ float2 fn_gather(const int * __restrict__ pp, const int n) {
     half2 c[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         c[j] = fn_h2(pp[j]);
     }
+#pragma unroll 1
+    for (int j = 4; j < n; j += 4) {
 #pragma unroll
-    for (int j = 4; j < TPR; ++j) {
-        c[j % 4] = __hadd2(c[j % 4], fn_h2(pp[j]));
+        for (int q = 0; q < 4; ++q) {
+            c[q] = __hadd2(c[q], fn_h2(pp[j + q]));
+        }
     }
     return __half22float2(__hadd2(__hadd2(c[0], c[1]), __hadd2(c[2], c[3])));
+}
+
+// the sum of a few partial pairs
+static __device__ __forceinline__ float2 fn_gather_few(const int * __restrict__ pp, const int n) {
+    half2 c = fn_h2(pp[0]);
+#pragma unroll
+    for (int j = 1; j < n; ++j) {
+        c = __hadd2(c, fn_h2(pp[j]));
+    }
+    return __half22float2(c);
 }
 
 #define FN_EPI_NONE 0
@@ -348,29 +508,71 @@ static __device__ __forceinline__ float fn_epilogue(const float y, const int epi
     return y;
 }
 
+// A launch computes up to FN_MAX_SEG mat-vecs of one geometry (segments), e.g. the projections that read the same
+// vector: a launch has a fixed cost of several microseconds (its code and the activations reach every SM again),
+// more than the mat-vec of a small matrix takes. Each block serves one segment.
+#define FN_MAX_SEG 4
+
+struct fn_dense_seg {
+    const uint4 * W;          // the codes of the segment's part of the first row
+    const half *  D;          // the block scales, likewise
+    const float * rowscale;
+    const half2 * X;          // the activations of the tokens, xstride half2 apart
+    const float * xscale;     // [T]
+    float *       dst;        // [T][dst_stride]
+    int           xstride;
+    int           dst_stride;
+    int           ntiles;
+    int           block_end;  // the segment's blocks: from the block_end of the segment before to this one
+};
+
+struct fn_dense_job {
+    fn_dense_seg seg[FN_MAX_SEG];
+};
+
 // y[t][row] = sum_c W[row][c] x[t][c], for T tokens.
 //   block: G rows x TPR threads; thread (g, k) owns columns [16k, 16k + 16) of the rows g, g + G, ... of a tile
-//   tile:  G*R rows; the block loops over the tiles blockIdx, blockIdx + grid, ...
+//   tile:  G*R rows; block b of a segment's n blocks loops over its tiles b, b + n, ...
+//   S:     the rows of W are S parts of 16*TPR columns wide and the segment is one of the parts (S = 1: the row)
 // A thread's R*T partial sums go to shared memory two per word; thread (g, p) then sums pair p over row g's threads.
 // The geometry is compile-time: with it as kernel arguments the index arithmetic (XMAD chains for every load and
 // store) doubled the instruction count and the kernel ran at half the speed.
-template <int T, int R, int TPR, int G, int BPS>
+template <int T, int R, int TPR, int G, int BPS, int S>
 static __global__ void __launch_bounds__(G*TPR, BPS)
-fn_dense_p8(const uint4 * __restrict__ W, const half * __restrict__ D, const float * __restrict__ rowscale,
-            const half2 * __restrict__ X, const float * __restrict__ xscale,
-            float * __restrict__ dst, const int dst_stride, const int nrows,
-            const int epi, const float es, const float eb) {
+fn_dense_p8(const fn_dense_job job) {
 #if defined(FP16_AVAILABLE)
-    constexpr int NT  = G*TPR;
-    constexpr int NPG = R*T/2;
-    __shared__ int s_part[NPG][NT];
+    constexpr int  NT   = G*TPR;
+    constexpr int  NPG  = R*T/2;
+    // A row group of whole warps: the warps reduce their partial sums with shuffles and thread (0, p) sums pair p
+    // over the warps. Otherwise the threads store their partial sums and thread (g, p) sums pair p over the threads
+    // of row group g.
+    constexpr bool WRED = G == 1 && TPR % WARP_SIZE == 0;
+    constexpr int  NSP  = WRED ? TPR/WARP_SIZE : NT;
+    // The rows are an odd number of words long: shared memory has 32 four-byte banks, and the gathering threads of
+    // a warp, which read the same position of consecutive rows, would otherwise all hit one bank.
+    __shared__ int s_part[NPG][NSP | 1];
     const int tid = threadIdx.x;
     const int g   = tid/TPR;
     const int k   = tid - g*TPR;
     const half2 magic = __float2half2_rn(1152.0f);
 
+    int si = 0, b0 = 0;
+#pragma unroll
+    for (int j = 0; j + 1 < FN_MAX_SEG; ++j) {
+        if ((int) blockIdx.x >= job.seg[j].block_end) {
+            si = j + 1;
+            b0 = job.seg[j].block_end;
+        }
+    }
+    const int nb     = job.seg[si].block_end - b0;
+    const int ntiles = job.seg[si].ntiles;
+    // The segment's pointers are read from the kernel arguments where they are used, like the arguments of a kernel
+    // without segments. Its index is read from memory for that: the pointers of a segment the compiler knows are
+    // loop invariants, which it keeps in registers that the tile loop does not have.
+    volatile int si_mem = si;
+
     half2 a[T][8];
-    fn_load_act<T>(X, TPR, k, a);
+    fn_load_act<T>(job.seg[si].X, job.seg[si].xstride, k, a);
 
     // the threads that gather: pair p of row group gg, i.e. the values (2p, 2p + 1) = (row step, token)
     const bool gather = tid < G*NPG;
@@ -382,233 +584,233 @@ fn_dense_p8(const uint4 * __restrict__ W, const half * __restrict__ D, const flo
     const int  vt1    = (2*p + 1) % T;
     float xs0 = 0.0f, xs1 = 0.0f;
     if (gather) {
-        xs0 = xscale[vt0];
-        xs1 = xscale[vt1];
+        xs0 = job.seg[si].xscale[vt0];
+        xs1 = job.seg[si].xscale[vt1];
     }
 
-    const int ntiles = nrows/(G*R);
-    for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+    for (int tile = blockIdx.x - b0; tile < ntiles; tile += nb) {
+        const fn_dense_seg & sg = job.seg[si_mem];
         // row (r, g) of the tile is tile*G*R + r*G + g: consecutive rows for consecutive g
-        const uint4 * wr = W + (size_t) tile*(R*NT) + tid;
-        const half *  dr = D + (size_t) tile*(R*NT/2) + g*(TPR/2) + (k >> 1);
+        const uint4 * wr = sg.W + (size_t) tile*(R*NT*S) + g*(TPR*S) + k;
+        const half *  dr = sg.D + (size_t) tile*(R*NT*S/2) + g*(TPR*S/2) + (k >> 1);
         uint4 v[R];
         half  d[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            v[r] = __ldg(wr + r*NT);
-            d[r] = dr[r*(NT/2)];
+            v[r] = __ldg(wr + r*(NT*S));
+            d[r] = dr[r*(NT*S/2)];
         }
         // the row scales are loaded with the weights: a load issued by the gathering threads after the barrier
         // would make the whole block wait for it
         float rs0 = 0.0f, rs1 = 0.0f;
         if (gather) {
-            rs0 = rowscale[tile*(G*R) + vr0];
-            rs1 = rowscale[tile*(G*R) + vr1];
+            rs0 = sg.rowscale[tile*(G*R) + vr0];
+            rs1 = sg.rowscale[tile*(G*R) + vr1];
         }
-        half s[R*T];
+        // in two halves of the rows: the partial sums of all rows next to the words of the rows still to come would
+        // not fit the registers
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            fn_dot16<T>(v[r], d[r], magic, a, s + r*T);
-        }
+        for (int h = 0; h < 2; ++h) {
+            half s[(R/2)*T];
 #pragma unroll
-        for (int p = 0; p < NPG; ++p) {
-            s_part[p][tid] = fn_i2(__halves2half2(s[2*p], s[2*p + 1]));
+            for (int r = 0; r < R/2; ++r) {
+                fn_dot16<T>(v[h*(R/2) + r], d[h*(R/2) + r], magic, a, s + r*T);
+            }
+            int pr[NPG/2];
+#pragma unroll
+            for (int q = 0; q < NPG/2; ++q) {
+                pr[q] = fn_i2(__halves2half2(s[2*q], s[2*q + 1]));
+            }
+            if (WRED) {
+                // A serial sum over the row's threads would be several hundred instructions of one warp, which has
+                // to compete for them with the warps of the other blocks of the SM while the rest of its block waits.
+#pragma unroll
+                for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+#pragma unroll
+                    for (int q = 0; q < NPG/2; ++q) {
+                        pr[q] = fn_i2(__hadd2(fn_h2(pr[q]), fn_h2(__shfl_xor_sync(0xffffffff, pr[q], off))));
+                    }
+                }
+                if (tid % WARP_SIZE == 0) {
+#pragma unroll
+                    for (int q = 0; q < NPG/2; ++q) {
+                        s_part[h*(NPG/2) + q][tid/WARP_SIZE] = pr[q];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int q = 0; q < NPG/2; ++q) {
+                    s_part[h*(NPG/2) + q][tid] = pr[q];
+                }
+            }
         }
         __syncthreads();
         if (gather) {
-            const float2 f = fn_gather<TPR>(&s_part[p][gg*TPR]);
-            dst[vt0*dst_stride + tile*(G*R) + vr0] = fn_epilogue(f.x*rs0*xs0, epi, es, eb);
-            dst[vt1*dst_stride + tile*(G*R) + vr1] = fn_epilogue(f.y*rs1*xs1, epi, es, eb);
+            const fn_dense_seg & so = job.seg[si_mem];
+            const float2 f = WRED ? fn_gather_few(&s_part[p][0], NSP) : fn_gather(&s_part[p][gg*TPR], TPR);
+            so.dst[vt0*so.dst_stride + tile*(G*R) + vr0] = f.x*rs0*xs0;
+            so.dst[vt1*so.dst_stride + tile*(G*R) + vr1] = f.y*rs1*xs1;
         }
         __syncthreads();
     }
 #else
-    GGML_UNUSED_VARS(W, D, rowscale, X, xscale, dst, dst_stride, nrows, epi, es, eb);
+    GGML_UNUSED_VARS(job);
     NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
 }
 
-template <int T, int R, int TPR, int G, int BPS>
-static void fn_dense_launch_t(const uint4 * W, const half * D, const float * rowscale, const half2 * X, const float * xscale,
-                              float * dst, const int dst_stride, const int nrows, const int nsm,
-                              const int epi, const float es, const float eb, cudaStream_t stream) {
-    const int ntiles = nrows/(G*R);
-    fn_dense_p8<T, R, TPR, G, BPS><<<std::min(ntiles, nsm*BPS), G*TPR, 0, stream>>>(
-        W, D, rowscale, X, xscale, dst, dst_stride, nrows, epi, es, eb);
-}
-
-static void fn_dense_launch(const int nt, const uint4 * W, const half * D, const float * rowscale, const half2 * X,
-                            const float * xscale, float * dst, const int dst_stride, const int nrows, const int tpr,
-                            const int nsm, const int epi, const float es, const float eb, cudaStream_t stream) {
-    GGML_ASSERT(fn_dense_geometry(tpr) && nrows % fn_dense_tile_rows(tpr) == 0);
-#define FN_ARGS W, D, rowscale, X, xscale, dst, dst_stride, nrows, nsm, epi, es, eb, stream
-#define FN_CASE(N, R20, B20, R40, B40, R160, B160, R384, B384, R640)                       \
-        case N:                                                                              \
-            switch (tpr) {                                                                   \
-                case  20: fn_dense_launch_t<N, R20,   20, 8, B20 >(FN_ARGS); break;          \
-                case  40: fn_dense_launch_t<N, R40,   40, 4, B40 >(FN_ARGS); break;          \
-                case 160: fn_dense_launch_t<N, R160, 160, 1, B160>(FN_ARGS); break;          \
-                case 384: fn_dense_launch_t<N, R384, 384, 1, B384>(FN_ARGS); break;          \
-                default:  fn_dense_launch_t<N, R640, 640, 1, 1   >(FN_ARGS); break;          \
-            }                                                                                \
-            break;
+static void fn_dense_launch(const int nt, const fn_dense_geom & gm, const fn_dense_job & job, const int grid, cudaStream_t stream) {
+    GGML_ASSERT(gm.s == 1 || gm.tpr == 160);
     switch (nt) {
-        FN_CASE(1, 8, 8, 8, 8, 8, 8, 8, 3, 8)
-        FN_CASE(2, 8, 6, 8, 6, 8, 6, 8, 2, 8)
-        FN_CASE(3, 8, 6, 8, 6, 8, 6, 8, 2, 8)
-        FN_CASE(4, 8, 4, 8, 4, 8, 4, 8, 2, 8)
-        FN_CASE(5, 8, 4, 8, 4, 8, 4, 8, 2, 4)
-        FN_CASE(6, 4, 4, 8, 3, 8, 3, 4, 1, 4)
-        FN_CASE(7, 4, 3, 4, 3, 4, 3, 4, 1, 4)
-        FN_CASE(8, 4, 3, 4, 3, 4, 3, 4, 1, 4)
+#define FN_ROW(N, R20, B20, R40, B40, R160, B160, R192, B192, R384, B384)                                                  \
+        case N:                                                                                                       \
+            switch (gm.tpr) {                                                                                         \
+                case  20: fn_dense_p8<N, R20,   20, 8, B20,  1><<<grid, 8*20, 0, stream>>>(job); break;               \
+                case  40: fn_dense_p8<N, R40,   40, 4, B40,  1><<<grid, 4*40, 0, stream>>>(job); break;               \
+                case 160:                                                                                             \
+                    if (gm.s == 1) {                                                                                  \
+                        fn_dense_p8<N, R160, 160, 1, B160, 1><<<grid, 160, 0, stream>>>(job);                         \
+                    } else {                                                                                          \
+                        fn_dense_p8<N, R160, 160, 1, B160, 4><<<grid, 160, 0, stream>>>(job);                         \
+                    }                                                                                                 \
+                    break;                                                                                            \
+                case 192: fn_dense_p8<N, R192, 192, 1, B192, 1><<<grid, 192, 0, stream>>>(job); break;                \
+                default:  fn_dense_p8<N, R384, 384, 1, B384, 1><<<grid, 384, 0, stream>>>(job); break;                \
+            }                                                                                                         \
+            break;
+        FN_DENSE_TABLE(FN_ROW)
+#undef FN_ROW
         default:
             GGML_ABORT("fatal error");
     }
-#undef FN_CASE
-#undef FN_ARGS
     CUDA_CHECK(cudaGetLastError());
 }
 
-#ifndef FN_STANDALONE
+// one mat-vec of a launch
+struct fn_dense_part {
+    const char *  w;          // planar weights [rows x cols]
+    int64_t       rows, cols;
+    const float * rowscale;
+    int           part;       // which of the row's parts (S > 1)
+    const half *  X;          // activations: [T][xstride halves]
+    int           xstride;
+    const float * xscale;
+    float *       dst;
+    int           dst_stride;
+};
 
-// ---------------------------------------------------------------------------------------------------------------
-// MUL_MAT
-
-bool ggml_cuda_fn_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    return ggml_cuda_fn_planar(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src1->ne[1] <= 4*FN_MAX_T && src1->ne[2] == 1 && src1->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
-           src1->nb[0] == sizeof(float) && src1->ne[0] == src0->ne[0] && ggml_is_contiguous(dst);
+// n mat-vecs of the same row width in one launch
+static void fn_dense(const int nt, const fn_dense_part * parts, const int n, const int nsm, cudaStream_t stream) {
+    GGML_ASSERT(n >= 1 && n <= FN_MAX_SEG);
+    fn_dense_geom gm;
+    GGML_ASSERT(fn_dense_geometry(parts[0].cols, &gm, nt));
+    const int tile_rows = gm.g*gm.r;
+    int ntiles[FN_MAX_SEG];
+    int total = 0;
+    for (int i = 0; i < n; ++i) {
+        GGML_ASSERT(parts[i].cols == parts[0].cols && parts[i].rows % tile_rows == 0 && parts[i].part < gm.s);
+        ntiles[i] = (int) (parts[i].rows/tile_rows);
+        total    += ntiles[i];
+    }
+    // the blocks of a segment by its share of the tiles, at least one
+#ifdef FN_STANDALONE
+    extern int g_fn_grid_max;
+    const int grid = std::max(n, std::min(total, g_fn_grid_max > 0 ? g_fn_grid_max : nsm*gm.bps));
+#else
+    const int grid = std::max(n, std::min(total, nsm*gm.bps));
+#endif
+    int nb[FN_MAX_SEG];
+    int used = 0;
+    for (int i = 0; i < n; ++i) {
+        nb[i] = std::min(ntiles[i], std::max(1, (int) ((int64_t) grid*ntiles[i]/total)));
+        used += nb[i];
+    }
+    while (used != grid) {
+        // one block more where a block has the most tiles, one less where it has the fewest
+        int best = -1;
+        for (int i = 0; i < n; ++i) {
+            if (used < grid ? nb[i] >= ntiles[i] : nb[i] <= 1) {
+                continue;
+            }
+            if (best < 0 || (used < grid ? (int64_t) ntiles[i]*nb[best] > (int64_t) ntiles[best]*nb[i]
+                                         : (int64_t) ntiles[i]*nb[best] < (int64_t) ntiles[best]*nb[i])) {
+                best = i;
+            }
+        }
+        GGML_ASSERT(best >= 0);
+        nb[best] += used < grid ? 1 : -1;
+        used     += used < grid ? 1 : -1;
+    }
+    fn_dense_job job;
+    int end = 0;
+    for (int i = 0; i < FN_MAX_SEG; ++i) {
+        fn_dense_seg & sg = job.seg[i];
+        if (i >= n) {
+            sg = job.seg[n - 1];
+            sg.ntiles    = 0;
+            sg.block_end = grid;
+            continue;
+        }
+        const fn_dense_part & pt = parts[i];
+        end += nb[i];
+        sg.W          = (const uint4 *) pt.w + (size_t) pt.part*gm.tpr;
+        sg.D          = (const half *) (pt.w + pt.rows*pt.cols) + (size_t) pt.part*(gm.tpr/2);
+        sg.rowscale   = pt.rowscale;
+        sg.X          = (const half2 *) pt.X;
+        sg.xscale     = pt.xscale;
+        sg.dst        = pt.dst;
+        sg.xstride    = pt.xstride/2;
+        sg.dst_stride = pt.dst_stride;
+        sg.ntiles     = ntiles[i];
+        sg.block_end  = end;
+    }
+    fn_dense_launch(nt, gm, job, grid, stream);
 }
 
-// the fp16 activations of src1 (two slots: consecutive mat-vecs mostly read the same vector)
-static const ggml_backend_cuda_context::fn_act_slot & fn_act_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
-                                                                  const float * x, const int64_t stride_t, const int n,
-                                                                  const int nt) {
-    for (auto & s : ctx.fn_act) {
-        if (s.mem != nullptr && s.src1 == src1 && s.data == x && s.n == n && s.nt == nt && s.stride == stride_t) {
-            return s;
-        }
-    }
-    auto & s = ctx.fn_act[ctx.fn_act_next];
-    ctx.fn_act_next ^= 1;
-    const size_t need = (size_t) FN_MAX_T*n*sizeof(half) + FN_MAX_T*sizeof(float);
-    if (need > s.cap) {
-        ctx.retire_mem(s.mem, s.cap);
-        ggml_cuda_set_device(ctx.device);
-        CUDA_CHECK(cudaMalloc((void **) &s.mem, need));
-        s.cap = need;
-    }
-    s.src1   = src1;
-    s.data   = x;
-    s.n      = n;
-    s.nt     = nt;
-    s.stride = stride_t;
-    fn_act_h16<<<nt, FN_ACT_TPB, 0, ctx.stream()>>>(x, stride_t, n, fn_gain(n), (half *) s.mem,
-                                                    (float *) (s.mem + (size_t) FN_MAX_T*n*sizeof(half)));
-    CUDA_CHECK(cudaGetLastError());
-    return s;
-}
-
-void ggml_cuda_fn_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    ggml_cuda_fn_plane plane;
-    GGML_ASSERT(ggml_cuda_fn_planar(src0, &plane));
-    const int     cols = (int) src0->ne[0];
-    const int     rows = (int) src0->ne[1];
-    const int     tpr  = cols/16;
-    const int     nsm  = ggml_cuda_info().devices[ctx.device].nsm;
-    const int64_t s1   = src1->nb[1]/sizeof(float);
-    const int64_t sd   = dst->nb[1]/sizeof(float);
-    const uint4 * W = (const uint4 *) src0->data;
-    const half *  D = (const half *) ((const char *) src0->data + (int64_t) rows*cols);
-
-    for (int64_t c0 = 0; c0 < src1->ne[1]; c0 += FN_MAX_T) {
-        const int     nt = (int) std::min<int64_t>(FN_MAX_T, src1->ne[1] - c0);
-        const float * x  = (const float *) src1->data + c0*s1;
-        const auto &  s  = fn_act_get(ctx, src1, x, s1, cols, nt);
-        fn_dense_launch(nt, W, D, plane.rowscale, (const half2 *) s.mem,
-                        (const float *) (s.mem + (size_t) FN_MAX_T*cols*sizeof(half)),
-                        (float *) dst->data + c0*sd, sd, rows, tpr, nsm, FN_EPI_NONE, 0.0f, 0.0f, ctx.stream());
-    }
-}
-
-#endif // FN_STANDALONE
-
-// ---------------------------------------------------------------------------------------------------------------
-// the hyper-connection read (see hc-mix.cuh for the math), planar weights
-
-#define FN_HC      4   // streams
-#define FN_HC_TPB  512
-
-// One block per token: xn = rms_norm(R)*w_norm per stream (written for the inject mat-vec and the up kernel), and
-// xn as fp16 activations of the down mat-vec.
-static __global__ void fn_hc_norm(const float * __restrict__ R, const int64_t sr_c, const int64_t sr_t,
-                                  const float * __restrict__ wn, const int n_embd, const float eps,
-                                  float * __restrict__ xn, const int64_t sxn_c, const int64_t sxn_t,
-                                  half * __restrict__ X, float * __restrict__ xscale, const float gain) {
-    __shared__ float s_red[FN_HC][FN_HC_TPB/WARP_SIZE];
-    __shared__ float s_max[FN_HC_TPB/WARP_SIZE];
-    const int t    = blockIdx.x;
-    const int warp = threadIdx.x / WARP_SIZE;
-    const float * Rt = R + t*sr_t;
-
-    float ss[FN_HC];
+// out[t][i] = epilogue(sum over the np parts of parts[p][t][i]), one block per token: as floats, and as fp16
+// activations with their scale if X is not null. n <= 2*FN_ACT_TPB.
+static __global__ void fn_sum_parts(const float * __restrict__ parts, const int np, const int n, const int epi, const float es,
+                                    const float eb, float * __restrict__ dst, const int dst_stride, const float gain,
+                                    half * __restrict__ X, float * __restrict__ xscale) {
+    __shared__ float s_red[FN_ACT_TPB/WARP_SIZE];
+    const int t  = blockIdx.x;
+    const int nt = gridDim.x;
+    float v[2] = { 0.0f, 0.0f };
+    float m    = 0.0f;
 #pragma unroll
-    for (int c = 0; c < FN_HC; ++c) {
-        ss[c] = 0.0f;
-        for (int i = 4*threadIdx.x; i < n_embd; i += 4*FN_HC_TPB) {
-            const float4 r = *(const float4 *) (Rt + c*sr_c + i);
-            ss[c] += r.x*r.x + r.y*r.y + r.z*r.z + r.w*r.w;
-        }
-        ss[c] = warp_reduce_sum(ss[c]);
-        if (threadIdx.x % WARP_SIZE == 0) {
-            s_red[c][warp] = ss[c];
+    for (int j = 0; j < 2; ++j) {
+        const int i = threadIdx.x + j*FN_ACT_TPB;
+        if (i < n) {
+            for (int q = 0; q < np; ++q) {
+                v[j] += parts[((int64_t) q*nt + t)*n + i];
+            }
+            v[j] = fn_epilogue(v[j], epi, es, eb);
+            dst[t*dst_stride + i] = v[j];
+            m = fmaxf(m, fabsf(v[j]));
         }
     }
-    __syncthreads();
-    float rs[FN_HC];
-#pragma unroll
-    for (int c = 0; c < FN_HC; ++c) {
-        float sum = 0.0f;
-#pragma unroll
-        for (int w = 0; w < FN_HC_TPB/WARP_SIZE; ++w) {
-            sum += s_red[c][w];
-        }
-        rs[c] = rsqrtf(sum/n_embd + eps);
-    }
-    float m = 0.0f;
-#pragma unroll
-    for (int c = 0; c < FN_HC; ++c) {
-        for (int i = 4*threadIdx.x; i < n_embd; i += 4*FN_HC_TPB) {
-            const float4 r = *(const float4 *) (Rt + c*sr_c + i);
-            const float4 g = *(const float4 *) (wn + (int64_t) c*n_embd + i);
-            const float4 v = make_float4(r.x*g.x*rs[c], r.y*g.y*rs[c], r.z*g.z*rs[c], r.w*g.w*rs[c]);
-            *(float4 *) (xn + t*sxn_t + c*sxn_c + i) = v;
-            m = fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
-        }
+    if (X == nullptr) {
+        return;
     }
 #pragma unroll
     for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
         m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
     }
     if (threadIdx.x % WARP_SIZE == 0) {
-        s_max[warp] = m;
+        s_red[threadIdx.x / WARP_SIZE] = m;
     }
     __syncthreads();
     m = 0.0f;
 #pragma unroll
-    for (int w = 0; w < FN_HC_TPB/WARP_SIZE; ++w) {
-        m = fmaxf(m, s_max[w]);
+    for (int w = 0; w < FN_ACT_TPB/WARP_SIZE; ++w) {
+        m = fmaxf(m, s_red[w]);
     }
-    const float s = m > 0.0f ? gain/m : 0.0f;
-    half * Xt = X + (int64_t) t*FN_HC*n_embd;
+    const float sc = m > 0.0f ? gain/m : 0.0f;
 #pragma unroll
-    for (int c = 0; c < FN_HC; ++c) {
-        for (int i = 4*threadIdx.x; i < n_embd; i += 4*FN_HC_TPB) {
-            const float4 r = *(const float4 *) (Rt + c*sr_c + i);
-            const float4 g = *(const float4 *) (wn + (int64_t) c*n_embd + i);
-            const float  f = rs[c]*s;
-            *(half2 *) (Xt + (int64_t) c*n_embd + i)     = __floats2half2_rn(r.x*g.x*f, r.y*g.y*f);
-            *(half2 *) (Xt + (int64_t) c*n_embd + i + 2) = __floats2half2_rn(r.z*g.z*f, r.w*g.w*f);
+    for (int j = 0; j < 2; ++j) {
+        const int i = threadIdx.x + j*FN_ACT_TPB;
+        if (i < n) {
+            X[(int64_t) t*n + i] = __float2half_rn(v[j]*sc);
         }
     }
     if (threadIdx.x == 0) {
@@ -616,10 +818,413 @@ static __global__ void fn_hc_norm(const float * __restrict__ R, const int64_t sr
     }
 }
 
+#ifndef FN_STANDALONE
+
+// ---------------------------------------------------------------------------------------------------------------
+// MUL_MAT
+
+static fn_dense_part fn_dense_part_of(const ggml_tensor * w, const ggml_cuda_fn_plane & plane, const int part,
+                                      const fn_act_slot & x, float * dst, const int64_t dst_stride) {
+    fn_dense_part pt;
+    pt.w          = (const char *) w->data;
+    pt.rows       = w->ne[1];
+    pt.cols       = w->ne[0];
+    pt.rowscale   = plane.rowscale;
+    pt.part       = part;
+    pt.X          = fn_act_X(x);
+    pt.xstride    = x.n;
+    pt.xscale     = fn_act_xs(x);
+    pt.dst        = dst;
+    pt.dst_stride = (int) dst_stride;
+    return pt;
+}
+
+// The mat-vec of a matrix whose rows are several parts wide: one segment per part, then the sum of their outputs.
+// x: activations of the nt vectors of all columns. Xo, xso (may be null): the output as activations.
+static void fn_dense_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const fn_act_slot & x, const int nt,
+                          const int epi, const float es, const float eb, float * dst, const int64_t dst_stride,
+                          half * Xo, float * xso) {
+    ggml_cuda_fn_plane plane;
+    fn_dense_geom      gm;
+    GGML_ASSERT(ggml_cuda_fn_planar(w, &plane) && fn_dense_geometry(w->ne[0], &gm, nt) && gm.s <= FN_MAX_SEG);
+    const int rows = (int) w->ne[1];
+    GGML_ASSERT(rows <= 2*FN_ACT_TPB && x.n == w->ne[0]);
+    ggml_cuda_pool_alloc<float> parts(ctx.pool(), (size_t) gm.s*nt*rows);
+    fn_dense_part pt[FN_MAX_SEG];
+    for (int c = 0; c < gm.s; ++c) {
+        pt[c]   = fn_dense_part_of(w, plane, c, x, parts.get() + (size_t) c*nt*rows, rows);
+        pt[c].X = fn_act_X(x) + (size_t) c*(x.n/gm.s);
+    }
+    fn_dense(nt, pt, gm.s, ggml_cuda_info().devices[ctx.device].nsm, ctx.stream());
+    fn_sum_parts<<<nt, FN_ACT_TPB, 0, ctx.stream()>>>(parts.get(), gm.s, rows, epi, es, eb, dst, (int) dst_stride,
+                                                     fn_gain(rows), Xo, xso);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_fn_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    fn_dense_geom gm;
+    return ggml_cuda_fn_planar(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src1->ne[1] <= 4*FN_MAX_T && src1->ne[2] == 1 && src1->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+           src1->nb[0] == sizeof(float) && src1->ne[0] == src0->ne[0] && ggml_is_contiguous(dst) &&
+           fn_dense_geometry(src0->ne[0], &gm) && (gm.s == 1 || (src0->ne[1] <= 2*FN_ACT_TPB && src1->ne[1] <= FN_MAX_T));
+}
+
+void ggml_cuda_fn_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_fn_plane plane;
+    fn_dense_geom      gm;
+    GGML_ASSERT(ggml_cuda_fn_planar(src0, &plane) && fn_dense_geometry(src0->ne[0], &gm));
+    const int     cols = (int) src0->ne[0];
+    const int     nsm  = ggml_cuda_info().devices[ctx.device].nsm;
+    const int64_t s1   = src1->nb[1]/sizeof(float);
+    const int64_t sd   = dst->nb[1]/sizeof(float);
+
+    if (src1->ne[1] <= FN_MAX_T) {
+        const int    nt = (int) src1->ne[1];
+        const auto & x  = fn_act_get(ctx, src1, (const float *) src1->data, s1, cols, nt);
+        if (gm.s > 1) {
+            fn_dense_wide(ctx, src0, x, nt, FN_EPI_NONE, 0.0f, 0.0f, (float *) dst->data, sd, nullptr, nullptr);
+            return;
+        }
+        const fn_dense_part pt = fn_dense_part_of(src0, plane, 0, x, (float *) dst->data, sd);
+        fn_dense(nt, &pt, 1, nsm, ctx.stream());
+        return;
+    }
+    // wider batches in passes; their activations are not kept
+    fn_act_slot x;
+    ggml_cuda_pool_alloc<char> xm(ctx.pool(), (size_t) FN_MAX_T*cols*sizeof(half) + FN_MAX_T*sizeof(float));
+    x.mem = xm.get();
+    x.n   = cols;
+    for (int64_t c0 = 0; c0 < src1->ne[1]; c0 += FN_MAX_T) {
+        const int nt = (int) std::min<int64_t>(FN_MAX_T, src1->ne[1] - c0);
+        fn_act_h16<<<nt, FN_ACT_TPB, 0, ctx.stream()>>>((const float *) src1->data + c0*s1, s1, cols, fn_gain(cols), fn_act_X(x), fn_act_xs(x));
+        const fn_dense_part pt = fn_dense_part_of(src0, plane, 0, x, (float *) dst->data + c0*sd, sd);
+        fn_dense(nt, &pt, 1, nsm, ctx.stream());
+    }
+}
+
+// Consecutive MUL_MAT nodes from node i that read the same vector with planar weights of the same row width: they
+// are one launch. Returns their number, 0 if there are less than two.
+int ggml_cuda_fn_mul_mat_run_match(const ggml_cgraph * cgraph, const int i) {
+    if (!ggml_cuda_fn_enabled()) {
+        return 0;
+    }
+    const ggml_tensor * first = cgraph->nodes[i];
+    int n = 0;
+    while (n < FN_MAX_SEG && i + n < cgraph->n_nodes) {
+        const ggml_tensor * node = cgraph->nodes[i + n];
+        fn_dense_geom gm;
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != first->src[1] || node->src[0]->ne[0] != first->src[0]->ne[0] ||
+            node->src[1]->ne[1] > FN_MAX_T || node->flags != first->flags || ggml_is_empty(node) ||
+            !ggml_cuda_fn_mul_mat_supported(node->src[0], node->src[1], node) ||
+            !fn_dense_geometry(node->src[0]->ne[0], &gm) || gm.s != 1) {
+            break;
+        }
+        ++n;
+    }
+    return n >= 2 ? n : 0;
+}
+
+void ggml_cuda_fn_mul_mat_run(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, const int n) {
+    const ggml_tensor * src1 = nodes[0]->src[1];
+    const int    nt = (int) src1->ne[1];
+    const auto & x  = fn_act_get(ctx, src1, (const float *) src1->data, src1->nb[1]/sizeof(float), (int) src1->ne[0], nt);
+    fn_dense_part pt[FN_MAX_SEG];
+    for (int j = 0; j < n; ++j) {
+        ggml_cuda_fn_plane plane;
+        GGML_ASSERT(ggml_cuda_fn_planar(nodes[j]->src[0], &plane));
+        pt[j] = fn_dense_part_of(nodes[j]->src[0], plane, 0, x, (float *) nodes[j]->data, nodes[j]->nb[1]/sizeof(float));
+    }
+    fn_dense(nt, pt, n, ggml_cuda_info().devices[ctx.device].nsm, ctx.stream());
+}
+
+// graph_optimize: the MUL_MAT nodes that read the same vector become neighbours (a later one moves up behind the
+// first: all it needs is that vector), so that ggml_cuda_fn_mul_mat_run_match finds them.
+void ggml_cuda_fn_reorder(ggml_cgraph * cgraph) {
+    if (!ggml_cuda_fn_enabled()) {
+        return;
+    }
+    const int max_dist = 96;
+    auto candidate = [](const ggml_tensor * node) {
+        const ggml_tensor * w = node->src[0];
+        const ggml_tensor * x = node->src[1];
+        return node->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_Q8_0 && w->ne[2] == 1 && w->ne[3] == 1 &&
+               x->type == GGML_TYPE_F32 && x->ne[1] <= FN_MAX_T && x->ne[2] == 1 && x->ne[3] == 1 &&
+               fn_dense_geometry(w->ne[0]) && w->ne[0]/16 != 640;
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (!candidate(cgraph->nodes[i])) {
+            continue;
+        }
+        const ggml_tensor * first = cgraph->nodes[i];
+        int n = 1;
+        while (i + n < cgraph->n_nodes && n < FN_MAX_SEG && candidate(cgraph->nodes[i + n]) &&
+               cgraph->nodes[i + n]->src[1] == first->src[1] && cgraph->nodes[i + n]->src[0]->ne[0] == first->src[0]->ne[0]) {
+            ++n;
+        }
+        for (int j = i + n; j < cgraph->n_nodes && j <= i + max_dist && n < FN_MAX_SEG; ++j) {
+            ggml_tensor * node = cgraph->nodes[j];
+            if (!candidate(node) || node->src[1] != first->src[1] || node->src[0]->ne[0] != first->src[0]->ne[0]) {
+                continue;
+            }
+            for (int q = j; q > i + n; --q) {
+                cgraph->nodes[q] = cgraph->nodes[q - 1];
+            }
+            cgraph->nodes[i + n] = node;
+            ++n;
+        }
+        i += n - 1;
+    }
+}
+
+#endif // FN_STANDALONE
+
+// ---------------------------------------------------------------------------------------------------------------
+// the hyper-connection read (see hc-mix.cuh for the math), planar weights
+//   norm: one block per token; thread i owns the values [4i, 4i + 4) of the four streams, in registers. It also
+//         writes the fp16 activations of xn for the down mat-vec and the scale of the read's output for the up kernel
+//   down: the dense mat-vec, a segment per stream (a block then loads the activations of one stream, not of all
+//         four: they were as many bytes as the weights), and the sum of the four with the SiLU, as activations
+//   up:   the dense mat-vec with the rows of a tile taken from all four streams, so that the block that computes a
+//         column's four gates also sums them; it writes the output as fp32 and as fp16 activations
+
+#define FN_HC         4    // streams
+#define FN_HCN_MAX_NW 32   // warps of a norm block: n_embd <= 4096
+
+// what the norm writes besides xn (any of them may be null)
+struct fn_hc_norm_out {
+    half *  X;          // fp16 activations of xn: [nt][hc*n_embd]
+    float * xs;         // their scales: [nt]
+    float * xs_mixed;   // the scales of the read's output: [nt]
+    float   mix_scale;  // |scale of the read| / gain of its output
+};
+
+// Block-wide reductions of N values per thread, for blocks of up to FN_HCN_MAX_NW warps: the warps reduce, the
+// first warp reduces their results, one thread applies `fin` to each total and every thread reads the results.
+//   - a thread that summed the warp results itself would do one shared-memory load per warp and value: with 20
+//     warps that kept the load/store units of the SM busy for most of the kernel;
+//   - what follows a reduction is mostly divisions, square roots and exponentials of the totals, which the SM
+//     computes on 16 units: done by every thread they cost more than the reduction.
+// s_w: [N][FN_HCN_MAX_NW], s_tot: [N]; two barriers.
+template <int N, bool is_max, typename F>
+static __device__ __forceinline__ void fn_block_reduce(float v[N], float (* s_w)[FN_HCN_MAX_NW], float * s_tot, const F fin) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            const float o = __shfl_xor_sync(0xffffffff, v[c], off);
+            v[c] = is_max ? fmaxf(v[c], o) : v[c] + o;
+        }
+        if (lane == 0) {
+            s_w[c][warp] = v[c];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float x[N];
+#pragma unroll
+        for (int c = 0; c < N; ++c) {
+            x[c] = lane < nw ? s_w[c][lane] : 0.0f; // the maxima are of magnitudes
+#pragma unroll
+            for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+                const float o = __shfl_xor_sync(0xffffffff, x[c], off);
+                x[c] = is_max ? fmaxf(x[c], o) : x[c] + o;
+            }
+        }
+        if (lane == 0) {
+            fin(x);
+#pragma unroll
+            for (int c = 0; c < N; ++c) {
+                s_tot[c] = x[c];
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+        v[c] = s_tot[c];
+    }
+}
+
+// r[c]: this thread's four values of stream c, g[c]: their norm weights (the caller loads them with its other
+// inputs: a load issued after the barriers below would add its latency to the kernel).
+// xn = r*w_norm*rsqrt(mean(r^2) + eps) over each stream of the token.
+static __device__ __forceinline__ void fn_hc_norm_part(const float4 r[FN_HC], const float4 g[FN_HC], const int n_embd,
+                                                       const float eps, float * xn_t, const int64_t sxn_c,
+                                                       const fn_hc_norm_out o, const int t,
+                                                       float (* s_w)[FN_HCN_MAX_NW], float * s_tot) {
+    const int i = threadIdx.x;
+    float ss[FN_HC];
+#pragma unroll
+    for (int c = 0; c < FN_HC; ++c) {
+        ss[c] = r[c].x*r[c].x + r[c].y*r[c].y + r[c].z*r[c].z + r[c].w*r[c].w;
+    }
+    // the totals become the factors rsqrt(mean + eps)
+    fn_block_reduce<FN_HC, false>(ss, s_w, s_tot, [=](float * x) {
+#pragma unroll
+        for (int c = 0; c < FN_HC; ++c) {
+            x[c] = rsqrtf(x[c]/n_embd + eps);
+        }
+    });
+    float4 v[FN_HC];
+    float  mx[2] = { 0.0f, 0.0f };                       // max |xn|, max over d of sum over the streams of |xn|
+    float4 b     = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int c = 0; c < FN_HC; ++c) {
+        v[c] = make_float4(r[c].x*g[c].x*ss[c], r[c].y*g[c].y*ss[c], r[c].z*g[c].z*ss[c], r[c].w*g[c].w*ss[c]);
+        *(float4 *) (xn_t + c*sxn_c + 4*i) = v[c];
+        b = make_float4(b.x + fabsf(v[c].x), b.y + fabsf(v[c].y), b.z + fabsf(v[c].z), b.w + fabsf(v[c].w));
+        mx[0] = fmaxf(mx[0], fmaxf(fmaxf(fabsf(v[c].x), fabsf(v[c].y)), fmaxf(fabsf(v[c].z), fabsf(v[c].w))));
+    }
+    if (o.xs == nullptr) {
+        return;
+    }
+    mx[1] = fmaxf(fmaxf(b.x, b.y), fmaxf(b.z, b.w));
+    // The down mat-vec reads the four streams of a token as one vector of hc*n_embd values. The maximum becomes the
+    // factor of its activations; the scales are written by the one thread that has the totals.
+    const float gain = 400.0f/(FN_HC*n_embd);
+    fn_block_reduce<2, true>(mx, s_w, s_tot, [=](float * x) {
+        o.xs[t] = x[0] > 0.0f ? x[0]/gain : 0.0f;
+        if (o.xs_mixed != nullptr) {
+            // |mixed[d]| <= |scale| * sum_c |xn[c][d]|: the gates are sigmoids
+            o.xs_mixed[t] = x[1]*o.mix_scale;
+        }
+        x[0] = x[0] > 0.0f ? gain/x[0] : 0.0f;
+    });
+    const float sc = mx[0];
+#pragma unroll
+    for (int c = 0; c < FN_HC; ++c) {
+        // 8-byte stores
+        const half2 h0 = __floats2half2_rn(v[c].x*sc, v[c].y*sc);
+        const half2 h1 = __floats2half2_rn(v[c].z*sc, v[c].w*sc);
+        *(uint2 *) (o.X + ((int64_t) t*FN_HC + c)*n_embd + 4*i) = make_uint2((unsigned int) fn_i2(h0), (unsigned int) fn_i2(h1));
+    }
+}
+
+static __global__ void fn_hc_norm(const float * __restrict__ R, const int64_t sr_c, const int64_t sr_t,
+                                  const float * __restrict__ wn, const int n_embd, const float eps,
+                                  float * __restrict__ xn, const int64_t sxn_c, const int64_t sxn_t, const fn_hc_norm_out o) {
+    __shared__ float s_w[FN_HC][FN_HCN_MAX_NW];
+    __shared__ float s_tot[FN_HC];
+    const int t = blockIdx.x;
+    float4 r[FN_HC], g[FN_HC];
+#pragma unroll
+    for (int c = 0; c < FN_HC; ++c) {
+        r[c] = *(const float4 *) (R + t*sr_t + c*sr_c + 4*threadIdx.x);
+        g[c] = *(const float4 *) (wn + (int64_t) c*n_embd + 4*threadIdx.x);
+    }
+    fn_hc_norm_part(r, g, n_embd, eps, xn + t*sxn_t, sxn_c, o, t, s_w, s_tot);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The output of a recurrent (gated delta net) layer before its projection:
+//   y = rms_norm(x)*w * gate(z), over the 128 values of each head; the gate is a SiLU or a sigmoid
+// as floats and as the activations of the projection. One block per token, one warp per head: a lane owns four
+// values, the warp sums the squares with shuffles.
+#define FN_GDN_HEAD 128
+
+static __device__ __forceinline__ float fn_gate(const float z, const bool silu) {
+    const float s = 1.0f/(1.0f + expf(-z));
+    return silu ? z*s : s;
+}
+
+static __global__ void fn_gdn_out(const float * __restrict__ x, const int64_t sx_t, const float * __restrict__ z, const int64_t sz_t,
+                                  const float * __restrict__ w, const float eps, const bool silu, const float gain,
+                                  float * __restrict__ y, const int64_t sy_t, half * __restrict__ X, float * __restrict__ xscale) {
+    __shared__ float s_w[1][FN_HCN_MAX_NW];
+    __shared__ float s_tot[1];
+    const int t    = blockIdx.x;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int n    = blockDim.x*4;
+    const float4 x4 = *(const float4 *) (x + t*sx_t + 4*threadIdx.x);
+    const float4 z4 = *(const float4 *) (z + t*sz_t + 4*threadIdx.x);
+    const float4 w4 = *(const float4 *) (w + 4*lane);
+    float ss = x4.x*x4.x + x4.y*x4.y + x4.z*x4.z + x4.w*x4.w;
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        ss += __shfl_xor_sync(0xffffffff, ss, off);
+    }
+    const float rs = rsqrtf(ss/FN_GDN_HEAD + eps);
+    const float4 v = make_float4(x4.x*rs*w4.x*fn_gate(z4.x, silu), x4.y*rs*w4.y*fn_gate(z4.y, silu),
+                                 x4.z*rs*w4.z*fn_gate(z4.z, silu), x4.w*rs*w4.w*fn_gate(z4.w, silu));
+    *(float4 *) (y + t*sy_t + 4*threadIdx.x) = v;
+    float m[1] = { fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))) };
+    fn_block_reduce<1, true>(m, s_w, s_tot, [=](float * a) {
+        xscale[t] = a[0] > 0.0f ? a[0]/gain : 0.0f;
+        a[0] = a[0] > 0.0f ? gain/a[0] : 0.0f;
+    });
+    const float sc = m[0];
+    const half2 h0 = __floats2half2_rn(v.x*sc, v.y*sc);
+    const half2 h1 = __floats2half2_rn(v.z*sc, v.w*sc);
+    *(uint2 *) (X + (int64_t) t*n + 4*threadIdx.x) = make_uint2((unsigned int) fn_i2(h0), (unsigned int) fn_i2(h1));
+}
+
+// The output of an attention layer before its projection: y = x*sigmoid(g), as floats and as the activations of the
+// projection. g is a view: d values per head, the heads sg_h apart. One block per token, a thread owns four values.
+static __global__ void fn_gate_out(const float * __restrict__ x, const int64_t sx_t, const float * __restrict__ g, const int64_t sg_h,
+                                   const int64_t sg_t, const int d4, const float gain,
+                                   float * __restrict__ y, const int64_t sy_t, half * __restrict__ X, float * __restrict__ xscale) {
+    __shared__ float s_w[1][FN_HCN_MAX_NW];
+    __shared__ float s_tot[1];
+    const int t    = blockIdx.x;
+    const int head = threadIdx.x/d4;
+    const int n    = blockDim.x*4;
+    const float4 x4 = *(const float4 *) (x + t*sx_t + 4*threadIdx.x);
+    const float4 g4 = *(const float4 *) (g + t*sg_t + head*sg_h + 4*(threadIdx.x - head*d4));
+    const float4 v  = make_float4(x4.x*fn_gate(g4.x, false), x4.y*fn_gate(g4.y, false), x4.z*fn_gate(g4.z, false), x4.w*fn_gate(g4.w, false));
+    *(float4 *) (y + t*sy_t + 4*threadIdx.x) = v;
+    float m[1] = { fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))) };
+    fn_block_reduce<1, true>(m, s_w, s_tot, [=](float * a) {
+        xscale[t] = a[0] > 0.0f ? a[0]/gain : 0.0f;
+        a[0] = a[0] > 0.0f ? gain/a[0] : 0.0f;
+    });
+    const float sc = m[0];
+    const half2 h0 = __floats2half2_rn(v.x*sc, v.y*sc);
+    const half2 h1 = __floats2half2_rn(v.z*sc, v.w*sc);
+    *(uint2 *) (X + (int64_t) t*n + 4*threadIdx.x) = make_uint2((unsigned int) fn_i2(h0), (unsigned int) fn_i2(h1));
+}
+
+// The selection mask of a QSA attention layer (the top blocks of the indexer plus the tail), one block per token:
+//   out[cell] = kq_mask[cell] if the cell is selected, -inf otherwise
+// slot s of the token selects the cell sel_idx[s] if it is live: a slot of a top block if the block's score is not
+// -inf, a tail slot if its cell is not the sentinel n_kv. A dead slot goes to its own row n_kv + s, beyond the mask.
+static __global__ void fn_qsa_sel(const int32_t * __restrict__ sel_idx, const int64_t s_sel, const int n_sel, const int n_top,
+                                  const int kpool, const float * __restrict__ score, const int64_t s_score,
+                                  const int32_t * __restrict__ top_k, const int64_t s_topk, const int n_kv,
+                                  const half * __restrict__ kq_mask, const int64_t s_kq, half * out, const int64_t s_out) {
+    const int t = blockIdx.x;
+    half * o = out + t*s_out;
+    const half ninf = __ushort_as_half((unsigned short) 0xFC00);
+    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
+        o[c] = ninf;
+    }
+    __syncthreads();
+    for (int s = threadIdx.x; s < n_sel; s += blockDim.x) {
+        const float idx = (float) sel_idx[t*s_sel + s];
+        float live;
+        if (s < n_top) {
+            live = fminf(fmaxf(score[t*s_score + top_k[t*s_topk + s/kpool]] + 1.0f, 0.0f), 1.0f);
+        } else {
+            live = fminf(fmaxf((float) n_kv - idx, 0.0f), 1.0f);
+        }
+        const float dump = (float) (n_kv + s);
+        const int   cell = (int) ((idx - dump)*live + dump);
+        if (cell < n_kv) {
+            o[cell] = __ushort_as_half((unsigned short) 0);
+        }
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
+        o[c] = __half_as_ushort(o[c]) == 0 ? kq_mask[t*s_kq + c] : ninf;
+    }
+}
+
 // up: mixed[t][d] = scale * sum_c xn[t][c][d] * sigmoid(w_up[c*n_embd + d] . lo[t]).
-// The dense kernel with the rows of a tile taken from all four streams: row (g, r) of a tile is stream g % 4 of
-// column d = 8*tile + 2*r + g/4, so the block that computes a column's four gates also sums them.
+// Row (g, r) of a tile is stream g % 4 of column d = 8*tile + 2*r + g/4.
 // tpr = hc_lr/16 threads per row, 8 rows per step, R = 4 steps per tile.
+// Xm (may be null): mixed as fp16 activations, with the scales xs_mixed that the norm derived from xn.
 #define FN_HC_UP_G   8
 #define FN_HC_UP_R   4
 #define FN_HC_UP_TPR 20 // hc_lr = 320
@@ -629,13 +1234,13 @@ static __global__ void __launch_bounds__(FN_HC_UP_G*TPR, BPS)
 fn_hc_up(const uint4 * __restrict__ W, const half * __restrict__ D, const float * __restrict__ rowscale,
          const half2 * __restrict__ X, const float * __restrict__ xscale, const int n_embd,
          const float scale, const float * __restrict__ xn, const int sxn_c, const int sxn_t,
-         float * __restrict__ mixed, const int smx_t) {
+         float * __restrict__ mixed, const int smx_t, half * __restrict__ Xm, const float * __restrict__ xs_mixed) {
 #if defined(FP16_AVAILABLE)
     constexpr int R   = FN_HC_UP_R;
     constexpr int G   = FN_HC_UP_G;
     constexpr int NT  = G*TPR;
     constexpr int NPG = R*T/2;
-    __shared__ int   s_part[NPG][NT];
+    __shared__ int   s_part[NPG][NT + 1]; // as in fn_dense_p8
     __shared__ float s_term[G][R*T];
     const int tid = threadIdx.x;
     const int g   = tid/TPR;
@@ -645,7 +1250,7 @@ fn_hc_up(const uint4 * __restrict__ W, const half * __restrict__ D, const float 
     const half2 magic = __float2half2_rn(1152.0f);
 
     half2 a[T][8];
-    fn_load_act<T>(X, TPR, k, a);
+    fn_load_act<T>(X, TPR*8, k, a);
 
     // the gathering threads: pair p of row group gg (stream gg % 4 of the column step gg / 4)
     const bool gather = tid < G*NPG;
@@ -660,6 +1265,15 @@ fn_hc_up(const uint4 * __restrict__ W, const half * __restrict__ D, const float 
     if (gather) {
         xs0 = xscale[vt0];
         xs1 = xscale[vt1];
+    }
+    // the threads that sum a column's four terms: value vi = (column step, token) of column half hi
+    const bool sums = tid < 2*R*T;
+    const int  hi   = tid/(R*T);
+    const int  vi   = tid - hi*(R*T);
+    float mx = 0.0f;
+    if (sums && Xm != nullptr) {
+        const float xm = xs_mixed[vi % T];
+        mx = xm > 0.0f ? 1.0f/xm : 0.0f;
     }
 
     const int ntiles = n_embd/(2*R);
@@ -693,76 +1307,511 @@ fn_hc_up(const uint4 * __restrict__ W, const half * __restrict__ D, const float 
         }
         __syncthreads();
         if (gather) {
-            const float2 f = fn_gather<TPR>(&s_part[p][gg*TPR]);
+            const float2 f = fn_gather(&s_part[p][gg*TPR], TPR);
             s_term[gg][2*p]     = x0/(1.0f + expf(-f.x*rs0*xs0));
             s_term[gg][2*p + 1] = x1/(1.0f + expf(-f.y*rs1*xs1));
         }
         __syncthreads();
-        if (tid < 2*R*T) {
-            const int hi = tid/(R*T);  // which of the two columns of a step
-            const int vi = tid - hi*(R*T);
+        if (sums) {
             float m = 0.0f;
 #pragma unroll
             for (int cc = 0; cc < FN_HC; ++cc) {
                 m += s_term[hi*4 + cc][vi];
             }
-            mixed[(vi % T)*smx_t + tile*(2*R) + 2*(vi/T) + hi] = scale*m;
+            m *= scale;
+            const int col = tile*(2*R) + 2*(vi/T) + hi;
+            mixed[(vi % T)*smx_t + col] = m;
+            if (Xm != nullptr) {
+                Xm[(int64_t) (vi % T)*n_embd + col] = __float2half_rn(m*mx);
+            }
         }
         __syncthreads();
     }
 #else
-    GGML_UNUSED_VARS(W, D, rowscale, X, xscale, n_embd, scale, xn, sxn_c, sxn_t, mixed, smx_t);
+    GGML_UNUSED_VARS(W, D, rowscale, X, xscale, n_embd, scale, xn, sxn_c, sxn_t, mixed, smx_t, Xm, xs_mixed);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// AllReduce of a projection's partial sums + hyper-connection write + the norm of the next read, one block per token
+// (tensor-split windows, allreduce.cuh):
+//   out      = y + y_peer [+ z]                (z: a term that every device has, e.g. the shared expert)
+//   R'[c][d] = R[c][d] + out[d]*gate[c],   gate[c] = a.z*sigmoid(a.x*(w_inject[c] . xn_prev) + a.y) + a.w
+//   xn       = rms_norm(R')*w_norm
+// Thread i owns the values [4i, 4i + 4): it publishes its part of y to the peer first, computes its part of the
+// inject dot products while the peer catches up, and keeps the 16 values of R' in registers for the norm.
+// Every input is read before the first barrier and every output written after it, so the outputs may share memory
+// with the inputs; R' and xn have to be distinct.
+//
+// The exchange: a thread's four values travel as one 16-byte store, 24 bits each plus the token of the reduction,
+// and the peer's thread polls that unit until it carries the token. A 16-byte store arrives whole (4.4e9 units
+// exchanged without a torn one), so a unit with the token is complete: no token ring and no
+// __threadfence_system() between the data and a separate signal (that fence takes microseconds on GP100, three of
+// them were most of this kernel). Both devices add the same two rounded values, so their results are identical.
+
+// a float as its upper 24 bits, rounded to nearest
+static __device__ __forceinline__ unsigned int fn_f24(const float x) {
+    return (__float_as_uint(x) + 0x80u) >> 8;
+}
+
+static __device__ __forceinline__ float fn_f24_value(const unsigned int t) {
+    return __uint_as_float(t << 8);
+}
+
+static __device__ __forceinline__ uint4 fn_ar_pack(const unsigned int t0, const unsigned int t1, const unsigned int t2,
+                                                   const unsigned int t3, const int token) {
+    return make_uint4(t0 | (t1 << 24), (t1 >> 8) | (t2 << 16), (t2 >> 16) | (t3 << 8), (unsigned int) token);
+}
+
+static __device__ __forceinline__ float4 fn_ar_unpack(const uint4 u) {
+    return make_float4(fn_f24_value(u.x & 0xffffffu), fn_f24_value((u.x >> 24) | ((u.y & 0xffffu) << 8)),
+                       fn_f24_value((u.y >> 16) | ((u.z & 0xffu) << 16)), fn_f24_value(u.z >> 8));
+}
+
+// four consecutive weights with one load
+static __device__ __forceinline__ float4 fn_load4(const float * p) {
+    return *(const float4 *) p;
+}
+
+static __device__ __forceinline__ float4 fn_load4(const nv_bfloat16 * p) {
+    const uint2 v = *(const uint2 *) p; // a bfloat16 is the upper half of a float
+    return make_float4(__uint_as_float(v.x << 16), __uint_as_float(v.x & 0xffff0000u),
+                       __uint_as_float(v.y << 16), __uint_as_float(v.y & 0xffff0000u));
+}
+
+static __device__ __forceinline__ float4 fn_load4(const half * p) {
+    const uint2 v = *(const uint2 *) p;
+    const float2 a = __half22float2(fn_h2((int) v.x));
+    const float2 b = __half22float2(fn_h2((int) v.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
+template <typename T_inj>
+static __global__ void fn_ar_hc(
+        const float * y, const int64_t sy_t, const float * z, const int64_t sz_t,
+        uint4 * wire_mine, const uint4 * wire_other, const unsigned int * epoch, const int site,
+        const float * xn_prev, const int64_t sxp_c, const int64_t sxp_t,
+        const T_inj * __restrict__ w_inject, const float4 act,
+        const float * R, const int64_t sr_c, const int64_t sr_t,
+        float * Rn, const int64_t sd_c, const int64_t sd_t,
+        const float * __restrict__ wn, const int n_embd, const float eps,
+        float * xn, const int64_t sxn_c, const int64_t sxn_t, const fn_hc_norm_out o, unsigned long long * dbg) {
+    __shared__ float s_w[FN_HC][FN_HCN_MAX_NW];
+    __shared__ float s_tot[FN_HC];
+    const int t  = blockIdx.x;
+    const int i  = threadIdx.x;
+    const int n4 = n_embd/4;
+    const int token = ggml_cuda_ar_window_token(epoch, site);
+
+    float4 y4;
+    {
+        const float4 v = *(const float4 *) (y + t*sy_t + 4*i);
+        const unsigned int t0 = fn_f24(v.x), t1 = fn_f24(v.y), t2 = fn_f24(v.z), t3 = fn_f24(v.w);
+        wire_mine[t*n4 + i] = fn_ar_pack(t0, t1, t2, t3, token);
+        y4 = make_float4(fn_f24_value(t0), fn_f24_value(t1), fn_f24_value(t2), fn_f24_value(t3));
+    }
+    // every input is loaded here, before the first barrier: one memory latency for the kernel instead of one per
+    // phase, and the outputs may then share memory with any of them (see above)
+    float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (z != nullptr) {
+        z4 = *(const float4 *) (z + t*sz_t + 4*i);
+    }
+    float4 r[FN_HC], gn[FN_HC];
+#pragma unroll
+    for (int c = 0; c < FN_HC; ++c) {
+        r[c]  = *(const float4 *) (R + t*sr_t + c*sr_c + 4*i);
+        gn[c] = *(const float4 *) (wn + (int64_t) c*n_embd + 4*i);
+    }
+
+    // the inject gates of the four streams
+    float gate[FN_HC];
+    {
+        float4 xp[FN_HC];
+#pragma unroll
+        for (int c = 0; c < FN_HC; ++c) {
+            xp[c] = *(const float4 *) (xn_prev + t*sxp_t + c*sxp_c + 4*i);
+        }
+#pragma unroll
+        for (int g = 0; g < FN_HC; ++g) {
+            gate[g] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < FN_HC; ++c) {
+                const float4 w = fn_load4(w_inject + (int64_t) g*FN_HC*n_embd + (int64_t) c*n_embd + 4*i);
+                gate[g] += w.x*xp[c].x + w.y*xp[c].y + w.z*xp[c].z + w.w*xp[c].w;
+            }
+        }
+        fn_block_reduce<FN_HC, false>(gate, s_w, s_tot, [=](float * x) {
+#pragma unroll
+            for (int g = 0; g < FN_HC; ++g) {
+                x[g] = act.z/(1.0f + expf(-(act.x*x[g] + act.y))) + act.w;
+            }
+        });
+    }
+    // The peer's unit for the same four values. The accesses are volatile: __ldcv() and inline PTX loads are
+    // loop-invariant for the compiler, which then drops the loop.
+    const volatile unsigned int * q = (const volatile unsigned int *) (wire_other + t*n4 + i);
+    const long long t_poll = dbg != nullptr ? clock64() : 0;
+    while ((int) q[3] != token) {
+    }
+    const uint4 u = make_uint4(q[0], q[1], q[2], 0);
+    if (dbg != nullptr && i == 0 && t == 0) {
+        atomicAdd(dbg + 2, (unsigned long long) (clock64() - t_poll));
+        atomicAdd(dbg + 3, 1ull);
+    }
+
+    const float4 o4  = fn_ar_unpack(u);
+    const float4 out = make_float4(y4.x + o4.x + z4.x, y4.y + o4.y + z4.y, y4.z + o4.z + z4.z, y4.w + o4.w + z4.w);
+#pragma unroll
+    for (int c = 0; c < FN_HC; ++c) {
+        r[c] = make_float4(r[c].x + out.x*gate[c], r[c].y + out.y*gate[c], r[c].z + out.z*gate[c], r[c].w + out.w*gate[c]);
+        *(float4 *) (Rn + t*sd_t + c*sd_c + 4*i) = r[c];
+    }
+    fn_hc_norm_part(r, gn, n_embd, eps, xn + t*sxn_t, sxn_c, o, t, s_w, s_tot);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// MoE experts with Q2_0 weights: gate, up, SwiGLU and down of the routed (token, expert) pairs of a decode window
+//
+// A Q2_0 block is { half d; 16 bytes of 2-bit codes }: 64 weights (code - 1)*d, 18 bytes. A thread owns one block
+// of every row it reads: 64 columns, whose activations it keeps in registers as 32 half2, in the order that the
+// decode produces (pair j of a 16-code word holds its elements j and j + 8).
+// The blocks are read where they are, with aligned 4-byte loads: an even block starts on a word, its codes two
+// bytes into it; the codes of an odd block are words themselves and its scale ends the word before them. So every
+// block is five words from an aligned address, and __byte_perm puts the codes together.
+//   fn_moe_up:   block (row tile, pair): h = silu(w_gate . x)*(w_up . x) for 16 rows of the pair's expert
+//   fn_moe_down: block (row tile, token): y = sum over the token's pairs of weight * (w_down . h), in registers
+// Pairs whose expert is not in VRAM (position >= n_hot) are left to the host threads (moe-host.cuh).
+
+#define FN_Q2_TPR 40   // threads per row of gate/up: n_embd = 2560
+
+struct fn_q2_raw {
+    uint32_t w[5];
+};
+
+static __device__ __forceinline__ void fn_q2_load(const char * __restrict__ row, const int kb, fn_q2_raw & r) {
+    const uint32_t * p = (const uint32_t *) (row + kb*18 - 2*(kb & 1));
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+        r.w[j] = p[j];
+    }
+}
+
+// 16 codes (one word) -> 8 half2 holding code - 1, pair j = elements (j, j + 8) for j < 4, (j, j + 8) + 4 above
+static __device__ __forceinline__ void fn_q2_decode16(const uint32_t q, half2 * h) {
+    const uint32_t qs = q >> 8;
+    uint32_t t[8];
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[0]) : "r"(q),  "n"(0x00030003), "n"(0x64006400));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[1]) : "r"(q),  "n"(0x000c000c), "n"(0x5c005c00));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[2]) : "r"(q),  "n"(0x00300030), "n"(0x54005400));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[3]) : "r"(q),  "n"(0x00c000c0), "n"(0x4c004c00));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[4]) : "r"(qs), "n"(0x00030003), "n"(0x64006400));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[5]) : "r"(qs), "n"(0x000c000c), "n"(0x5c005c00));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[6]) : "r"(qs), "n"(0x00300030), "n"(0x54005400));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[7]) : "r"(qs), "n"(0x00c000c0), "n"(0x4c004c00));
+    // a code sits on a base (1024, 256, 64, 16 by its bit position): base + 1 maps it to code - 1
+    const half2 m0 = __float2half2_rn(1025.0f);
+    const half2 m1 = __float2half2_rn( 257.0f);
+    const half2 m2 = __float2half2_rn(  65.0f);
+    const half2 m3 = __float2half2_rn(  17.0f);
+    h[0] = __hsub2(fn_h2((int) t[0]), m0);
+    h[1] = __hsub2(fn_h2((int) t[1]), m1);
+    h[2] = __hsub2(fn_h2((int) t[2]), m2);
+    h[3] = __hsub2(fn_h2((int) t[3]), m3);
+    h[4] = __hsub2(fn_h2((int) t[4]), m0);
+    h[5] = __hsub2(fn_h2((int) t[5]), m1);
+    h[6] = __hsub2(fn_h2((int) t[6]), m2);
+    h[7] = __hsub2(fn_h2((int) t[7]), m3);
+}
+
+// the 64 activations of a thread (16 words of natural pairs) in the decode order
+static __device__ __forceinline__ void fn_q2_load_act(const half2 * __restrict__ X, half2 a[32]) {
+    const int4 * ap = (const int4 *) X;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int4 lo = ap[2*q];      // elements 16q .. 16q + 7
+        const int4 hi = ap[2*q + 1];  // elements 16q + 8 .. 16q + 15
+        a[8*q + 0] = fn_h2(__byte_perm(lo.x, hi.x, 0x5410));
+        a[8*q + 1] = fn_h2(__byte_perm(lo.x, hi.x, 0x7632));
+        a[8*q + 2] = fn_h2(__byte_perm(lo.y, hi.y, 0x5410));
+        a[8*q + 3] = fn_h2(__byte_perm(lo.y, hi.y, 0x7632));
+        a[8*q + 4] = fn_h2(__byte_perm(lo.z, hi.z, 0x5410));
+        a[8*q + 5] = fn_h2(__byte_perm(lo.z, hi.z, 0x7632));
+        a[8*q + 6] = fn_h2(__byte_perm(lo.w, hi.w, 0x5410));
+        a[8*q + 7] = fn_h2(__byte_perm(lo.w, hi.w, 0x7632));
+    }
+}
+
+// the dot product of one block with the thread's activations, times the block's scale
+static __device__ __forceinline__ float fn_q2_dot(const fn_q2_raw & r, const int kb, const half2 a[32]) {
+    const int sel = (kb & 1) ? 0x7654 : 0x5432;
+    half2 acc = make_half2(0.0f, 0.0f);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        half2 h[8];
+        fn_q2_decode16((uint32_t) __byte_perm(r.w[q], r.w[q + 1], sel), h);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc = __hfma2(h[j], a[8*q + j], acc);
+        }
+    }
+    // the scale and the sum of the two halves of acc, converted as one pair
+    const uint32_t db  = (r.w[0] >> ((kb & 1)*16)) & 0xffffu;
+    const uint32_t sum = (uint32_t) __half_as_ushort(__hadd(__low2half(acc), __high2half(acc)));
+    const float2   f   = __half22float2(fn_h2((int) (db | (sum << 16))));
+    return f.x*f.y;
+}
+
+typedef ggml_cuda_fn_moe_route fn_moe_route;
+
+#define FN_MOE_UP_G 4
+#define FN_MOE_UP_R 4   // 16 rows of gate and of up per block, in two passes of 16 blocks
+
+// grid: (n_ff/16, pairs). h: [pairs][n_ff].
+// route (may be null): the pairs' positions and weights, copied for fn_moe_down, whose output may share memory with
+// the ids and the weights.
+static __global__ void __launch_bounds__(FN_MOE_UP_G*FN_Q2_TPR, 5)
+fn_moe_up(const char * __restrict__ wg, const char * __restrict__ wu, const int64_t nb1, const int64_t nb2,
+          const half2 * __restrict__ X, const int xstride, const float * __restrict__ xscale,
+          const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_hot,
+          const float * __restrict__ weights, const int sw1,
+          float * __restrict__ h, const int n_ff, fn_moe_route * __restrict__ route) {
+#if defined(FP16_AVAILABLE)
+    constexpr int G  = FN_MOE_UP_G;
+    constexpr int R  = FN_MOE_UP_R;
+    constexpr int NT = G*FN_Q2_TPR;
+    __shared__ float s_part[2*R][NT + 1];
+    const int tid = threadIdx.x;
+    const int g   = tid/FN_Q2_TPR;
+    const int k   = tid - g*FN_Q2_TPR;
+    const int c   = blockIdx.y;
+    const int t   = c/n_used;
+    const int e   = ids[t*si1 + c % n_used];
+    if (route != nullptr && blockIdx.x == 0 && tid == 0) {
+        route[c].e = e;
+        route[c].w = weights[t*sw1 + c % n_used];
+    }
+    if (e >= n_hot) {
+        return;
+    }
+    half2 a[32];
+    fn_q2_load_act(X + (int64_t) t*xstride + k*32, a);
+
+    // row (r, g) of the tile is tile*G*R + r*G + g
+    const int64_t row0 = (int64_t) blockIdx.x*(G*R) + g;
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+        const char * w = (m == 0 ? wg : wu) + (int64_t) e*nb2 + row0*nb1;
+        fn_q2_raw raw[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            fn_q2_load(w + (int64_t) r*G*nb1, k, raw[r]);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            s_part[m*R + r][tid] = fn_q2_dot(raw[r], k, a);
+        }
+    }
+    __syncthreads();
+    // thread (gg, r) of the first G*R: row r of group gg
+    if (tid < G*R) {
+        const int gg = tid/R;
+        const int r  = tid - gg*R;
+        float sg = 0.0f, su = 0.0f;
+#pragma unroll 4
+        for (int j = 0; j < FN_Q2_TPR; ++j) {
+            sg += s_part[r][gg*FN_Q2_TPR + j];
+            su += s_part[R + r][gg*FN_Q2_TPR + j];
+        }
+        const float xs = xscale[t];
+        sg *= xs;
+        su *= xs;
+        h[(int64_t) c*n_ff + blockIdx.x*(G*R) + r*G + gg] = sg/(1.0f + expf(-sg))*su;
+    }
+#else
+    GGML_UNUSED_VARS(wg, wu, nb1, nb2, X, xstride, xscale, ids, si1, n_used, n_hot, weights, sw1, h, n_ff, route);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
+#define FN_MOE_NU     10  // pairs of a token that a block of fn_moe_down has threads for
+#define FN_MOE_DOWN_R 8   // rows per row group of a tile, in two passes
+
+// grid: (n_embd/(G*R), tokens). Block: G row groups x FN_MOE_NU pairs x TPR = n_ff/64 threads (4, 6, 8 or 12): thread (g, s, k) owns
+// block k of the rows g, g + G, ... of the tile in the expert of the token's pair s, so the pairs of a token are
+// computed side by side (one after the other, a block waits for memory once per pair) and summed like the threads
+// of a row. Xh: the activations of h [pairs][n_ff halves] with the scales xsh [pairs]. y: [tokens][sy].
+// row groups of a block by TPR: blocks of 120 or 160 threads
+static constexpr __host__ __device__ int fn_moe_down_groups(const int tpr) {
+    return tpr == 4 ? 4 : tpr <= 8 ? 2 : 1;
+}
+
+template <int TPR>
+static __global__ void __launch_bounds__(fn_moe_down_groups(TPR)*FN_MOE_NU*TPR, 5)
+fn_moe_down(const char * __restrict__ wd, const int64_t nb1, const int64_t nb2,
+            const half2 * __restrict__ Xh, const float * __restrict__ xsh, const fn_moe_route * __restrict__ route,
+            const int n_used, const int n_hot, float * __restrict__ y, const int64_t sy) {
+#if defined(FP16_AVAILABLE)
+    constexpr int R   = FN_MOE_DOWN_R;
+    constexpr int TPG = FN_MOE_NU*TPR;  // threads per row
+    constexpr int G   = fn_moe_down_groups(TPR);
+    constexpr int NT  = G*TPG;
+    __shared__ float s_part[R][NT + 1];
+    const int tid = threadIdx.x;
+    const int g   = tid/TPG;
+    const int j   = tid - g*TPG;
+    const int s   = j/TPR;
+    const int k   = j - s*TPR;
+    const int t   = blockIdx.y;
+    const int c   = t*n_used + s;
+
+    fn_moe_route rt = { n_hot, 0.0f };
+    if (s < n_used) {
+        rt = route[c];
+    }
+    if (rt.e < n_hot) {
+        half2 a[32];
+        fn_q2_load_act(Xh + (int64_t) c*(TPR*32) + k*32, a);
+        const float  ws = rt.w*xsh[c];
+        const char * w  = wd + (int64_t) rt.e*nb2 + ((int64_t) blockIdx.x*(G*R) + g)*nb1;
+#pragma unroll
+        for (int b = 0; b < R; b += 4) {
+            fn_q2_raw raw[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                fn_q2_load(w + (int64_t) (b + r)*G*nb1, k, raw[r]);
+            }
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                s_part[b + r][tid] = ws*fn_q2_dot(raw[r], k, a);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            s_part[r][tid] = 0.0f;
+        }
+    }
+    __syncthreads();
+    // thread (gg, r) of the first G*R: row r of group gg
+    if (tid < G*R) {
+        const int gg = tid/R;
+        const int r  = tid - gg*R;
+        float v = 0.0f;
+#pragma unroll 4
+        for (int q = 0; q < TPG; ++q) {
+            v += s_part[r][gg*TPG + q];
+        }
+        y[t*sy + blockIdx.x*(G*R) + r*G + gg] = v;
+    }
+#else
+    GGML_UNUSED_VARS(wd, nb1, nb2, Xh, xsh, route, n_used, n_hot, y, sy);
     NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
 }
 
 #ifndef FN_STANDALONE
 
-bool ggml_cuda_fn_hc_mix_supported(const ggml_cuda_hc_mix_args & a) {
-    const ggml_tensor * R  = a.rms->src[0];
-    const ggml_tensor * wd = a.mm_down->src[0];
-    const ggml_tensor * wu = a.mm_up->src[0];
-    const int64_t n_embd = R->ne[0];
-    const int64_t hc_lr  = wd->ne[1];
-    return ggml_cuda_fn_planar(wd) && ggml_cuda_fn_planar(wu) && R->ne[1] == FN_HC && R->ne[2] <= FN_MAX_T &&
-           n_embd % (2*FN_HC_UP_R) == 0 && n_embd % 4 == 0 && fn_dense_geometry((int) (FN_HC*n_embd/16)) &&
-           hc_lr == 16*FN_HC_UP_TPR && hc_lr % 8 == 0;
+static bool fn_hc_aligned(const ggml_tensor * t) {
+    return ((uintptr_t) t->data & 0xF) == 0;
 }
 
-void ggml_cuda_fn_hc_mix(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_args & a) {
-    const ggml_tensor * R  = a.rms->src[0];
-    const ggml_tensor * wn = a.mul->src[1];
+static bool fn_overlap(const ggml_tensor * x, const ggml_tensor * y) {
+    const char * x0 = (const char *) x->data;
+    const char * y0 = (const char *) y->data;
+    return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+}
+
+// the norm of a read: R [n_embd, hc, nt], w_norm [n_embd, hc]
+static bool fn_hc_norm_supported(const ggml_tensor * rms, const ggml_tensor * mul) {
+    const ggml_tensor * R  = rms->src[0];
+    const ggml_tensor * wn = mul->src[1];
+    const int64_t n_embd = R->ne[0];
+    return mul->src[0] == rms && R->type == GGML_TYPE_F32 && wn->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+           R->ne[1] == FN_HC && R->ne[2] <= FN_MAX_T && R->ne[3] == 1 && ggml_is_contiguous(R) && ggml_is_contiguous(mul) &&
+           ggml_are_same_shape(R, mul) && ggml_is_contiguous(wn) && wn->ne[0] == n_embd && wn->ne[1] == FN_HC && ggml_nrows(wn) == FN_HC &&
+           n_embd % (4*WARP_SIZE) == 0 && n_embd/4 <= 1024 && n_embd/4/WARP_SIZE <= FN_HCN_MAX_NW &&
+           fn_hc_aligned(R) && fn_hc_aligned(wn) && fn_hc_aligned(mul);
+}
+
+// down, SiLU, up and the gated sum of a read whose xn is in a.mul
+static bool fn_hc_tail_supported(const ggml_cuda_hc_mix_args & a) {
     const ggml_tensor * wd = a.mm_down->src[0];
     const ggml_tensor * wu = a.mm_up->src[0];
-    const int     n_embd = (int) R->ne[0];
-    const int     nt     = (int) R->ne[2];
+    const int64_t n_embd = a.mul->ne[0];
+    const int64_t hc_lr  = wd->ne[1];
+    fn_dense_geom gm;
+    return ggml_cuda_fn_planar(wd) && ggml_cuda_fn_planar(wu) && a.mul->ne[1] == FN_HC && a.mul->ne[2] <= FN_MAX_T &&
+           a.mul->type == GGML_TYPE_F32 && ggml_is_contiguous(a.mul) &&
+           wd->ne[0] == FN_HC*n_embd && wu->ne[0] == hc_lr && wu->ne[1] == FN_HC*n_embd &&
+           n_embd % (2*FN_HC_UP_R) == 0 && n_embd % 4 == 0 && fn_dense_geometry(FN_HC*n_embd, &gm) && gm.s == FN_HC &&
+           hc_lr == 16*FN_HC_UP_TPR && hc_lr % fn_dense_tile_rows(FN_HC*n_embd) == 0 && hc_lr <= 2*FN_ACT_TPB &&
+           a.pre->type == GGML_TYPE_F32 && ggml_is_contiguous(a.pre) && !fn_overlap(a.mul, a.pre);
+}
+
+bool ggml_cuda_fn_hc_mix_supported(const ggml_cuda_hc_mix_args & a) {
+    return fn_hc_norm_supported(a.rms, a.mul) && fn_hc_tail_supported(a) &&
+           !fn_overlap(a.mul, a.rms->src[0]) && !fn_overlap(a.pre, a.rms->src[0]);
+}
+
+// What the norm of a read writes for its down mat-vec (reading xd, the view of xn as [hc*n_embd, nt]) and for the
+// consumers of its output pre (either may be null)
+static fn_hc_norm_out fn_hc_norm_outputs(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, const ggml_tensor * xd, const ggml_tensor * pre) {
+    const int n_embd = (int) mul->ne[0];
+    const int nt     = (int) mul->ne[2];
+    fn_hc_norm_out o = { nullptr, nullptr, nullptr, 0.0f };
+    if (xd == nullptr) {
+        return o;
+    }
+    fn_act_slot & sd = fn_act_put(ctx, xd, FN_HC*n_embd, nt, true);
+    o.X  = fn_act_X(sd);
+    o.xs = fn_act_xs(sd);
+    if (pre != nullptr) {
+        fn_act_slot & sp = fn_act_put(ctx, pre, n_embd, nt, false);
+        // the put above may not have taken the slot of xd
+        GGML_ASSERT(&sp != &sd);
+        o.xs_mixed  = fn_act_xs(sp);
+        o.mix_scale = fabsf(ggml_get_op_params_f32(pre, 0))/fn_gain(n_embd);
+    }
+    return o;
+}
+
+static void fn_hc_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_args & a) {
+    const ggml_tensor * wd = a.mm_down->src[0];
+    const ggml_tensor * wu = a.mm_up->src[0];
+    const ggml_tensor * xd = a.mm_down->src[1];
+    const int     n_embd = (int) a.mul->ne[0];
+    const int     nt     = (int) a.mul->ne[2];
     const int     hc_lr  = (int) wd->ne[1];
     const int     hd     = FN_HC*n_embd;
-    const int64_t sr_c   = R->nb[1]/sizeof(float);
-    const int64_t sr_t   = R->nb[2]/sizeof(float);
     const int64_t sxn_c  = a.mul->nb[1]/sizeof(float);
     const int64_t sxn_t  = a.mul->nb[2]/sizeof(float);
     const int64_t smx_t  = a.pre->nb[1]/sizeof(float);
     const int     nsm    = ggml_cuda_info().devices[ctx.device].nsm;
     cudaStream_t  stream = ctx.stream();
 
-    ggml_cuda_fn_plane pd, pu;
-    GGML_ASSERT(ggml_cuda_fn_planar(wd, &pd) && ggml_cuda_fn_planar(wu, &pu));
+    ggml_cuda_fn_plane pu;
+    GGML_ASSERT(ggml_cuda_fn_planar(wu, &pu));
+    GGML_ASSERT(sxn_c == n_embd); // the four streams of a token are one vector of hd values
 
-    ggml_cuda_pool_alloc<half>  X  (ctx.pool(), (size_t) nt*hd);
-    ggml_cuda_pool_alloc<float> xs (ctx.pool(), nt);
     ggml_cuda_pool_alloc<float> lo (ctx.pool(), (size_t) nt*hc_lr);
     ggml_cuda_pool_alloc<half>  Xl (ctx.pool(), (size_t) nt*hc_lr);
     ggml_cuda_pool_alloc<float> xsl(ctx.pool(), nt);
 
-    fn_hc_norm<<<nt, FN_HC_TPB, 0, stream>>>((const float *) R->data, sr_c, sr_t, (const float *) wn->data, n_embd,
-        ggml_get_op_params_f32(a.rms, 0), (float *) a.mul->data, sxn_c, sxn_t, X.get(), xs.get(), fn_gain(hd));
+    // the activations of xn: from the norm, or converted here
+    const fn_act_slot & sx = fn_act_get(ctx, xd, (const float *) a.mul->data, sxn_t, hd, nt);
+    fn_dense_wide(ctx, wd, sx, nt, FN_EPI_SILU, ggml_get_op_params_f32(a.scale, 0), ggml_get_op_params_f32(a.scale, 1),
+                  lo.get(), hc_lr, Xl.get(), xsl.get());
 
-    fn_dense_launch(nt, (const uint4 *) wd->data, (const half *) ((const char *) wd->data + (int64_t) hc_lr*hd),
-        pd.rowscale, (const half2 *) X.get(), xs.get(), lo.get(), hc_lr, hc_lr, hd/16, nsm, FN_EPI_SILU,
-        ggml_get_op_params_f32(a.scale, 0), ggml_get_op_params_f32(a.scale, 1), stream);
-
-    fn_act_h16<<<nt, FN_ACT_TPB, 0, stream>>>(lo.get(), hc_lr, hc_lr, fn_gain(hc_lr), Xl.get(), xsl.get());
+    // the output as activations, if the norm left its scales
+    fn_act_slot * sp = fn_act_find(ctx, a.pre, n_embd, nt);
+    half *        Xm = nullptr;
+    const float * xm = nullptr;
+    if (sp != nullptr && !sp->full) {
+        Xm = fn_act_X(*sp);
+        xm = fn_act_xs(*sp);
+        sp->full = true;
+    }
 
     const uint4 * Wu    = (const uint4 *) wu->data;
     const half *  Du    = (const half *) ((const char *) wu->data + (int64_t) hd*hc_lr);
@@ -773,20 +1822,610 @@ void ggml_cuda_fn_hc_mix(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix
         case N:                                                                                                       \
             fn_hc_up<N, FN_HC_UP_TPR, BPS><<<std::min(ntiles, nsm*BPS), FN_HC_UP_G*FN_HC_UP_TPR, 0, stream>>>(        \
                 Wu, Du, pu.rowscale, (const half2 *) Xl.get(), xsl.get(), n_embd, scale,                              \
-                (const float *) a.mul->data, (int) sxn_c, (int) sxn_t, (float *) a.pre->data, (int) smx_t);           \
+                (const float *) a.mul->data, (int) sxn_c, (int) sxn_t, (float *) a.pre->data, (int) smx_t, Xm, xm);   \
             break;
         FN_CASE(1, 8)
-        FN_CASE(2, 8)
+        FN_CASE(2, 6)
         FN_CASE(3, 5)
-        FN_CASE(4, 5)
+        FN_CASE(4, 4)
         FN_CASE(5, 4)
-        FN_CASE(6, 4)
+        FN_CASE(6, 3)
         FN_CASE(7, 3)
         FN_CASE(8, 3)
 #undef FN_CASE
         default:
             GGML_ABORT("fatal error");
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_fn_hc_mix(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_args & a) {
+    const ggml_tensor * R  = a.rms->src[0];
+    const ggml_tensor * wn = a.mul->src[1];
+    const int n_embd = (int) R->ne[0];
+    const int nt     = (int) R->ne[2];
+
+    const fn_hc_norm_out o = fn_hc_norm_outputs(ctx, a.mul, a.mm_down->src[1], a.pre);
+    fn_hc_norm<<<nt, n_embd/4, 0, ctx.stream()>>>(
+        (const float *) R->data, R->nb[1]/sizeof(float), R->nb[2]/sizeof(float), (const float *) wn->data, n_embd,
+        ggml_get_op_params_f32(a.rms, 0), (float *) a.mul->data, a.mul->nb[1]/sizeof(float), a.mul->nb[2]/sizeof(float), o);
+    CUDA_CHECK(cudaGetLastError());
+
+    fn_hc_tail(ctx, a);
+}
+
+// The six nodes of a read after its norm, from the first one: MUL_MAT (down), SCALE, SILU, MUL_MAT (up), RESHAPE,
+// DSV4_HC_PRE, on the xn of a MUL node.
+static bool fn_hc_tail_nodes(ggml_tensor * const * n, ggml_cuda_hc_mix_args & a) {
+    a.mm_down = n[0];
+    a.scale   = n[1];
+    a.silu    = n[2];
+    a.mm_up   = n[3];
+    a.pre     = n[5];
+    if (a.mm_down->op != GGML_OP_MUL_MAT || a.scale->op != GGML_OP_SCALE || a.silu->op != GGML_OP_UNARY ||
+        a.mm_up->op != GGML_OP_MUL_MAT || n[4]->op != GGML_OP_RESHAPE || a.pre->op != GGML_OP_DSV4_HC_PRE) {
+        return false;
+    }
+    const ggml_tensor * xd = a.mm_down->src[1]; // view of xn as [hc*n_embd, nt]
+    const ggml_tensor * xp = a.pre->src[0];     // view of xn as [n_embd, hc, nt]
+    if (xd->view_src == nullptr || xd->view_src->op != GGML_OP_MUL || xp->view_src != xd->view_src ||
+        xd->data != xd->view_src->data || xp->data != xd->view_src->data) {
+        return false;
+    }
+    a.mul = xd->view_src;
+    a.rms = nullptr;
+    if (ggml_get_unary_op(a.silu) != GGML_UNARY_OP_SILU || ggml_get_op_params_i32(a.pre, 1) == 0 ||
+        a.scale->src[0] != a.mm_down || a.silu->src[0] != a.scale || a.mm_up->src[1] != a.silu ||
+        a.pre->src[1] != n[4] || n[4]->view_src != a.mm_up || a.mul->ne[3] != 1) {
+        return false;
+    }
+    return fn_hc_tail_supported(a);
+}
+
+// the read without its norm (the xn of a.mul was computed with an AllReduce, ggml_cuda_fn_ar_epilogue)
+bool ggml_cuda_fn_hc_tail_match(const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_mix_args & a) {
+    if (!ggml_cuda_fn_enabled() || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    static const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE };
+    const int outputs[] = { i + 5 };
+    return ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 1) && fn_hc_tail_nodes(cgraph->nodes + i, a);
+}
+
+void ggml_cuda_fn_hc_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_args & a) {
+    fn_hc_tail(ctx, a);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// the shared expert (shexp-fuse.cuh) on planar weights:
+//   gate and up as two segments of one launch, the SwiGLU of their outputs as activations, down.
+// The gate of the expert's output, sigmoid(w_gate_inp . x), is one value per token: it goes into the scale of the
+// activations that down reads.
+
+bool ggml_cuda_fn_shexp_supported(const ggml_cuda_shexp_args & a) {
+    const ggml_tensor * x   = a.gate->src[1];
+    const ggml_tensor * wg  = a.gate->src[0];
+    const ggml_tensor * wu  = a.up->src[0];
+    const ggml_tensor * wd  = a.down->src[0];
+    const ggml_tensor * wgi = a.ginp->src[0];
+    const int64_t n_ff = wg->ne[1];
+    fn_dense_geom gu, gd;
+    return ggml_cuda_fn_enabled() && ggml_cuda_fn_planar(wg) && ggml_cuda_fn_planar(wu) && ggml_cuda_fn_planar(wd) &&
+           x->ne[1] <= FN_MAX_T && fn_dense_geometry(wg->ne[0], &gu) && gu.s == 1 && fn_dense_geometry(wd->ne[0], &gd) && gd.s == 1 &&
+           n_ff <= 4*FN_ACT_TPB && (wgi->type == GGML_TYPE_F32 || wgi->type == GGML_TYPE_BF16) && ggml_is_contiguous(x);
+}
+
+// h = silu(g)*u of a token as activations; their scale times sigmoid(w_gi . x). One block per token; n <= 4*FN_ACT_TPB.
+template <typename T_gi>
+static __global__ void fn_swiglu_h16(const float * __restrict__ g, const float * __restrict__ u, const int n,
+                                     const float * __restrict__ x, const int64_t sx, const int n_embd,
+                                     const T_gi * __restrict__ w_gi, const float gain,
+                                     half * __restrict__ X, float * __restrict__ xscale) {
+    __shared__ float s_red[2][FN_ACT_TPB/WARP_SIZE];
+    const int t = blockIdx.x;
+    float h[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float m    = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int i = threadIdx.x + j*FN_ACT_TPB;
+        if (i < n) {
+            const float gv = g[(int64_t) t*n + i];
+            h[j] = gv/(1.0f + expf(-gv))*u[(int64_t) t*n + i];
+            m    = fmaxf(m, fabsf(h[j]));
+        }
+    }
+    float dot = 0.0f;
+    for (int i = threadIdx.x; i < n_embd; i += FN_ACT_TPB) {
+        dot += ggml_cuda_cast<float>(w_gi[i])*x[t*sx + i];
+    }
+#pragma unroll
+    for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+        m    = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        dot += __shfl_xor_sync(0xffffffff, dot, o);
+    }
+    if (threadIdx.x % WARP_SIZE == 0) {
+        s_red[0][threadIdx.x / WARP_SIZE] = m;
+        s_red[1][threadIdx.x / WARP_SIZE] = dot;
+    }
+    __syncthreads();
+    m   = 0.0f;
+    dot = 0.0f;
+#pragma unroll
+    for (int w = 0; w < FN_ACT_TPB/WARP_SIZE; ++w) {
+        m    = fmaxf(m, s_red[0][w]);
+        dot += s_red[1][w];
+    }
+    const float sc = m > 0.0f ? gain/m : 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int i = threadIdx.x + j*FN_ACT_TPB;
+        if (i < n) {
+            X[(int64_t) t*n + i] = __float2half_rn(h[j]*sc);
+        }
+    }
+    if (threadIdx.x == 0) {
+        xscale[t] = (m > 0.0f ? m/gain : 0.0f)/(1.0f + expf(-dot));
+    }
+}
+
+void ggml_cuda_fn_shexp(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & a) {
+    const ggml_tensor * x   = a.gate->src[1];
+    const ggml_tensor * wg  = a.gate->src[0];
+    const ggml_tensor * wu  = a.up->src[0];
+    const ggml_tensor * wd  = a.down->src[0];
+    const ggml_tensor * wgi = a.ginp->src[0];
+    const int     n_embd = (int) wg->ne[0];
+    const int     n_ff   = (int) wg->ne[1];
+    const int     nt     = (int) x->ne[1];
+    const int64_t sx     = x->nb[1]/sizeof(float);
+    const int     nsm    = ggml_cuda_info().devices[ctx.device].nsm;
+    cudaStream_t  stream = ctx.stream();
+
+    ggml_cuda_fn_plane pg, pu, pd;
+    GGML_ASSERT(ggml_cuda_fn_planar(wg, &pg) && ggml_cuda_fn_planar(wu, &pu) && ggml_cuda_fn_planar(wd, &pd));
+
+    ggml_cuda_pool_alloc<float> gu(ctx.pool(), (size_t) 2*nt*n_ff);
+    ggml_cuda_pool_alloc<char>  hm(ctx.pool(), (size_t) FN_MAX_T*n_ff*sizeof(half) + FN_MAX_T*sizeof(float));
+    fn_act_slot h;
+    h.mem = hm.get();
+    h.n   = n_ff;
+
+    const fn_act_slot & sxa = fn_act_get(ctx, x, (const float *) x->data, sx, n_embd, nt);
+    const fn_dense_part pt[2] = {
+        fn_dense_part_of(wg, pg, 0, sxa, gu.get(), n_ff),
+        fn_dense_part_of(wu, pu, 0, sxa, gu.get() + (size_t) nt*n_ff, n_ff),
+    };
+    fn_dense(nt, pt, 2, nsm, stream);
+
+    if (wgi->type == GGML_TYPE_F32) {
+        fn_swiglu_h16<float><<<nt, FN_ACT_TPB, 0, stream>>>(gu.get(), gu.get() + (size_t) nt*n_ff, n_ff, (const float *) x->data, sx,
+            n_embd, (const float *) wgi->data, fn_gain(n_ff), fn_act_X(h), fn_act_xs(h));
+    } else {
+        fn_swiglu_h16<nv_bfloat16><<<nt, FN_ACT_TPB, 0, stream>>>(gu.get(), gu.get() + (size_t) nt*n_ff, n_ff, (const float *) x->data, sx,
+            n_embd, (const nv_bfloat16 *) wgi->data, fn_gain(n_ff), fn_act_X(h), fn_act_xs(h));
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const fn_dense_part pdn = fn_dense_part_of(wd, pd, 0, h, (float *) a.mul->data, a.mul->nb[1]/sizeof(float));
+    fn_dense(nt, &pdn, 1, nsm, stream);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// RMS_NORM, MUL (by the norm weights), RESHAPE (of z), UNARY (SiLU), MUL, RESHAPE from node i: fn_gdn_out
+
+int ggml_cuda_fn_gdn_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (!ggml_cuda_fn_enabled() || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_RMS_NORM) {
+        return 0;
+    }
+    static const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE };
+    const int outputs[] = { i + 5 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 1)) {
+        return 0;
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * rms  = n[0];
+    const ggml_tensor * mulw = n[1];
+    const ggml_tensor * zr   = n[2];
+    const ggml_tensor * silu = n[3];
+    ggml_tensor *       out  = n[4];
+    const ggml_tensor * key  = n[5];
+    const ggml_tensor * x    = rms->src[0];
+    const ggml_tensor * w    = mulw->src[0] == rms ? mulw->src[1] : mulw->src[0];
+    const int64_t heads = x->ne[1];
+    const int64_t nt    = x->ne[2];
+    const bool is_silu = ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU;
+    if ((mulw->src[0] != rms && mulw->src[1] != rms) || (!is_silu && ggml_get_unary_op(silu) != GGML_UNARY_OP_SIGMOID) || silu->src[0] != zr ||
+        !((out->src[0] == mulw && out->src[1] == silu) || (out->src[1] == mulw && out->src[0] == silu)) || key->src[0] != out ||
+        x->type != GGML_TYPE_F32 || x->ne[0] != FN_GDN_HEAD || heads < 1 || heads > FN_HCN_MAX_NW || nt < 1 || nt > FN_MAX_T ||
+        x->ne[3] != 1 || !ggml_is_contiguous(x) || !ggml_are_same_shape(x, zr) || zr->type != GGML_TYPE_F32 || !ggml_is_contiguous(zr) ||
+        !ggml_are_same_shape(x, out) || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+        w->type != GGML_TYPE_F32 || ggml_nelements(w) != FN_GDN_HEAD || !ggml_is_contiguous(w) ||
+        !fn_hc_aligned(x) || !fn_hc_aligned(zr) || !fn_hc_aligned(out) || !fn_hc_aligned(w) ||
+        (out->data != x->data && fn_overlap(out, x)) || (out->data != zr->data && fn_overlap(out, zr)) ||
+        key->ne[0] != heads*FN_GDN_HEAD || key->ne[1] != nt || key->data != out->data) {
+        return 0;
+    }
+    const int nvals = (int) (heads*FN_GDN_HEAD);
+    fn_act_slot & slot = fn_act_put(ctx, key, nvals, (int) nt, true);
+    fn_gdn_out<<<(unsigned) nt, (unsigned) (heads*WARP_SIZE), 0, ctx.stream()>>>(
+        (const float *) x->data, x->nb[2]/sizeof(float), (const float *) zr->data, zr->nb[2]/sizeof(float),
+        (const float *) w->data, ggml_get_op_params_f32(rms, 0), is_silu, fn_gain(nvals),
+        (float *) out->data, out->nb[2]/sizeof(float), fn_act_X(slot), fn_act_xs(slot));
+    CUDA_CHECK(cudaGetLastError());
+    return 5;
+}
+
+// CONT (of the gate, a view of the q projection's output), UNARY (sigmoid), MUL from node i: fn_gate_out
+int ggml_cuda_fn_gate_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (!ggml_cuda_fn_enabled() || i + 2 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_CONT) {
+        return 0;
+    }
+    static const ggml_op ops[] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
+    const int outputs[] = { i + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+        return 0;
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * cont = n[0];
+    const ggml_tensor * sig  = n[1];
+    ggml_tensor *       out  = n[2];
+    const ggml_tensor * g    = cont->src[0];
+    const ggml_tensor * x    = out->src[0] == sig ? out->src[1] : out->src[0];
+    const int64_t d  = g->ne[0];
+    const int64_t nv = cont->ne[0];
+    const int64_t nt = cont->ne[1];
+    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != cont || (out->src[0] != sig && out->src[1] != sig) ||
+        x == sig || g->type != GGML_TYPE_F32 || g->nb[0] != sizeof(float) || d % 4 != 0 || g->ne[0]*g->ne[1] != nv || g->ne[2] != nt ||
+        g->ne[3] != 1 || cont->ne[2] != 1 || nv % (4*WARP_SIZE) != 0 || nv/4 > 1024 || nt < 1 || nt > FN_MAX_T ||
+        x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] != nv || x->ne[1] != nt || !ggml_are_same_shape(x, out) ||
+        out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+        !fn_hc_aligned(g) || !fn_hc_aligned(x) || !fn_hc_aligned(out) || g->nb[1] % 16 != 0 || g->nb[2] % 16 != 0 ||
+        (out->data != x->data && fn_overlap(out, x)) || fn_overlap(out, g->view_src != nullptr ? g->view_src : g)) {
+        return 0;
+    }
+    fn_act_slot & slot = fn_act_put(ctx, out, (int) nv, (int) nt, true);
+    fn_gate_out<<<(unsigned) nt, (unsigned) (nv/4), 0, ctx.stream()>>>(
+        (const float *) x->data, x->nb[1]/sizeof(float), (const float *) g->data, g->nb[1]/sizeof(float), g->nb[2]/sizeof(float),
+        (int) (d/4), fn_gain((int) nv), (float *) out->data, out->nb[1]/sizeof(float), fn_act_X(slot), fn_act_xs(slot));
+    CUDA_CHECK(cudaGetLastError());
+    return 2;
+}
+
+// The selection mask of a QSA layer, from the FILL of its first node: 28 nodes -> fn_qsa_sel
+int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const ggml_op ops[] = {
+        GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE,                                     // the zeros of the selection
+        GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_CLAMP,      // slots as floats; live blocks
+        GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_CLAMP,        // ... per slot; live tail
+        GGML_OP_CONCAT, GGML_OP_FILL, GGML_OP_CUMSUM, GGML_OP_SCALE,                       // live; the dump rows
+        GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_CPY, GGML_OP_RESHAPE,               // dump + live*(slot - dump)
+        GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_SET_ROWS, GGML_OP_VIEW,     // the scatter into -inf
+        GGML_OP_ADD,                                                                        // + kq_mask
+    };
+    constexpr int n_ops = sizeof(ops)/sizeof(ops[0]);
+    if (!ggml_cuda_fn_enabled() || i + n_ops > cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_FILL) {
+        return 0;
+    }
+    const int outputs[] = { i + n_ops - 1 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, outputs, 1)) {
+        return 0;
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * sel_idx = n[3]->src[0];
+    const ggml_tensor * score   = n[4]->src[0];
+    const ggml_tensor * top_k   = n[5]->src[1];
+    ggml_tensor *       out     = n[27];
+    const ggml_tensor * kq_mask = out->src[0] == n[26] ? out->src[1] : out->src[0];
+    const int64_t n_sel = sel_idx->ne[0];
+    const int64_t nt    = sel_idx->ne[1];
+    const int64_t kpool = n[8]->ne[0];
+    const int64_t n_kv  = out->ne[0];
+    auto params = [](const ggml_tensor * t, const float a, const float b) {
+        return ggml_get_op_params_f32(t, 0) == a && ggml_get_op_params_f32(t, 1) == b;
+    };
+    // the wiring that the values depend on; the rest follows from the op sequence
+    if (n[5]->src[0] != n[4] || n[6]->src[0] != n[5] || n[7]->src[0] != n[6] || n[8]->src[0] != n[7] ||
+        n[11]->src[0] != n[10] || n[12]->src[0] != n[11] || n[10]->src[0]->type != GGML_TYPE_I32 ||
+        n[13]->src[0] != n[9] || n[13]->src[1] != n[12] || n[14]->src[0] != n[13] || n[15]->src[0] != n[14] || n[16]->src[0] != n[15] ||
+        n[17]->src[0] != n[3] || n[17]->src[1] != n[16] || n[18]->src[0] != n[17] || n[18]->src[1] != n[13] ||
+        n[19]->src[0] != n[18] || n[19]->src[1] != n[16] || n[20]->src[0] != n[19] || n[21]->src[0] != n[20] ||
+        n[25]->src[0] != n[2] || n[25]->src[1] != n[21] || n[25]->src[2] != n[24] || n[26]->src[0] != n[25] ||
+        (out->src[0] != n[26] && out->src[1] != n[26]) ||
+        ggml_get_op_params_f32(n[0], 0) != 0.0f || ggml_get_op_params_f32(n[14], 0) != 1.0f || !std::isinf(ggml_get_op_params_f32(n[22], 0)) ||
+        ggml_get_op_params_f32(n[22], 0) > 0.0f ||
+        !params(n[6], 1.0f, 1.0f) || !params(n[7], 0.0f, 1.0f) || !params(n[11], -1.0f, (float) n_kv) || !params(n[12], 0.0f, 1.0f) ||
+        !params(n[16], 1.0f, (float) (n_kv - 1))) {
+        return 0;
+    }
+    if (sel_idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(sel_idx) || score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) ||
+        score->ne[1] != nt || top_k->type != GGML_TYPE_I32 || top_k->nb[0] != sizeof(int32_t) || top_k->ne[1] != nt ||
+        n_sel != kpool*top_k->ne[0] + kpool - 1 || n[10]->src[0]->ne[0] != kpool - 1 ||
+        out->type != GGML_TYPE_F16 || !ggml_is_contiguous(out) || out->ne[1]*out->ne[2]*out->ne[3] != nt ||
+        kq_mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(kq_mask) || kq_mask->ne[0] != n_kv ||
+        kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] != nt || n[25]->ne[1] != n_kv + n_sel ||
+        fn_overlap(out, sel_idx) || fn_overlap(out, score) || fn_overlap(out, top_k) || fn_overlap(out, kq_mask)) {
+        return 0;
+    }
+    fn_qsa_sel<<<(unsigned) nt, 256, 0, ctx.stream()>>>(
+        (const int32_t *) sel_idx->data, sel_idx->nb[1]/sizeof(int32_t), (int) n_sel, (int) (kpool*top_k->ne[0]), (int) kpool,
+        (const float *) score->data, score->nb[1]/sizeof(float), (const int32_t *) top_k->data, top_k->nb[1]/sizeof(int32_t),
+        (int) n_kv, (const half *) kq_mask->data, n_kv, (half *) out->data, n_kv);
+    CUDA_CHECK(cudaGetLastError());
+    return n_ops - 1;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// MoE experts: the nodes
+
+static bool fn_moe_q2(const ggml_tensor * w, const int64_t cols, const int64_t rows) {
+    return w->type == GGML_TYPE_Q2_0 && w->ne[0] == cols && w->ne[1] == rows && w->ne[3] == 1 &&
+           w->nb[1] == (size_t) cols/64*18 && w->nb[2] == w->nb[1]*rows && ((uintptr_t) w->data & 0x3) == 0;
+}
+
+bool ggml_cuda_fn_moe_supported(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
+                                const ggml_tensor * weights, const ggml_tensor * dst) {
+    static const bool enabled = getenv("GGML_CUDA_FN_MOE") == nullptr || atoi(getenv("GGML_CUDA_FN_MOE")) != 0;
+    if (!enabled || !ggml_cuda_fn_enabled()) {
+        return false;
+    }
+    const ggml_tensor * x   = gate->src[1];
+    const ggml_tensor * ids = gate->src[2];
+    const int64_t n_embd = gate->src[0]->ne[0];
+    const int64_t n_ff   = gate->src[0]->ne[1];
+    const int64_t n_used = ids->ne[0];
+    const int64_t nt     = ids->ne[1];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_DP4A &&
+           n_embd == 64*FN_Q2_TPR && (n_ff == 256 || n_ff == 384 || n_ff == 512 || n_ff == 768) &&
+           n_embd % (4*FN_MOE_DOWN_R) == 0 && n_used <= FN_MOE_NU &&
+           nt >= 1 && nt <= FN_MAX_T &&
+           fn_moe_q2(gate->src[0], n_embd, n_ff) && fn_moe_q2(up->src[0], n_embd, n_ff) && fn_moe_q2(down->src[0], n_ff, n_embd) &&
+           gate->src[0]->ne[2] == up->src[0]->ne[2] && gate->src[0]->ne[2] == down->src[0]->ne[2] &&
+           up->src[1] == x && up->src[2] == ids && down->src[2] == ids &&
+           x->type == GGML_TYPE_F32 && x->ne[0] == n_embd && x->ne[1] == 1 && x->ne[2] == nt && x->nb[0] == sizeof(float) &&
+           ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
+           weights->type == GGML_TYPE_F32 && weights->ne[0] == 1 && weights->ne[1] == n_used && weights->ne[2] == nt &&
+           weights->nb[1] == sizeof(float) &&
+           dst->type == GGML_TYPE_F32 && dst->ne[0] == n_embd && dst->ne[1] == nt && ggml_is_contiguous(dst);
+}
+
+// the layout of the context's memory for a layer: [pairs*n_ff halves: the activations of h][pairs*n_ff: h]
+// [pairs: scales of h][pairs: routes]; the activations are read as 16-byte words
+static half * fn_moe_Xh(const ggml_backend_cuda_context & ctx) {
+    return (half *) ctx.fn_moe_mem;
+}
+
+static float * fn_moe_h(const ggml_backend_cuda_context & ctx) {
+    return (float *) (ctx.fn_moe_mem + (size_t) ctx.fn_moe_n_pairs*ctx.fn_moe_n_ff*sizeof(half));
+}
+
+static float * fn_moe_xsh(const ggml_backend_cuda_context & ctx) {
+    return fn_moe_h(ctx) + (size_t) ctx.fn_moe_n_pairs*ctx.fn_moe_n_ff;
+}
+
+static fn_moe_route * fn_moe_route_ptr(const ggml_backend_cuda_context & ctx) {
+    return (fn_moe_route *) (fn_moe_xsh(ctx) + ctx.fn_moe_n_pairs);
+}
+
+const ggml_cuda_fn_moe_route * ggml_cuda_fn_moe_routes(const ggml_backend_cuda_context & ctx) {
+    return fn_moe_route_ptr(ctx);
+}
+
+void ggml_cuda_fn_moe_up(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * weights) {
+    const ggml_tensor * x   = gate->src[1];
+    const ggml_tensor * ids = gate->src[2];
+    const int n_embd = (int) gate->src[0]->ne[0];
+    const int n_ff   = (int) gate->src[0]->ne[1];
+    const int n_used = (int) ids->ne[0];
+    const int nt     = (int) ids->ne[1];
+    const int np     = n_used*nt;
+
+    const size_t need = (size_t) np*(sizeof(fn_moe_route) + sizeof(float)) + (size_t) np*n_ff*(sizeof(float) + sizeof(half));
+    if (need > ctx.fn_moe_cap) {
+        ctx.retire_mem(ctx.fn_moe_mem, ctx.fn_moe_cap);
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMalloc((void **) &ctx.fn_moe_mem, need));
+        ctx.fn_moe_cap = need;
+    }
+    ctx.fn_moe_n_ff    = n_ff;
+    ctx.fn_moe_n_pairs = np;
+
+    // the activations of the layer's input: the read that produced it left them under its own tensor
+    const ggml_tensor * key = x->view_src != nullptr && x->view_offs == 0 ? x->view_src : x;
+    const fn_act_slot & sx  = fn_act_get(ctx, key, (const float *) x->data, x->nb[2]/sizeof(float), n_embd, nt);
+
+    fn_moe_up<<<dim3(n_ff/(FN_MOE_UP_G*FN_MOE_UP_R), np, 1), FN_MOE_UP_G*FN_Q2_TPR, 0, ctx.stream()>>>(
+        (const char *) gate->src[0]->data, (const char *) up->src[0]->data, gate->src[0]->nb[1], gate->src[0]->nb[2],
+        (const half2 *) fn_act_X(sx), n_embd/2, fn_act_xs(sx),
+        (const int32_t *) ids->data, (int) (ids->nb[1]/sizeof(int32_t)), n_used, (int) gate->src[0]->ne[2],
+        (const float *) weights->data, (int) (weights->nb[2]/sizeof(float)),
+        fn_moe_h(ctx), n_ff, fn_moe_route_ptr(ctx));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_fn_moe_down(ggml_backend_cuda_context & ctx, const ggml_tensor * down, ggml_tensor * dst) {
+    const ggml_tensor * ids = down->src[2];
+    const int n_ff   = (int) down->src[0]->ne[0];
+    const int n_embd = (int) down->src[0]->ne[1];
+    const int n_used = (int) ids->ne[0];
+    const int nt     = (int) ids->ne[1];
+    const int np     = n_used*nt;
+    GGML_ASSERT(ctx.fn_moe_n_ff == n_ff && ctx.fn_moe_n_pairs == np);
+    cudaStream_t stream = ctx.stream();
+
+    // |sum of n_ff products of weights up to 2| stays far inside fp16 with activations up to 16
+    fn_act_h16<<<np, FN_ACT_TPB, 0, stream>>>(fn_moe_h(ctx), n_ff, n_ff, 16.0f, fn_moe_Xh(ctx), fn_moe_xsh(ctx));
+    switch (n_ff/64) {
+#define FN_CASE(TPR)                                                                                                  \
+        case TPR:                                                                                                     \
+            fn_moe_down<TPR><<<dim3(n_embd/(fn_moe_down_groups(TPR)*FN_MOE_DOWN_R), nt, 1),                           \
+                               fn_moe_down_groups(TPR)*FN_MOE_NU*TPR, 0, stream>>>(                                   \
+                (const char *) down->src[0]->data, down->src[0]->nb[1], down->src[0]->nb[2],                          \
+                (const half2 *) fn_moe_Xh(ctx), fn_moe_xsh(ctx), fn_moe_route_ptr(ctx), n_used, (int) down->src[0]->ne[2], \
+                (float *) dst->data, dst->nb[1]/sizeof(float));                                                       \
+            break;
+        FN_CASE(4)
+        FN_CASE(6)
+        FN_CASE(8)
+        FN_CASE(12)
+#undef FN_CASE
+        default:
+            GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// AllReduce epilogue: the nodes after a reduced projection output y,
+//   [RESHAPE] MUL_MAT (inject) SCALE SIGMOID SCALE DSV4_HC_POST RMS_NORM MUL
+// computed with the reduction by fn_ar_hc.
+
+struct fn_ar_hc_args {
+    const ggml_tensor * y;       // the reduced tensor [n_embd, nt]
+    const ggml_tensor * z;       // what an ADD adds to it before the write, or null
+    const ggml_tensor * inject;  // MUL_MAT(w_inject [hc*n_embd -> hc], xn_prev)
+    const ggml_tensor * scale0;  // SCALE before the sigmoid
+    const ggml_tensor * scale1;  // SCALE after it
+    const ggml_tensor * post;    // DSV4_HC_POST(y, R, gates): dst = R'
+    const ggml_tensor * rms;     // RMS_NORM(R')
+    const ggml_tensor * mul;     // MUL by w_norm: dst = xn
+    int                 n_nodes;
+    // the read that follows, if it is one the engine computes: its activations are written with the norm
+    const ggml_tensor * xd;      // src[1] of the down MUL_MAT
+    const ggml_tensor * pre;     // DSV4_HC_PRE
+};
+
+static bool fn_ar_hc_match(const ggml_tensor * y, ggml_tensor ** next, const int n_next, fn_ar_hc_args & a) {
+    int i = 0;
+    const ggml_tensor * yv = y; // what the write reads
+    a.z = nullptr;
+    if (n_next > 0 && next[0]->op == GGML_OP_RESHAPE && next[0]->src[0] == y) {
+        yv = next[0];
+        i  = 1;
+    } else if (n_next > 0 && next[0]->op == GGML_OP_ADD && (next[0]->src[0] == y || next[0]->src[1] == y)) {
+        yv  = next[0];
+        a.z = next[0]->src[0] == y ? next[0]->src[1] : next[0]->src[0];
+        i   = 1;
+        if (a.z == y || !ggml_are_same_shape(a.z, y) || a.z->type != GGML_TYPE_F32 || !ggml_is_contiguous(a.z) ||
+            ((uintptr_t) a.z->data & 0xF) != 0) {
+            return false;
+        }
+    }
+    if (i + 7 > n_next) {
+        return false;
+    }
+    a.y      = y;
+    a.inject = next[i];
+    a.scale0 = next[i + 1];
+    const ggml_tensor * sig = next[i + 2];
+    a.scale1 = next[i + 3];
+    a.post   = next[i + 4];
+    a.rms    = next[i + 5];
+    a.mul    = next[i + 6];
+    a.n_nodes = i + 7;
+    a.xd      = nullptr;
+    a.pre     = nullptr;
+    if (a.inject->op != GGML_OP_MUL_MAT || a.scale0->op != GGML_OP_SCALE || sig->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || a.scale1->op != GGML_OP_SCALE ||
+        a.post->op != GGML_OP_DSV4_HC_POST || a.rms->op != GGML_OP_RMS_NORM || a.mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (a.scale0->src[0] != a.inject || sig->src[0] != a.scale0 || a.scale1->src[0] != sig ||
+        a.post->src[0] != yv || a.post->src[2] != a.scale1 || a.post->src[3] != nullptr || a.rms->src[0] != a.post) {
+        return false;
+    }
+    // nothing but the write reads the reduced values, the gates or the norm
+    for (const ggml_tensor * t : { y, yv, a.inject, a.scale0, sig, a.scale1, a.rms }) {
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+    }
+    const ggml_tensor * R   = a.post->src[1];
+    const ggml_tensor * wi  = a.inject->src[0];
+    const ggml_tensor * xpv = a.inject->src[1];                               // [hc*n_embd, nt]
+    const ggml_tensor * xp  = xpv->view_src != nullptr ? xpv->view_src : xpv; // [n_embd, hc, nt]
+    const int64_t n_embd = y->ne[0];
+    const int64_t nt     = y->ne[1];
+    if (!fn_hc_norm_supported(a.rms, a.mul) || a.post->type != GGML_TYPE_F32 || !ggml_is_contiguous(a.post) ||
+        !ggml_are_same_shape(a.post, R) || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) || R->ne[0] != n_embd ||
+        R->ne[2] != nt || y->type != GGML_TYPE_F32 || !ggml_is_contiguous(y) || y->ne[2] != 1 || y->ne[3] != 1 ||
+        nt > GGML_CUDA_AR_WINDOW_BLOCKS || y->nb[1] % 16 != 0 ||
+        (wi->type != GGML_TYPE_F32 && wi->type != GGML_TYPE_F16 && wi->type != GGML_TYPE_BF16) || !ggml_is_contiguous(wi) ||
+        wi->ne[0] != FN_HC*n_embd || wi->ne[1] != FN_HC || ggml_nrows(wi) != FN_HC ||
+        xpv->type != GGML_TYPE_F32 || xpv->data != xp->data || xp->ne[0] != n_embd || xp->ne[1] != FN_HC || xp->ne[2] != nt ||
+        !ggml_is_contiguous(xp) || xpv->ne[0] != FN_HC*n_embd || xpv->ne[1] != nt ||
+        !fn_hc_aligned(y) || !fn_hc_aligned(R) || !fn_hc_aligned(a.post) || !fn_hc_aligned(xp)) {
+        return false;
+    }
+    // see fn_ar_hc for what may share memory
+    if (fn_overlap(a.post, a.mul)) {
+        return false;
+    }
+    // RESHAPE, RESHAPE and the six nodes of the read
+    ggml_cuda_hc_mix_args h;
+    if (a.n_nodes + 8 <= n_next && next[a.n_nodes]->op == GGML_OP_RESHAPE && next[a.n_nodes + 1]->op == GGML_OP_RESHAPE &&
+        fn_hc_tail_nodes(next + a.n_nodes + 2, h) && h.mul == a.mul) {
+        a.xd  = h.mm_down->src[1];
+        a.pre = h.pre;
+    }
+    return true;
+}
+
+int ggml_cuda_fn_ar_epilogue_match(const ggml_tensor * reduced, ggml_tensor ** next, const int n_next) {
+    if (!ggml_cuda_fn_enabled()) {
+        return 0;
+    }
+    static const bool enabled = getenv("GGML_CUDA_FN_AR") == nullptr || atoi(getenv("GGML_CUDA_FN_AR")) != 0;
+    fn_ar_hc_args a;
+    return enabled && fn_ar_hc_match(reduced, next, n_next, a) ? a.n_nodes : 0;
+}
+
+void ggml_cuda_fn_ar_epilogue(ggml_backend_cuda_context & ctx, const ggml_tensor * reduced, ggml_tensor ** next, const int n_next,
+                              const int n_fused, const ggml_cuda_ar_window_io & io) {
+    fn_ar_hc_args a;
+    GGML_ASSERT(fn_ar_hc_match(reduced, next, n_next, a) && a.n_nodes == n_fused);
+    GGML_ASSERT((reduced->flags & GGML_TENSOR_FLAG_COMPUTE) != 0);
+    const ggml_tensor * y   = a.y;
+    const ggml_tensor * R   = a.post->src[1];
+    const ggml_tensor * wi  = a.inject->src[0];
+    const ggml_tensor * xpv = a.inject->src[1];
+    const ggml_tensor * xp  = xpv->view_src != nullptr ? xpv->view_src : xpv;
+    const ggml_tensor * wn  = a.mul->src[1];
+    const int n_embd = (int) y->ne[0];
+    const int nt     = (int) y->ne[1];
+    // the units go to the upper half of the slot: the lower half may hold the data of a plain reduction
+    GGML_ASSERT((size_t) nt*n_embd*sizeof(float) <= io.wire_bytes/2);
+
+    const float * p0 = (const float *) a.scale0->op_params;
+    const float * p1 = (const float *) a.scale1->op_params;
+    const float4 act = make_float4(p0[0], p0[1], p1[0], p1[1]);
+
+    const fn_hc_norm_out o = fn_hc_norm_outputs(ctx, a.mul, a.xd, a.pre);
+    {
+        static int n_dbg = 0;
+        if (getenv("GGML_CUDA_FN_DEBUG") != nullptr && n_dbg++ < 400 && (n_dbg % 97) == 0) {
+            fprintf(stderr, "fn-debug: ar_hc n_next %d xd %d pre %d\n", n_next, a.xd != nullptr, a.pre != nullptr);
+        }
+    }
+
+#define FN_AR_HC(T_inj)                                                                                               \
+    fn_ar_hc<T_inj><<<nt, n_embd/4, 0, ctx.stream()>>>(                                                               \
+        (const float *) y->data, y->nb[1]/sizeof(float),                                                              \
+        a.z != nullptr ? (const float *) a.z->data : nullptr, a.z != nullptr ? a.z->nb[1]/sizeof(float) : 0,          \
+        (uint4 *) (io.wire_mine + io.wire_bytes/2), (const uint4 *) (io.wire_other + io.wire_bytes/2), io.epoch, io.site, \
+        (const float *) xp->data, xp->nb[1]/sizeof(float), xp->nb[2]/sizeof(float),                                   \
+        (const T_inj *) wi->data, act,                                                                                \
+        (const float *) R->data, R->nb[1]/sizeof(float), R->nb[2]/sizeof(float),                                      \
+        (float *) a.post->data, a.post->nb[1]/sizeof(float), a.post->nb[2]/sizeof(float),                             \
+        (const float *) wn->data, n_embd, ggml_get_op_params_f32(a.rms, 0),                                           \
+        (float *) a.mul->data, a.mul->nb[1]/sizeof(float), a.mul->nb[2]/sizeof(float), o, ctx.fn_dbg_get())
+    switch (wi->type) {
+        case GGML_TYPE_F32:  FN_AR_HC(float);       break;
+        case GGML_TYPE_F16:  FN_AR_HC(half);        break;
+        case GGML_TYPE_BF16: FN_AR_HC(nv_bfloat16); break;
+        default: GGML_ABORT("fatal error");
+    }
+#undef FN_AR_HC
     CUDA_CHECK(cudaGetLastError());
 }
 

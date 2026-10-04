@@ -1250,6 +1250,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+
+                        // host memory of a tensor-split device: one slice per device, like the tensors in its VRAM
+                        ggml_backend_buffer_type_t buft_split =
+                            ggml_backend_meta_device_host_split_buffer_type(buft_list->front().first, buft);
+                        if (buft_split != nullptr) {
+                            buft = buft_split;
+                        }
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",

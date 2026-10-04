@@ -3301,7 +3301,11 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int     n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+    // an empty batch (the last layer of a ubatch without outputs) still matches, so that the alloc deps
+    // graph_optimize adds for it, and with them the node count of the allocated graph, do not depend on whether a
+    // ubatch has outputs: a different node count makes the scheduler re-allocate, which synchronizes every backend
+    // and stalls a pipeline-parallel prompt at every ubatch
+    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens < 0) {
         return false;
     }
 
@@ -3895,6 +3899,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            if (ggml_is_empty(match.dst)) {
+                return match.node_count - 1;
+            }
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(

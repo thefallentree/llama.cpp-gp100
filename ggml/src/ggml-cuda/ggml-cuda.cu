@@ -37,6 +37,7 @@
 #include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/hc-mix.cuh"
+#include "ggml-cuda/shexp-fuse.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -3837,6 +3838,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // shared expert: gate, up, swiglu, down and the sigmoid-gated scale -> two kernels
+    if (node->op == GGML_OP_MUL_MAT) {
+        ggml_cuda_shexp_args sx_args;
+        if (ggml_cuda_shexp_match(cgraph, i, sx_args)) {
+            ggml_cuda_shexp(*cuda_ctx, sx_args);
+            return 6;
+        }
+    }
 
     // qwen4exp hyper-connection read: norm, down, scale, silu, up, gated mean -> three kernels
     if (node->op == GGML_OP_RMS_NORM) {

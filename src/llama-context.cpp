@@ -431,12 +431,15 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // tensor overrides usually move weights to the CPU, where it does not pay off; LLAMA_PIPELINE_PARALLEL=1
+        // enables it anyway (e.g. for overrides that keep weights in host memory the GPUs read themselves)
+        const char * pp_env = getenv("LLAMA_PIPELINE_PARALLEL");
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            (!model.has_tensor_overrides() || (pp_env != nullptr && atoi(pp_env) != 0));
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {

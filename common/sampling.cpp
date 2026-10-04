@@ -611,6 +611,13 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+static bool common_sampler_is_greedy(const common_params_sampling & params) {
+    return params.temp <= 0.0f && params.mirostat == 0 && params.n_probs == 0 && params.typ_p >= 1.0f &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
+        params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f &&
+        std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == params.samplers.end();
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -660,6 +667,90 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             }
 
             return id;
+        }
+    }
+
+    // Temperature 0 with nothing in the chain that can move the argmax (the greedy_only condition of
+    // common_sampler_init) and no caller interested in probabilities: scan the logits row for its maximum instead
+    // of materializing and filtering an n_vocab-sized candidate array (~1.3 ms per token on a 248k vocabulary).
+    // Logit biases (e.g. --ignore-eos) and suppressed tokens are applied to the few tokens they name.
+    if (!grmr && !rbudget && common_sampler_is_greedy(gsmpl->params)) {
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int     n_vocab = llama_vocab_n_tokens(vocab);
+        const float * logits  = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        int32_t             n_suppress = 0;
+        const llama_token * suppress   = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        const auto & bias = gsmpl->params.logit_bias;
+        auto special = [&](llama_token t) {
+            if (std::find(suppress, suppress + n_suppress, t) != suppress + n_suppress) {
+                return true;
+            }
+            for (const auto & b : bias) {
+                if (b.token == t) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // the max first, with independent partial maxima (a single running max is a dependency chain the
+        // compiler may not vectorize without -ffast-math: ~0.8 ms on a 248k vocabulary), then its first index
+        float vm[8] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+        int t0 = 0;
+        for (; t0 + 8 <= n_vocab; t0 += 8) {
+            for (int j = 0; j < 8; ++j) {
+                vm[j] = logits[t0 + j] > vm[j] ? logits[t0 + j] : vm[j];
+            }
+        }
+        float vmax = -INFINITY;
+        for (int j = 0; j < 8; ++j) {
+            vmax = std::max(vmax, vm[j]);
+        }
+        for (int t = t0; t < n_vocab; ++t) {
+            vmax = std::max(vmax, logits[t]);
+        }
+        llama_token best = LLAMA_TOKEN_NULL;
+        for (int t = 0; t < n_vocab; ++t) {
+            if (logits[t] == vmax) {
+                best = t;
+                break;
+            }
+        }
+        if (best != LLAMA_TOKEN_NULL && special(best)) {
+            // the plain winner is biased or suppressed: take the best of the others ...
+            best = LLAMA_TOKEN_NULL;
+            vmax = -INFINITY;
+            for (llama_token t = 0; t < n_vocab; ++t) {
+                if (logits[t] > vmax && !special(t)) {
+                    vmax = logits[t];
+                    best = t;
+                }
+            }
+        }
+        // ... and let the biased tokens compete with their bias applied
+        for (const auto & b : bias) {
+            if (b.token < 0 || b.token >= n_vocab || std::find(suppress, suppress + n_suppress, b.token) != suppress + n_suppress) {
+                continue;
+            }
+            float v = logits[b.token];
+            for (const auto & b2 : bias) {
+                if (b2.token == b.token) {
+                    v += b2.bias;
+                }
+            }
+            if (v > vmax) {
+                vmax = v;
+                best = b.token;
+            }
+        }
+        if (best != LLAMA_TOKEN_NULL) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ best, vmax, 1.0f };
+            cur_p = { gsmpl->cur.data(), 1, 0, true };
+            return best;
         }
     }
 

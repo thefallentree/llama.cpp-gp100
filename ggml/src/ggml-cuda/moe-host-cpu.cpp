@@ -276,7 +276,8 @@ struct pool {
     const act_block *    jxq = nullptr; // [n_tokens][n_embd/64], in the mailbox
     std::vector<float>     h;    // [MH_MAX_PAIRS][n_ff]: the swiglu outputs
     std::vector<act_block> hq;   // [MH_MAX_PAIRS][n_ff/64]: ... quantized
-    std::unique_ptr<std::atomic<int>[]> blk_cnt; // [MH_MAX_PAIRS][MH_MAX_FF/64]: finished CH1-row chunks per block
+    std::unique_ptr<std::atomic<int>[]> blk_cnt;   // [MH_MAX_PAIRS][MH_MAX_FF/64]: finished CH1-row chunks per expert block
+    std::unique_ptr<std::atomic<int>[]> grp_ready; // [MH_MAX_PAIRS]: quantized activation blocks per expert
 
     alignas(64) std::atomic<uint32_t> job_gen { 0 };
     alignas(64) std::atomic<int>      chunk1 { 0 };
@@ -314,35 +315,47 @@ struct pool {
         const int nb_f = s.n_ff/QK;
         const int rb1  = s.n_ff/CH1;
         const int n1   = n_groups*rb1;
-        for (int c; (c = chunk1.fetch_add(1, std::memory_order_relaxed)) < n1; ) {
-            const group & g  = groups[c/rb1];
-            const int     r0 = (c % rb1)*CH1;
-            const uint8_t * gate = s.gate + (size_t) g.c*s.gate_nb2;
-            const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
-            for (int r = r0; r < r0 + CH1; ++r) {
-                const q2_block * wg = (const q2_block *) (gate + (size_t) r*s.gate_nb1);
-                const q2_block * wu = (const q2_block *) (up   + (size_t) r*s.up_nb1);
-                for (int i = 0; i < g.n; ++i) {
-                    float vg, vu;
-                    dot2(wg, wu, jxq + (size_t) g.tok[i]*nb_e, nb_e, &vg, &vu);
-                    h[(size_t) g.pair[i]*s.n_ff + r] = vg/(1.0f + expf(-vg))*vu;
+        const int rb3  = s.n_embd/CH3;
+        const int n3   = n_groups*rb3;
+        // one queue: the gate/up chunks of all experts, then their down chunks. A down chunk waits for its own
+        // expert's activations only, so the threads that finish early start on the down projections of the experts
+        // that are complete instead of waiting for all of them.
+        for (int c; (c = chunk1.fetch_add(1, std::memory_order_relaxed)) < n1 + n3; ) {
+            if (c < n1) {
+                const int       gi = c/rb1;
+                const group &   g  = groups[gi];
+                const int       r0 = (c % rb1)*CH1;
+                const uint8_t * gate = s.gate + (size_t) g.c*s.gate_nb2;
+                const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
+                for (int r = r0; r < r0 + CH1; ++r) {
+                    const q2_block * wg = (const q2_block *) (gate + (size_t) r*s.gate_nb1);
+                    const q2_block * wu = (const q2_block *) (up   + (size_t) r*s.up_nb1);
+                    for (int i = 0; i < g.n; ++i) {
+                        float vg, vu;
+                        dot2(wg, wu, jxq + (size_t) g.tok[i]*nb_e, nb_e, &vg, &vu);
+                        h[(size_t) g.pair[i]*s.n_ff + r] = vg/(1.0f + expf(-vg))*vu;
+                    }
                 }
-            }
-            const int kb = r0/QK;
-            for (int i = 0; i < g.n; ++i) {
-                const int p = g.pair[i];
-                if (blk_cnt[(size_t) p*(MH_MAX_FF/QK) + kb].fetch_add(1, std::memory_order_acq_rel) == QK/CH1 - 1) {
-                    quant(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hq.data() + (size_t) p*nb_f + kb);
+                const int kb = r0/QK;
+                if (blk_cnt[(size_t) gi*(MH_MAX_FF/QK) + kb].fetch_add(1, std::memory_order_acq_rel) == QK/CH1 - 1) {
+                    for (int i = 0; i < g.n; ++i) {
+                        const int p = g.pair[i];
+                        quant(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hq.data() + (size_t) p*nb_f + kb);
+                    }
+                    grp_ready[gi].fetch_add(1, std::memory_order_release);
                 }
+                continue;
             }
-        }
-        barrier();
-        const int rb3 = s.n_embd/CH3;
-        const int n3  = n_groups*rb3;
-        for (int c; (c = chunk3.fetch_add(1, std::memory_order_relaxed)) < n3; ) {
-            const group & g  = groups[c/rb3];
-            const int     r0 = (c % rb3)*CH3;
+            const int       c3 = c - n1;
+            const int       gi = c3/rb3;
+            const group &   g  = groups[gi];
+            const int       r0 = (c3 % rb3)*CH3;
             const uint8_t * down = s.down + (size_t) g.c*s.down_nb2;
+            while (grp_ready[gi].load(std::memory_order_acquire) < nb_f) {
+#if MH_X86
+                _mm_pause();
+#endif
+            }
             for (int r = r0; r < r0 + CH3; r += 2) {
                 const q2_block * w0 = (const q2_block *) (down + (size_t) (r + 0)*s.down_nb1);
                 const q2_block * w1 = (const q2_block *) (down + (size_t) (r + 1)*s.down_nb1);
@@ -421,16 +434,16 @@ struct pool {
         }
         // the GPU quantized the input rows (mh_publish)
         jxq = m->xq;
-        for (int p = 0; p < n_pairs; ++p) {
+        for (int gi = 0; gi < n_groups; ++gi) {
             for (int kb = 0; kb < js->n_ff/QK; ++kb) {
-                blk_cnt[(size_t) p*(MH_MAX_FF/QK) + kb].store(0, std::memory_order_relaxed);
+                blk_cnt[(size_t) gi*(MH_MAX_FF/QK) + kb].store(0, std::memory_order_relaxed);
             }
+            grp_ready[gi].store(0, std::memory_order_relaxed);
         }
         GGML_UNUSED(tok_used);
         GGML_UNUSED(nb_e);
         const auto t_quant = std::chrono::steady_clock::now();
         chunk1.store(0, std::memory_order_relaxed);
-        chunk3.store(0, std::memory_order_relaxed);
         job_gen.fetch_add(1, std::memory_order_acq_rel);
         work();
         barrier();
@@ -506,6 +519,7 @@ struct pool {
         h.resize((size_t) MH_MAX_PAIRS*MH_MAX_FF);
         hq.resize((size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK));
         blk_cnt.reset(new std::atomic<int>[(size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK)]);
+        grp_ready.reset(new std::atomic<int>[MH_MAX_PAIRS]);
         threads.emplace_back(&pool::leader, this);
         for (int t = 1; t < n_threads; ++t) {
             threads.emplace_back(&pool::helper, this);

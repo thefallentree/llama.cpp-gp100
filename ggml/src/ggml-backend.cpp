@@ -2026,6 +2026,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    if (parallel && getenv("GGML_SCHED_COPIES") != nullptr) {
+        // every copy duplicates the inputs of each split (e.g. the KQ mask): a pipeline of two devices needs fewer
+        sched->n_copies = std::max(2, std::min(GGML_SCHED_MAX_COPIES, atoi(getenv("GGML_SCHED_COPIES"))));
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

@@ -686,6 +686,9 @@ public:
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, false, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_rows->buffer));
+        memcpy(new_pool_rows->data, new_pool_idxs->data, ggml_nbytes(new_pool_idxs));
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -716,6 +719,8 @@ public:
     ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
+    ggml_tensor * new_pool_rows = nullptr; // I32 [kpool*n_new]    the same as the rows of a gather: reshaping an input
+                                           //                      in every layer would be a host node and a copy each
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
 
@@ -760,6 +765,9 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
+    ggml_build_forward_expand(gf, inp->new_pool_idxs);
+    inp->new_pool_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, kpool*inp->n_new);
+    ggml_set_input(inp->new_pool_rows);
     if (inp->cache_safe) {
         inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp->n_new);
         ggml_set_input(inp->new_pool_rep);
@@ -802,7 +810,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
 
     // pool only the blocks this ubatch completes or regroups
-    ggml_tensor * rows = kpool_cache.gather_key_gate(ggml_reshape_1d(ctx0, inp_kpool->new_pool_idxs, kpool*n_new));
+    ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_rows);
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 
     // mean over the members; kpool is small, so summing slices beats a transpose plus sum_rows
@@ -812,13 +820,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         pooled_new = pooled_new ? ggml_add(ctx0, pooled_new, slice) : ggml_cont(ctx0, slice);
     }
     pooled_new = ggml_scale(ctx0, pooled_new, 1.0f/(float) kpool);
-    pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
+    // norm, rope and the view of the result are consecutive nodes, so that a backend can fuse them with the cache write
     pooled_new = ggml_reshape_3d(ctx0, pooled_new, idx_dim, 1, n_new);
+    pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
     pooled_new = ggml_rope_multi(ctx0, pooled_new, inp_kpool->new_pool_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled_new = ggml_reshape_2d(ctx0, pooled_new, idx_dim, n_new);
+    pooled_new = ggml_view_2d(ctx0, pooled_new, idx_dim, n_new, pooled_new->nb[2], 0);
     cb(pooled_new, "indexer_pool_k_new", il);
 
     ggml_tensor * pooled = nullptr;

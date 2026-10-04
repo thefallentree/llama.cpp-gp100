@@ -1848,27 +1848,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_synchronize(split_backend);
                     }
                     synced = true;
-                    if (i > 0) { FN_PROF_ADD("sched.in.first_sync", t_s0); }
+                    FN_PROF_ADD("sched.in.first_sync", t_s0);
                 }
                 FN_PROF_T(t_c0);
                 if (split_backend->iface.set_tensor_async != NULL && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
                         input->data != NULL && ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy)) {
                     split_backend->iface.set_tensor_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                     pending = true;
-                    if (i > 0) { FN_PROF_ADD(ggml_nbytes(input) <= 4096 ? "sched.in.copy_async(<=4K)" : "sched.in.copy_async(>4K)", t_c0); }
+                    FN_PROF_ADD(ggml_nbytes(input) <= 4096 ? "sched.in.copy_async(<=4K)" : "sched.in.copy_async(>4K)", t_c0);
                 } else {
                     if (pending) {
                         ggml_backend_synchronize(split_backend);
                         pending = false;
                     }
                     ggml_backend_tensor_copy(input, input_cpy);
-                    if (i > 0) { FN_PROF_ADD("sched.in.copy_sync", t_c0); }
+                    FN_PROF_ADD("sched.in.copy_sync", t_c0);
                 }
             }
             if (pending) {
                 FN_PROF_T(t_f0);
                 ggml_backend_synchronize(split_backend);
-                if (i > 0) { FN_PROF_ADD("sched.in.final_sync", t_f0); }
+                FN_PROF_ADD("sched.in.final_sync", t_f0);
             }
         }
 

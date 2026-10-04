@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -1161,6 +1162,117 @@ static __global__ void fn_gdn_out(const float * __restrict__ x, const int64_t sx
     *(uint2 *) (X + (int64_t) t*n + 4*threadIdx.x) = make_uint2((unsigned int) fn_i2(h0), (unsigned int) fn_i2(h1));
 }
 
+// The input side of a recurrent (gated delta net) layer, from its projections to the inputs of the delta rule:
+//   conv:  y[t][c] = silu(sum_j in[t + j][c]*w[c][j]); in: the K - 1 columns of the layer's conv state, then x
+//   q, k:  y*rsqrt(mean of the head's y^2 + eps)*norm_scale (the l2 norm over each head)
+//   state: the last K - 1 columns of in, once per rollback slot (slot s ends s tokens earlier)
+//   gate:  softplus(alpha + dt)*a
+// One warp per head; a lane owns four channels, whose window of K - 1 columns it keeps in registers while it steps
+// through the tokens. A lane reads its channels of the state before it stores them: the row of a slot may be the
+// row that is read. The last block computes the gates.
+#define FN_GDN_PRE_SLOTS 4
+
+struct fn_gdn_pre_args {
+    const float *   cache;    // the conv state: row rows[0] (crow floats per row), or the state itself if rows is null
+    const int32_t * rows;
+    int64_t         crow;
+    float *         slot[FN_GDN_PRE_SLOTS]; // [C][K - 1] each
+    const float *   x;        // [T][C], sx_t apart
+    const float *   w;        // [C][K]
+    float *         y;        // [T][C], sy_t apart
+    float *         q;        // [T][n_head_k][128], sq_t apart
+    float *         k;
+    const float *   alpha;    // [T][n_gate], sa_t apart
+    const float *   dt;       // [n_gate]
+    const float *   a;        // [n_gate]
+    float *         gate;     // [T][n_gate], sg_t apart
+    int             sx_t, sy_t, sq_t, sa_t, sg_t;
+    int             nt, n_slots, n_head_k, n_heads, n_gate;
+    float           eps, norm_scale;
+};
+
+static __device__ __forceinline__ float4 fn_mul4(const float4 a, const float4 b) {
+    return make_float4(a.x*b.x, a.y*b.y, a.z*b.z, a.w*b.w);
+}
+
+static __device__ __forceinline__ float4 fn_fma4(const float4 a, const float4 b, const float4 c) {
+    return make_float4(a.x*b.x + c.x, a.y*b.y + c.y, a.z*b.z + c.z, a.w*b.w + c.w);
+}
+
+// the window of a lane's four channels as it is stored: three columns per channel
+static __device__ __forceinline__ void fn_gdn_pre_store(float * row, const float4 c0, const float4 c1, const float4 c2) {
+    *(float4 *) (row + 0) = make_float4(c0.x, c1.x, c2.x, c0.y);
+    *(float4 *) (row + 4) = make_float4(c1.y, c2.y, c0.z, c1.z);
+    *(float4 *) (row + 8) = make_float4(c2.z, c0.w, c1.w, c2.w);
+}
+
+static __global__ void fn_gdn_pre(const fn_gdn_pre_args a) {
+    const int lane = threadIdx.x;
+    const int h    = blockIdx.x;
+    if (h == a.n_heads) {
+        for (int e = lane; e < a.nt*a.n_gate; e += WARP_SIZE) {
+            const int   t = e/a.n_gate;
+            const int   g = e - t*a.n_gate;
+            const float v = a.alpha[t*a.sa_t + g] + a.dt[g];
+            a.gate[t*a.sg_t + g] = (v > 20.0f ? v : logf(1.0f + expf(v)))*a.a[g];
+        }
+        return;
+    }
+    const int     c0    = h*FN_GDN_HEAD + 4*lane;
+    const float * state = a.rows != nullptr ? a.cache + (int64_t) a.rows[0]*a.crow : a.cache;
+    float4 col0, col1, col2;
+    {
+        const float4 s0 = *(const float4 *) (state + 3*c0);
+        const float4 s1 = *(const float4 *) (state + 3*c0 + 4);
+        const float4 s2 = *(const float4 *) (state + 3*c0 + 8);
+        col0 = make_float4(s0.x, s0.w, s1.z, s2.y);
+        col1 = make_float4(s0.y, s1.x, s1.w, s2.z);
+        col2 = make_float4(s0.z, s1.y, s2.x, s2.w);
+    }
+    float4 tap0, tap1, tap2, tap3;
+    {
+        const float4 w0 = *(const float4 *) (a.w + 4*c0);
+        const float4 w1 = *(const float4 *) (a.w + 4*c0 + 4);
+        const float4 w2 = *(const float4 *) (a.w + 4*c0 + 8);
+        const float4 w3 = *(const float4 *) (a.w + 4*c0 + 12);
+        tap0 = make_float4(w0.x, w1.x, w2.x, w3.x);
+        tap1 = make_float4(w0.y, w1.y, w2.y, w3.y);
+        tap2 = make_float4(w0.z, w1.z, w2.z, w3.z);
+        tap3 = make_float4(w0.w, w1.w, w2.w, w3.w);
+    }
+    // the slots that end before the first token of this window keep the state that was read
+    for (int sl = a.nt; sl < a.n_slots; ++sl) {
+        fn_gdn_pre_store(a.slot[sl] + 3*c0, col0, col1, col2);
+    }
+    const bool is_qk = h < 2*a.n_head_k;
+    float * qk = nullptr;
+    if (is_qk) {
+        qk = (h < a.n_head_k ? a.q + h*FN_GDN_HEAD : a.k + (h - a.n_head_k)*FN_GDN_HEAD) + 4*lane;
+    }
+    for (int t = 0; t < a.nt; ++t) {
+        const float4 xt = *(const float4 *) (a.x + t*a.sx_t + c0);
+        float4 v = fn_fma4(xt, tap3, fn_fma4(col2, tap2, fn_fma4(col1, tap1, fn_mul4(col0, tap0))));
+        v = make_float4(v.x/(1.0f + expf(-v.x)), v.y/(1.0f + expf(-v.y)), v.z/(1.0f + expf(-v.z)), v.w/(1.0f + expf(-v.w)));
+        col0 = col1;
+        col1 = col2;
+        col2 = xt;
+        const int sl = a.nt - 1 - t;
+        if (sl < a.n_slots) {
+            fn_gdn_pre_store(a.slot[sl] + 3*c0, col0, col1, col2);
+        }
+        *(float4 *) (a.y + t*a.sy_t + c0) = v;
+        if (is_qk) {
+            float ss = v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+#pragma unroll
+            for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+                ss += __shfl_xor_sync(0xffffffff, ss, o);
+            }
+            const float sc = rsqrtf(ss/FN_GDN_HEAD + a.eps)*a.norm_scale;
+            *(float4 *) (qk + t*a.sq_t) = make_float4(v.x*sc, v.y*sc, v.z*sc, v.w*sc);
+        }
+    }
+}
+
 // The output of an attention layer before its projection: y = x*sigmoid(g), as floats and as the activations of the
 // projection. g is a view: d values per head, the heads sg_h apart. One block per token, a thread owns four values.
 static __global__ void fn_gate_out(const float * __restrict__ x, const int64_t sx_t, const float * __restrict__ g, const int64_t sg_h,
@@ -1186,22 +1298,23 @@ static __global__ void fn_gate_out(const float * __restrict__ x, const int64_t s
     *(uint2 *) (X + (int64_t) t*n + 4*threadIdx.x) = make_uint2((unsigned int) fn_i2(h0), (unsigned int) fn_i2(h1));
 }
 
-// The selection mask of a QSA attention layer (the top blocks of the indexer plus the tail), one block per token:
+// The selection mask of a QSA attention layer (the top blocks of the indexer plus the tail):
 //   out[cell] = kq_mask[cell] if the cell is selected, -inf otherwise
-// slot s of the token selects the cell sel_idx[s] if it is live: a slot of a top block if the block's score is not
+// slot s of a token selects the cell sel_idx[s] if it is live: a slot of a top block if the block's score is not
 // -inf, a tail slot if its cell is not the sentinel n_kv. A dead slot goes to its own row n_kv + s, beyond the mask.
-static __global__ void fn_qsa_sel(const int32_t * __restrict__ sel_idx, const int64_t s_sel, const int n_sel, const int n_top,
-                                  const int kpool, const float * __restrict__ score, const int64_t s_score,
-                                  const int32_t * __restrict__ top_k, const int64_t s_topk, const int n_kv,
+// One block for all the tokens: the cells of the slots are staged in shared memory before the first store, because
+// the output usually shares memory with the scores and the top blocks (their buffers are free by then).
+#define FN_QSA_SEL_THREADS 1024
+#define FN_QSA_SEL_DEAD    0xFFFFu
+
+static __global__ void fn_qsa_sel(const int32_t * sel_idx, const int64_t s_sel, const int n_sel, const int n_top,
+                                  const int kpool, const float * score, const int64_t s_score,
+                                  const int32_t * top_k, const int64_t s_topk, const int n_kv, const int nt,
                                   const half * __restrict__ kq_mask, const int64_t s_kq, half * out, const int64_t s_out) {
-    const int t = blockIdx.x;
-    half * o = out + t*s_out;
-    const half ninf = __ushort_as_half((unsigned short) 0xFC00);
-    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
-        o[c] = ninf;
-    }
-    __syncthreads();
-    for (int s = threadIdx.x; s < n_sel; s += blockDim.x) {
+    extern __shared__ unsigned short s_cell[];
+    for (int e = threadIdx.x; e < nt*n_sel; e += blockDim.x) {
+        const int t = e/n_sel;
+        const int s = e - t*n_sel;
         const float idx = (float) sel_idx[t*s_sel + s];
         float live;
         if (s < n_top) {
@@ -1211,13 +1324,45 @@ static __global__ void fn_qsa_sel(const int32_t * __restrict__ sel_idx, const in
         }
         const float dump = (float) (n_kv + s);
         const int   cell = (int) ((idx - dump)*live + dump);
-        if (cell < n_kv) {
-            o[cell] = __ushort_as_half((unsigned short) 0);
-        }
+        s_cell[e] = cell < n_kv ? (unsigned short) cell : (unsigned short) FN_QSA_SEL_DEAD;
     }
     __syncthreads();
-    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
-        o[c] = __half_as_ushort(o[c]) == 0 ? kq_mask[t*s_kq + c] : ninf;
+    const half ninf = __ushort_as_half((unsigned short) 0xFC00);
+    for (int e = threadIdx.x; e < nt*n_kv; e += blockDim.x) {
+        const int t = e/n_kv;
+        out[t*s_out + (e - t*n_kv)] = ninf;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < nt*n_sel; e += blockDim.x) {
+        const int t = e/n_sel;
+        const unsigned int cell = s_cell[e];
+        if (cell != FN_QSA_SEL_DEAD) {
+            out[t*s_out + cell] = kq_mask[t*s_kq + cell];
+        }
+    }
+}
+
+// The pooled indexer keys of a QSA attention layer (qwen4exp build_qsa_sel), one block:
+//   the raw keys of the new tokens go to the first half of their cache rows (the second half is zeroed), then the
+//   mean over the kpool member rows of each block to re-pool is taken from the cache.
+static __global__ void fn_qsa_pool(const float * __restrict__ k_raw, const int64_t sk_t, const int d, const int nt,
+                                   const int64_t * __restrict__ k_idxs, half * cache, const int64_t s_cell,
+                                   const int32_t * __restrict__ pool_idx, const int kpool, const int n_new, const float scale,
+                                   float * __restrict__ out, const int64_t so) {
+    for (int e = threadIdx.x; e < nt*2*d; e += blockDim.x) {
+        const int t = e/(2*d);
+        const int c = e - t*(2*d);
+        cache[k_idxs[t]*s_cell + c] = c < d ? __float2half(k_raw[t*sk_t + c]) : __float2half(0.0f);
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_new*d; e += blockDim.x) {
+        const int j = e/d;
+        const int c = e - j*d;
+        float acc = 0.0f;
+        for (int m = 0; m < kpool; ++m) {
+            acc += __half2float(cache[(int64_t) pool_idx[j*kpool + m]*s_cell + c]);
+        }
+        out[j*so + c] = acc*scale;
     }
 }
 
@@ -1712,6 +1857,102 @@ fn_moe_down(const char * __restrict__ wd, const int64_t nb1, const int64_t nb2,
 
 #ifndef FN_STANDALONE
 
+// Are the n nodes from node i the ops, computed, and used by nothing but each other, except for the last one?
+// ggml_can_fuse_subgraph asks more than these patterns have: it refuses a node that is a view of a tensor outside
+// (a RESHAPE of an input, which nothing elides) and a cast (a CPY whose destination is the node itself and counts
+// as a use).
+// GGML_CUDA_FN_OFF: a bit mask of the fused patterns below that are left to the generic ops
+enum fn_pattern_bit { FN_PAT_GDN_OUT, FN_PAT_GATE_OUT, FN_PAT_QSA_SEL, FN_PAT_QSA_POOL, FN_PAT_NORM_ROPE, FN_PAT_GDN_PRE };
+
+static bool fn_pattern_on(const fn_pattern_bit bit) {
+    static const int off = getenv("GGML_CUDA_FN_OFF") != nullptr ? atoi(getenv("GGML_CUDA_FN_OFF")) : 0;
+    return ggml_cuda_fn_enabled() && (off & (1 << bit)) == 0;
+}
+
+bool ggml_cuda_fn_pattern_closed(const ggml_cgraph * cgraph, const int i, const ggml_op * ops, const int n, const uint64_t open) {
+    if (i + n > cgraph->n_nodes) {
+        return false;
+    }
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * node = cgraph->nodes[i + k];
+        if (node->op != ops[k] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        if (k == n - 1 || ((open >> k) & 1)) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int j = 0; j < n; ++j) {
+            const ggml_tensor * other = cgraph->nodes[i + j];
+            for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                uses += other->src[q] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(cgraph, i + k)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool fn_pattern_closed(const ggml_cgraph * cgraph, const int i, const ggml_op * ops, const int n) {
+    return ggml_cuda_fn_pattern_closed(cgraph, i, ops, n, 0);
+}
+
+// temporary: why a fused pattern was declined (GGML_CUDA_FN_DEBUG)
+static bool fn_debug() {
+    static const bool on = getenv("GGML_CUDA_FN_DEBUG") != nullptr;
+    return on;
+}
+
+static void fn_pattern_why(const char * name, const ggml_cgraph * cgraph, const int i, const ggml_op * ops, const int n) {
+    static std::atomic<int> n_msg { 0 };
+    if (!fn_debug() || i + 3 > cgraph->n_nodes || cgraph->nodes[i + 1]->op != ops[1] || cgraph->nodes[i + 2]->op != ops[2] ||
+        n_msg.fetch_add(1) >= 60) {
+        return;
+    }
+    for (int k = 0; k < n; ++k) {
+        if (i + k >= cgraph->n_nodes) {
+            fprintf(stderr, "fn-decline: %s at %d: graph ends at +%d\n", name, i, k);
+            return;
+        }
+        const ggml_tensor * node = cgraph->nodes[i + k];
+        if (node->op != ops[k]) {
+            fprintf(stderr, "fn-decline: %s at %d: +%d is %s, expected %s\n", name, i, k, ggml_op_name(node->op), ggml_op_name(ops[k]));
+            return;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            fprintf(stderr, "fn-decline: %s at %d: +%d (%s) is not computed\n", name, i, k, ggml_op_name(node->op));
+            return;
+        }
+        if (k == n - 1) {
+            break;
+        }
+        int uses = 0;
+        for (int j = 0; j < n && i + j < cgraph->n_nodes; ++j) {
+            for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                uses += cgraph->nodes[i + j]->src[q] == node;
+            }
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || uses != ggml_node_get_use_count(cgraph, i + k)) {
+            fprintf(stderr, "fn-decline: %s at %d: +%d (%s %s) output %d, uses inside %d of %d\n", name, i, k, ggml_op_name(node->op),
+                    node->name, (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0, uses, ggml_node_get_use_count(cgraph, i + k));
+            return;
+        }
+    }
+}
+
+static bool fn_decline(const char * what, const int i) {
+    static std::atomic<int> n_msg { 0 };
+    if (fn_debug() && n_msg.fetch_add(1) < 60) {
+        fprintf(stderr, "fn-decline: %s at %d\n", what, i);
+    }
+    return false;
+}
+
 static bool fn_hc_aligned(const ggml_tensor * t) {
     return ((uintptr_t) t->data & 0xF) == 0;
 }
@@ -2014,12 +2255,11 @@ void ggml_cuda_fn_shexp(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_a
 // RMS_NORM, MUL (by the norm weights), RESHAPE (of z), UNARY (SiLU), MUL, RESHAPE from node i: fn_gdn_out
 
 int ggml_cuda_fn_gdn_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    if (!ggml_cuda_fn_enabled() || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_RMS_NORM) {
+    if (!fn_pattern_on(FN_PAT_GDN_OUT) || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_RMS_NORM) {
         return 0;
     }
     static const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE };
-    const int outputs[] = { i + 5 };
-    if (!ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 1)) {
+    if (!fn_pattern_closed(cgraph, i, ops, 6)) {
         return 0;
     }
     ggml_tensor * const * n = cgraph->nodes + i;
@@ -2057,12 +2297,11 @@ int ggml_cuda_fn_gdn_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
 
 // CONT (of the gate, a view of the q projection's output), UNARY (sigmoid), MUL from node i: fn_gate_out
 int ggml_cuda_fn_gate_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    if (!ggml_cuda_fn_enabled() || i + 2 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_CONT) {
+    if (!fn_pattern_on(FN_PAT_GATE_OUT) || i + 2 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_CONT) {
         return 0;
     }
     static const ggml_op ops[] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
-    const int outputs[] = { i + 2 };
-    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+    if (!fn_pattern_closed(cgraph, i, ops, 3)) {
         return 0;
     }
     ggml_tensor * const * n = cgraph->nodes + i;
@@ -2091,6 +2330,306 @@ int ggml_cuda_fn_gate_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     return 2;
 }
 
+// The input side of a recurrent layer (fn_gdn_pre). Its nodes are in two runs:
+//   at the CONCAT of the conv input: CONCAT (state, x transposed), then per rollback slot VIEW, CONT, VIEW, CPY
+//   at the SSM_CONV: SSM_CONV, UNARY (SiLU), VIEW, RMS_NORM, SCALE (q), VIEW, RMS_NORM, SCALE (k), VIEW (v),
+//                    RESHAPE, ADD, UNARY (softplus), MUL, RESHAPE (the gate)
+// The first run is matched with the second and skipped; the kernel is launched at the SSM_CONV, when the other
+// projection that it reads (alpha) is computed as well.
+static bool fn_gdn_pre_match(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int ic, fn_gdn_pre_args & a, int & i_conv,
+                             int & n_slots) {
+    ggml_tensor * const * n = cgraph->nodes + ic;
+    const ggml_tensor * concat = n[0];
+    if (concat->op != GGML_OP_CONCAT || ((const int32_t *) concat->op_params)[0] != 0 || concat->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * st = concat->src[0];
+    const ggml_tensor * tr = concat->src[1];
+    if (tr->op != GGML_OP_TRANSPOSE || st->type != GGML_TYPE_F32 || !ggml_is_contiguous(st)) {
+        return false;
+    }
+    const ggml_tensor * x = tr->src[0];
+    const int64_t C  = x->ne[0];
+    const int64_t nt = x->ne[1];
+    const int64_t K1 = st->ne[0];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 || nt < 1 || nt > FN_MAX_T ||
+        K1 != 3 || st->ne[1] != C || st->ne[2] != 1 || concat->ne[0] != K1 + nt || concat->ne[1] != C || concat->ne[2] != 1 ||
+        C % FN_GDN_HEAD != 0 || tr->data != x->data || !fn_hc_aligned(x)) {
+        return false;
+    }
+    // the rollback slots
+    n_slots = 0;
+    while (n_slots < FN_GDN_PRE_SLOTS && ic + 4*n_slots + 4 < cgraph->n_nodes) {
+        const ggml_tensor * tail = n[1 + 4*n_slots];
+        const ggml_tensor * cont = n[2 + 4*n_slots];
+        const ggml_tensor * dst  = n[3 + 4*n_slots];
+        const ggml_tensor * cpy  = n[4 + 4*n_slots];
+        if (tail->op != GGML_OP_VIEW || cont->op != GGML_OP_CONT || dst->op != GGML_OP_VIEW || cpy->op != GGML_OP_CPY) {
+            break;
+        }
+        const int64_t s_idx = std::max<int64_t>(0, nt - n_slots);
+        if (tail->view_src != concat || tail->data != (const char *) concat->data + s_idx*sizeof(float) || tail->ne[0] != K1 ||
+            tail->ne[1] != C || tail->nb[1] != concat->nb[1] || cont->src[0] != tail || cpy->src[0] != cont || cpy->src[1] != dst ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != K1*C || !fn_hc_aligned(dst) ||
+            ggml_node_get_use_count(cgraph, ic + 1 + 4*n_slots) != 1 || ggml_node_get_use_count(cgraph, ic + 2 + 4*n_slots) != 1) {
+            return false;
+        }
+        a.slot[n_slots] = (float *) dst->data;
+        n_slots++;
+    }
+    if (n_slots < 1 || ggml_node_get_use_count(cgraph, ic) != n_slots + 1) {
+        return false;
+    }
+    for (int sl = n_slots; sl < FN_GDN_PRE_SLOTS; ++sl) {
+        a.slot[sl] = nullptr;
+    }
+    // the convolution of this input
+    i_conv = -1;
+    for (int j = ic + 4*n_slots + 1; j < std::min(cgraph->n_nodes, ic + 4*n_slots + 48); ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_SSM_CONV && cgraph->nodes[j]->src[0] == concat) {
+            i_conv = j;
+            break;
+        }
+    }
+    static const ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_VIEW,
+                                   GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY,
+                                   GGML_OP_MUL, GGML_OP_RESHAPE };
+    // the views of y, the scaled norms and the gate are read by the delta rule
+    if (i_conv < 0 || !ggml_cuda_fn_pattern_closed(cgraph, i_conv, ops, 14, (1u << 4) | (1u << 7) | (1u << 8) | (1u << 12))) {
+        return false;
+    }
+    ggml_tensor * const * m = cgraph->nodes + i_conv;
+    const ggml_tensor * w     = m[0]->src[1];
+    const ggml_tensor * y     = m[1];
+    const ggml_tensor * qv    = m[2];
+    const ggml_tensor * q     = m[4];
+    const ggml_tensor * kv    = m[5];
+    const ggml_tensor * k     = m[7];
+    const ggml_tensor * vv    = m[8];
+    const ggml_tensor * alpha = m[9];
+    const ggml_tensor * add   = m[10];
+    const ggml_tensor * gate  = m[12];
+    const ggml_tensor * dt    = add->src[0] == alpha ? add->src[1] : add->src[0];
+    const ggml_tensor * ga    = gate->src[0] == m[11] ? gate->src[1] : gate->src[0];
+    const int64_t n_head_k = qv->ne[1];
+    const int64_t n_gate   = alpha->ne[0];
+    if (ggml_get_unary_op(m[1]) != GGML_UNARY_OP_SILU || m[1]->src[0] != m[0] || ggml_get_unary_op(m[11]) != GGML_UNARY_OP_SOFTPLUS ||
+        w->type != GGML_TYPE_F32 || w->ne[0] != K1 + 1 || w->ne[1] != C || !ggml_is_contiguous(w) || !fn_hc_aligned(w) ||
+        y->type != GGML_TYPE_F32 || y->ne[0] != C || y->ne[1] != nt || y->ne[2] != 1 || !ggml_is_contiguous(y) || !fn_hc_aligned(y) ||
+        qv->view_src != y || qv->data != y->data || qv->ne[0] != FN_GDN_HEAD || qv->ne[2] != nt || qv->nb[2] != y->nb[1] ||
+        kv->view_src != y || kv->data != (const char *) y->data + n_head_k*FN_GDN_HEAD*sizeof(float) || kv->ne[0] != FN_GDN_HEAD ||
+        kv->ne[1] != n_head_k || kv->nb[2] != y->nb[1] ||
+        vv->view_src != y || vv->data != (const char *) y->data + 2*n_head_k*FN_GDN_HEAD*sizeof(float) || 2*n_head_k*FN_GDN_HEAD > C ||
+        m[3]->src[0] != qv || q->src[0] != m[3] || m[6]->src[0] != kv || k->src[0] != m[6] ||
+        ggml_get_op_params_f32(m[3], 0) != ggml_get_op_params_f32(m[6], 0) ||
+        ggml_get_op_params_f32(q, 0) != ggml_get_op_params_f32(k, 0) || ggml_get_op_params_f32(q, 1) != 0.0f ||
+        ggml_get_op_params_f32(k, 1) != 0.0f ||
+        q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || !fn_hc_aligned(q) || !ggml_are_same_shape(q, qv) ||
+        k->type != GGML_TYPE_F32 || !ggml_is_contiguous(k) || !fn_hc_aligned(k) || !ggml_are_same_shape(k, kv) ||
+        (add->src[0] != alpha && add->src[1] != alpha) || m[11]->src[0] != add || (gate->src[0] != m[11] && gate->src[1] != m[11]) ||
+        alpha->type != GGML_TYPE_F32 || alpha->ne[1] != nt || alpha->ne[2] != 1 || !ggml_is_contiguous(alpha) ||
+        dt->type != GGML_TYPE_F32 || ggml_nelements(dt) != n_gate || !ggml_is_contiguous(dt) ||
+        ga->type != GGML_TYPE_F32 || ggml_nelements(ga) != n_gate || !ggml_is_contiguous(ga) ||
+        gate->type != GGML_TYPE_F32 || !ggml_are_same_shape(gate, alpha) || !ggml_is_contiguous(gate) ||
+        (y->data != x->data && fn_overlap(y, x)) || fn_overlap(q, x) || fn_overlap(k, x) || fn_overlap(q, y) || fn_overlap(k, y) ||
+        fn_overlap(q, k) || (gate->data != alpha->data && fn_overlap(gate, alpha)) || fn_overlap(gate, x) || fn_overlap(gate, y) ||
+        fn_overlap(gate, q) || fn_overlap(gate, k)) {
+        return false;
+    }
+    // x and the state are read at the convolution, later than their nodes read them: nothing computed between the
+    // two runs may reuse their memory (a gather may be deferred further, it is checked as if it ran here)
+    auto is_view = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+               t->op == GGML_OP_TRANSPOSE || ggml_is_empty(t);
+    };
+    for (int j = ic + 4*n_slots + 1; j < i_conv; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (is_view(t)) {
+            continue;
+        }
+        if (t->op != GGML_OP_GET_ROWS || fn_overlap(t, x) || fn_overlap(t, st) || fn_overlap(t, alpha)) {
+            return false;
+        }
+    }
+    // the state: the row of the cache that a deferred gather names, or the gathered copy
+    if (ctx.gdn_gather_owner == concat && ctx.gdn_gather_node != nullptr) {
+        const ggml_tensor * gr = ctx.gdn_gather_node;
+        if (gr->src[0]->type != GGML_TYPE_F32 || gr->src[0]->nb[1] % (4*sizeof(float)) != 0 || !fn_hc_aligned(gr->src[0]) ||
+            ggml_nelements(gr->src[1]) != 1 || gr->ne[0] != K1*C) {
+            return false;
+        }
+        // the gathered copy is not written: only this CONCAT may read it
+        auto root = [](const ggml_tensor * t) {
+            while (t->view_src != nullptr) {
+                t = t->view_src;
+            }
+            return t;
+        };
+        for (int j = ic + 1; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            if (is_view(t)) {
+                continue;
+            }
+            for (int q0 = 0; q0 < GGML_MAX_SRC && t->src[q0] != nullptr; ++q0) {
+                if (root(t->src[q0]) == gr) {
+                    return false;
+                }
+            }
+        }
+        a.cache = (const float *) gr->src[0]->data;
+        a.rows  = ctx.gdn_rows_scratch;
+        a.crow  = gr->src[0]->nb[1]/sizeof(float);
+    } else {
+        if (!fn_hc_aligned(st) || fn_overlap(st, y) || fn_overlap(st, q) || fn_overlap(st, k) || fn_overlap(st, gate)) {
+            return false;
+        }
+        a.cache = (const float *) st->data;
+        a.rows  = nullptr;
+        a.crow  = 0;
+    }
+    a.x          = (const float *) x->data;
+    a.w          = (const float *) w->data;
+    a.y          = (float *) y->data;
+    a.q          = (float *) q->data;
+    a.k          = (float *) k->data;
+    a.alpha      = (const float *) alpha->data;
+    a.dt         = (const float *) dt->data;
+    a.a          = (const float *) ga->data;
+    a.gate       = (float *) gate->data;
+    a.sx_t       = (int) (x->nb[1]/sizeof(float));
+    a.sy_t       = (int) (y->nb[1]/sizeof(float));
+    a.sq_t       = (int) (q->nb[2]/sizeof(float));
+    a.sa_t       = (int) (alpha->nb[1]/sizeof(float));
+    a.sg_t       = (int) (gate->nb[1]/sizeof(float));
+    a.nt         = (int) nt;
+    a.n_slots    = n_slots;
+    a.n_head_k   = (int) n_head_k;
+    a.n_heads    = (int) (C/FN_GDN_HEAD);
+    a.n_gate     = (int) n_gate;
+    a.eps        = ggml_get_op_params_f32(m[3], 0);
+    a.norm_scale = ggml_get_op_params_f32(q, 0);
+    return true;
+}
+
+int ggml_cuda_fn_gdn_pre_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    // not validated yet (written after the last tested build): opt-in with GGML_CUDA_FN_GDN_PRE=1
+    static const bool enabled = getenv("GGML_CUDA_FN_GDN_PRE") != nullptr && atoi(getenv("GGML_CUDA_FN_GDN_PRE")) != 0;
+    if (!enabled || !fn_pattern_on(FN_PAT_GDN_PRE) || cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+        return 0;
+    }
+    fn_gdn_pre_args a;
+    int i_conv  = -1;
+    int n_slots = 0;
+    if (!fn_gdn_pre_match(ctx, cgraph, i, a, i_conv, n_slots)) {
+        return 0;
+    }
+    static_assert(sizeof(a) <= sizeof(ctx.fn_gdn_pre_args), "fn_gdn_pre_args");
+    memcpy(ctx.fn_gdn_pre_args, &a, sizeof(a));
+    ctx.fn_gdn_pre_conv = cgraph->nodes[i_conv];
+    if (ctx.gdn_gather_owner == cgraph->nodes[i]) {
+        ctx.gdn_gather_clear();
+    }
+    return 4*n_slots;
+}
+
+int ggml_cuda_fn_gdn_pre(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (ctx.fn_gdn_pre_conv == nullptr || ctx.fn_gdn_pre_conv != cgraph->nodes[i]) {
+        return 0;
+    }
+    fn_gdn_pre_args a;
+    memcpy(&a, ctx.fn_gdn_pre_args, sizeof(a));
+    ctx.fn_gdn_pre_conv = nullptr;
+    fn_gdn_pre<<<a.n_heads + 1, WARP_SIZE, 0, ctx.stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+    return 13;
+}
+
+// The pooled keys of a QSA layer, from the FILL of its first node: FILL, CONCAT, RESHAPE, VIEW, SET_ROWS (the raw
+// keys into the cache), VIEW, GET_ROWS, RESHAPE (the members of the blocks to re-pool), VIEW, CONT, kpool - 1 times
+// VIEW, ADD and the SCALE of their mean -> fn_qsa_pool
+int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (!fn_pattern_on(FN_PAT_QSA_POOL) || i + 11 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_FILL) {
+        return 0;
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    if (n[7]->op != GGML_OP_RESHAPE || n[7]->ne[1] < 2 || n[7]->ne[1] > 8) {
+        if (fn_debug() && n[1]->op == GGML_OP_CONCAT && n[2]->op == GGML_OP_RESHAPE) {
+            fprintf(stderr, "fn-decline: qsa_pool at %d:", i);
+            for (int k = 0; k < 24 && i + k < cgraph->n_nodes; ++k) {
+                fprintf(stderr, " %s[%lld,%lld,%lld]", ggml_op_name(n[k]->op), (long long) n[k]->ne[0], (long long) n[k]->ne[1], (long long) n[k]->ne[2]);
+            }
+            fprintf(stderr, "\n");
+        }
+        return 0;
+    }
+    const int64_t kpool = n[7]->ne[1];
+    ggml_op ops[32] = { GGML_OP_FILL, GGML_OP_CONCAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_VIEW,
+                        GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONT };
+    int n_ops = 10;
+    for (int m = 1; m < kpool; ++m) {
+        ops[n_ops++] = GGML_OP_VIEW;
+        ops[n_ops++] = GGML_OP_ADD;
+    }
+    ops[n_ops++] = GGML_OP_SCALE;
+    if (!fn_pattern_closed(cgraph, i, ops, n_ops)) {
+        fn_pattern_why("qsa_pool", cgraph, i, ops, n_ops);
+        return 0;
+    }
+    const ggml_tensor * concat   = n[1];
+    const ggml_tensor * k_raw    = concat->src[0];
+    const ggml_tensor * set_rows = n[4];
+    const ggml_tensor * k_idxs   = set_rows->src[1];
+    const ggml_tensor * cache    = set_rows->src[2];
+    const ggml_tensor * keys     = n[5];              // the cells' raw keys: the first half of the rows
+    const ggml_tensor * get_rows = n[6];
+    const ggml_tensor * pool_idx = get_rows->src[1];
+    ggml_tensor *       out      = n[n_ops - 1];
+    const int64_t d     = k_raw->ne[0];
+    const int64_t nt    = k_raw->ne[1];
+    const int64_t n_new = n[7]->ne[2];
+    // the wiring: [k_raw | 0] rows scattered at k_idxs, the member rows gathered from the same cache, summed in order
+    bool ok = concat->src[1] == n[0] && ggml_get_op_params_f32(n[0], 0) == 0.0f && ((const int32_t *) concat->op_params)[0] == 0 &&
+              n[2]->src[0] == concat && n[3]->view_src != nullptr && n[3]->data == concat->data && set_rows->src[0] == n[3] &&
+              keys->view_src == cache && keys->data == cache->data && get_rows->src[0] == keys &&
+              n[7]->src[0] == get_rows && n[9]->src[0] == n[8] && n[8]->data == get_rows->data &&
+              out->src[0] == n[n_ops - 2] && ggml_get_op_params_f32(out, 1) == 0.0f;
+    for (int m = 1; m < kpool && ok; ++m) {
+        const ggml_tensor * view = n[8 + 2*m];
+        const ggml_tensor * add  = n[9 + 2*m];
+        ok = view->data == (const char *) get_rows->data + m*get_rows->nb[1] && add->src[0] == n[m == 1 ? 9 : 7 + 2*m] && add->src[1] == view;
+    }
+    if (!ok) {
+        fn_decline("qsa_pool: wiring", i);
+    }
+    ok = ok && k_raw->type == GGML_TYPE_F32 && ggml_is_contiguous(k_raw) && d <= 256 && nt >= 1 && nt <= FN_MAX_T &&
+         n[0]->ne[0] == d && n[3]->ne[0] == 2*d && n[3]->ne[1] == nt &&
+         k_idxs->type == GGML_TYPE_I64 && ggml_nelements(k_idxs) == nt && cache->type == GGML_TYPE_F16 && cache->ne[0] == 2*d &&
+         cache->nb[0] == sizeof(half) && keys->ne[0] == d && keys->nb[1] == cache->nb[1] &&
+         pool_idx->type == GGML_TYPE_I32 && ggml_nelements(pool_idx) == kpool*n_new && ggml_is_contiguous(pool_idx) &&
+         get_rows->type == GGML_TYPE_F32 && get_rows->ne[0] == d && get_rows->ne[1] == kpool*n_new &&
+         out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && out->ne[0] == d && out->ne[1] == n_new && n_new <= 64;
+    if (!ok) {
+        if (fn_debug()) {
+            fprintf(stderr, "fn-decline: qsa_pool at %d: k_raw %s [%lld,%lld] cont %d, idxs %s n %lld, cache %s [%lld,%lld] nb0 %zu, keys [%lld] nb1 %zu/%zu, "
+                    "pool_idx %s n %lld, rows %s [%lld,%lld], out %s [%lld,%lld], kpool %lld n_new %lld\n", i,
+                    ggml_type_name(k_raw->type), (long long) k_raw->ne[0], (long long) k_raw->ne[1], ggml_is_contiguous(k_raw),
+                    ggml_type_name(k_idxs->type), (long long) ggml_nelements(k_idxs),
+                    ggml_type_name(cache->type), (long long) cache->ne[0], (long long) cache->ne[1], cache->nb[0],
+                    (long long) keys->ne[0], keys->nb[1], cache->nb[1],
+                    ggml_type_name(pool_idx->type), (long long) ggml_nelements(pool_idx),
+                    ggml_type_name(get_rows->type), (long long) get_rows->ne[0], (long long) get_rows->ne[1],
+                    ggml_type_name(out->type), (long long) out->ne[0], (long long) out->ne[1], (long long) kpool, (long long) n_new);
+        }
+        return 0;
+    }
+    fn_qsa_pool<<<1, 256, 0, ctx.stream()>>>(
+        (const float *) k_raw->data, k_raw->nb[1]/sizeof(float), (int) d, (int) nt, (const int64_t *) k_idxs->data,
+        (half *) cache->data, cache->nb[1]/sizeof(half), (const int32_t *) pool_idx->data, (int) kpool, (int) n_new,
+        ggml_get_op_params_f32(out, 0), (float *) out->data, out->nb[1]/sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+    return n_ops - 1;
+}
+
 // The selection mask of a QSA layer, from the FILL of its first node: 28 nodes -> fn_qsa_sel
 int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     static const ggml_op ops[] = {
@@ -2103,11 +2642,11 @@ int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
         GGML_OP_ADD,                                                                        // + kq_mask
     };
     constexpr int n_ops = sizeof(ops)/sizeof(ops[0]);
-    if (!ggml_cuda_fn_enabled() || i + n_ops > cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_FILL) {
+    if (!fn_pattern_on(FN_PAT_QSA_SEL) || cgraph->nodes[i]->op != GGML_OP_FILL) {
         return 0;
     }
-    const int outputs[] = { i + n_ops - 1 };
-    if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, outputs, 1)) {
+    if (!fn_pattern_closed(cgraph, i, ops, n_ops)) {
+        fn_pattern_why("qsa_sel", cgraph, i, ops, n_ops);
         return 0;
     }
     ggml_tensor * const * n = cgraph->nodes + i;
@@ -2135,6 +2674,7 @@ int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
         ggml_get_op_params_f32(n[22], 0) > 0.0f ||
         !params(n[6], 1.0f, 1.0f) || !params(n[7], 0.0f, 1.0f) || !params(n[11], -1.0f, (float) n_kv) || !params(n[12], 0.0f, 1.0f) ||
         !params(n[16], 1.0f, (float) (n_kv - 1))) {
+        fn_decline("qsa_sel: wiring", i);
         return 0;
     }
     if (sel_idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(sel_idx) || score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) ||
@@ -2142,14 +2682,20 @@ int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
         n_sel != kpool*top_k->ne[0] + kpool - 1 || n[10]->src[0]->ne[0] != kpool - 1 ||
         out->type != GGML_TYPE_F16 || !ggml_is_contiguous(out) || out->ne[1]*out->ne[2]*out->ne[3] != nt ||
         kq_mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(kq_mask) || kq_mask->ne[0] != n_kv ||
-        kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] != nt || n[25]->ne[1] != n_kv + n_sel ||
-        fn_overlap(out, sel_idx) || fn_overlap(out, score) || fn_overlap(out, top_k) || fn_overlap(out, kq_mask)) {
+        kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] != nt || n[25]->ne[1] != n_kv + n_sel) {
+        fn_decline("qsa_sel: shapes", i);
         return 0;
     }
-    fn_qsa_sel<<<(unsigned) nt, 256, 0, ctx.stream()>>>(
+    // the slots are staged as 16-bit cells in shared memory; the mask is a graph input
+    const size_t smem = (size_t) nt*n_sel*sizeof(unsigned short);
+    if (n_kv >= (int64_t) FN_QSA_SEL_DEAD || smem > 40000 || fn_overlap(out, kq_mask)) {
+        fn_decline("qsa_sel: size", i);
+        return 0;
+    }
+    fn_qsa_sel<<<1, FN_QSA_SEL_THREADS, smem, ctx.stream()>>>(
         (const int32_t *) sel_idx->data, sel_idx->nb[1]/sizeof(int32_t), (int) n_sel, (int) (kpool*top_k->ne[0]), (int) kpool,
         (const float *) score->data, score->nb[1]/sizeof(float), (const int32_t *) top_k->data, top_k->nb[1]/sizeof(int32_t),
-        (int) n_kv, (const half *) kq_mask->data, n_kv, (half *) out->data, n_kv);
+        (int) n_kv, (int) nt, (const half *) kq_mask->data, n_kv, (half *) out->data, n_kv);
     CUDA_CHECK(cudaGetLastError());
     return n_ops - 1;
 }

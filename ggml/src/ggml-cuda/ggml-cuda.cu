@@ -3009,7 +3009,8 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
-                                                const ggml_tensor * set_rows) {
+                                                const ggml_tensor * set_rows,
+                                                const bool          norm_fused = false) {
 
     if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
         return false;
@@ -3032,9 +3033,9 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    // Only norm/neox shaders have the fusion code
+    // Only norm/neox shaders have the fusion code; the kernel that also fuses the norm has its own check
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (!norm_fused && mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
         return false;
     }
 
@@ -3073,9 +3074,14 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
+    // the fused kernel handles the norm/neox and the multi-section rope modes
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE) {
+        return false;
+    }
+
+    // one position per section and token
+    if ((mode & GGML_ROPE_TYPE_MROPE) && rope->src[1]->ne[0] != 4*rope->src[0]->ne[2]) {
         return false;
     }
 
@@ -3583,7 +3589,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}}) &&
             ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope) &&
-            ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows)) {
+            ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows, true)) {
             int out_nodes[] = { node_idx + 4 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
@@ -4079,6 +4085,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // the input side of a gated delta net layer: its nodes around the CONCAT of the conv input are computed at the
+    // SSM_CONV, with the convolution and what follows it
+    if (node->op == GGML_OP_CONCAT) {
+        const int n_pre = ggml_cuda_fn_gdn_pre_begin(*cuda_ctx, cgraph, i);
+        if (n_pre > 0) {
+            return n_pre;
+        }
+    }
+    if (node->op == GGML_OP_SSM_CONV) {
+        const int n_pre = ggml_cuda_fn_gdn_pre(*cuda_ctx, cgraph, i);
+        if (n_pre > 0) {
+            return n_pre;
+        }
+    }
+
     // the output of a gated delta net layer: norm, norm weights, gate and the activations of its projection
     if (node->op == GGML_OP_RMS_NORM) {
         const int n_gdn = ggml_cuda_fn_gdn_out(*cuda_ctx, cgraph, i);
@@ -4093,11 +4114,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n_gate;
         }
     }
-    // the selection mask of a QSA attention layer
+    // the selection mask and the pooled keys of a QSA attention layer
     if (node->op == GGML_OP_FILL) {
         const int n_sel = ggml_cuda_fn_qsa_sel(*cuda_ctx, cgraph, i);
         if (n_sel > 0) {
             return n_sel;
+        }
+        const int n_pool = ggml_cuda_fn_qsa_pool(*cuda_ctx, cgraph, i);
+        if (n_pool > 0) {
+            return n_pool;
         }
     }
 
@@ -4986,6 +5011,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 4;
     }
 
+    // the same into rows of a view of the cache (a part of wider rows: the pooled keys of a k-pool indexer); the
+    // view of the destination is a node between the two and is read again later
+    if (node->op == GGML_OP_RMS_NORM && i + 5 < cgraph->n_nodes) {
+        static const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+        ggml_tensor * mul      = cgraph->nodes[i + 1];
+        ggml_tensor * rope     = cgraph->nodes[i + 2];
+        ggml_tensor * view     = cgraph->nodes[i + 3];
+        ggml_tensor * dst_view = cgraph->nodes[i + 4];
+        ggml_tensor * set_rows = cgraph->nodes[i + 5];
+        if (ggml_cuda_fn_pattern_closed(cgraph, i, ops, 6, 1u << 4) &&
+            mul->src[0] == node && rope->src[0] == mul && view->src[0] == rope && set_rows->src[0] == view &&
+            set_rows->src[2] == dst_view && dst_view->view_src != nullptr &&
+            ggml_cuda_should_fuse_rms_norm_mul_rope(node, mul, rope) && ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows, true)) {
+            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, mul, rope, set_rows);
+            return 5;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
@@ -5339,6 +5382,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->ec_last_ids = nullptr;
     cuda_ctx->ec_pending  = true;
     cuda_ctx->fn_moe_down = nullptr;
+    cuda_ctx->fn_gdn_pre_conv = nullptr;
     ggml_cuda_expert_cache_prepare(*cuda_ctx, cgraph);
     {
         // temporary: the nodes of the first graphs of device 0 (GGML_CUDA_FN_DUMP=<number of graphs>)

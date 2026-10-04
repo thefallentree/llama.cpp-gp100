@@ -71,6 +71,23 @@ int ggml_cuda_fn_gdn_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
 // one kernel that also leaves the activations for the projection. Returns the number of nodes to skip or 0.
 int ggml_cuda_fn_gate_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 
+// Do the n nodes from i have the ops `ops`, are they computed, and is every node but the last used only by nodes of
+// the pattern? Bit k of `open` exempts node k from the last condition (a view that later nodes read as well: it has
+// no kernel to skip). Unlike ggml_can_fuse_subgraph it accepts views of tensors outside the pattern and casts.
+bool ggml_cuda_fn_pattern_closed(const ggml_cgraph * cgraph, int i, const ggml_op * ops, int n, uint64_t open);
+
+// The input side of a recurrent (gated delta net) layer as one kernel: the conv input and its state snapshots, the
+// convolution with its SiLU, the l2 norms of q and k and the gate (qwen4exp build_layer_attn_linear).
+//   _begin: at the CONCAT of the conv input; matches the whole pattern, returns the number of nodes to skip or 0
+//   the other: at the SSM_CONV that _begin matched; launches the kernel and returns the number of nodes to skip
+int ggml_cuda_fn_gdn_pre_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_fn_gdn_pre(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+// The pooled indexer keys of a QSA attention layer from node i (the FILL that pads the raw keys): the scatter of the
+// raw keys into the cache and the mean of the members of the blocks to re-pool as one kernel. Returns the number of
+// nodes to skip or 0.
+int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
 // The selection mask of a QSA attention layer (qwen4exp build_qsa_sel) from node i, the first of the 28 nodes that
 // scatter the selected cells into a row of -inf: one kernel. Returns the number of nodes to skip or 0.
 int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

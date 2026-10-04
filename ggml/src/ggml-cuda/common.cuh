@@ -1559,6 +1559,10 @@ struct ggml_backend_cuda_context {
     int     fn_moe_n_ff = 0;
     int     fn_moe_n_pairs = 0;
     // ... and what the down projection of the open layer writes: the weighted sum and the nodes it replaces
+    // the SSM_CONV of a recurrent layer whose input side the fused engine computes there, and the kernel's arguments
+    const ggml_tensor * fn_gdn_pre_conv = nullptr;
+    char                fn_gdn_pre_args[192];
+
     const ggml_tensor * fn_moe_down = nullptr;
     ggml_tensor *       fn_moe_dst  = nullptr;
     int                 fn_moe_skip = 0;

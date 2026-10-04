@@ -1518,6 +1518,37 @@ struct ggml_backend_cuda_context {
     const void *        mmid16_cache_data = nullptr;
     int64_t             mmid16_cache_key  = -1;
 
+    // sm_60 fused engine (fn-engine.cuh): the fp16 activations of the last two mat-vec inputs. The keys hold tensor
+    // pointers, so they are cleared at the top of every graph compute; the buffers are kept.
+    struct fn_act_slot {
+        const ggml_tensor * src1   = nullptr;
+        const void *        data   = nullptr;
+        int64_t             stride = 0;
+        int                 n      = 0;
+        int                 nt     = 0;
+        char *              mem    = nullptr;
+        size_t              cap    = 0;
+    };
+    fn_act_slot fn_act[2];
+    int         fn_act_next = 0;
+
+    void fn_act_clear() {
+        for (auto & s : fn_act) {
+            s.src1 = nullptr;
+            s.data = nullptr;
+        }
+    }
+    void fn_act_free() {
+        for (auto & s : fn_act) {
+            if (s.mem != nullptr) {
+                cudaFree(s.mem);
+                s.mem = nullptr;
+            }
+            s.cap = 0;
+        }
+        fn_act_clear();
+    }
+
     // cache buffers replaced by larger ones: a captured CUDA graph may still use them (its kernels write and read
     // them consistently), and freeing them during a capture is not permitted, so they are freed with the context
     std::vector<void *> retired_mem;

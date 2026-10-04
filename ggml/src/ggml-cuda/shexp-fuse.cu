@@ -1,4 +1,5 @@
 #include "shexp-fuse.cuh"
+#include "fn-engine.cuh"
 #include "convert.cuh"
 
 #define SHEXP_QK        32
@@ -267,6 +268,11 @@ bool ggml_cuda_shexp_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_ar
     const int outputs[] = { i + 6 };
     if (!ggml_can_fuse_subgraph(cgraph, i, 7, ops, outputs, 1)) {
         return false;
+    }
+    for (int k : { 0, 1, 3, 4 }) {
+        if (ggml_cuda_fn_planar(cgraph->nodes[i + k]->src[0])) {
+            return false; // planar weights go through the fused engine's mat-vec
+        }
     }
     ggml_tensor * const * n = cgraph->nodes + i;
     a.glu  = n[2];

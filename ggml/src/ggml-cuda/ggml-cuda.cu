@@ -37,6 +37,7 @@
 #include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/hc-mix.cuh"
+#include "ggml-cuda/fn-engine.cuh"
 #include "ggml-cuda/shexp-fuse.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -709,6 +710,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     a16_cache_free();
     gdn_gather_free();
     mmid16_cache_free();
+    fn_act_free();
     for (void * mem : retired_mem) {
         cudaFree(mem);
     }
@@ -755,6 +757,7 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_fn_planes_release(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -1512,7 +1515,14 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
 
-        if (ggml_is_contiguously_allocated(src0)) {
+        if (ggml_cuda_fn_planar(src0)) {
+            // planar Q8_0 (fn-engine.cuh)
+            ggml_cuda_fn_dequantize(src0, src0_alloc.get(), compute_type, main_stream);
+            const size_t src0_bs = ggml_blck_size(src0->type);
+            s01 *= src0_bs;
+            s02 *= src0_bs;
+            s03 *= src0_bs;
+        } else if (ggml_is_contiguously_allocated(src0)) {
             const auto convert_func = traits::convert(src0->type);
             GGML_ASSERT(convert_func != nullptr);
             convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
@@ -1963,6 +1973,17 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // planar Q8_0 weights (fn-engine.cuh): the fused mat-vec for decode windows, cuBLAS on the dequantized planes
+    // for prompt batches
+    if (ggml_cuda_fn_planar(src0)) {
+        if (ggml_cuda_fn_mul_mat_supported(src0, src1, dst)) {
+            ggml_cuda_fn_mul_mat(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
+        return;
+    }
+
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
@@ -2273,6 +2294,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // planar weights (fn-engine.cuh) keep their ggml type but only MUL_MAT can read them, as src0
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = dst->src[j];
+        if (src != nullptr && src->type == GGML_TYPE_Q8_0 && !(dst->op == GGML_OP_MUL_MAT && j == 0) && ggml_cuda_fn_planar(src)) {
+            GGML_ABORT("%s: %s reads the planar weight %s\n", __func__, ggml_op_name(dst->op), src->name);
+        }
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -3874,8 +3902,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_RMS_NORM) {
         ggml_cuda_hc_mix_args hc_args;
         if (ggml_cuda_hc_mix_match(cgraph, i, hc_args)) {
-            ggml_cuda_hc_mix(*cuda_ctx, hc_args);
-            return 9;
+            const bool planar = ggml_cuda_fn_planar(hc_args.mm_down->src[0]) || ggml_cuda_fn_planar(hc_args.mm_up->src[0]);
+            if (!planar) {
+                ggml_cuda_hc_mix(*cuda_ctx, hc_args);
+                return 9;
+            }
+            if (ggml_cuda_fn_hc_mix_supported(hc_args)) {
+                ggml_cuda_fn_hc_mix(*cuda_ctx, hc_args);
+                return 9;
+            }
         }
     }
 
@@ -5083,6 +5118,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->a16_cache_clear();
     cuda_ctx->gdn_gather_reset_graph();
     cuda_ctx->mmid16_cache_clear();
+    cuda_ctx->fn_act_clear();
     cuda_ctx->moe_host = {};
     // prompt batches of a hot/cold MoE: one ubatch is thousands of kernels, more than the launch queue holds, so
     // launched one by one the host blocks in the launches and cannot feed another GPU of a pipeline meanwhile.
@@ -5180,6 +5216,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+    ggml_cuda_fn_planes_optimize(*cuda_ctx, cgraph);
     ggml_cuda_moe_host_reorder(cgraph);
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));

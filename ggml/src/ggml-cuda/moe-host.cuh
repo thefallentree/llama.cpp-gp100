@@ -22,6 +22,8 @@
 // Called before node i is computed. Opens a host triple at its first node and returns true for every
 // node of the open triple: their mat-vec kernels have to skip the cold pairs.
 bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
+// whether batches above MMVQ_MAX_BATCH_SIZE tokens go to the host too (opt-in)
+bool ggml_cuda_moe_host_takes_prompts();
 
 // Does node belong to the open host triple?
 bool ggml_cuda_moe_host_active(const ggml_backend_cuda_context & ctx, const ggml_tensor * node);

@@ -414,6 +414,9 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// set while this thread captures a CUDA graph: a pool allocation cannot synchronize then
+static thread_local bool ggml_cuda_capturing = false;
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -492,6 +495,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        if (err == cudaErrorMemoryAllocation && ggml_cuda_capturing) {
+            GGML_ABORT("%s: out of VRAM for %.2f MiB while capturing a CUDA graph, where the pool cannot be flushed "
+                       "(prompt graphs: GGML_CUDA_PROMPT_GRAPHS=0 or a smaller ubatch)", __func__, look_ahead_size/1048576.0);
+        }
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
@@ -702,7 +709,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     a16_cache_free();
     gdn_gather_free();
     mmid16_cache_free();
+    for (void * mem : retired_mem) {
+        cudaFree(mem);
+    }
     ggml_cuda_moe_host_free(*this);
+    ggml_cuda_cold_prefetch_free(*this);
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2113,7 +2124,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (ggml_cuda_mmid_cold(dst)) {
         // experts beyond src0->ne[2] are only known to the sm_60 Q2_0 kernels
         if (ggml_cuda_moe_host_active(ctx, dst)) {
-            ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
+            if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+                ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
+            } else {
+                ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
+            }
             return;
         }
         if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_mmid_vec_f16_sm60_supported(src0, src1, ids, dst)) {
@@ -2121,6 +2136,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
         GGML_ASSERT(ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst) && "cold experts need the sm_60 Q2_0 MUL_MAT_ID kernels");
+        if (ggml_cuda_cold_prefetch_run(ctx, dst)) {
+            return;
+        }
         ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
         return;
     }
@@ -4867,6 +4885,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
+            ggml_cuda_cold_prefetch_start(*cuda_ctx);
+
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
@@ -5023,6 +5043,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         }
 
+        ggml_cuda_cold_prefetch_finish(*cuda_ctx);
+
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
@@ -5032,6 +5054,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            ggml_cuda_capturing = false;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -5089,6 +5112,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->gdn_gather_reset_graph();
     cuda_ctx->mmid16_cache_clear();
     cuda_ctx->moe_host = {};
+    // prompt batches of a hot/cold MoE: one ubatch is thousands of kernels, more than the launch queue holds, so
+    // launched one by one the host blocks in the launches and cannot feed another GPU of a pipeline meanwhile.
+    // They are captured as a CUDA graph on every call instead (their node properties change between ubatches).
+    [[maybe_unused]] static const bool prompt_graphs = getenv("GGML_CUDA_PROMPT_GRAPHS") == nullptr || atoi(getenv("GGML_CUDA_PROMPT_GRAPHS")) != 0;
+    [[maybe_unused]] const bool cold_prompt = ggml_cuda_cold_prefetch_prepare(*cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5105,7 +5133,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (cold_prompt && prompt_graphs) {
+                // the first prompt graph of a ubatch size runs directly: the pool grows outside of a capture,
+                // where an allocation that runs out of memory can still flush the pool and retry
+                if (!cuda_ctx->prompt_graph_ntok.insert(cuda_ctx->cold_pf.ops[0]->ne[2]).second) {
+                    use_cuda_graph             = true;
+                    cuda_graph_update_required = true;
+                }
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
@@ -5137,6 +5172,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        ggml_cuda_capturing = true;
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);

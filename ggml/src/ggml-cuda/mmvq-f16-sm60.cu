@@ -987,7 +987,8 @@ void ggml_cuda_mmvq_f16_sm60(
         ads = ads_scoped.alloc(ads_size/sizeof(half2));
     } else {
         if (total_size > ctx.a16_cache_cap) {
-            ctx.a16_cache_free();
+            ctx.retire_mem(ctx.a16_cache_mem, ctx.a16_cache_cap);
+            ctx.a16_cache_clear();
             ggml_cuda_set_device(ctx.device);
             CUDA_CHECK(cudaMalloc((void **) &ctx.a16_cache_mem, total_size));
             ctx.a16_cache_cap = total_size;

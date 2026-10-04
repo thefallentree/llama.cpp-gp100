@@ -38,6 +38,9 @@
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/fn-engine.cuh"
+#include "ggml-cuda/expert-cache.cuh"
+#include "fn-prof.h"
+FN_PROF_DECL("cuda");
 #include "ggml-cuda/shexp-fuse.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -92,6 +95,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -706,11 +710,64 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+static __global__ void k_fn_clock(unsigned long long * out) {
+    *out = (unsigned long long) clock64();
+}
+
+unsigned long long * ggml_backend_cuda_context::fn_dbg_get() {
+    static const bool enabled = getenv("GGML_CUDA_FN_WAITS") != nullptr;
+    if (!enabled) {
+        return nullptr;
+    }
+    if (fn_dbg == nullptr) {
+        cudaStreamCaptureStatus status;
+        CUDA_CHECK(cudaStreamIsCapturing(stream(), &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMalloc((void **) &fn_dbg, 8*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(fn_dbg, 0, 8*sizeof(unsigned long long)));
+    }
+    return fn_dbg;
+}
+
+void ggml_backend_cuda_context::fn_dbg_report() {
+    if (fn_dbg == nullptr) {
+        return;
+    }
+    ggml_cuda_set_device(device);
+    unsigned long long v[8], c0 = 0, c1 = 0;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(v, fn_dbg, sizeof(v), cudaMemcpyDeviceToHost));
+    // ticks per microsecond
+    k_fn_clock<<<1, 1>>>(fn_dbg);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const int64_t t0 = ggml_time_us();
+    CUDA_CHECK(cudaMemcpy(&c0, fn_dbg, sizeof(c0), cudaMemcpyDeviceToHost));
+    while (ggml_time_us() - t0 < 50000) {
+    }
+    k_fn_clock<<<1, 1>>>(fn_dbg);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const int64_t t1 = ggml_time_us();
+    CUDA_CHECK(cudaMemcpy(&c1, fn_dbg, sizeof(c1), cudaMemcpyDeviceToHost));
+    const double tpu = (double) (c1 - c0)/(double) (t1 - t0);
+    fprintf(stderr, "fn-waits dev%d: %.1f ticks/us; collect: n %llu, mean wait %.1f us, total %.1f ms; allreduce: n %llu, mean wait %.1f us, total %.1f ms\n",
+            device, tpu, v[1], v[1] ? v[0]/tpu/v[1] : 0.0, v[0]/tpu/1000.0, v[3], v[3] ? v[2]/tpu/v[3] : 0.0, v[2]/tpu/1000.0);
+    CUDA_CHECK(cudaFree(fn_dbg));
+    fn_dbg = nullptr;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    fn_dbg_report();
+    ggml_cuda_expert_cache_context_free(*this);
     a16_cache_free();
     gdn_gather_free();
     mmid16_cache_free();
     fn_act_free();
+    if (fn_moe_mem != nullptr) {
+        cudaFree(fn_moe_mem);
+    }
     for (void * mem : retired_mem) {
         cudaFree(mem);
     }
@@ -758,6 +815,7 @@ struct ggml_backend_cuda_buffer_context {
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     ggml_cuda_fn_planes_release(ctx->dev_ptr, buffer->size);
+    ggml_cuda_expert_cache_release(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -1000,11 +1058,39 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // a window is open (ggml_backend_cuda_comm_window_begin): the AllReduces are window-mode ones, and with
+    // window_capture the streams of the devices are capturing
+    bool                        window_active  = false;
+    bool                        window_capture = false;
+
+    // Launching a captured window takes the host about a microsecond per node. A helper thread launches the second
+    // device's graph while the calling thread launches the first one, so that both devices start together.
+    struct window_launcher {
+        std::thread             thread;
+        std::mutex              mutex;
+        std::condition_variable cv;
+        cudaGraphExec_t         exec    = nullptr;
+        cudaStream_t            stream  = nullptr;
+        int                     device  = -1;
+        bool                    pending = false;
+        bool                    done    = false;
+        bool                    stop    = false;
+    };
+    std::unique_ptr<window_launcher> launcher;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
+        if (launcher) {
+            {
+                std::lock_guard<std::mutex> lock(launcher->mutex);
+                launcher->stop = true;
+            }
+            launcher->cv.notify_all();
+            launcher->thread.join();
+        }
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1274,6 +1360,19 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->window_active) {
+        // no fallback inside a window: the meta backend only opens one for graphs the window mode can reduce
+        for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+            const ggml_tensor * t = tensors[i];
+            GGML_ASSERT(t != nullptr && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16));
+            GGML_ASSERT(ggml_are_same_shape(t, tensors[0]) && t->type == tensors[0]->type);
+            GGML_ASSERT(ggml_is_contiguously_allocated(t) && ((uintptr_t) t->data & 0xF) == 0 && (ggml_nbytes(t) & 0xF) == 0);
+        }
+        if (ggml_nelements(tensors[0]) == 0) {
+            return true;
+        }
+        return ggml_cuda_ar_window_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
@@ -1299,6 +1398,9 @@ static bool ggml_backend_cuda_comm_allreduce_tensor_add_rms_norm_mul(
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal || comm_ctx->ar_pipeline == nullptr) {
         return false;
+    }
+    if (comm_ctx->window_active) {
+        return false; // the caller reduces and then runs the chain as nodes
     }
     const size_t n_backends = comm_ctx->backends.size();
     if (n_backends != 2) {
@@ -2785,6 +2887,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
+    // the graphs are done: the experts they routed to may take the VRAM slots of idle ones
+    ggml_cuda_expert_cache_update(*cuda_ctx);
+
     GGML_UNUSED(backend);
 }
 
@@ -3878,6 +3983,61 @@ static bool ggml_cuda_take_deferred_gather(ggml_backend_cuda_context * cuda_ctx,
     return out.base != nullptr && out.rows != nullptr && out.gather_dst != nullptr && out.row_stride > 0;
 }
 
+// The nodes of an open host triple (moe-host.cuh) on the fused engine: at its first node gate, up and the SwiGLU, at
+// its down projection the projection and the weighted sum of the pairs. Returns the number of nodes to skip, 0 if
+// the node is computed as usual.
+static int ggml_cuda_fn_moe(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    const ggml_cuda_moe_host_triple & t = cuda_ctx->moe_host;
+    if (node == t.down) {
+        if (cuda_ctx->fn_moe_down != node) {
+            return 0;
+        }
+        ggml_cuda_fn_moe_down(*cuda_ctx, node, cuda_ctx->fn_moe_dst);
+        const int n_skip = cuda_ctx->fn_moe_skip;
+        ggml_cuda_moe_host_end_weighted(*cuda_ctx, node, cuda_ctx->fn_moe_dst);
+        cuda_ctx->fn_moe_down = nullptr;
+        return n_skip;
+    }
+    // gate and up, then their SwiGLU
+    if (i + 2 >= cgraph->n_nodes || cuda_ctx->fn_moe_down != nullptr) {
+        return 0;
+    }
+    const ggml_tensor * second = cgraph->nodes[i + 1];
+    const ggml_tensor * glu    = cgraph->nodes[i + 2];
+    if (!((node == t.gate && second == t.up) || (node == t.up && second == t.gate)) || glu->op != GGML_OP_GLU ||
+        glu->src[0] != t.gate || glu->src[1] != t.up || t.down->src[1] != glu) {
+        return 0;
+    }
+    int j = -1;
+    for (int k = i + 3; k < std::min(cgraph->n_nodes, i + 40) && j < 0; ++k) {
+        if (cgraph->nodes[k] == t.down) {
+            j = k;
+        }
+    }
+    ggml_cuda_moe_weighted_reduction_match match;
+    if (j < 0 || j + 1 >= cgraph->n_nodes || !ggml_cuda_match_moe_weighted_reduction(cgraph, j + 1, match) ||
+        match.experts != t.down || match.expert_scale != nullptr || ggml_is_empty(match.dst) ||
+        !ggml_cuda_fn_moe_supported(t.gate, t.up, t.down, match.weights, match.dst)) {
+        return 0;
+    }
+    // nothing else reads what is not computed
+    for (const ggml_tensor * x : { t.gate, t.up, glu, t.down }) {
+        if (x->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+        ggml_node_get_use_count(cgraph, i + 2) != 1 || ggml_node_get_use_count(cgraph, j) != 1) {
+        return 0;
+    }
+    ggml_cuda_fn_moe_up(*cuda_ctx, t.gate, t.up, match.weights);
+    cuda_ctx->fn_moe_down = t.down;
+    cuda_ctx->fn_moe_dst  = match.dst;
+    cuda_ctx->fn_moe_skip = match.node_count;
+    return 2;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool allow_defer) {
@@ -3892,8 +4052,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // shared expert: gate, up, swiglu, down and the sigmoid-gated scale -> two kernels
     if (node->op == GGML_OP_MUL_MAT) {
         ggml_cuda_shexp_args sx_args;
-        if (ggml_cuda_shexp_match(cgraph, i, sx_args)) {
-            ggml_cuda_shexp(*cuda_ctx, sx_args);
+        bool                 sx_planar;
+        if (ggml_cuda_shexp_match(cgraph, i, sx_args, &sx_planar)) {
+            if (sx_planar) {
+                ggml_cuda_fn_shexp(*cuda_ctx, sx_args);
+            } else {
+                ggml_cuda_shexp(*cuda_ctx, sx_args);
+            }
             return 6;
         }
     }
@@ -3911,6 +4076,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_fn_hc_mix(*cuda_ctx, hc_args);
                 return 9;
             }
+        }
+    }
+
+    // the output of a gated delta net layer: norm, norm weights, gate and the activations of its projection
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_gdn = ggml_cuda_fn_gdn_out(*cuda_ctx, cgraph, i);
+        if (n_gdn > 0) {
+            return n_gdn;
+        }
+    }
+    // ... of an attention layer: the sigmoid gate and the activations of its projection
+    if (node->op == GGML_OP_CONT) {
+        const int n_gate = ggml_cuda_fn_gate_out(*cuda_ctx, cgraph, i);
+        if (n_gate > 0) {
+            return n_gate;
+        }
+    }
+    // the selection mask of a QSA attention layer
+    if (node->op == GGML_OP_FILL) {
+        const int n_sel = ggml_cuda_fn_qsa_sel(*cuda_ctx, cgraph, i);
+        if (n_sel > 0) {
+            return n_sel;
+        }
+    }
+
+    // the same read when its norm was computed with an AllReduce (tensor-split windows)
+    if (node->op == GGML_OP_MUL_MAT) {
+        ggml_cuda_hc_mix_args hc_args;
+        if (ggml_cuda_fn_hc_tail_match(cgraph, i, hc_args)) {
+            ggml_cuda_fn_hc_tail(*cuda_ctx, hc_args);
+            return 5;
+        }
+    }
+
+    // the projections of one vector with planar weights: one launch
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int n_run = ggml_cuda_fn_mul_mat_run_match(cgraph, i);
+        if (n_run > 0) {
+            ggml_cuda_fn_mul_mat_run(*cuda_ctx, cgraph->nodes + i, n_run);
+            return n_run - 1;
         }
     }
 
@@ -4998,10 +5203,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // expert cache: the ids of a hot/cold MoE layer become the positions of its experts
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    ggml_cuda_moe_host_register(*cuda_ctx, cgraph, i);
+                    ggml_cuda_expert_cache_remap(*cuda_ctx, node);
+                }
+
                 // cold experts of a hot/cold MoE layer on the host: rings the doorbell before the triple's first node
                 const bool moe_host = ggml_cuda_moe_host_begin(*cuda_ctx, cgraph, i);
 
-                int nodes_to_skip = moe_host ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i, allow_defer);
+                int nodes_to_skip = moe_host ? ggml_cuda_fn_moe(cuda_ctx, cgraph, i) : ggml_cuda_try_fuse(cuda_ctx, cgraph, i, allow_defer);
 
                 if (nodes_to_skip == GGML_CUDA_FUSE_DEFERRED) {
                     // This node is executed folded into a later node (or has been already)
@@ -5113,13 +5324,57 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    FN_PROF_T(t_gc0);
 
     // The sm_60 activation cache keys on a tensor pointer a later graph may reuse.
     cuda_ctx->a16_cache_clear();
     cuda_ctx->gdn_gather_reset_graph();
     cuda_ctx->mmid16_cache_clear();
-    cuda_ctx->fn_act_clear();
+    if (!cuda_ctx->window_active) {
+        // within a window the graphs are the parts of one graph, and an AllReduce epilogue leaves activations for
+        // the part that follows it
+        cuda_ctx->fn_act_clear();
+    }
     cuda_ctx->moe_host = {};
+    cuda_ctx->ec_last_ids = nullptr;
+    cuda_ctx->ec_pending  = true;
+    cuda_ctx->fn_moe_down = nullptr;
+    ggml_cuda_expert_cache_prepare(*cuda_ctx, cgraph);
+    {
+        // temporary: the nodes of the first graphs of device 0 (GGML_CUDA_FN_DUMP=<number of graphs>)
+        static const int n_dump = getenv("GGML_CUDA_FN_DUMP") != nullptr ? atoi(getenv("GGML_CUDA_FN_DUMP")) : 0;
+        static int n_dumped = 0;
+        static const int dump_t = getenv("GGML_CUDA_FN_DUMP_T") != nullptr ? atoi(getenv("GGML_CUDA_FN_DUMP_T")) : 3;
+        bool dump = n_dumped < n_dump && cuda_ctx->device == 0 && cgraph->n_nodes > 1;
+        if (dump) {
+            dump = false;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                if (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) {
+                    dump = t->src[1]->ne[t->op == GGML_OP_MUL_MAT ? 1 : 2] == dump_t;
+                    break;
+                }
+            }
+        }
+        if (dump) {
+            fprintf(stderr, "fn-dump: graph %d, %d nodes\n", n_dumped, cgraph->n_nodes);
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                fprintf(stderr, "fn-dump:  %3d %-16s %-28s [%lld,%lld,%lld,%lld] %s <-", i, ggml_op_name(t->op), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type));
+                for (int j = 0; j < GGML_MAX_SRC && t->src[j] != nullptr; ++j) {
+                    fprintf(stderr, " %s(%s)", t->src[j]->name, ggml_type_name(t->src[j]->type));
+                }
+                fprintf(stderr, "\n");
+            }
+            n_dumped++;
+        }
+    }
+    // graphs that did not pass through graph_optimize (the per-device graphs of a tensor-split device): their
+    // weights are repacked before their first compute
+    if (cgraph->uid == 0 || cuda_ctx->fn_planes_seen(cgraph->uid)) {
+        ggml_cuda_fn_planes_optimize(*cuda_ctx, cgraph);
+    }
     // prompt batches of a hot/cold MoE: one ubatch is thousands of kernels, more than the launch queue holds, so
     // launched one by one the host blocks in the launches and cannot feed another GPU of a pipeline meanwhile.
     // They are captured as a CUDA graph on every call instead (their node properties change between ubatches).
@@ -5131,6 +5386,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    if (cuda_ctx->window_active) {
+        // part of a tensor-split window (ggml_backend_cuda_comm_window_begin): the nodes go straight to the stream,
+        // which the window may be capturing
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, ggml_cuda_graph_get_key(cgraph));
+        return GGML_STATUS_SUCCESS;
+    }
+
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -5172,6 +5434,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    FN_PROF_ADD("gc.pre", t_gc0);
+    FN_PROF_T(t_gc1);
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5184,6 +5448,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    FN_PROF_ADD(use_cuda_graph ? (cuda_graph_update_required ? "gc.capture+launch" : "gc.launch") : "gc.direct", t_gc1);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5218,6 +5483,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     ggml_cuda_fn_planes_optimize(*cuda_ctx, cgraph);
     ggml_cuda_moe_host_reorder(cgraph);
+    ggml_cuda_fn_reorder(cgraph);
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
 
@@ -6502,8 +6768,260 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// AllReduce fused with the nodes that follow the reduced tensor (window mode, fn-engine.cuh).
+// next[j]: the nodes after the reduced tensor on device j. Returns how many of them the reduction computes.
+static int ggml_backend_cuda_comm_allreduce_epilogue_match(void * comm_ctx_v, struct ggml_tensor ** reduced, struct ggml_tensor *** next, int n_next) {
+    if (comm_ctx_v == nullptr) {
+        return 0;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal || comm_ctx->backends.size() != 2 ||
+            !ggml_cuda_ar_window_supported(comm_ctx->ar_pipeline, ggml_nbytes(reduced[0]))) {
+        return 0;
+    }
+    int n = 0;
+    for (size_t j = 0; j < comm_ctx->backends.size(); ++j) {
+        if ((reduced[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+        const int nj = ggml_cuda_fn_ar_epilogue_match(reduced[j], next[j], n_next);
+        if (getenv("GGML_CUDA_FN_DEBUG") != nullptr && j == 0) {
+            fprintf(stderr, "fn-debug: epilogue after %s (%s [%lld,%lld]) n_next %d -> %d:", reduced[j]->name, ggml_op_name(reduced[j]->op),
+                    (long long) reduced[j]->ne[0], (long long) reduced[j]->ne[1], n_next, nj);
+            for (int q = 0; q < n_next && q < 12; ++q) {
+                fprintf(stderr, " %s", ggml_op_name(next[j][q]->op));
+            }
+            fprintf(stderr, "\n");
+        }
+        if (j > 0 && nj != n) {
+            return 0;
+        }
+        n = nj;
+    }
+    return n;
+}
+
+static bool ggml_backend_cuda_comm_allreduce_epilogue(void * comm_ctx_v, struct ggml_tensor ** reduced, struct ggml_tensor *** next, int n_next, int n_fused) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(comm_ctx->window_active);
+    ggml_cuda_ar_window_io io[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_ar_window_next(comm_ctx->ar_pipeline, io);
+    for (size_t j = 0; j < comm_ctx->backends.size(); ++j) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_fn_ar_epilogue(*cuda_ctx, reduced[j], next[j], n_next, n_fused, io[j]);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Tensor-split windows
+//
+// The meta backend computes a graph as a sequence of per-device subgraphs with an AllReduce between them. For a decode
+// window that is a hundred small launches per device, paced by the host. A window brackets the whole sequence: the
+// devices run the subgraphs without CUDA graphs of their own and the AllReduces synchronize on the devices
+// (allreduce.cuh, window mode). With capture, each device's part becomes one CUDA graph that
+// ggml_backend_cuda_comm_window_launch replays as long as the meta graph does not change.
+// ---------------------------------------------------------------------------
+struct ggml_backend_cuda_comm_window {
+    std::vector<cudaGraph_t>     graphs;
+    std::vector<cudaGraphExec_t> execs;
+};
+
+static bool ggml_backend_cuda_comm_window_supported(void * comm_ctx_v, struct ggml_cgraph * cgraph, size_t max_bytes) {
+#ifdef USE_CUDA_GRAPH
+    static const bool enabled = getenv("GGML_CUDA_WINDOW") == nullptr || atoi(getenv("GGML_CUDA_WINDOW")) != 0;
+    if (!enabled || comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal ||
+            !ggml_cuda_ar_window_supported(comm_ctx->ar_pipeline, max_bytes)) {
+        return false;
+    }
+    static const bool graphs_pre_volta = getenv("GGML_CUDA_GRAPHS_PRE_VOLTA") != nullptr && atoi(getenv("GGML_CUDA_GRAPHS_PRE_VOLTA")) != 0;
+    for (ggml_backend_t backend : comm_ctx->backends) {
+        const ggml_backend_cuda_context * cuda_ctx = (const ggml_backend_cuda_context *) backend->context;
+        if (!graphs_pre_volta && ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+            return false;
+        }
+    }
+    // prompt-sized MoE batches have host-driven paths (expert staging, the cold-expert prefetch)
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->ne[2] > MMVQ_MAX_BATCH_SIZE) {
+            return false;
+        }
+    }
+    ggml_cuda_set_device(((const ggml_backend_cuda_context *) comm_ctx->backends[0]->context)->device);
+    return ggml_cuda_graph_check_compability(cgraph);
+#else
+    GGML_UNUSED_VARS(comm_ctx_v, cgraph, max_bytes);
+    return false;
+#endif // USE_CUDA_GRAPH
+}
+
+static void ggml_backend_cuda_comm_window_begin(void * comm_ctx_v, bool capture) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(!comm_ctx->window_active);
+    for (ggml_backend_t backend : comm_ctx->backends) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+        cuda_ctx->window_active = true;
+        cuda_ctx->fn_act_clear();
+#ifdef USE_CUDA_GRAPH
+        if (capture) {
+            ggml_cuda_set_device(cuda_ctx->device);
+            {
+                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+                ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+            }
+            CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        }
+#endif // USE_CUDA_GRAPH
+    }
+    ggml_cuda_capturing      = capture;
+    comm_ctx->window_active  = true;
+    comm_ctx->window_capture = capture;
+    ggml_cuda_ar_window_begin(comm_ctx->ar_pipeline, comm_ctx->backends.data());
+}
+
+// returns the captured window, or NULL if the window was not capturing
+static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(comm_ctx->window_active);
+    ggml_backend_cuda_comm_window * window = nullptr;
+#ifdef USE_CUDA_GRAPH
+    if (comm_ctx->window_capture) {
+        window = new ggml_backend_cuda_comm_window;
+        for (ggml_backend_t backend : comm_ctx->backends) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            cudaGraph_t     graph = nullptr;
+            cudaGraphExec_t exec  = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
+            window->graphs.push_back(graph);
+            window->execs.push_back(exec);
+
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+    }
+#endif // USE_CUDA_GRAPH
+    ggml_cuda_capturing = false;
+    for (ggml_backend_t backend : comm_ctx->backends) {
+        ((ggml_backend_cuda_context *) backend->context)->window_active = false;
+    }
+    comm_ctx->window_active  = false;
+    comm_ctx->window_capture = false;
+    return window;
+}
+
+#ifdef USE_CUDA_GRAPH
+static void ggml_backend_cuda_comm_window_launcher_main(ggml_backend_cuda_comm_context::window_launcher * l) {
+    std::unique_lock<std::mutex> lock(l->mutex);
+    while (true) {
+        l->cv.wait(lock, [l] { return l->pending || l->stop; });
+        if (l->stop) {
+            return;
+        }
+        ggml_cuda_set_device(l->device);
+        CUDA_CHECK(cudaGraphLaunch(l->exec, l->stream));
+        l->pending = false;
+        l->done    = true;
+        l->cv.notify_all();
+    }
+}
+#endif // USE_CUDA_GRAPH
+
+static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * window_v) {
+#ifdef USE_CUDA_GRAPH
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    auto * window   = static_cast<ggml_backend_cuda_comm_window *>(window_v);
+    static const bool threaded = getenv("GGML_CUDA_WINDOW_THREADS") == nullptr || atoi(getenv("GGML_CUDA_WINDOW_THREADS")) != 0;
+    for (ggml_backend_t backend : comm_ctx->backends) {
+        ((ggml_backend_cuda_context *) backend->context)->ec_pending = true;
+    }
+    if (threaded && comm_ctx->backends.size() == 2) {
+        if (!comm_ctx->launcher) {
+            comm_ctx->launcher = std::make_unique<ggml_backend_cuda_comm_context::window_launcher>();
+            comm_ctx->launcher->thread = std::thread(ggml_backend_cuda_comm_window_launcher_main, comm_ctx->launcher.get());
+        }
+        auto * l = comm_ctx->launcher.get();
+        ggml_backend_cuda_context * ctx0 = (ggml_backend_cuda_context *) comm_ctx->backends[0]->context;
+        ggml_backend_cuda_context * ctx1 = (ggml_backend_cuda_context *) comm_ctx->backends[1]->context;
+        cudaStream_t stream1 = ctx1->stream();
+        {
+            std::lock_guard<std::mutex> lock(l->mutex);
+            l->exec    = window->execs[1];
+            l->stream  = stream1;
+            l->device  = ctx1->device;
+            l->done    = false;
+            l->pending = true;
+        }
+        l->cv.notify_all();
+        ggml_cuda_set_device(ctx0->device);
+        CUDA_CHECK(cudaGraphLaunch(window->execs[0], ctx0->stream()));
+        std::unique_lock<std::mutex> lock(l->mutex);
+        l->cv.wait(lock, [l] { return l->done; });
+        return;
+    }
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaGraphLaunch(window->execs[i], cuda_ctx->stream()));
+    }
+#else
+    GGML_UNUSED_VARS(comm_ctx_v, window_v);
+#endif // USE_CUDA_GRAPH
+}
+
+static void ggml_backend_cuda_comm_window_free(void * comm_ctx_v, void * window_v) {
+#ifdef USE_CUDA_GRAPH
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    auto * window   = static_cast<ggml_backend_cuda_comm_window *>(window_v);
+    if (window == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < comm_ctx->backends.size() && i < window->execs.size(); ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        // a launch of the window may still be running
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaGraphExecDestroy(window->execs[i]));
+        CUDA_CHECK(cudaGraphDestroy(window->graphs[i]));
+    }
+    delete window;
+#else
+    GGML_UNUSED_VARS(comm_ctx_v, window_v);
+#endif // USE_CUDA_GRAPH
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_comm_allreduce_epilogue_match") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_epilogue_match;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_epilogue") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_epilogue;
+    }
+    if (strcmp(name, "ggml_backend_comm_window_supported") == 0) {
+        return (void *)ggml_backend_cuda_comm_window_supported;
+    }
+    if (strcmp(name, "ggml_backend_comm_window_begin") == 0) {
+        return (void *)ggml_backend_cuda_comm_window_begin;
+    }
+    if (strcmp(name, "ggml_backend_comm_window_end") == 0) {
+        return (void *)ggml_backend_cuda_comm_window_end;
+    }
+    if (strcmp(name, "ggml_backend_comm_window_launch") == 0) {
+        return (void *)ggml_backend_cuda_comm_window_launch;
+    }
+    if (strcmp(name, "ggml_backend_comm_window_free") == 0) {
+        return (void *)ggml_backend_cuda_comm_window_free;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

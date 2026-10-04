@@ -415,6 +415,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     if (!model.exps_cold.empty()) {
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            // a split hot tensor needs a cold tensor that is split the same way
+            for (const auto & it : model.exps_cold) {
+                if (it.second->buffer != nullptr && !ggml_backend_buffer_is_meta(it.second->buffer)) {
+                    throw std::runtime_error(std::string("tensor split: ") + it.second->name +
+                        " must be in the host memory of the split device (e.g. -ot _exps_cold=CUDA_Host)");
+                }
+            }
+        }
         exps_cold = &model.exps_cold;
     }
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -1238,10 +1247,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        if (emb != nullptr) {
+            return emb->ne[1] == (int64_t) params.ubatch.n_tokens;
+        }
         return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * ple_n_heads, n_tokens], gathered here when the table is in host memory
 
     const llama_model & model;
 
@@ -1250,6 +1263,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<float>       emb_buf;
 };
 
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
@@ -1321,6 +1335,32 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (emb != nullptr) {
+        // the rows are read here: a graph node on the table would be a CPU split of its own in front of every batch
+        const ggml_tensor * ple      = model.per_layer_tok_embd;
+        const int64_t       head_dim = ple->ne[0];
+        const auto *        traits   = ggml_get_type_traits(ple->type);
+
+        emb_buf.resize(idx.size() * head_dim);
+        // the rows are spread over a table of tens of GB: start all the cache misses before the first row is read
+        for (size_t k = 0; k < idx.size(); ++k) {
+            const char * row = (const char *) ple->data + (size_t) idx[k] * ple->nb[1];
+            for (size_t o = 0; o < ple->nb[1]; o += 64) {
+                __builtin_prefetch(row + o);
+            }
+        }
+        for (size_t k = 0; k < idx.size(); ++k) {
+            const char * row = (const char *) ple->data + (size_t) idx[k] * ple->nb[1];
+            if (ple->type == GGML_TYPE_F32) {
+                memcpy(emb_buf.data() + k*head_dim, row, head_dim*sizeof(float));
+            } else {
+                traits->to_float(row, emb_buf.data() + k*head_dim, head_dim);
+            }
+        }
+        ggml_backend_tensor_set(emb, emb_buf.data(), 0, emb_buf.size()*sizeof(float));
+        return;
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -1386,6 +1426,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+
+    // a table in host memory is gathered by set_input()
+    const ggml_tensor * ple = model.per_layer_tok_embd;
+    if (ple->data != nullptr && ple->buffer != nullptr && ggml_backend_buffer_is_host(ple->buffer) &&
+            (ple->type == GGML_TYPE_F32 || ggml_get_type_traits(ple->type)->to_float != nullptr)) {
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->emb);
+        ggml_tensor * emb = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+        cb(emb, "ple_embd", -1);
+
+        return emb;
+    }
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);

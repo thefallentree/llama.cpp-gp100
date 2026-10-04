@@ -22,6 +22,9 @@
 // Called before node i is computed. Opens a host triple at its first node and returns true for every
 // node of the open triple: their mat-vec kernels have to skip the cold pairs.
 bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
+// Called before the MUL_MAT_ID node i is computed, for batches of any size: a hot/cold triple that opens there is
+// made known to the expert cache (expert-cache.cuh).
+void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 // whether batches above MMVQ_MAX_BATCH_SIZE tokens go to the host too (opt-in)
 bool ggml_cuda_moe_host_takes_prompts();
 
@@ -30,6 +33,10 @@ bool ggml_cuda_moe_host_active(const ggml_backend_cuda_context & ctx, const ggml
 
 // Called after a node is computed: after the triple's down projection, collects the host's rows.
 void ggml_cuda_moe_host_end(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+
+// The same when the triple's down projection was computed as the sum of the token's pairs times their weights
+// (ggml_cuda_fn_moe_down): adds the host's rows to that sum.
+void ggml_cuda_moe_host_end_weighted(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_tensor * dst);
 
 void ggml_cuda_moe_host_free(ggml_backend_cuda_context & ctx);
 

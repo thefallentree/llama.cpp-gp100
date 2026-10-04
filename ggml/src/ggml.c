@@ -524,6 +524,9 @@ const char * ggml_commit(void) {
 // timing
 //
 
+
+int ggml_fn_prof_tag = 0; // temporary profiling tag (fn-prof.h)
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 static int64_t timer_freq, timer_start;
 static BOOL CALLBACK ggml_time_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {

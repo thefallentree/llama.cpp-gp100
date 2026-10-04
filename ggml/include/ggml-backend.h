@@ -407,6 +407,14 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // A buffer type of the meta device made of the host buffer type of its simple devices: a tensor allocated in it is
+    // split like any tensor of the meta device, but every slice stays in host memory next to its device.
+    // Returns NULL if dev is not a meta device or host_buft is not the host buffer type of all its simple devices.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_device_host_split_buffer_type(ggml_backend_dev_t dev, ggml_backend_buffer_type_t host_buft);
+
+    // is the buffer one of a meta device (its tensors have a slice per simple device)?
+    GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
     //
     // Utils
     //

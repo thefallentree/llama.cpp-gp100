@@ -258,7 +258,8 @@ shexp_down(const char * __restrict__ wd, const int64_t w_row, const float * __re
 #endif // FP16_AVAILABLE
 }
 
-bool ggml_cuda_shexp_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_args & a) {
+bool ggml_cuda_shexp_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_args & a, bool * planar) {
+    *planar = false;
     static const bool enabled = getenv("GGML_CUDA_SHEXP_FUSE") == nullptr || atoi(getenv("GGML_CUDA_SHEXP_FUSE")) != 0;
     if (!enabled || i + 6 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
         return false;
@@ -269,11 +270,15 @@ bool ggml_cuda_shexp_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_ar
     if (!ggml_can_fuse_subgraph(cgraph, i, 7, ops, outputs, 1)) {
         return false;
     }
-    for (int k : { 0, 1, 3, 4 }) {
-        if (ggml_cuda_fn_planar(cgraph->nodes[i + k]->src[0])) {
-            return false; // planar weights go through the fused engine's mat-vec
-        }
+    // planar weights go through the fused engine (ggml_cuda_fn_shexp)
+    int n_planar = 0;
+    for (int k : { 0, 1, 3 }) {
+        n_planar += ggml_cuda_fn_planar(cgraph->nodes[i + k]->src[0]);
     }
+    if (n_planar != 0 && n_planar != 3) {
+        return false;
+    }
+    *planar = n_planar == 3;
     ggml_tensor * const * n = cgraph->nodes + i;
     a.glu  = n[2];
     a.gate = a.glu->src[0];
@@ -310,6 +315,9 @@ bool ggml_cuda_shexp_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_ar
         n_embd % 64 != 0 || n_ff % 64 != 0 || n_ff % SHEXP_UP_RB != 0 || n_embd % SHEXP_DOWN_RB != 0 ||
         a.mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(a.mul) || a.mul->ne[0] != n_embd || a.mul->ne[1] != nt) {
         return false;
+    }
+    if (*planar) {
+        return ggml_cuda_fn_shexp_supported(a);
     }
     // one half block of each row per thread in the first kernel, at most two per lane in the second
     if ((2*n_embd/SHEXP_QK) % WARP_SIZE != 0 || 2*n_embd/SHEXP_QK > 1024 || 2*n_ff/SHEXP_QK > 2*WARP_SIZE) {

@@ -1,5 +1,7 @@
 #include "moe-host.cuh"
 #include "moe-host-cpu.h"
+#include "expert-cache.cuh"
+#include "fn-engine.cuh"
 #include "mmid-f16-sm60.cuh"
 #include "mmvq.cuh"
 
@@ -192,24 +194,26 @@ static __global__ void mh_publish(
             mh_quantize_block(x + (bi / nb_t)*sx_tok + 64*(bi % nb_t), s_blk[w], mh_xq(mb) + bi, lane);
         }
     }
-    __threadfence_system();
-    __syncthreads();
     if (i == 0) {
         mb->slot     = slot;
         mb->n_tokens = n_tokens;
         mb->n_used   = n_used;
         mb->n_pairs  = np;
+    }
+    // One fence per thread, then the barrier: everything above is in host memory before the doorbell is written.
+    // A fence takes microseconds on GP100; the doorbell needs none after it.
+    __threadfence_system();
+    __syncthreads();
+    if (i == 0) {
         const uint32_t s = dstate[MH_DSTATE_SEQ] + 1;
         dstate[MH_DSTATE_SEQ] = s;
-        __threadfence_system();
         mb->req = s;
-        __threadfence_system();
     }
 }
 
 static __global__ void mh_collect(
         const mh_mailbox * mb, const uint32_t * __restrict__ dstate, float * __restrict__ dst,
-        const int64_t sd_slot, const int64_t sd_tok, const int n_used, const int n_embd) {
+        const int64_t sd_slot, const int64_t sd_tok, const int n_used, const int n_embd, unsigned long long * dbg) {
     const int np = dstate[MH_DSTATE_NEED];
     if (np == 0 || (int) blockIdx.x >= np) {
         return;
@@ -223,6 +227,10 @@ static __global__ void mh_collect(
                 __trap();
             }
         }
+        if (dbg != nullptr && blockIdx.x == 0) {
+            atomicAdd(dbg + 0, (unsigned long long) (clock64() - t0));
+            atomicAdd(dbg + 1, 1ull);
+        }
     }
     __syncthreads();
     const int n4 = n_embd/4;
@@ -234,6 +242,47 @@ static __global__ void mh_collect(
         const float4 * src = (const float4 *) (mh_y((mh_mailbox *) mb) + (int64_t) p*n_embd);
         for (int c = threadIdx.x; c < n4; c += blockDim.x) {
             out[c] = __ldcv(src + c);
+        }
+    }
+}
+
+// The same for a down projection whose output is the sum of the token's pairs times their weights (fn-engine.cuh):
+// one block per token adds the token's cold rows to it.
+static __global__ void mh_collect_weighted(
+        const mh_mailbox * mb, const uint32_t * __restrict__ dstate, const ggml_cuda_fn_moe_route * __restrict__ route,
+        float * __restrict__ y, const int64_t sy, const int n_used, const int n_embd, unsigned long long * dbg) {
+    const int np = dstate[MH_DSTATE_NEED];
+    if (np == 0) {
+        return;
+    }
+    if (threadIdx.x == 0) {
+        const uint32_t  s  = dstate[MH_DSTATE_SEQ];
+        const long long t0 = clock64();
+        while (*((volatile const uint32_t *) &mb->done) != s) {
+            if (clock64() - t0 > 20000000000LL) {
+                printf("moe-host: no answer from the host threads for request %u\n", s);
+                __trap();
+            }
+        }
+        if (dbg != nullptr && blockIdx.x == 0) {
+            atomicAdd(dbg + 0, (unsigned long long) (clock64() - t0));
+            atomicAdd(dbg + 1, 1ull);
+        }
+    }
+    __syncthreads();
+    const int n4 = n_embd/4;
+    float4 *  out = (float4 *) (y + blockIdx.x*sy);
+    for (int p = 0; p < np; ++p) {
+        const int idx = dstate[MH_DSTATE_PAIR + p];
+        if (idx / n_used != (int) blockIdx.x) {
+            continue;
+        }
+        const float    w   = route[idx].w;
+        const float4 * src = (const float4 *) (mh_y((mh_mailbox *) mb) + (int64_t) p*n_embd);
+        for (int c = threadIdx.x; c < n4; c += blockDim.x) {
+            const float4 v = __ldcv(src + c);
+            const float4 o = out[c];
+            out[c] = make_float4(o.x + w*v.x, o.y + w*v.y, o.z + w*v.z, o.w + w*v.w);
         }
     }
 }
@@ -304,6 +353,81 @@ bool ggml_cuda_moe_host_takes_prompts() {
     return prompt && ggml_cuda_moe_host_enabled();
 }
 
+// The gate/up/swiglu/down triple of a hot/cold Q2_0 layer that the MUL_MAT_ID node i opens: the other two
+// MUL_MAT_IDs on the same ids and the swiglu between gate/up and down.
+static bool mh_triple(const ggml_cgraph * cgraph, const int i, const ggml_tensor *& up, const ggml_tensor *& gate,
+                      const ggml_tensor *& down) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    const ggml_tensor * ids  = node->src[2];
+    if (ids->type != GGML_TYPE_I32 || !mh_is_cold_q2(node)) {
+        return false;
+    }
+    const ggml_tensor * mm[3] = { node, nullptr, nullptr };
+    int n_mm = 1;
+    const ggml_tensor * glu = nullptr;
+    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 32) && (n_mm < 3 || glu == nullptr); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == ids) {
+            if (n_mm == 3 || !mh_is_cold_q2(n)) {
+                return false;
+            }
+            mm[n_mm++] = n;
+        } else if (n->op == GGML_OP_GLU && glu == nullptr) {
+            glu = n;
+        }
+    }
+    if (n_mm != 3 || glu == nullptr || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    gate = glu->src[0];
+    up   = glu->src[1];
+    down = nullptr;
+    bool has_gate = false, has_up = false;
+    for (const ggml_tensor * m : mm) {
+        has_gate |= m == gate;
+        has_up   |= m == up;
+        if (m != gate && m != up) {
+            down = m;
+        }
+    }
+    if (!has_gate || !has_up || gate == up || down == nullptr || down->src[1] != glu) {
+        return false;
+    }
+    const int n_tokens = (int) ids->ne[1];
+    const ggml_tensor * x = up->src[1];
+    const int64_t n_embd = up->src[0]->ne[0];
+    const int64_t n_ff   = up->src[0]->ne[1];
+    const int64_t n_hot  = up->src[0]->ne[2];
+    if (gate->src[1] != x || x->ne[0] != n_embd || x->ne[1] != 1 || x->ne[2] != n_tokens || x->nb[0] != sizeof(float) ||
+        x->nb[2] % 16 != 0 || !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+        down->src[0]->ne[0] != n_ff || down->src[0]->ne[1] != n_embd || down->src[0]->ne[2] != n_hot ||
+        !ggml_is_contiguous(down) || n_embd % 64 != 0 || n_ff % 64 != 0 || n_embd > MH_MAX_EMBD || n_ff > MH_MAX_FF) {
+        return false;
+    }
+    int n_up = 0, n_gate = 0, n_down = 0;
+    ggml_cuda_mmid_cold(up,   nullptr, &n_up);
+    ggml_cuda_mmid_cold(gate, nullptr, &n_gate);
+    ggml_cuda_mmid_cold(down, nullptr, &n_down);
+    return n_up == n_gate && n_up == n_down && n_up > 0;
+}
+
+void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!ggml_cuda_mmid_cold(node) || !ggml_cuda_moe_host_enabled() || ggml_cuda_expert_cache_known(ctx, node->src[0])) {
+        return;
+    }
+    const ggml_tensor * up = nullptr, * gate = nullptr, * down = nullptr;
+    if (!mh_triple(cgraph, i, up, gate, down)) {
+        return;
+    }
+    const char * c_up = nullptr, * c_gate = nullptr, * c_down = nullptr;
+    int n_cold = 0;
+    ggml_cuda_mmid_cold(up,   &c_up,   &n_cold);
+    ggml_cuda_mmid_cold(gate, &c_gate, &n_cold);
+    ggml_cuda_mmid_cold(down, &c_down, &n_cold);
+    ggml_cuda_expert_cache_register(ctx, up, gate, down, c_up, c_gate, c_down, n_cold);
+}
+
 bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     const ggml_tensor * node = cgraph->nodes[i];
     if (node->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(node)) {
@@ -323,62 +447,24 @@ bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     if (n_tokens > MH_SMALL_TOK && !ggml_cuda_moe_host_takes_prompts()) {
         return false;
     }
-    if (ids->type != GGML_TYPE_I32 || !mh_is_cold_q2(node) ||
-        (ctx.moe_host_mb != nullptr && (n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs))) {
+    if (ctx.moe_host_mb != nullptr && (n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs)) {
         return false;
     }
-
-    // the other two MUL_MAT_IDs on the same ids and the swiglu between gate/up and down
-    const ggml_tensor * mm[3] = { node, nullptr, nullptr };
-    int n_mm = 1;
-    const ggml_tensor * glu = nullptr;
-    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 32) && (n_mm < 3 || glu == nullptr); ++j) {
-        const ggml_tensor * n = cgraph->nodes[j];
-        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == ids) {
-            if (n_mm == 3 || !mh_is_cold_q2(n)) {
-                return false;
-            }
-            mm[n_mm++] = n;
-        } else if (n->op == GGML_OP_GLU && glu == nullptr) {
-            glu = n;
-        }
-    }
-    if (n_mm != 3 || glu == nullptr || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
-        return false;
-    }
-    const ggml_tensor * gate = glu->src[0];
-    const ggml_tensor * up   = glu->src[1];
-    const ggml_tensor * down = nullptr;
-    bool has_gate = false, has_up = false;
-    for (const ggml_tensor * m : mm) {
-        has_gate |= m == gate;
-        has_up   |= m == up;
-        if (m != gate && m != up) {
-            down = m;
-        }
-    }
-    if (!has_gate || !has_up || gate == up || down == nullptr || down->src[1] != glu) {
+    const ggml_tensor * up = nullptr, * gate = nullptr, * down = nullptr;
+    if (!mh_triple(cgraph, i, up, gate, down)) {
         return false;
     }
     const ggml_tensor * x = up->src[1];
     const int64_t n_embd = up->src[0]->ne[0];
     const int64_t n_ff   = up->src[0]->ne[1];
     const int64_t n_hot  = up->src[0]->ne[2];
-    if (gate->src[1] != x || x->ne[0] != n_embd || x->ne[1] != 1 || x->ne[2] != n_tokens || x->nb[0] != sizeof(float) ||
-        x->nb[2] % 16 != 0 || !ggml_are_same_shape(gate->src[0], up->src[0]) ||
-        down->src[0]->ne[0] != n_ff || down->src[0]->ne[1] != n_embd || down->src[0]->ne[2] != n_hot ||
-        !ggml_is_contiguous(down) || n_embd % 64 != 0 || n_ff % 64 != 0 || n_embd > MH_MAX_EMBD || n_ff > MH_MAX_FF ||
-        (ctx.moe_host_mb != nullptr && n_embd > ctx.moe_host_mb->cap_embd)) {
+    if (ctx.moe_host_mb != nullptr && n_embd > ctx.moe_host_mb->cap_embd) {
         return false;
     }
     const char * c_up = nullptr, * c_gate = nullptr, * c_down = nullptr;
-    int n_up = 0, n_gate = 0, n_down = 0;
-    ggml_cuda_mmid_cold(up,   &c_up,   &n_up);
-    ggml_cuda_mmid_cold(gate, &c_gate, &n_gate);
-    ggml_cuda_mmid_cold(down, &c_down, &n_down);
-    if (n_up != n_gate || n_up != n_down || n_up <= 0) {
-        return false;
-    }
+    ggml_cuda_mmid_cold(up,   &c_up);
+    ggml_cuda_mmid_cold(gate, &c_gate);
+    ggml_cuda_mmid_cold(down, &c_down);
     if (!ggml_cuda_moe_host_init(ctx, (int) n_embd, n_used) ||
         n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs) {
         return false;
@@ -429,7 +515,19 @@ void ggml_cuda_moe_host_end(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int n_tokens = (int) node->src[2]->ne[1];
     mh_collect<<<n_tokens <= MH_SMALL_TOK ? 8 : 64, 256, 0, ctx.stream()>>>(
         ctx.moe_host_mb, ctx.moe_host_dstate, (float *) node->data,
-        (int64_t) (node->nb[1]/sizeof(float)), (int64_t) (node->nb[2]/sizeof(float)), n_used, (int) node->ne[0]);
+        (int64_t) (node->nb[1]/sizeof(float)), (int64_t) (node->nb[2]/sizeof(float)), n_used, (int) node->ne[0], ctx.fn_dbg_get());
+    CUDA_CHECK(cudaGetLastError());
+    ctx.moe_host = {};
+}
+
+void ggml_cuda_moe_host_end_weighted(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_tensor * dst) {
+    GGML_ASSERT(node == ctx.moe_host.down);
+    const int n_used   = (int) node->src[2]->ne[0];
+    const int n_tokens = (int) node->src[2]->ne[1];
+    GGML_ASSERT(((uintptr_t) dst->data & 0xF) == 0 && dst->nb[1] % 16 == 0);
+    mh_collect_weighted<<<n_tokens, 256, 0, ctx.stream()>>>(
+        ctx.moe_host_mb, ctx.moe_host_dstate, ggml_cuda_fn_moe_routes(ctx), (float *) dst->data,
+        (int64_t) (dst->nb[1]/sizeof(float)), n_used, (int) dst->ne[0], ctx.fn_dbg_get());
     CUDA_CHECK(cudaGetLastError());
     ctx.moe_host = {};
 }

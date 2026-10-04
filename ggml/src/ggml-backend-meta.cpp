@@ -2,6 +2,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "fn-prof.h"
+FN_PROF_DECL("meta");
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
@@ -254,6 +256,9 @@ struct ggml_backend_meta_buffer_type_context {
 
     std::string name;
 
+    // slices in the host memory of the simple devices (ggml_backend_meta_device_host_split_buffer_type)
+    bool host_split = false;
+
     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
         name = "Meta(";
         for (size_t i = 0; i < simple_bufts.size(); i++) {
@@ -324,6 +329,10 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
 }
 
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    if (((const ggml_backend_meta_buffer_type_context *) buft->context)->host_split) {
+        // the slices are in host memory, the meta tensor itself has no address
+        return false;
+    }
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         if (!ggml_backend_buft_is_host(ggml_backend_meta_buft_simple_buft(buft, i))) {
@@ -365,6 +374,41 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
         simple_bufts.push_back(ggml_backend_dev_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i)));
     }
     ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
+
+    struct ggml_backend_buffer_type meta_buft = {
+        /*iface  =*/ ggml_backend_meta_buffer_type_iface,
+        /*device =*/ dev,
+        /*ctx    =*/ buft_ctx,
+    };
+    auto result = meta_bufts.emplace(dev, meta_buft);
+    return &result.first->second;
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_device_host_split_buffer_type(ggml_backend_dev_t dev, ggml_backend_buffer_type_t host_buft) {
+    static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type> meta_bufts;
+    if (!ggml_backend_dev_is_meta(dev) || host_buft == nullptr) {
+        return nullptr;
+    }
+    {
+        auto it = meta_bufts.find(dev);
+        if (it != meta_bufts.end()) {
+            return ggml_backend_meta_buft_simple_buft(&it->second, 0) == host_buft ? &it->second : nullptr;
+        }
+    }
+
+    const size_t n_devs = ggml_backend_meta_dev_n_devs(dev);
+    std::vector<ggml_backend_buffer_type_t> simple_bufts;
+    simple_bufts.reserve(n_devs);
+    for (size_t i = 0; i < n_devs; i++) {
+        if (ggml_backend_dev_host_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i)) != host_buft) {
+            return nullptr;
+        }
+        simple_bufts.push_back(host_buft);
+    }
+    ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
+    buft_ctx->host_split = true;
+    // buffer types are told apart by their name
+    buft_ctx->name = std::string("Meta_") + ggml_backend_buft_name(host_buft);
 
     struct ggml_backend_buffer_type meta_buft = {
         /*iface  =*/ ggml_backend_meta_buffer_type_iface,
@@ -1966,6 +2010,7 @@ struct ggml_backend_meta_context {
         // itself must not move, or this subgraph's last node would no longer be the reduced one.
         int   n_skip_front    = 0;
         int   n_fused         = 0;
+        bool  fused_epilogue  = false; // the n_fused nodes are computed by comm_allreduce_epilogue (see below)
         int   i_fused_add     = -1;
         int   i_fused_rms     = -1;
         int   i_fused_mul     = -1;
@@ -2009,6 +2054,41 @@ struct ggml_backend_meta_context {
     comm_allreduce_add_rms_norm_mul_supported_t comm_allreduce_add_rms_norm_mul_supported = nullptr;
     std::vector<ggml_cgraph *>                  cgraphs_fused_fallback; // per device, capacity 4 nodes
 
+    // Optional: AllReduce epilogues.  The comm layer is shown the nodes that follow a reduced tensor (the same nodes
+    // on every device) and answers how many of them it computes together with the reduction; they leave the next
+    // subgraph.  Only for graphs that run as windows.
+    using comm_allreduce_epilogue_match_t = int  (*)(void * comm_ctx, ggml_tensor ** reduced, ggml_tensor *** next, int n_next);
+    using comm_allreduce_epilogue_t       = bool (*)(void * comm_ctx, ggml_tensor ** reduced, ggml_tensor *** next, int n_next, int n_fused);
+    static constexpr int epilogue_max_nodes = 24; // how many nodes after a reduced tensor the comm layer is shown
+    comm_allreduce_epilogue_match_t comm_allreduce_epilogue_match = nullptr;
+    comm_allreduce_epilogue_t       comm_allreduce_epilogue       = nullptr;
+
+    // Optional: windows.  The comm layer brackets the subgraphs and AllReduces of one graph compute and can capture
+    // each device's part into a single launch.  A graph's first compute runs as it is submitted, the second one is
+    // captured, and from then on the graph (identified by its uid) is only launched: no rebuild, no host pacing.
+    using comm_window_supported_t = bool   (*)(void * comm_ctx, struct ggml_cgraph * cgraph, size_t max_bytes);
+    using comm_window_begin_t     = void   (*)(void * comm_ctx, bool capture);
+    using comm_window_end_t       = void * (*)(void * comm_ctx);
+    using comm_window_launch_t    = void   (*)(void * comm_ctx, void * window);
+    using comm_window_free_t      = void   (*)(void * comm_ctx, void * window);
+    comm_window_supported_t comm_window_supported = nullptr;
+    comm_window_begin_t     comm_window_begin     = nullptr;
+    comm_window_end_t       comm_window_end       = nullptr;
+    comm_window_launch_t    comm_window_launch    = nullptr;
+    comm_window_free_t      comm_window_free      = nullptr;
+
+    struct window_entry {
+        uint64_t uid       = 0;
+        void *   window    = nullptr; // captured
+        int      n_compute = 0;       // computes without a captured window
+        bool     supported = false;
+        uint64_t last_use  = 0;
+    };
+    static constexpr size_t   max_windows = 8;
+    std::vector<window_entry> windows;
+    uint64_t                  window_clock    = 0;
+    size_t                    max_partial_cur = 0; // largest reduced tensor of the graph built last
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -2048,10 +2128,35 @@ struct ggml_backend_meta_context {
                 comm_allreduce_add_rms_norm_mul_supported = (comm_allreduce_add_rms_norm_mul_supported_t)
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_add_rms_norm_mul_supported");
             }
+            if (n_devs == 2) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+                comm_window_supported = (comm_window_supported_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_supported");
+                comm_window_begin     = (comm_window_begin_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_begin");
+                comm_window_end       = (comm_window_end_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_end");
+                comm_window_launch    = (comm_window_launch_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_launch");
+                comm_window_free      = (comm_window_free_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_free");
+                if (comm_window_begin == nullptr || comm_window_end == nullptr || comm_window_launch == nullptr || comm_window_free == nullptr) {
+                    comm_window_supported = nullptr;
+                }
+                if (comm_window_supported != nullptr) {
+                    comm_allreduce_epilogue_match = (comm_allreduce_epilogue_match_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_epilogue_match");
+                    comm_allreduce_epilogue = (comm_allreduce_epilogue_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_epilogue");
+                    if (comm_allreduce_epilogue == nullptr) {
+                        comm_allreduce_epilogue_match = nullptr;
+                    }
+                }
+            }
         }
     }
 
     ~ggml_backend_meta_context() {
+        for (window_entry & w : windows) {
+            if (w.window != nullptr) {
+                comm_window_free(comm_ctx, w.window);
+            }
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2077,14 +2182,20 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static void ggml_backend_meta_synchronize(ggml_backend_t backend);
+
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        // several segments: the buffer's synchronous path splices them
+        ggml_backend_meta_synchronize(backend);
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -2117,7 +2228,9 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             }
         } break;
         default: {
-            GGML_ABORT("fatal error");
+            // the other split states go through the buffer's synchronous path
+            ggml_backend_meta_synchronize(backend);
+            ggml_backend_tensor_set(tensor, data, offset, size);
         }
     }
 }
@@ -2230,6 +2343,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    // A graph with a captured window is launched as it is.
+    ggml_backend_meta_context::window_entry * win = nullptr;
+    const bool windows = backend_ctx->comm_window_supported != nullptr && cgraph->uid != 0;
+    if (windows) {
+        for (auto & w : backend_ctx->windows) {
+            if (w.uid == cgraph->uid) {
+                win = &w;
+                break;
+            }
+        }
+        if (win != nullptr) {
+            win->last_use = ++backend_ctx->window_clock;
+            if (win->window != nullptr) {
+                FN_PROF_T(t_win0);
+                backend_ctx->comm_window_launch(backend_ctx->comm_ctx, win->window);
+                FN_PROF_ADD("meta.window_launch", t_win0);
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+    }
+
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
     static const int meta_debug = getenv("GGML_META_DEBUG") ? atoi(getenv("GGML_META_DEBUG")) : 0;
@@ -2251,6 +2385,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     const int64_t t_rebuild_start = meta_debug >= 1 && needs_rebuild ? ggml_time_us() : 0;
+    if (needs_rebuild) { FN_PROF_ADD("meta.n_rebuild", fn_prof_now() - 1000); }
     if (needs_rebuild) {
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
@@ -2526,8 +2661,50 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // leave the next subgraph and the fused call produces the ADD and MUL outputs.
             for (size_t j = 0; j < n_backends; j++) {
                 for (size_t sg = 0; sg < n_subgraphs; sg++) {
-                    backend_ctx->backend_configs[j].cgraphs[sg].n_fused      = 0;
-                    backend_ctx->backend_configs[j].cgraphs[sg].n_skip_front = 0;
+                    backend_ctx->backend_configs[j].cgraphs[sg].n_fused        = 0;
+                    backend_ctx->backend_configs[j].cgraphs[sg].n_skip_front   = 0;
+                    backend_ctx->backend_configs[j].cgraphs[sg].fused_epilogue = false;
+                }
+            }
+            // window graphs: epilogues of the comm layer
+            if (backend_ctx->comm_allreduce_epilogue_match != nullptr && cgraph->uid != 0 &&
+                    backend_ctx->comm_window_supported(backend_ctx->comm_ctx, cgraph, max_tmp_size)) {
+                auto & cg0 = backend_ctx->backend_configs[0].cgraphs;
+                int n_epilogues = 0;
+                for (size_t sg = 0; sg + 1 < n_subgraphs; sg++) {
+                    const int i_ar  = cg0[sg + 1].offset - 1;                                           // the reduced node
+                    // up to the next reduced node (exclusive), and not further than an epilogue can look: nodes
+                    // further on may be hidden views of the host (an attention layer's cache)
+                    const int i_end = std::min(i_ar + 1 + ggml_backend_meta_context::epilogue_max_nodes,
+                                               sg + 2 < n_subgraphs ? cg0[sg + 2].offset - 1 : cgraph->n_nodes);
+                    ggml_tensor *  reduced[GGML_BACKEND_META_MAX_DEVICES];
+                    ggml_tensor ** next   [GGML_BACKEND_META_MAX_DEVICES];
+                    bool ok = i_end > i_ar + 1;
+                    for (size_t j = 0; j < n_backends && ok; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        reduced[j] = bcj.nodes[i_ar];
+                        next[j]    = &bcj.nodes[i_ar + 1];
+                        // the hidden views of the host (see the FIXME above) are not per-device tensors
+                        for (int ii = i_ar; ii < i_end; ii++) {
+                            ok = ok && bcj.nodes[ii] != cgraph->nodes[ii];
+                        }
+                    }
+                    if (!ok) {
+                        continue;
+                    }
+                    const int n_fused = backend_ctx->comm_allreduce_epilogue_match(backend_ctx->comm_ctx, reduced, next, i_end - (i_ar + 1));
+                    if (n_fused > 0) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            auto & cg = backend_ctx->backend_configs[j].cgraphs;
+                            cg[sg].n_fused          = n_fused;
+                            cg[sg].fused_epilogue   = true;
+                            cg[sg + 1].n_skip_front = n_fused;
+                        }
+                        n_epilogues++;
+                    }
+                }
+                if (meta_debug >= 1) {
+                    GGML_LOG_WARN("meta-debug: %d of %zu AllReduces have an epilogue (%d nodes)\n", n_epilogues, n_subgraphs - 1, cgraph->n_nodes);
                 }
             }
             if (n_backends == 2 && backend_ctx->comm_ctx != nullptr &&
@@ -2538,6 +2715,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const int i_ar   = cg0[sg + 1].offset - 1;              // the reduced node
                     const int i_end  = sg + 2 < n_subgraphs ? cg0[sg + 2].offset - 1 : cgraph->n_nodes; // next reduced node (exclusive)
                     ggml_tensor * reduced = cgraph->nodes[i_ar];
+                    if (cg0[sg].fused_epilogue) {
+                        continue;
+                    }
                     if (reduced->type != GGML_TYPE_F32 || !ggml_is_contiguous(reduced) || reduced->ne[2] != 1 || reduced->ne[3] != 1 ||
                             (reduced->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
                             ggml_node_get_use_count(cgraph, i_ar) != 1) {
@@ -2615,8 +2795,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        backend_ctx->uid         = cgraph->uid;
-        backend_ctx->n_subgraphs = n_subgraphs;
+        backend_ctx->uid             = cgraph->uid;
+        backend_ctx->n_subgraphs     = n_subgraphs;
+        backend_ctx->max_partial_cur = max_tmp_size;
         if (meta_debug >= 1) {
             static int64_t t_rebuild_total = 0; static int n_rebuilds = 0;
             t_rebuild_total += ggml_time_us() - t_rebuild_start; n_rebuilds++;
@@ -2838,7 +3019,44 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // Open a window for this graph: its first compute runs as submitted (memory pools grow, weights are repacked),
+    // the second one is captured.
+    bool window_capture = false;
+    if (windows) {
+        if (win == nullptr) {
+            ggml_backend_meta_context::window_entry entry;
+            entry.uid       = cgraph->uid;
+            entry.supported = backend_ctx->comm_window_supported(backend_ctx->comm_ctx, cgraph, backend_ctx->max_partial_cur);
+            entry.last_use  = ++backend_ctx->window_clock;
+            if (backend_ctx->windows.size() < backend_ctx->max_windows) {
+                backend_ctx->windows.push_back(entry);
+                win = &backend_ctx->windows.back();
+            } else {
+                win = &backend_ctx->windows[0];
+                for (auto & w : backend_ctx->windows) {
+                    if (w.last_use < win->last_use) {
+                        win = &w;
+                    }
+                }
+                if (win->window != nullptr) {
+                    backend_ctx->comm_window_free(backend_ctx->comm_ctx, win->window);
+                }
+                *win = entry;
+            }
+        }
+        if (!win->supported) {
+            win = nullptr;
+        }
+    }
+    if (win != nullptr) {
+        window_capture = win->n_compute >= 1;
+        backend_ctx->comm_window_begin(backend_ctx->comm_ctx, window_capture);
+    }
+
+    FN_PROF_T(t_meta0);
+    int64_t t_sub = 0, t_ar = 0;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        FN_PROF_T(t_sub0);
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -2846,11 +3064,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return status;
             }
         }
+        if (g_fn_prof.on) { t_sub += fn_prof_now() - t_sub0; }
+        FN_PROF_T(t_ar0);
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             bool backend_allreduce_success = false;
             const auto & cg0 = backend_ctx->backend_configs[0].cgraphs[i];
-            if (backend_ctx->comm_ctx && cg0.n_fused > 0) {
+            if (cg0.fused_epilogue) {
+                GGML_ASSERT(win != nullptr && "AllReduce epilogues are for window graphs");
+                ggml_tensor *  reduced[GGML_BACKEND_META_MAX_DEVICES];
+                ggml_tensor ** next   [GGML_BACKEND_META_MAX_DEVICES];
+                // the nodes up to the next reduced one, as shown to comm_allreduce_epilogue_match
+                const int i_ar  = backend_ctx->backend_configs[0].cgraphs[i + 1].offset - 1;
+                const int i_end = std::min(i_ar + 1 + ggml_backend_meta_context::epilogue_max_nodes,
+                                           i + 2 < backend_ctx->n_subgraphs ? backend_ctx->backend_configs[0].cgraphs[i + 2].offset - 1 : cgraph->n_nodes);
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    reduced[j] = bcj.nodes[i_ar];
+                    next[j]    = &bcj.nodes[i_ar + 1];
+                }
+                backend_allreduce_success = backend_ctx->comm_allreduce_epilogue(backend_ctx->comm_ctx, reduced, next, i_end - (i_ar + 1), cg0.n_fused);
+                GGML_ASSERT(backend_allreduce_success);
+            } else if (backend_ctx->comm_ctx && cg0.n_fused > 0) {
                 ggml_tensor * tensors  [GGML_MAX_SRC];
                 ggml_tensor * residuals[GGML_MAX_SRC];
                 ggml_tensor * adds     [GGML_MAX_SRC];
@@ -2908,14 +3143,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (!backend_allreduce_success) {
+                GGML_ASSERT(win == nullptr && "the comm layer must reduce every tensor of a window");
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
         }
+        if (g_fn_prof.on) { t_ar += fn_prof_now() - t_ar0; }
     }
+    if (win != nullptr) {
+        void * window = backend_ctx->comm_window_end(backend_ctx->comm_ctx);
+        win->n_compute++;
+        if (window_capture) {
+            win->window = window;
+            backend_ctx->comm_window_launch(backend_ctx->comm_ctx, window);
+        }
+    }
+    if (g_fn_prof.on) {
+        g_fn_prof.add("meta.subgraphs", t_sub);
+        g_fn_prof.add("meta.allreduce", t_ar);
+        g_fn_prof.add("meta.n_subgraphs", (int64_t) backend_ctx->n_subgraphs*1000);
+    }
+    FN_PROF_ADD("meta.compute", t_meta0);
     return GGML_STATUS_SUCCESS;
+}
+
+// The simple backends reorder nodes and add allocation dependencies by op pattern. The patterns are the same on every
+// device, so the first simple backend does it on the meta graph.
+static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
+    ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
+    if (simple_backend->iface.graph_optimize != nullptr) {
+        simple_backend->iface.graph_optimize(simple_backend, cgraph, params);
+    }
 }
 
 static const ggml_backend_i ggml_backend_meta_i = {
@@ -2934,7 +3194,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
-    /* .graph_optimize          = */ nullptr,
+    /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

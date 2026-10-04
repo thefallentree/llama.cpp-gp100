@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 #include <set>
 
 #if defined(GGML_USE_HIP)
@@ -1518,24 +1519,24 @@ struct ggml_backend_cuda_context {
     const void *        mmid16_cache_data = nullptr;
     int64_t             mmid16_cache_key  = -1;
 
-    // sm_60 fused engine (fn-engine.cuh): the fp16 activations of the last two mat-vec inputs. The keys hold tensor
-    // pointers, so they are cleared at the top of every graph compute; the buffers are kept.
+    // sm_60 fused engine (fn-engine.cuh): the fp16 activations of the vectors that mat-vecs read, by tensor. The keys
+    // are tensor pointers, so they are cleared at the top of every graph compute (of every window when the graph is
+    // computed in parts, see window_active); the buffers are kept.
     struct fn_act_slot {
-        const ggml_tensor * src1   = nullptr;
-        const void *        data   = nullptr;
-        int64_t             stride = 0;
-        int                 n      = 0;
-        int                 nt     = 0;
-        char *              mem    = nullptr;
-        size_t              cap    = 0;
+        const ggml_tensor * key      = nullptr;
+        int                 n        = 0;
+        int                 nt       = 0;
+        bool                full     = false; // the activations are (or will be, in stream order) written, not only the scales
+        uint64_t            last_use = 0;
+        char *              mem      = nullptr;
+        size_t              cap      = 0;
     };
-    fn_act_slot fn_act[2];
-    int         fn_act_next = 0;
+    fn_act_slot fn_act[4];
+    uint64_t    fn_act_clock = 0;
 
     void fn_act_clear() {
         for (auto & s : fn_act) {
-            s.src1 = nullptr;
-            s.data = nullptr;
+            s.key = nullptr;
         }
     }
     void fn_act_free() {
@@ -1547,6 +1548,39 @@ struct ggml_backend_cuda_context {
             s.cap = 0;
         }
         fn_act_clear();
+    }
+
+    // part of a tensor-split window: graph_compute runs the nodes on the stream without a CUDA graph of its own
+    bool window_active = false;
+
+    // fn-engine MoE experts: the pairs, the SwiGLU outputs and their activations between the up and the down kernels
+    char *  fn_moe_mem = nullptr;
+    size_t  fn_moe_cap = 0;
+    int     fn_moe_n_ff = 0;
+    int     fn_moe_n_pairs = 0;
+    // ... and what the down projection of the open layer writes: the weighted sum and the nodes it replaces
+    const ggml_tensor * fn_moe_down = nullptr;
+    ggml_tensor *       fn_moe_dst  = nullptr;
+    int                 fn_moe_skip = 0;
+
+    // expert cache (expert-cache.cuh): the ids tensor whose ids were last made positions in this graph, and whether
+    // graphs ran since the last update
+    const ggml_tensor * ec_last_ids = nullptr;
+    bool                ec_pending  = false;
+
+    // temporary (GGML_CUDA_FN_WAITS=1): device counters of the waits inside kernels, in clock64() ticks:
+    // [0] host-tier collect wait, [1] collects, [2] AllReduce wait, [3] AllReduces
+    unsigned long long * fn_dbg = nullptr;
+    unsigned long long * fn_dbg_get();
+    void                 fn_dbg_report();
+
+    // uids of the graphs whose weights were looked at for the planar repack; true the first time a uid is seen
+    std::unordered_set<uint64_t> fn_planes_uids;
+    bool fn_planes_seen(const uint64_t uid) {
+        if (fn_planes_uids.size() > 4096) {
+            fn_planes_uids.clear();
+        }
+        return fn_planes_uids.insert(uid).second;
     }
 
     // cache buffers replaced by larger ones: a captured CUDA graph may still use them (its kernels write and read

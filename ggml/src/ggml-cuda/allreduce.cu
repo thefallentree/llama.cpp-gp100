@@ -76,6 +76,14 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // slot so multiple SMs can pump PCIe stores in parallel.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
+// Window mode: the reductions of one decode window are part of a captured CUDA graph per device, so their launch
+// arguments cannot carry a call number. A device counts the windows it has started in its own memory (the epoch,
+// advanced by ggml_cuda_ar_window_tick at the top of each window) and a reduction's token is epoch * MAX_SITES + its
+// index in the window: both devices start the same windows and run the same reductions in the same order.
+static __global__ void ggml_cuda_ar_window_tick(unsigned int * epoch) {
+    *epoch = *epoch + 1;
+}
+
 // ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
 //
@@ -115,13 +123,17 @@ static __global__ void ggml_cuda_ar_kernel(
         int                         count,
         int *                       arrival_mine,
         int *                       arrival_other,
-        int                         token) {
+        int                         token_arg,
+        const unsigned int *        epoch) {
 
     // Vector unit for the wire type, sized to the arch's widest single-instruction
     // copy (16 B on Volta+).  Each phase-1 iter writes one vector to host memory;
     // each phase-3 iter reads one and produces ELEMS_PER_VEC sums.
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
     constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    // window mode: token_arg is the index of the reduction in its window (see ggml_cuda_ar_window_allreduce)
+    const int token = epoch != nullptr ? ggml_cuda_ar_window_token(epoch, token_arg) : token_arg;
 
     const int tid       = threadIdx.x;
     const int nt        = blockDim.x;
@@ -452,6 +464,13 @@ struct ggml_cuda_ar_pipeline {
     bool   p2p;
     char * dev_buf[GGML_CUDA_MAX_DEVICES];      // POOL_SIZE * buf_bytes, on device i, written by the peer
     int *  dev_arrival[GGML_CUDA_MAX_DEVICES];  // (slot, rank) token ring on device i, written by the peer
+
+    // Window mode (peer-memory transport only): its own staging and token ring, the epoch of each device, and the
+    // number of reductions issued in the open window.
+    char *         win_buf[GGML_CUDA_MAX_DEVICES];
+    int *          win_arrival[GGML_CUDA_MAX_DEVICES];
+    unsigned int * win_epoch[GGML_CUDA_MAX_DEVICES];
+    int            win_site;
 };
 
 // Token block for (slot, rank) inside device `owner`'s arrival ring.
@@ -647,7 +666,13 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             ggml_cuda_set_device(p->devices[i]);
             ok = cudaMalloc(reinterpret_cast<void **>(&p->dev_buf[i]), host_buf_total) == cudaSuccess &&
                  cudaMalloc(reinterpret_cast<void **>(&p->dev_arrival[i]), arrival_bytes_dev) == cudaSuccess &&
-                 cudaMemset(p->dev_arrival[i], 0, arrival_bytes_dev) == cudaSuccess;
+                 cudaMemset(p->dev_arrival[i], 0, arrival_bytes_dev) == cudaSuccess &&
+                 cudaMalloc(reinterpret_cast<void **>(&p->win_buf[i]), host_buf_total) == cudaSuccess &&
+                 cudaMemset(p->win_buf[i], 0, host_buf_total) == cudaSuccess && // units carry a token, never 0
+                 cudaMalloc(reinterpret_cast<void **>(&p->win_arrival[i]), arrival_bytes_dev) == cudaSuccess &&
+                 cudaMemset(p->win_arrival[i], 0, arrival_bytes_dev) == cudaSuccess &&
+                 cudaMalloc(reinterpret_cast<void **>(&p->win_epoch[i]), sizeof(unsigned int)) == cudaSuccess &&
+                 cudaMemset(p->win_epoch[i], 0, sizeof(unsigned int)) == cudaSuccess;
         }
         if (ok) {
             p->p2p = true;
@@ -701,10 +726,13 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         p->host_buf[i].free();
         p->host_large[i].free();
-        if (p->dev_buf[i] || p->dev_arrival[i]) {
+        if (p->dev_buf[i] || p->dev_arrival[i] || p->win_buf[i] || p->win_arrival[i] || p->win_epoch[i]) {
             ggml_cuda_set_device(p->devices[i]);
             if (p->dev_buf[i])     { cudaFree(p->dev_buf[i]); }
             if (p->dev_arrival[i]) { cudaFree(p->dev_arrival[i]); }
+            if (p->win_buf[i])     { cudaFree(p->win_buf[i]); }
+            if (p->win_arrival[i]) { cudaFree(p->win_arrival[i]); }
+            if (p->win_epoch[i])   { cudaFree(p->win_epoch[i]); }
         }
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
@@ -1089,7 +1117,8 @@ bool ggml_cuda_ar_allreduce(
                     static_cast<int>(chunk_elems), \
                     arr_mine, \
                     arr_other, \
-                    token)
+                    token, \
+                    nullptr)
 
                 if (use_bf16) {
                     GGML_ASSERT(input_type == GGML_TYPE_F32);
@@ -1114,6 +1143,121 @@ bool ggml_cuda_ar_allreduce(
     }
 
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Window mode
+// ---------------------------------------------------------------------------
+
+bool ggml_cuda_ar_window_supported(const ggml_cuda_ar_pipeline * p, const size_t max_bytes) {
+    // one launch of the chunked kernel per reduction, whatever the wire type
+    return p != nullptr && p->n_devices == 2 && p->p2p && max_bytes <= p->buf_bytes;
+}
+
+void ggml_cuda_ar_window_begin(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends) {
+    GGML_ASSERT(p != nullptr && p->p2p);
+    p->win_site = 0;
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        ggml_cuda_ar_window_tick<<<1, 1, 0, cuda_ctx->stream()>>>(p->win_epoch[i]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static_assert(GGML_CUDA_AR_KERNEL_BLOCKS == GGML_CUDA_AR_WINDOW_BLOCKS, "window blocks");
+static_assert(GGML_CUDA_AR_ARRIVAL_STRIDE == GGML_CUDA_AR_WINDOW_ARRIVAL_INTS*sizeof(int), "window arrival stride");
+
+void ggml_cuda_ar_window_next(ggml_cuda_ar_pipeline * p, ggml_cuda_ar_window_io * io) {
+    GGML_ASSERT(p != nullptr && p->p2p);
+    const int n    = p->n_devices;
+    const int site = p->win_site++;
+    GGML_ASSERT(site < (int) GGML_CUDA_AR_WINDOW_MAX_SITES);
+    // consecutive reductions alternate between the two slots: a device can only be one reduction ahead of its peer
+    const int slot = site % GGML_CUDA_AR_POOL_SIZE;
+
+    const size_t ring_offset = (size_t) GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    for (int i = 0; i < n; ++i) {
+        const int peer = 1 - i;
+        io[i].wire_mine  = p->win_buf[peer] + (size_t) slot * p->buf_bytes; // lands in the peer's memory
+        io[i].wire_other = p->win_buf[i]    + (size_t) slot * p->buf_bytes; // the peer wrote it here
+        io[i].wire_bytes = p->buf_bytes;
+        // the token of (slot, rank): ours in the peer's ring, the peer's in our ring
+        io[i].arrival_mine  = reinterpret_cast<int *>(reinterpret_cast<char *>(p->win_arrival[peer]) + ((size_t) slot * n + i)    * ring_offset);
+        io[i].arrival_other = reinterpret_cast<int *>(reinterpret_cast<char *>(p->win_arrival[i])    + ((size_t) slot * n + peer) * ring_offset);
+        io[i].epoch = p->win_epoch[i];
+        io[i].site  = site;
+    }
+}
+
+bool ggml_cuda_ar_window_allreduce(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    GGML_ASSERT(p != nullptr && p->p2p);
+    const int n = p->n_devices;
+
+    const ggml_type input_type = tensors[0]->type;
+    GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
+
+    const int64_t ne = ggml_nelements(tensors[0]);
+    GGML_ASSERT(ne > 0);
+
+    const size_t input_nbytes = ggml_nbytes(tensors[0]);
+    GGML_ASSERT(input_nbytes <= p->buf_bytes);
+
+    // the wire type of ggml_cuda_ar_allreduce
+    const bool use_bf16 = input_type == GGML_TYPE_F32 && p->bf16_threshold > 0 && input_nbytes >= p->bf16_threshold;
+
+    ggml_cuda_ar_window_io io[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_ar_window_next(p, io);
+
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+        cudaStream_t stream = cuda_ctx->stream();
+
+        char * data = static_cast<char *>(tensors[i]->data);
+
+        // inactive shards contribute zeros
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            CUDA_CHECK(cudaMemsetAsync(data, 0, input_nbytes, stream));
+        }
+
+        char *       wire_mine  = io[i].wire_mine;
+        const char * wire_other = io[i].wire_other;
+        int *        arr_mine   = io[i].arrival_mine;
+        int *        arr_other  = const_cast<int *>(io[i].arrival_other);
+        const int    site       = io[i].site;
+
+#define LAUNCH_AR_KERNEL(T_dst, T_wire) \
+        ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+            reinterpret_cast<const T_dst *>(data), \
+            reinterpret_cast<T_dst *>(data), \
+            reinterpret_cast<T_wire *>(wire_mine), \
+            reinterpret_cast<const T_wire *>(wire_other), \
+            static_cast<int>(ne), \
+            arr_mine, \
+            arr_other, \
+            site, \
+            p->win_epoch[i])
+
+        if (use_bf16) {
+            LAUNCH_AR_KERNEL(float, nv_bfloat16);
+        } else {
+            switch (input_type) {
+                case GGML_TYPE_F32:  LAUNCH_AR_KERNEL(float,       float);       break;
+                case GGML_TYPE_F16:  LAUNCH_AR_KERNEL(half,        half);        break;
+                case GGML_TYPE_BF16: LAUNCH_AR_KERNEL(nv_bfloat16, nv_bfloat16); break;
+                default: GGML_ASSERT(false);
+            }
+        }
+#undef LAUNCH_AR_KERNEL
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    return true;
 }
 
 bool ggml_cuda_ar_allreduce_add_rms_norm_mul_supported(
@@ -1227,6 +1371,16 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
     return nullptr;
 }
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
+}
+bool ggml_cuda_ar_window_supported(const ggml_cuda_ar_pipeline *, size_t) {
+    return false;
+}
+void ggml_cuda_ar_window_begin(ggml_cuda_ar_pipeline *, ggml_backend_t *) {
+}
+bool ggml_cuda_ar_window_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+void ggml_cuda_ar_window_next(ggml_cuda_ar_pipeline *, ggml_cuda_ar_window_io *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;

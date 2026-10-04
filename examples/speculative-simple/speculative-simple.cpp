@@ -159,6 +159,8 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
 
+    int64_t t_tgt_us = 0, t_smpl_us = 0, n_tgt = 0, n_tgt_tok = 0;
+
     while (true) {
         // generate or reuse draft tokens
         //
@@ -229,7 +231,14 @@ int main(int argc, char ** argv) {
             }
 
 
+            const int64_t t0 = ggml_time_us();
             llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
+            if (getenv("LLAMA_SPEC_TIMING") != nullptr) {
+                llama_synchronize(ctx_tgt);
+            }
+            t_tgt_us += ggml_time_us() - t0;
+            n_tgt++;
+            n_tgt_tok += batch_tgt.size();
         }
 
         // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.
@@ -254,7 +263,9 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
+        const int64_t t_smpl0 = ggml_time_us();
         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        t_smpl_us += ggml_time_us() - t_smpl0;
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
@@ -348,6 +359,10 @@ int main(int argc, char ** argv) {
 
     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
+    if (getenv("LLAMA_SPEC_TIMING") != nullptr && n_tgt > 0) {
+        LOG_INF("spec-timing: %d rounds, %.2f ms/round; target %.2f ms/window (%.2f tokens), sample+accept %.2f ms/round\n",
+                (int) n_tgt, (t_dec_end - t_dec_start)/1e3/n_tgt, t_tgt_us/1e3/n_tgt, (double) n_tgt_tok/n_tgt, t_smpl_us/1e3/n_tgt);
+    }
 
     LOG_INF("\n");
     LOG_INF("n_draft   = %d\n", params_spec.draft.n_max);

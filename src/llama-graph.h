@@ -986,9 +986,10 @@ struct llm_graph_qkv {
 };
 
 // op_params[12..15] of a MUL_MAT_ID whose experts continue in a cold tensor: { magic, n_cold, data pointer (2 ints) }
-// (the low op_params of MUL_MAT_ID hold precision settings)
+// (the low op_params of MUL_MAT_ID hold precision settings); on a tensor-split device the cold tensor is src[3] instead
 #define LLAMA_EXPS_COLD_MAGIC 0x434f4c44
 #define LLAMA_EXPS_COLD_PARAM 12
+#define LLAMA_EXPS_COLD_SRC   3
 
 struct llm_graph_context {
     // hot expert tensor -> cold expert tensor (pinned host memory); set by models that split their experts

@@ -20,7 +20,8 @@ struct ggml_cuda_shexp_args {
     const ggml_tensor * mul;     // MUL(down, sig): the output
 };
 
-// Matches the seven nodes from i and checks that the kernels support them.
-bool ggml_cuda_shexp_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_args & args);
+// Matches the seven nodes from i and checks that the kernels support them. planar: the weights are in the planar
+// layout of the fused engine, which then computes the nodes (ggml_cuda_fn_shexp).
+bool ggml_cuda_shexp_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_args & args, bool * planar);
 
 void ggml_cuda_shexp(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & args);

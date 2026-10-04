@@ -1,6 +1,7 @@
 #include "moe-host.cuh"
 #include "moe-host-cpu.h"
 #include "mmid-f16-sm60.cuh"
+#include "mmvq.cuh"
 
 #include <atomic>
 #include <cstring>
@@ -9,12 +10,11 @@
 
 #define MH_DSTATE_SEQ  0 // last request number
 #define MH_DSTATE_NEED 1 // cold pairs of the last request
-#define MH_DSTATE_PAIR 2 // their t*n_used + k, MH_MAX_PAIRS entries
+#define MH_DSTATE_PAIR 2 // their t*n_used + k, cap_pairs entries
 
-#define MH_PUBLISH_THREADS 256
-#define MH_COLLECT_BLOCKS  8
-
-static_assert(MH_MAX_PAIRS <= MH_PUBLISH_THREADS, "one publish thread per (token, slot) pair");
+#define MH_PUBLISH_THREADS 256 // decode batches: one fused publish block, one thread per (token, slot) pair
+#define MH_RING_THREADS    1024
+#define MH_SMALL_TOK       8   // up to this many tokens the fused publish is used
 
 static bool ggml_cuda_moe_host_enabled() {
     static const bool enabled = [] {
@@ -24,8 +24,124 @@ static bool ggml_cuda_moe_host_enabled() {
     return enabled;
 }
 
-// One thread per (token, slot) pair: the cold ones are compacted with a ballot. Then the input rows are copied
-// and the doorbell is rung. Nothing is published when the step has no cold pair.
+// One warp quantizes 64 values into the host kernels' activation block: staged in shared memory, copied out with
+// 16-byte stores (mapped memory is written over PCIe).
+static __device__ __forceinline__ void mh_quantize_block(const float * __restrict__ x, mh_act_block & ob, mh_act_block * out, const int lane) {
+    const float2 v = *(const float2 *) (x + 2*lane); // elements 2*lane, 2*lane + 1
+    float amax = fmaxf(fabsf(v.x), fabsf(v.y));
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o)); // within each half of the warp
+    }
+    const float d  = amax/127.0f;
+    const float id = d != 0.0f ? 1.0f/d : 0.0f;
+    const int   q0 = __float2int_rn(v.x*id);
+    const int   q1 = __float2int_rn(v.y*id);
+    int sum = q0 + q1;
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, o);
+    }
+    const int e0 = 2*lane;
+    const int e1 = 2*lane + 1;
+    ob.q[16*(e0 % 4) + e0/4] = (int8_t) q0;
+    ob.q[16*(e1 % 4) + e1/4] = (int8_t) q1;
+    const float d0 = __shfl_sync(0xffffffff, d,   0);
+    const float d1 = __shfl_sync(0xffffffff, d,   16);
+    const int   s1 = __shfl_sync(0xffffffff, sum, 16);
+    if (lane < 16) {
+        ob.s[lane] = (lane & 2) ? d1 : d0;
+    }
+    if (lane == 0) {
+        ob.corr = d*(float) sum + d1*(float) s1;
+    }
+    __syncwarp();
+    if (lane < (int) (sizeof(mh_act_block)/16)) {
+        ((int4 *) out)[lane] = ((const int4 *) &ob)[lane];
+    }
+    __syncwarp();
+}
+
+// Prompt-sized batches, 1/2: quantize all rows, one warp per block of 64.
+static __global__ void mh_quantize_rows(const float * __restrict__ x, const int64_t sx_tok, const int n_embd, const int n_tokens,
+                                        mh_mailbox * mb) {
+    __shared__ mh_act_block s_blk[MH_PUBLISH_THREADS/WARP_SIZE];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int w    = threadIdx.x / WARP_SIZE;
+    const int nb_t = n_embd/64;
+    const int bi   = blockIdx.x*(MH_PUBLISH_THREADS/WARP_SIZE) + w;
+    if (bi < n_tokens*nb_t) {
+        mh_quantize_block(x + (bi / nb_t)*sx_tok + 64*(bi % nb_t), s_blk[w], mh_xq(mb) + bi, lane);
+    }
+}
+
+// Prompt-sized batches, 2/2: compact the cold pairs (one block, a running offset over chunks of the ids) and ring.
+static __global__ void mh_ring(const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_tokens,
+                               const int n_hot, mh_mailbox * mb, uint32_t * dstate, const int slot) {
+    __shared__ int wcount[MH_RING_THREADS/WARP_SIZE];
+    __shared__ int s_base;
+    const int lane  = threadIdx.x % WARP_SIZE;
+    const int w     = threadIdx.x / WARP_SIZE;
+    const int n_all = n_tokens*n_used;
+    if (threadIdx.x == 0) {
+        s_base = 0;
+    }
+    __syncthreads();
+    for (int c0 = 0; c0 < n_all; c0 += MH_RING_THREADS) {
+        const int i = c0 + threadIdx.x;
+        int  e    = 0;
+        bool cold = false;
+        if (i < n_all) {
+            e    = ids[(i / n_used)*si1 + i % n_used];
+            cold = e >= n_hot;
+        }
+        const unsigned int m = __ballot_sync(0xffffffff, cold);
+        if (lane == 0) {
+            wcount[w] = __popc(m);
+        }
+        __syncthreads();
+        int base = s_base;
+        int nc   = 0;
+        for (int j = 0; j < MH_RING_THREADS/WARP_SIZE; ++j) {
+            base += j < w ? wcount[j] : 0;
+            nc   += wcount[j];
+        }
+        if (cold) {
+            const int pos = base + __popc(m & ((1u << lane) - 1));
+            mh_pair_idx(mb)[pos] = i;
+            mh_pair_exp(mb)[pos] = e - n_hot;
+            dstate[MH_DSTATE_PAIR + pos] = i;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            s_base += nc;
+        }
+        __syncthreads();
+    }
+    const int np = s_base;
+    if (threadIdx.x == 0) {
+        dstate[MH_DSTATE_NEED] = np;
+    }
+    if (np == 0) {
+        return;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        mb->slot     = slot;
+        mb->n_tokens = n_tokens;
+        mb->n_used   = n_used;
+        mb->n_pairs  = np;
+        const uint32_t s = dstate[MH_DSTATE_SEQ] + 1;
+        dstate[MH_DSTATE_SEQ] = s;
+        __threadfence_system();
+        mb->req = s;
+        __threadfence_system();
+    }
+}
+
+// Decode batches: one thread per (token, slot) pair, the cold ones compacted with a ballot; then the input rows are
+// quantized and the doorbell is rung. Nothing is published when the step has no cold pair.
 static __global__ void mh_publish(
         const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_tokens, const int n_hot,
         const float * __restrict__ x, const int64_t sx_tok, const int n_embd,
@@ -56,8 +172,8 @@ static __global__ void mh_publish(
     }
     if (cold) {
         const int pos = base + __popc(m & ((1u << lane) - 1));
-        mb->pair_idx[pos] = i;
-        mb->pair_exp[pos] = e - n_hot;
+        mh_pair_idx(mb)[pos] = i;
+        mh_pair_exp(mb)[pos] = e - n_hot;
         dstate[MH_DSTATE_PAIR + pos] = i;
     }
     if (i == 0) {
@@ -67,50 +183,13 @@ static __global__ void mh_publish(
         return;
     }
 
-    // quantize the rows into the host kernels' activation blocks: one warp per block of 64, staged in shared
-    // memory and copied out with 16-byte stores (mapped memory is written over PCIe)
+    // quantize the rows into the host kernels' activation blocks
     __shared__ mh_act_block s_blk[MH_PUBLISH_THREADS/WARP_SIZE];
     const int nb_t = n_embd/64;
     for (int b0 = 0; b0 < n_tokens*nb_t; b0 += MH_PUBLISH_THREADS/WARP_SIZE) {
         const int bi = b0 + w;
         if (bi < n_tokens*nb_t) {
-            const int t  = bi / nb_t;
-            const int kb = bi % nb_t;
-            const float2 v = *(const float2 *) (x + t*sx_tok + 64*kb + 2*lane); // elements 2*lane, 2*lane + 1
-            float amax = fmaxf(fabsf(v.x), fabsf(v.y));
-#pragma unroll
-            for (int o = 8; o > 0; o >>= 1) {
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o)); // within each half of the warp
-            }
-            const float d  = amax/127.0f;
-            const float id = d != 0.0f ? 1.0f/d : 0.0f;
-            const int   q0 = __float2int_rn(v.x*id);
-            const int   q1 = __float2int_rn(v.y*id);
-            int sum = q0 + q1;
-#pragma unroll
-            for (int o = 8; o > 0; o >>= 1) {
-                sum += __shfl_xor_sync(0xffffffff, sum, o);
-            }
-            mh_act_block & ob = s_blk[w];
-            const int e0 = 2*lane;
-            const int e1 = 2*lane + 1;
-            ob.q[16*(e0 % 4) + e0/4] = (int8_t) q0;
-            ob.q[16*(e1 % 4) + e1/4] = (int8_t) q1;
-            const float d1 = __shfl_sync(0xffffffff, d,   16);
-            const int   s1 = __shfl_sync(0xffffffff, sum, 16);
-            if (lane < 16) {
-                ob.s[lane] = (lane & 2) ? d1 : __shfl_sync(0x0000ffff, d, 0);
-            }
-            if (lane == 0) {
-                ob.corr = d*(float) sum + d1*(float) s1;
-            }
-            __syncwarp();
-            const int4 * src = (const int4 *) &ob;
-            int4 *       dst = (int4 *) (mb->xq + (int64_t) t*nb_t + kb);
-            if (lane < (int) (sizeof(mh_act_block)/16)) {
-                dst[lane] = src[lane];
-            }
-            __syncwarp();
+            mh_quantize_block(x + (bi / nb_t)*sx_tok + 64*(bi % nb_t), s_blk[w], mh_xq(mb) + bi, lane);
         }
     }
     __threadfence_system();
@@ -152,7 +231,7 @@ static __global__ void mh_collect(
         const int t   = idx / n_used;
         const int k   = idx % n_used;
         float4 *       out = (float4 *) (dst + t*sd_tok + k*sd_slot);
-        const float4 * src = (const float4 *) (mb->y + (int64_t) p*n_embd);
+        const float4 * src = (const float4 *) (mh_y((mh_mailbox *) mb) + (int64_t) p*n_embd);
         for (int c = threadIdx.x; c < n4; c += blockDim.x) {
             out[c] = __ldcv(src + c);
         }
@@ -161,7 +240,10 @@ static __global__ void mh_collect(
 
 static std::atomic<int> g_mh_mailboxes { 0 };
 
-static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx) {
+// The mailbox is sized once, at the first host triple: GGML_CUDA_MOE_HOST_MAX_TOK tokens (default 512, the usual
+// prompt ubatch) of that triple's n_embd. Wider batches keep the GPU path. It is never reallocated: graphs queued
+// earlier may still be using it.
+static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n_embd, const int n_used) {
     if (ctx.moe_host_mb != nullptr) {
         return true;
     }
@@ -171,16 +253,22 @@ static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx) {
     if (status != cudaStreamCaptureStatusNone) {
         return false;
     }
+    const char * env = getenv("GGML_CUDA_MOE_HOST_MAX_TOK");
+    const int cap_tok   = std::max(MH_SMALL_TOK, env ? atoi(env) : 512);
+    const int cap_pairs = cap_tok*n_used;
+    const size_t size   = mh_mailbox_layout(nullptr, cap_tok, cap_pairs, n_embd);
+
     ggml_cuda_set_device(ctx.device);
     mh_mailbox * mb = nullptr;
-    if (cudaHostAlloc((void **) &mb, sizeof(mh_mailbox), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+    if (cudaHostAlloc((void **) &mb, size, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
         (void) cudaGetLastError();
-        GGML_LOG_WARN("%s: no pinned mailbox, cold experts stay on the GPU\n", __func__);
+        GGML_LOG_WARN("%s: no pinned mailbox (%.1f MiB), cold experts stay on the GPU\n", __func__, size/1048576.0);
         return false;
     }
     memset((void *) mb, 0, sizeof(mh_mailbox));
-    CUDA_CHECK(cudaMalloc((void **) &ctx.moe_host_dstate, (MH_DSTATE_PAIR + MH_MAX_PAIRS)*sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(ctx.moe_host_dstate, 0, (MH_DSTATE_PAIR + MH_MAX_PAIRS)*sizeof(uint32_t)));
+    mh_mailbox_layout(mb, cap_tok, cap_pairs, n_embd);
+    CUDA_CHECK(cudaMalloc((void **) &ctx.moe_host_dstate, (MH_DSTATE_PAIR + (size_t) cap_pairs)*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(ctx.moe_host_dstate, 0, (MH_DSTATE_PAIR + (size_t) cap_pairs)*sizeof(uint32_t)));
     ctx.moe_host_mb = mb;
     mh_pool_attach(g_mh_mailboxes.fetch_add(1), mb);
     return true;
@@ -200,9 +288,20 @@ bool ggml_cuda_moe_host_active(const ggml_backend_cuda_context & ctx, const ggml
 }
 
 static bool mh_is_cold_q2(const ggml_tensor * n) {
-    return n->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(n) && n->src[0]->type == GGML_TYPE_Q2_0 &&
-           n->src[1]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32 &&
-           ggml_cuda_mmid_vec_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n);
+    if (n->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(n) || n->src[0]->type != GGML_TYPE_Q2_0 ||
+        n->src[1]->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the hot pairs go to the sm_60 kernels: the mat-vec for decode batches, the GEMM for prompt batches
+    return n->ne[2] <= MMVQ_MAX_BATCH_SIZE ? ggml_cuda_mmid_vec_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)
+                                           : ggml_cuda_mmid_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n);
+}
+
+bool ggml_cuda_moe_host_takes_prompts() {
+    // prompt batches: the GPU with prefetched cold experts is faster than the host threads here (many tokens per
+    // expert make the host kernels compute-bound); GGML_CUDA_MOE_HOST_PROMPT=1 sends them to the host anyway
+    static const bool prompt = getenv("GGML_CUDA_MOE_HOST_PROMPT") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_PROMPT")) != 0;
+    return prompt && ggml_cuda_moe_host_enabled();
 }
 
 bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
@@ -221,7 +320,11 @@ bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     const ggml_tensor * ids = node->src[2];
     const int n_used   = (int) ids->ne[0];
     const int n_tokens = (int) ids->ne[1];
-    if (n_tokens > MH_MAX_TOK || n_used*n_tokens > MH_MAX_PAIRS || ids->type != GGML_TYPE_I32 || !mh_is_cold_q2(node)) {
+    if (n_tokens > MH_SMALL_TOK && !ggml_cuda_moe_host_takes_prompts()) {
+        return false;
+    }
+    if (ids->type != GGML_TYPE_I32 || !mh_is_cold_q2(node) ||
+        (ctx.moe_host_mb != nullptr && (n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs))) {
         return false;
     }
 
@@ -264,7 +367,8 @@ bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     if (gate->src[1] != x || x->ne[0] != n_embd || x->ne[1] != 1 || x->ne[2] != n_tokens || x->nb[0] != sizeof(float) ||
         x->nb[2] % 16 != 0 || !ggml_are_same_shape(gate->src[0], up->src[0]) ||
         down->src[0]->ne[0] != n_ff || down->src[0]->ne[1] != n_embd || down->src[0]->ne[2] != n_hot ||
-        !ggml_is_contiguous(down) || n_embd % 64 != 0 || n_ff % 64 != 0 || n_embd > MH_MAX_EMBD || n_ff > MH_MAX_FF) {
+        !ggml_is_contiguous(down) || n_embd % 64 != 0 || n_ff % 64 != 0 || n_embd > MH_MAX_EMBD || n_ff > MH_MAX_FF ||
+        (ctx.moe_host_mb != nullptr && n_embd > ctx.moe_host_mb->cap_embd)) {
         return false;
     }
     const char * c_up = nullptr, * c_gate = nullptr, * c_down = nullptr;
@@ -275,7 +379,8 @@ bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     if (n_up != n_gate || n_up != n_down || n_up <= 0) {
         return false;
     }
-    if (!ggml_cuda_moe_host_init(ctx)) {
+    if (!ggml_cuda_moe_host_init(ctx, (int) n_embd, n_used) ||
+        n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs) {
         return false;
     }
 
@@ -293,10 +398,20 @@ bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     d.n_ff     = (int) n_ff;
     const int slot = mh_pool_register(d);
 
-    mh_publish<<<1, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
-        (const int32_t *) ids->data, (int) (ids->nb[1]/sizeof(int32_t)), n_used, n_tokens, (int) n_hot,
-        (const float *) x->data, (int64_t) (x->nb[2]/sizeof(float)), (int) n_embd,
-        ctx.moe_host_mb, ctx.moe_host_dstate, slot);
+    const int     si1    = (int) (ids->nb[1]/sizeof(int32_t));
+    const int64_t sx_tok = (int64_t) (x->nb[2]/sizeof(float));
+    if (n_tokens <= MH_SMALL_TOK && n_tokens*n_used <= MH_PUBLISH_THREADS) {
+        mh_publish<<<1, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
+            (const int32_t *) ids->data, si1, n_used, n_tokens, (int) n_hot, (const float *) x->data, sx_tok, (int) n_embd,
+            ctx.moe_host_mb, ctx.moe_host_dstate, slot);
+    } else {
+        const int nblk = n_tokens*(int) (n_embd/64);
+        const int wpb  = MH_PUBLISH_THREADS/WARP_SIZE;
+        mh_quantize_rows<<<(nblk + wpb - 1)/wpb, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
+            (const float *) x->data, sx_tok, (int) n_embd, n_tokens, ctx.moe_host_mb);
+        mh_ring<<<1, MH_RING_THREADS, 0, ctx.stream()>>>(
+            (const int32_t *) ids->data, si1, n_used, n_tokens, (int) n_hot, ctx.moe_host_mb, ctx.moe_host_dstate, slot);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     ctx.moe_host.ids  = ids;
@@ -310,8 +425,9 @@ void ggml_cuda_moe_host_end(ggml_backend_cuda_context & ctx, const ggml_tensor *
     if (ctx.moe_host.down == nullptr || node != ctx.moe_host.down) {
         return;
     }
-    const int n_used = (int) node->src[2]->ne[0];
-    mh_collect<<<MH_COLLECT_BLOCKS, 256, 0, ctx.stream()>>>(
+    const int n_used   = (int) node->src[2]->ne[0];
+    const int n_tokens = (int) node->src[2]->ne[1];
+    mh_collect<<<n_tokens <= MH_SMALL_TOK ? 8 : 64, 256, 0, ctx.stream()>>>(
         ctx.moe_host_mb, ctx.moe_host_dstate, (float *) node->data,
         (int64_t) (node->nb[1]/sizeof(float)), (int64_t) (node->nb[2]/sizeof(float)), n_used, (int) node->ne[0]);
     CUDA_CHECK(cudaGetLastError());
@@ -332,9 +448,18 @@ void ggml_cuda_moe_host_reorder(ggml_cgraph * cgraph) {
         return;
     }
     const int n_nodes = cgraph->n_nodes;
+    // a prompt graph keeps its order even where it is decode-sized (the last layer, cut down to the output rows):
+    // the order would depend on the number of outputs, unlike the worst-case graph its allocation was reserved
+    // with, and a mismatch re-allocates, which synchronizes every backend at every ubatch
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2]->ne[1] > MH_SMALL_TOK) {
+            return;
+        }
+    }
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor * first = cgraph->nodes[i];
-        if (first->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(first) || first->src[2]->ne[1] > MH_MAX_TOK) {
+        if (first->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(first) || first->src[2]->ne[1] > MH_SMALL_TOK) {
             continue;
         }
         const ggml_tensor * ids = first->src[2];

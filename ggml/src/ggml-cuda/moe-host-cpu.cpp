@@ -249,8 +249,7 @@ static void pick_kernels(dot2_fn & dot2, quant_fn & quant, const char *& name) {
 struct group {
     int c;                  // cold expert
     int n;                  // pairs in the group
-    int pair[MH_MAX_TOK];   // pair index p (into mailbox y)
-    int tok[MH_MAX_TOK];    // token of each pair
+    int first;              // its pairs: pair_of[first .. first + n), tok_of[...]
 };
 
 struct pool {
@@ -272,12 +271,17 @@ struct pool {
     const mh_slot_desc * js = nullptr;
     mh_mailbox *         jm = nullptr;
     int                  n_groups = 0;
-    group                groups[MH_MAX_PAIRS];
-    const act_block *    jxq = nullptr; // [n_tokens][n_embd/64], in the mailbox
-    std::vector<float>     h;    // [MH_MAX_PAIRS][n_ff]: the swiglu outputs
-    std::vector<act_block> hq;   // [MH_MAX_PAIRS][n_ff/64]: ... quantized
-    std::unique_ptr<std::atomic<int>[]> blk_cnt;   // [MH_MAX_PAIRS][MH_MAX_FF/64]: finished CH1-row chunks per expert block
-    std::unique_ptr<std::atomic<int>[]> grp_ready; // [MH_MAX_PAIRS]: quantized activation blocks per expert
+    std::vector<group>   groups;         // the cold experts of the job
+    std::vector<int>     pair_of;        // pairs grouped by expert: pair index p (into the mailbox y)
+    std::vector<int>     tok_of;         // ... and its token
+    std::vector<int>     grp_of_exp;     // scratch: expert -> group
+    const act_block *    jxq = nullptr;  // [n_tokens][n_embd/64], in the mailbox
+    float *              jy  = nullptr;  // [n_pairs][n_embd], in the mailbox
+    std::vector<float>     h;    // [n_pairs][n_ff]: the swiglu outputs
+    std::vector<act_block> hq;   // [n_pairs][n_ff/64]: ... quantized
+    size_t                 cap_blk = 0;
+    std::unique_ptr<std::atomic<int>[]> blk_cnt;   // [n_groups][n_ff/64]: finished CH1-row chunks per expert block
+    std::unique_ptr<std::atomic<int>[]> grp_ready; // [n_groups]: quantized activation blocks per expert
 
     alignas(64) std::atomic<uint32_t> job_gen { 0 };
     alignas(64) std::atomic<int>      chunk1 { 0 };
@@ -327,19 +331,21 @@ struct pool {
                 const int       r0 = (c % rb1)*CH1;
                 const uint8_t * gate = s.gate + (size_t) g.c*s.gate_nb2;
                 const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
+                const int * gp = pair_of.data() + g.first;
+                const int * gt = tok_of.data()  + g.first;
                 for (int r = r0; r < r0 + CH1; ++r) {
                     const q2_block * wg = (const q2_block *) (gate + (size_t) r*s.gate_nb1);
                     const q2_block * wu = (const q2_block *) (up   + (size_t) r*s.up_nb1);
                     for (int i = 0; i < g.n; ++i) {
                         float vg, vu;
-                        dot2(wg, wu, jxq + (size_t) g.tok[i]*nb_e, nb_e, &vg, &vu);
-                        h[(size_t) g.pair[i]*s.n_ff + r] = vg/(1.0f + expf(-vg))*vu;
+                        dot2(wg, wu, jxq + (size_t) gt[i]*nb_e, nb_e, &vg, &vu);
+                        h[(size_t) gp[i]*s.n_ff + r] = vg/(1.0f + expf(-vg))*vu;
                     }
                 }
                 const int kb = r0/QK;
-                if (blk_cnt[(size_t) gi*(MH_MAX_FF/QK) + kb].fetch_add(1, std::memory_order_acq_rel) == QK/CH1 - 1) {
+                if (blk_cnt[(size_t) gi*nb_f + kb].fetch_add(1, std::memory_order_acq_rel) == QK/CH1 - 1) {
                     for (int i = 0; i < g.n; ++i) {
-                        const int p = g.pair[i];
+                        const int p = gp[i];
                         quant(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hq.data() + (size_t) p*nb_f + kb);
                     }
                     grp_ready[gi].fetch_add(1, std::memory_order_release);
@@ -356,14 +362,15 @@ struct pool {
                 _mm_pause();
 #endif
             }
+            const int * gp = pair_of.data() + g.first;
             for (int r = r0; r < r0 + CH3; r += 2) {
                 const q2_block * w0 = (const q2_block *) (down + (size_t) (r + 0)*s.down_nb1);
                 const q2_block * w1 = (const q2_block *) (down + (size_t) (r + 1)*s.down_nb1);
                 for (int i = 0; i < g.n; ++i) {
-                    const int p = g.pair[i];
+                    const int p = gp[i];
                     float v0, v1;
                     dot2(w0, w1, hq.data() + (size_t) p*nb_f, nb_f, &v0, &v1);
-                    float * y = jm->y + (size_t) p*s.n_embd;
+                    float * y = jy + (size_t) p*s.n_embd;
                     y[r + 0] = v0;
                     y[r + 1] = v1;
                 }
@@ -409,39 +416,58 @@ struct pool {
         js = &slot_tab[slot];
         jm = m;
         const int n_used  = m->n_used;
-        const int n_pairs = std::min<int>(m->n_pairs, MH_MAX_PAIRS);
-        const int nb_e    = js->n_embd/QK;
+        const int n_pairs = std::min<int>(m->n_pairs, m->cap_pairs);
+        const int nb_f    = js->n_ff/QK;
+        const int32_t * pidx = mh_pair_idx(m);
+        const int32_t * pexp = mh_pair_exp(m);
 
-        n_groups = 0;
-        bool tok_used[MH_MAX_TOK] = {};
+        // group the pairs by cold expert (counting sort, stable in pair order)
+        int max_c = 0;
         for (int p = 0; p < n_pairs; ++p) {
-            const int c = m->pair_exp[p];
-            const int t = m->pair_idx[p]/n_used;
-            tok_used[t] = true;
-            int gi = 0;
-            while (gi < n_groups && groups[gi].c != c) {
-                ++gi;
-            }
-            if (gi == n_groups) {
-                groups[n_groups].c = c;
-                groups[n_groups].n = 0;
-                ++n_groups;
-            }
-            group & g = groups[gi];
-            g.pair[g.n] = p;
-            g.tok[g.n]  = t;
-            ++g.n;
+            max_c = std::max(max_c, (int) pexp[p]);
         }
-        // the GPU quantized the input rows (mh_publish)
-        jxq = m->xq;
-        for (int gi = 0; gi < n_groups; ++gi) {
-            for (int kb = 0; kb < js->n_ff/QK; ++kb) {
-                blk_cnt[(size_t) gi*(MH_MAX_FF/QK) + kb].store(0, std::memory_order_relaxed);
+        grp_of_exp.assign((size_t) max_c + 1, -1);
+        groups.clear();
+        for (int p = 0; p < n_pairs; ++p) {
+            int & gi = grp_of_exp[pexp[p]];
+            if (gi < 0) {
+                gi = (int) groups.size();
+                groups.push_back({ (int) pexp[p], 0, 0 });
             }
+            groups[gi].n++;
+        }
+        n_groups = (int) groups.size();
+        for (int gi = 0, first = 0; gi < n_groups; ++gi) {
+            groups[gi].first = first;
+            first += groups[gi].n;
+            groups[gi].n = 0;
+        }
+        pair_of.resize(n_pairs);
+        tok_of.resize(n_pairs);
+        for (int p = 0; p < n_pairs; ++p) {
+            group & g = groups[grp_of_exp[pexp[p]]];
+            pair_of[g.first + g.n] = p;
+            tok_of [g.first + g.n] = pidx[p]/n_used;
+            g.n++;
+        }
+        if (h.size() < (size_t) n_pairs*js->n_ff) {
+            h.resize((size_t) n_pairs*js->n_ff);
+            hq.resize((size_t) n_pairs*nb_f);
+        }
+        if (cap_blk < (size_t) n_groups*nb_f) {
+            cap_blk = (size_t) n_groups*nb_f;
+            blk_cnt.reset(new std::atomic<int>[cap_blk]);
+            grp_ready.reset(new std::atomic<int>[cap_blk]);
+        }
+        for (size_t i = 0; i < (size_t) n_groups*nb_f; ++i) {
+            blk_cnt[i].store(0, std::memory_order_relaxed);
+        }
+        for (int gi = 0; gi < n_groups; ++gi) {
             grp_ready[gi].store(0, std::memory_order_relaxed);
         }
-        GGML_UNUSED(tok_used);
-        GGML_UNUSED(nb_e);
+        // the GPU quantized the input rows (mh_publish)
+        jxq = mh_xq(m);
+        jy  = mh_y(m);
         const auto t_quant = std::chrono::steady_clock::now();
         chunk1.store(0, std::memory_order_relaxed);
         job_gen.fetch_add(1, std::memory_order_acq_rel);
@@ -516,10 +542,6 @@ struct pool {
         const int hw = (int) std::thread::hardware_concurrency();
         n_threads = env != nullptr ? atoi(env) : std::max(1, std::min(16, hw - 4));
         n_threads = std::max(1, n_threads);
-        h.resize((size_t) MH_MAX_PAIRS*MH_MAX_FF);
-        hq.resize((size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK));
-        blk_cnt.reset(new std::atomic<int>[(size_t) MH_MAX_PAIRS*(MH_MAX_FF/QK)]);
-        grp_ready.reset(new std::atomic<int>[MH_MAX_PAIRS]);
         threads.emplace_back(&pool::leader, this);
         for (int t = 1; t < n_threads; ++t) {
             threads.emplace_back(&pool::helper, this);

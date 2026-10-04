@@ -10,6 +10,8 @@
 // LOP3 decode produces; the activations are converted to the same order, so the dot product is unchanged.
 
 #include "mmid-f16-sm60.cuh"
+#include "moe-host.cuh"
+#include "mmvq.cuh"
 #include "mmid.cuh"
 
 #define MMID16_TM      64
@@ -132,8 +134,8 @@ mmid16_q2_0_gemm(
     constexpr int TN = 16*NJ;
 
     const int e = tile_expert[blockIdx.y];
-    if (e < 0) {
-        return;
+    if (e < 0 || (e >= n_hot && w_cold == nullptr)) {
+        return; // no tile, or a cold expert the host computes (moe-host.cuh)
     }
     const int c0   = tile_col0[blockIdx.y];
     const int cend = expert_bounds[e + 1];
@@ -418,7 +420,7 @@ bool ggml_cuda_mmid_f16_sm60_supported(
 
 void ggml_cuda_mmid_f16_sm60(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-        ggml_tensor * dst) {
+        ggml_tensor * dst, const bool skip_cold, const char * cold_vram) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t ne00     = src0->ne[0];
@@ -444,7 +446,11 @@ void ggml_cuda_mmid_f16_sm60(
         ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
 
     ggml_cuda_pool_alloc<char> stage(ctx.pool());
-    if (n_cold > 0) {
+    if (n_cold > 0 && skip_cold) {
+        w_cold = nullptr; // the GEMM skips the cold experts' tiles
+    } else if (n_cold > 0 && cold_vram != nullptr) {
+        w_cold = cold_vram;
+    } else if (n_cold > 0) {
         GGML_ASSERT(src0->nb[2] % 16 == 0);
         const int64_t n16 = src0->nb[2]/16;
         stage.alloc((size_t) n_cold*src0->nb[2]);
@@ -531,7 +537,8 @@ void ggml_cuda_mmid_vec_f16_sm60(
                      ctx.mmid16_cache_data == src1->data && ctx.mmid16_cache_key == key;
     if (!hit) {
         if (total > ctx.mmid16_cache_cap) {
-            ctx.mmid16_cache_free();
+            ctx.retire_mem(ctx.mmid16_cache_mem, ctx.mmid16_cache_cap);
+            ctx.mmid16_cache_clear();
             ggml_cuda_set_device(ctx.device);
             CUDA_CHECK(cudaMalloc((void **) &ctx.mmid16_cache_mem, total));
             ctx.mmid16_cache_cap = total;
@@ -551,4 +558,178 @@ void ggml_cuda_mmid_vec_f16_sm60(
         (const char *) src0->data, xh, xs, (const int32_t *) ids->data, (float *) dst->data, nkb,
         src0->nb[1], src0->nb[2], ne11, n_used, si1, sd, w_cold, (int) src0->ne[2], (int) skip_cold);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// prefetch of the cold experts for prompt batches
+
+bool ggml_cuda_mmid_cold_prompt(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(node) && node->ne[2] > MMVQ_MAX_BATCH_SIZE;
+}
+
+static bool ggml_cuda_cold_prefetch_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_COLD_PREFETCH") == nullptr || atoi(getenv("GGML_CUDA_COLD_PREFETCH")) != 0;
+    return enabled;
+}
+
+static size_t cold_bytes(const ggml_tensor * node) {
+    int n_cold = 0;
+    ggml_cuda_mmid_cold(node, nullptr, &n_cold);
+    return (size_t) n_cold*node->src[0]->nb[2];
+}
+
+static void cold_issue(ggml_cuda_cold_prefetch & pf, const int k, const bool wait_freed = true) {
+    if (k >= (int) pf.ops.size()) {
+        return;
+    }
+    const int b = k % 2;
+    const char * host = nullptr;
+    ggml_cuda_mmid_cold(pf.ops[k], &host, nullptr);
+    if (wait_freed) {
+        CUDA_CHECK(cudaStreamWaitEvent(pf.copy, pf.freed[b], 0));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(pf.buf[b], host, cold_bytes(pf.ops[k]), cudaMemcpyHostToDevice, pf.copy));
+    CUDA_CHECK(cudaEventRecord(pf.ready[b], pf.copy));
+}
+
+bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
+    pf.active  = false;
+    pf.started = false;
+    pf.next    = 0;
+    pf.ops.clear();
+    if (!ggml_cuda_cold_prefetch_enabled() || ggml_cuda_moe_host_takes_prompts()) {
+        return false;
+    }
+    size_t need = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (ggml_cuda_mmid_cold_prompt(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_cuda_mmid_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)) {
+            pf.ops.push_back(n);
+            need = std::max(need, cold_bytes(n));
+        }
+    }
+    if (pf.ops.empty()) {
+        return false;
+    }
+    ggml_cuda_set_device(ctx.device);
+    if (pf.copy == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&pf.copy, cudaStreamNonBlocking));
+        for (int b = 0; b < 2; ++b) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&pf.ready[b], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&pf.freed[b], cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&pf.fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&pf.join, cudaEventDisableTiming));
+    }
+    if (need > pf.cap) {
+        // a larger buffer is only needed at the first prompt: wait for the old one's copies and users
+        CUDA_CHECK(cudaStreamSynchronize(pf.copy));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        for (int b = 0; b < 2; ++b) {
+            if (pf.buf[b] != nullptr) {
+                CUDA_CHECK(cudaFree(pf.buf[b]));
+                pf.buf[b] = nullptr;
+            }
+        }
+        pf.cap = 0;
+        for (int b = 0; b < 2; ++b) {
+            if (cudaMalloc((void **) &pf.buf[b], need) != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("%s: no VRAM for the cold-expert prefetch (2 x %.1f MiB), staging per op\n", __func__, need/1048576.0);
+                for (int c = 0; c < 2; ++c) {
+                    if (pf.buf[c] != nullptr) {
+                        CUDA_CHECK(cudaFree(pf.buf[c]));
+                        pf.buf[c] = nullptr;
+                    }
+                }
+                pf.ops.clear();
+                return false;
+            }
+        }
+        pf.cap = need;
+    }
+    pf.active = true;
+    return true;
+}
+
+void ggml_cuda_cold_prefetch_start(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
+    if (!pf.active || pf.started) {
+        return;
+    }
+    // the copy stream follows everything issued before this graph, so the buffers are free (also when captured:
+    // a CUDA graph starts after the previous work on its stream, and the fork makes the copy stream part of it)
+    CUDA_CHECK(cudaEventRecord(pf.fork, ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(pf.copy, pf.fork, 0));
+    cold_issue(pf, 0, /*wait_freed =*/ false);
+    cold_issue(pf, 1, /*wait_freed =*/ false);
+    pf.started = true;
+}
+
+void ggml_cuda_cold_prefetch_finish(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
+    if (!pf.started) {
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(pf.join, pf.copy));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), pf.join, 0));
+    pf.started = false;
+    pf.active  = false;
+}
+
+bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
+    if (!pf.started) {
+        return false;
+    }
+    int j = pf.next;
+    while (j < (int) pf.ops.size() && pf.ops[j] != dst) {
+        j++;
+    }
+    if (j == (int) pf.ops.size()) {
+        return false;
+    }
+    for (; pf.next < j; pf.next++) {
+        // an op that was not computed: its buffer is free once its copy is done
+        CUDA_CHECK(cudaEventRecord(pf.freed[pf.next % 2], pf.copy));
+        cold_issue(pf, pf.next + 2);
+    }
+    const int    b      = pf.next % 2;
+    cudaStream_t stream = ctx.stream();
+    CUDA_CHECK(cudaStreamWaitEvent(stream, pf.ready[b], 0));
+    ggml_cuda_mmid_f16_sm60(ctx, dst->src[0], dst->src[1], dst->src[2], dst, /*skip_cold =*/ false, pf.buf[b]);
+    CUDA_CHECK(cudaEventRecord(pf.freed[b], stream));
+    cold_issue(pf, pf.next + 2);
+    pf.next++;
+    return true;
+}
+
+void ggml_cuda_cold_prefetch_free(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
+    if (pf.copy != nullptr) {
+        cudaStreamSynchronize(pf.copy);
+    }
+    for (int b = 0; b < 2; ++b) {
+        if (pf.buf[b] != nullptr) {
+            cudaFree(pf.buf[b]);
+        }
+        if (pf.ready[b] != nullptr) {
+            cudaEventDestroy(pf.ready[b]);
+        }
+        if (pf.freed[b] != nullptr) {
+            cudaEventDestroy(pf.freed[b]);
+        }
+    }
+    if (pf.fork != nullptr) {
+        cudaEventDestroy(pf.fork);
+    }
+    if (pf.join != nullptr) {
+        cudaEventDestroy(pf.join);
+    }
+    if (pf.copy != nullptr) {
+        cudaStreamDestroy(pf.copy);
+    }
+    pf = {};
 }

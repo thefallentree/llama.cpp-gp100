@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <set>
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -1464,10 +1465,29 @@ struct ggml_cuda_moe_host_triple {
     const ggml_tensor * down = nullptr;
 };
 
+// prompt batches of a hot/cold MoE: the cold experts of the next MUL_MAT_ID are copied to VRAM on a second stream
+// while the current one computes (mmid-f16-sm60.cu)
+struct ggml_cuda_cold_prefetch {
+    cudaStream_t copy     = nullptr;
+    char *       buf[2]   = { nullptr, nullptr };
+    size_t       cap      = 0;
+    cudaEvent_t  ready[2] = { nullptr, nullptr };
+    cudaEvent_t  freed[2] = { nullptr, nullptr };
+    cudaEvent_t  fork     = nullptr;      // orders the copy stream after the graph start (and into a CUDA graph capture)
+    cudaEvent_t  join     = nullptr;      // joins the copy stream back at the graph end
+    std::vector<const ggml_tensor *> ops; // the graph's prompt-sized cold MUL_MAT_IDs, in order
+    int          next     = 0;            // the next of them to compute
+    bool         active   = false;        // buffers ready for this graph's ops
+    bool         started  = false;        // the first copies are issued
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_cold_prefetch cold_pf;
+    std::set<int64_t> prompt_graph_ntok; // ubatch sizes of the prompt graphs run so far, see ggml_backend_cuda_graph_compute
 
     // cold experts on the host: the open triple, the mapped mailbox and the request state on the device
     ggml_cuda_moe_host_triple moe_host;
@@ -1497,6 +1517,18 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * mmid16_cache_src1 = nullptr;
     const void *        mmid16_cache_data = nullptr;
     int64_t             mmid16_cache_key  = -1;
+
+    // cache buffers replaced by larger ones: a captured CUDA graph may still use them (its kernels write and read
+    // them consistently), and freeing them during a capture is not permitted, so they are freed with the context
+    std::vector<void *> retired_mem;
+
+    void retire_mem(char *& mem, size_t & cap) {
+        if (mem != nullptr) {
+            retired_mem.push_back(mem);
+            mem = nullptr;
+        }
+        cap = 0;
+    }
 
     void mmid16_cache_clear() {
         mmid16_cache_src1 = nullptr;

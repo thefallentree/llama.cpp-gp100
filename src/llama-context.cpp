@@ -1511,11 +1511,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // compute buffers from the previous turn would otherwise stay resident and
     // can OOM the next long context (measured: 505 MiB CUDA1 alloc after 64k
     // spec-decode then 128k prefill+decode).
+    // small slot graphs stay: a turn of the same shapes then builds nothing, and the main scheduler keeps its buffers too.
+    // if the large graph does not fit next to them, the allocation below drops them and tries again
     if (!use_slot) {
-        gf_slots_release_compute(false);
+        // temporary switch: the limit in MiB, 0 = always release
+        static const size_t keep_max = (getenv("LLAMA_GRAPH_SLOTS_KEEP_MIB") != nullptr ? (size_t) std::max(0, atoi(getenv("LLAMA_GRAPH_SLOTS_KEEP_MIB"))) : 256)*1024*1024;
+        if (!main_sched_held_large) {
+            FN_PROF_T(t_rel);
+            const size_t held = gf_slots_compute_size();
+            gf_slots_kept = held > 0 && held <= keep_max;
+            if (!gf_slots_kept) {
+                gf_slots_release_compute(false);
+            }
+            if (getenv("LLAMA_GRAPH_SLOTS_DEBUG") != nullptr) {
+                LLAMA_LOG_WARN("%s: graph slots hold %.1f MiB of compute buffers, %s\n", __func__, held/1024.0/1024.0, gf_slots_kept ? "kept" : "released");
+            }
+            FN_PROF_ADD(gf_slots_kept ? "pu.slots_kept" : "pu.slots_release", t_rel);
+        }
         main_sched_held_large = true;
     } else if (main_sched_held_large) {
-        gf_main_sched_recreate();
+        if (!gf_slots_kept) {
+            FN_PROF_T(t_rec);
+            gf_main_sched_recreate();
+            FN_PROF_ADD("pu.main_recreate", t_rec);
+        }
         main_sched_held_large = false;
     }
 
@@ -1575,6 +1594,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     FN_PROF_ADD(hit ? "pu.lookup(hit)" : "pu.lookup(miss)", t_pu1);
+    if (getenv("LLAMA_GRAPH_SLOTS_DEBUG") != nullptr && (!hit || ubatch.n_tokens != 3)) {
+        LLAMA_LOG_WARN("%s: %s slot %d, n_tokens %u, n_outputs %d, n_nodes %d\n", __func__, hit ? "hit" : "miss", use_slot ? slot : -1, ubatch.n_tokens, (int) n_outputs,
+                hit ? ggml_graph_n_nodes(gf) : 0);
+    }
     FN_PROF_T(t_pu2);
     if (hit) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1680,28 +1703,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (!allocated) {
+            // last resort: drop every cached graph with its compute buffers
+            // this graph goes with them (its slot, or the previous results), so build it again on the main scheduler
             gf_slots_release_compute(true);
             gf_main_sched_recreate();
-            main_sched_held_large = false;
+            main_sched_held_large = !use_slot;
+            gf_slots_kept         = false;
             sch = sched.get();
             gf_slot_cur = -1;
-            for (auto & r : gf_res_prev) {
-                if (r) {
-                    r->reset();
-                }
-            }
-            gf_res_prev_active = nullptr;
+            res = get_gf_res_prev();
+            res->reset();
             ggml_backend_sched_reset(sch);
             ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
-            allocated = ggml_backend_sched_alloc_graph(sch, gf);
-            if (!allocated && ggml_backend_sched_reserve(sch, gf)) {
+            gf = model.build_graph(graph_params(res, ubatch, mctx, gtype, sch));
+            allocated = gf != nullptr && ggml_backend_sched_alloc_graph(sch, gf);
+            if (gf != nullptr && !allocated && ggml_backend_sched_reserve(sch, gf)) {
                 ggml_backend_sched_reset(sch);
                 ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
                 allocated = ggml_backend_sched_alloc_graph(sch, gf);
             }
             if (allocated) {
-                res = get_gf_res_prev();
-                LLAMA_LOG_INFO("%s: allocated graph after dropping prefill compute buffers\n", __func__);
+                LLAMA_LOG_WARN("%s: allocated the graph after dropping every cached graph\n", __func__);
             }
         }
 
@@ -2914,6 +2936,20 @@ void llama_context::gf_slots_recreate_one(graph_slot & slot) {
     slot.last_use = 0;
     slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     slot.res.reset(new llm_graph_result(max_nodes));
+}
+
+size_t llama_context::gf_slots_compute_size() const {
+    size_t res = 0;
+    for (const auto & slot : gf_slots) {
+        if (!slot.valid) {
+            continue;
+        }
+        for (const auto & backend : backend_ptrs) {
+            res += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+        }
+    }
+
+    return res;
 }
 
 void llama_context::gf_main_sched_recreate() {

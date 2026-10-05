@@ -2438,6 +2438,45 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
+        // A view of a tensor of another buffer (a cache) is registered in that buffer's compute containers. They are
+        // never cleared and the current one changes with every graph that is allocated on the buffer, so a graph that is
+        // computed again can find the registration of an earlier graph that had the view's address: same source, old shape.
+        // The per-device views follow from the source, so register them again, in place.
+        {
+            int n_stale = 0;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node->view_src == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    continue;
+                }
+                ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) node->buffer->context;
+                if (buf_ctx->stc_static.simple_tensors.find(node->view_src) == buf_ctx->stc_static.simple_tensors.end()) {
+                    continue; // a view of a node of this graph, registered when the graph was allocated
+                }
+                ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(node);
+                if (&stc == &buf_ctx->stc_static) {
+                    continue;
+                }
+                const auto it = stc.simple_tensors.find(node);
+                const bool had = it != stc.simple_tensors.end();
+                int64_t ne_prev[GGML_MAX_DIMS] = {0, 0, 0, 0};
+                size_t  offs_prev = 0;
+                if (had) {
+                    memcpy(ne_prev, it->second[0]->ne, sizeof(ne_prev));
+                    offs_prev = it->second[0]->view_offs;
+                }
+                const ggml_status status = ggml_backend_meta_buffer_init_tensor_impl(stc, node);
+                GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+                if (had) {
+                    const ggml_tensor * t0 = stc.simple_tensors.find(node)->second[0];
+                    n_stale += memcmp(ne_prev, t0->ne, sizeof(ne_prev)) != 0 || offs_prev != t0->view_offs;
+                }
+            }
+            if (n_stale > 0 && meta_debug >= 1) {
+                GGML_LOG_WARN("meta-debug: %d views of cache tensors had the registration of another graph (%d nodes)\n", n_stale, cgraph->n_nodes);
+            }
+        }
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
 
@@ -2645,15 +2684,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
-                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                    max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
-                }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool partial      = split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool new_subgraph = i + 1 == cgraph->n_nodes || partial;
                 if (!new_subgraph) {
                     continue;
                 }
 
                 const int i_delayed = get_i_delayed(i);
+
+                // the AllReduce runs on the delayed node: for a prompt batch of an MoE layer the sum over the experts, not the experts
+                if (partial) {
+                    max_tmp_size = std::max(max_tmp_size, ggml_nbytes(cgraph->nodes[i_delayed]));
+                }
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has

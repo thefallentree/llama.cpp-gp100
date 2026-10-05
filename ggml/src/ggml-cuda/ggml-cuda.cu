@@ -148,6 +148,49 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+#if defined(__linux__)
+#include <execinfo.h>
+#endif
+
+// temporary: GGML_CUDA_MEM_TRACE=<MiB> prints the device allocations of at least that size and the free memory after each
+static void ggml_cuda_mem_trace(const char * what, size_t size, int device, bool always = false) {
+    static const long thold = getenv("GGML_CUDA_MEM_TRACE") != nullptr ? atol(getenv("GGML_CUDA_MEM_TRACE")) : -1;
+    if (thold < 0 || (!always && size < (size_t) thold*1024*1024)) {
+        return;
+    }
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    GGML_LOG_WARN("mem-trace dev%d: %s %.1f MiB, free %.0f MiB\n", device, what, size/1048576.0, free_b/1048576.0);
+#if defined(__linux__)
+    if (getenv("GGML_CUDA_MEM_TRACE_BT") != nullptr && !always) {
+        void * bt[24];
+        const int n = backtrace(bt, 24);
+        backtrace_symbols_fd(bt, n, 2);
+    }
+#endif
+}
+
+// temporary: with GGML_CUDA_MEM_TRACE, prints when the free memory of the device moved by 2 MiB or more since the last call
+static void ggml_cuda_mem_checkpoint(int device, const char * what, const char * name) {
+    static const bool on = getenv("GGML_CUDA_MEM_TRACE") != nullptr;
+    if (!on) {
+        return;
+    }
+    static size_t last[GGML_CUDA_MAX_DEVICES] = {};
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const long d = (long) last[device] - (long) free_b;
+    if (last[device] != 0 && (d >= 2*1024*1024 || d <= -2*1024*1024)) {
+        GGML_LOG_WARN("mem-check dev%d: %+.1f MiB by %s %s, free %.0f MiB\n", device, d/1048576.0, what, name, free_b/1048576.0);
+    }
+    last[device] = free_b;
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -175,6 +218,7 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     } else {
         err = cudaMalloc(ptr, size);
     }
+    ggml_cuda_mem_trace(err == cudaSuccess ? "alloc" : "alloc FAILED", size, device);
     return err;
 }
 
@@ -870,6 +914,7 @@ struct ggml_backend_cuda_buffer_context {
 };
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_cuda_mem_trace("buffer free", buffer->size, ((ggml_backend_cuda_buffer_context *) buffer->context)->device);
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     ggml_cuda_fn_planes_release(ctx->dev_ptr, buffer->size);
     ggml_cuda_expert_cache_release(ctx->dev_ptr, buffer->size);
@@ -1641,6 +1686,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // As long as dst is contiguous this does not matter though.
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (getenv("GGML_CUDA_MEM_TRACE") != nullptr) {
+        // temporary: which products go through cuBLAS
+        GGML_LOG_WARN("cublas dev%d: %s = %s (%s [%lld %lld %lld %lld]) x %s [%lld %lld %lld %lld]\n", ctx.device, dst->name, src0->name, ggml_type_name(src0->type),
+                (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03, ggml_type_name(src1->type), (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13);
+    }
 
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
@@ -5477,6 +5528,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                ggml_cuda_mem_checkpoint(cuda_ctx->device, ggml_op_name(node->op), node->name);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5517,7 +5569,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            ggml_cuda_mem_checkpoint(cuda_ctx->device, "capture", "");
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            ggml_cuda_mem_checkpoint(cuda_ctx->device, "instantiate", "");
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -5554,6 +5608,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_mem_checkpoint(cuda_ctx->device, "before graph_compute", "");
     ggml_cuda_in_flush(*cuda_ctx);
     FN_PROF_T(t_gc0);
 
@@ -7142,8 +7197,10 @@ static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph));
             FN_PROF_ADD("window.end_capture", t_ec);
             FN_PROF_T(t_in);
+            ggml_cuda_mem_checkpoint(cuda_ctx->device, "window capture", "");
             CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
             FN_PROF_ADD("window.instantiate", t_in);
+            ggml_cuda_mem_checkpoint(cuda_ctx->device, "window instantiate", "");
             window->graphs.push_back(graph);
             window->execs.push_back(exec);
 

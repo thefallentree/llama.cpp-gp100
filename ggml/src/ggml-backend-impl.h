@@ -154,6 +154,10 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) true if the backend has copies of all the data it was given with set_tensor_async since the last
+        // synchronize: the caller may change that data without synchronizing first
+        bool (*inputs_staged)(ggml_backend_t backend);
     };
 
     struct ggml_backend {

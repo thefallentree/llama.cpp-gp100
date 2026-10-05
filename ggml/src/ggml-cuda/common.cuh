@@ -1594,6 +1594,16 @@ struct ggml_backend_cuda_context {
         return fn_planes_uids.insert(uid).second;
     }
 
+    // Small inputs of a graph (set_tensor_async of up to GGML_CUDA_IN_SMALL bytes) wait here for one copy to the
+    // device and one kernel that distributes them: a copy of its own cost 5-6 us of host time per input and device,
+    // and a decode graph has 13 inputs. The blob is a table of GGML_CUDA_IN_MAX entries, then the data.
+    char * in_host = nullptr; // pinned
+    char * in_dev  = nullptr;
+    int    in_n    = 0;
+    size_t in_used = 0;       // bytes of data
+    bool   in_busy = false;   // a copy of the blob may still be on the stream
+    bool   in_direct = false; // since the last synchronize an input was copied from the caller's memory, not staged
+
     // cache buffers replaced by larger ones: a captured CUDA graph may still use them (its kernels write and read
     // them consistently), and freeing them during a capture is not permitted, so they are freed with the context
     std::vector<void *> retired_mem;

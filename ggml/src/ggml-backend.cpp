@@ -1801,6 +1801,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// An input of a split that a host backend computed (not a weight, not set by the user), in a form that
+// set_tensor_async takes: it is queued with the user's inputs instead of a synchronous copy between two synchronizations.
+static bool ggml_backend_sched_input_from_host(ggml_backend_t split_backend, const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
+    return split_backend->iface.set_tensor_async != NULL && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+           ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS && input->data != NULL &&
+           ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1836,10 +1844,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             bool pending = false;
             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
                 struct ggml_tensor * input = split->inputs[input_id];
-                if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                // what a host backend computed for this split is ready (it computes synchronously) and goes the same way
+                if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && !ggml_backend_sched_input_from_host(split_backend, input, input_cpy)) {
                     continue;
                 }
-                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
                 if (!synced) {
                     FN_PROF_T(t_s0);
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1865,7 +1874,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     FN_PROF_ADD("sched.in.copy_sync", t_c0);
                 }
             }
-            if (pending) {
+            // not where the backend took copies of everything: its stream keeps them in order with the graph
+            if (pending && !(split_backend->iface.inputs_staged != NULL && split_backend->iface.inputs_staged(split_backend))) {
                 FN_PROF_T(t_f0);
                 ggml_backend_synchronize(split_backend);
                 FN_PROF_ADD("sched.in.final_sync", t_f0);
@@ -1878,7 +1888,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || ggml_backend_sched_input_from_host(split_backend, input, input_cpy)) {
                 continue;
             } else {
                 // wait for the split backend to finish using the input before overwriting it

@@ -1374,10 +1374,11 @@ static __device__ __forceinline__ float fn_block_fold(float v, const bool is_max
 
 // QSA attention over the selected cells only: the cells of fn_qsa_sel, then for a head's query q
 //   s[j] = scale*(q . K[cell_j]) + kq_mask[cell_j],   out = sum over j of softmax(s)[j]*V[cell_j]
-// One block per (head, token). Thread j owns slot j; in the sum over V a warp takes the slots w, w + nw, ... and a
-// lane eight values. The cost does not depend on the size of the cache.
+// One block per (head, token). A thread owns the slots j, j + block, ...; in the sum over V a warp takes the slots
+// w, w + nw, ... and a lane eight values. The cost does not depend on the size of the cache.
 #define FN_QSA_ATTN_D       256
-#define FN_QSA_ATTN_MAX_SEL 512
+#define FN_QSA_ATTN_MAX_NW  16
+#define FN_QSA_ATTN_MAX_SEL 2080 // slots: the cells of the indexer's top blocks (2048), the tail, and up to a multiple of the warps
 
 struct fn_qsa_attn_args {
     const int32_t * cells;    // [nt][n_sel] staged by fn_qsa_cells (-1: none), or null: from the next three
@@ -1425,56 +1426,70 @@ static __global__ void fn_qsa_attn(const fn_qsa_attn_args a) {
     __shared__ float s_q[D];
     __shared__ float s_p[FN_QSA_ATTN_MAX_SEL];
     __shared__ int   s_cell[FN_QSA_ATTN_MAX_SEL];
-    __shared__ float s_w[FN_QSA_ATTN_MAX_SEL/WARP_SIZE];
+    __shared__ float s_w[FN_QSA_ATTN_MAX_NW];
     __shared__ float s_tot[1];
-    __shared__ float s_acc[FN_QSA_ATTN_MAX_SEL/WARP_SIZE][D];
-    const int h    = blockIdx.x;
-    const int t    = blockIdx.y;
-    const int j    = threadIdx.x;
-    const int lane = j % WARP_SIZE;
-    const int warp = j / WARP_SIZE;
-    const int nw   = blockDim.x / WARP_SIZE;
+    __shared__ float s_acc[FN_QSA_ATTN_MAX_NW][D];
+    const int h     = blockIdx.x;
+    const int t     = blockIdx.y;
+    const int j     = threadIdx.x;
+    const int lane  = j % WARP_SIZE;
+    const int warp  = j / WARP_SIZE;
+    const int nw    = blockDim.x / WARP_SIZE;
+    const int n_pad = ((a.n_sel + nw - 1)/nw)*nw; // the slots past n_sel have no cell
 
     if (j < D/4) {
         *(float4 *) (s_q + 4*j) = *(const float4 *) (a.q + (int64_t) t*a.sq_t + (int64_t) h*a.sq_h + 4*j);
     }
-    int   cell = -1;
-    float m    = -INFINITY;
-    if (j < a.n_sel) {
-        cell = a.cells != nullptr ? a.cells[t*a.n_sel + j]
-                                  : fn_qsa_cell(a.sel_idx, a.s_sel, a.n_top, a.kpool, a.score, a.s_score, a.top_k, a.s_topk, a.n_kv, t, j);
-        if (cell >= 0) {
-            m = __half2float(a.kq_mask[(int64_t) t*a.s_kq + cell]);
-        }
-    }
     __syncthreads();
-    float s = -INFINITY;
-    if (cell >= 0 && m > -INFINITY) {
-        const uint4 * kr  = (const uint4 *) (a.K + (int64_t) cell*a.sk);
-        float         acc = 0.0f;
-#pragma unroll 4
-        for (int b = 0; b < D/8; ++b) {
-            const uint4   u  = kr[b];
-            const float2  k0 = __half22float2(fn_h2((int) u.x));
-            const float2  k1 = __half22float2(fn_h2((int) u.y));
-            const float2  k2 = __half22float2(fn_h2((int) u.z));
-            const float2  k3 = __half22float2(fn_h2((int) u.w));
-            const float * qb = s_q + 8*b;
-            acc += k0.x*qb[0] + k0.y*qb[1] + k1.x*qb[2] + k1.y*qb[3] + k2.x*qb[4] + k2.y*qb[5] + k3.x*qb[6] + k3.y*qb[7];
+    float smax_t = -INFINITY;
+    for (int c = j; c < n_pad; c += blockDim.x) {
+        int   cell = -1;
+        float m    = -INFINITY;
+        if (c < a.n_sel) {
+            cell = a.cells != nullptr ? a.cells[t*a.n_sel + c]
+                                      : fn_qsa_cell(a.sel_idx, a.s_sel, a.n_top, a.kpool, a.score, a.s_score, a.top_k, a.s_topk, a.n_kv, t, c);
+            if (cell >= 0) {
+                m = __half2float(a.kq_mask[(int64_t) t*a.s_kq + cell]);
+            }
         }
-        s = acc*a.scale + m;
+        float s = -INFINITY;
+        if (cell >= 0 && m > -INFINITY) {
+            const uint4 * kr  = (const uint4 *) (a.K + (int64_t) cell*a.sk);
+            float         acc = 0.0f;
+#pragma unroll 4
+            for (int b = 0; b < D/8; ++b) {
+                const uint4   u  = kr[b];
+                const float2  k0 = __half22float2(fn_h2((int) u.x));
+                const float2  k1 = __half22float2(fn_h2((int) u.y));
+                const float2  k2 = __half22float2(fn_h2((int) u.z));
+                const float2  k3 = __half22float2(fn_h2((int) u.w));
+                const float * qb = s_q + 8*b;
+                acc += k0.x*qb[0] + k0.y*qb[1] + k1.x*qb[2] + k1.y*qb[3] + k2.x*qb[4] + k2.y*qb[5] + k3.x*qb[6] + k3.y*qb[7];
+            }
+            s = acc*a.scale + m;
+        }
+        s_p[c]    = s;
+        s_cell[c] = cell;
+        smax_t    = fmaxf(smax_t, s);
     }
-    const float smax = fn_block_fold(s, true, s_w, s_tot);
-    const float e    = s > -INFINITY ? expf(s - smax) : 0.0f;
-    const float sum  = fn_block_fold(e, false, s_w, s_tot);
-    // a slot without a cell reads row 0 with the weight 0: the loads below are unconditional
-    s_p[j]    = cell >= 0 && sum > 0.0f ? e/sum : 0.0f;
-    s_cell[j] = cell >= 0 ? cell : 0;
+    const float smax = fn_block_fold(smax_t, true, s_w, s_tot);
+    float sum_t = 0.0f;
+    for (int c = j; c < n_pad; c += blockDim.x) {
+        const float e = s_p[c] > -INFINITY ? expf(s_p[c] - smax) : 0.0f;
+        s_p[c] = e;
+        sum_t += e;
+    }
+    const float sum = fn_block_fold(sum_t, false, s_w, s_tot);
+    for (int c = j; c < n_pad; c += blockDim.x) {
+        // a slot without a cell reads row 0 with the weight 0: the loads below are unconditional
+        const int cell = s_cell[c];
+        s_p[c]    = cell >= 0 && sum > 0.0f ? s_p[c]/sum : 0.0f;
+        s_cell[c] = cell >= 0 ? cell : 0;
+    }
     __syncthreads();
     float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 #pragma unroll 4
-    for (int i = 0; i < WARP_SIZE; ++i) {
-        const int    c  = warp + i*nw;
+    for (int c = warp; c < n_pad; c += nw) {
         const float  p  = s_p[c];
         const uint4  u  = *(const uint4 *) (a.V + (int64_t) s_cell[c]*a.sv + 8*lane);
         const float2 v0 = __half22float2(fn_h2((int) u.x));
@@ -2930,7 +2945,7 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         k->type != GGML_TYPE_F16 || k->ne[0] != d || k->ne[1] != s.n_kv || k->ne[2] != 1 || k->nb[0] != sizeof(half) || !row16(k, k->nb[1]) ||
         v->type != GGML_TYPE_F16 || v->ne[0] != d || v->ne[1] != s.n_kv || v->ne[2] != 1 || v->nb[0] != sizeof(half) || !row16(v, v->nb[1]) ||
         out->type != GGML_TYPE_F32 || out->ne[0] != d || out->ne[1] != n_head || out->ne[2] != s.nt || !ggml_is_contiguous(out) ||
-        !fn_hc_aligned(out) || s.n_sel > FN_QSA_ATTN_MAX_SEL || s.n_kv < 1 || s.n_kv + s.n_sel >= ((int64_t) 1 << 24)) {
+        !fn_hc_aligned(out) || s.n_sel > FN_QSA_ATTN_MAX_SEL - FN_QSA_ATTN_MAX_NW || s.n_kv < 1 || s.n_kv + s.n_sel >= ((int64_t) 1 << 24)) {
         if (fn_debug()) {
             fprintf(stderr, "fn-decline: qsa_attn at %d: shapes: q [%lld,%lld,%lld] k %s [%lld,%lld,%lld] nb1 %zu out [%lld,%lld,%lld] n_sel %lld n_kv %lld nt %lld\n", i,
                     (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], ggml_type_name(k->type), (long long) k->ne[0],
@@ -2981,7 +2996,8 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         fn_qsa_cells<<<1, 1024, 0, ctx.stream()>>>(a, (int) s.nt, ctx.fn_qsa_cells);
         a.cells = ctx.fn_qsa_cells;
     }
-    const int nw = std::max(2, (int) ((s.n_sel + WARP_SIZE - 1)/WARP_SIZE)); // 64 threads store the output
+    // 64 threads store the output; from 512 slots on a thread owns several
+    const int nw = std::min(FN_QSA_ATTN_MAX_NW, std::max(2, (int) ((s.n_sel + WARP_SIZE - 1)/WARP_SIZE)));
     fn_qsa_attn<<<dim3((unsigned) n_head, (unsigned) s.nt, 1), nw*WARP_SIZE, 0, ctx.stream()>>>(a);
     CUDA_CHECK(cudaGetLastError());
     return n_ops - 1;

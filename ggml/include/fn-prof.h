@@ -35,8 +35,13 @@ struct fn_prof_t {
     int64_t      n[MAXT];
     int64_t      ring[MAXT][RING];
 
+    int64_t      slow_ns = 0; // FN_PROF_SLOW=<ms>: print every sample of at least that long when it happens
+
     fn_prof_t(const char * tu) : tu(tu) {
         on = getenv("FN_PROF") != nullptr;
+        if (on && getenv("FN_PROF_SLOW") != nullptr) {
+            slow_ns = (int64_t) (atof(getenv("FN_PROF_SLOW"))*1e6);
+        }
     }
     ~fn_prof_t() {
         if (!on) {
@@ -68,6 +73,10 @@ struct fn_prof_t {
         return cnt++;
     }
     void add(const char * name, int64_t ns) {
+        if (slow_ns > 0 && ns >= slow_ns) {
+            const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            fprintf(stderr, "\nfn-slow %.1f %s tag%d %s %.2f\n", now/1e6, tu, ggml_fn_prof_tag, name, ns/1e6);
+        }
         const int i = id(name);
         ring[i][n[i] % RING] = ns;
         sum[i] += ns;

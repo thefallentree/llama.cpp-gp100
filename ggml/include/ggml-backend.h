@@ -371,7 +371,11 @@ extern "C" {
     // Meta backend
     //
 
-#define GGML_BACKEND_META_MAX_DEVICES 16
+// 16 upstream. ggml_backend_meta_split_state is copied several times per tensor when a graph is allocated: with 16 a
+// new decode graph took 40-60 ms longer.
+#ifndef GGML_BACKEND_META_MAX_DEVICES
+#define GGML_BACKEND_META_MAX_DEVICES 4
+#endif
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:

@@ -191,6 +191,62 @@ static void ggml_cuda_mem_checkpoint(int device, const char * what, const char *
     last[device] = free_b;
 }
 
+// temporary: GGML_CUDA_NODE_TIMING=1 waits for the device after every node that is not run from a captured graph and adds
+// the time to its op and name (layer numbers removed). Printed when a backend is freed. For the prompt path.
+static std::mutex                                               ggml_cuda_node_time_mutex;
+static std::map<std::string, std::pair<double, int64_t>>        ggml_cuda_node_time[GGML_CUDA_MAX_DEVICES];
+
+static bool ggml_cuda_node_timing() {
+    static const bool on = getenv("GGML_CUDA_NODE_TIMING") != nullptr && atoi(getenv("GGML_CUDA_NODE_TIMING")) != 0;
+    return on;
+}
+
+static std::string ggml_cuda_node_stem(const char * name) {
+    std::string res;
+    for (const char * c = name; *c != 0; ++c) {
+        if (*c >= '0' && *c <= '9') {
+            if (res.empty() || res.back() != '#') {
+                res += '#';
+            }
+        } else {
+            res += *c;
+        }
+    }
+    return res;
+}
+
+static void ggml_cuda_node_time_add(int device, const ggml_tensor * node, double us) {
+    std::string key = ggml_op_name(node->op);
+    key += " " + ggml_cuda_node_stem(node->name);
+    if (node->src[0] != nullptr && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GET_ROWS)) {
+        key += " <- " + ggml_cuda_node_stem(node->src[0]->name);
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_node_time_mutex);
+    auto & e = ggml_cuda_node_time[device][key];
+    e.first  += us;
+    e.second += 1;
+}
+
+static void ggml_cuda_node_time_print(int device) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_node_time_mutex);
+    auto & m = ggml_cuda_node_time[device];
+    if (m.empty()) {
+        return;
+    }
+    std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(m.begin(), m.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    double total = 0.0;
+    for (const auto & e : v) {
+        total += e.second.first;
+    }
+    fprintf(stderr, "node-timing dev%d: %.1f ms in %zu kinds of nodes\n", device, total/1000.0, v.size());
+    for (size_t i = 0; i < v.size() && i < 60; ++i) {
+        fprintf(stderr, "node-timing dev%d: %9.1f ms %5.1f%% n %6lld %9.1f us  %s\n", device, v[i].second.first/1000.0, 100.0*v[i].second.first/total,
+                (long long) v[i].second.second, v[i].second.first/v[i].second.second, v[i].first.c_str());
+    }
+    m.clear();
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -2887,6 +2943,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_node_time_print(cuda_ctx->device);
     delete cuda_ctx;
     delete backend;
 }
@@ -5527,8 +5584,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                const int64_t t_node = ggml_cuda_node_timing() && !ggml_cuda_capturing && !cuda_ctx->window_active ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 ggml_cuda_mem_checkpoint(cuda_ctx->device, ggml_op_name(node->op), node->name);
+                if (t_node != 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    ggml_cuda_node_time_add(cuda_ctx->device, node, (double) (ggml_time_us() - t_node));
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }

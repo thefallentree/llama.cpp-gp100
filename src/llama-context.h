@@ -426,6 +426,9 @@ private:
     // later long prefill. force=true also recreates empty slots (OOM retry).
     void gf_slots_release_compute(bool force = false);
 
+    // compute buffer bytes of the valid graph slots, all backends
+    size_t gf_slots_compute_size() const;
+
     void gf_slots_recreate_one(graph_slot & slot);
 
     // recreate the main scheduler so a prior large (prefill) compute buffer
@@ -434,6 +437,9 @@ private:
     void gf_main_sched_recreate();
 
     bool main_sched_held_large = false;
+
+    // the graph slots stayed while the main scheduler ran a large ubatch
+    bool gf_slots_kept = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

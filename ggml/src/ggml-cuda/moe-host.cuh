@@ -22,6 +22,12 @@
 // Called before node i is computed. Opens a host triple at its first node and returns true for every
 // node of the open triple: their mat-vec kernels have to skip the cold pairs.
 bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
+// The routing of a decode batch and the publish of its triple as one kernel: the top experts of the router's logits
+// with their normalized weights (what ggml_cuda_op_topk_moe computes for a softmax gate with weight normalization),
+// as positions of the expert cache, for the triple whose first MUL_MAT_ID node is among the nodes from i_first.
+// False: nothing was launched and the caller computes the routing as usual.
+bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i_first, const ggml_tensor * logits,
+                              ggml_tensor * weights, ggml_tensor * ids, float clamp_val);
 // Called before the MUL_MAT_ID node i is computed, for batches of any size: a hot/cold triple that opens there is
 // made known to the expert cache (expert-cache.cuh).
 void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

@@ -211,6 +211,151 @@ static __global__ void mh_publish(
     }
 }
 
+#define MH_ROUTE_EXPERTS 512
+#define MH_ROUTE_EPT     (MH_ROUTE_EXPERTS/WARP_SIZE) // experts per thread
+
+// Decode batches, with the routing: warp w takes the top n_used of token w's logits (softmax, the weights divided by
+// their clamped sum, as topk_moe_cuda does), a thread per pair then writes the expert's position (expert-cache.cuh)
+// and its weight, and the block goes on as mh_publish. logits, weights and ids may share memory.
+static __global__ void mh_route(
+        const float * logits, float * weights, int32_t * ids, const int si1, const int n_used, const int n_tokens,
+        const float clamp_val, const int32_t * __restrict__ perm, uint32_t * counts, const int n_hot,
+        const float * __restrict__ x, const int64_t sx_tok, const int n_embd,
+        mh_mailbox * mb, uint32_t * dstate, const int slot) {
+    __shared__ int   s_e[MH_PUBLISH_THREADS];
+    __shared__ float s_wt[MH_PUBLISH_THREADS];
+    __shared__ float s_norm[MH_PUBLISH_THREADS/WARP_SIZE];
+    __shared__ int   wcount[MH_PUBLISH_THREADS/WARP_SIZE];
+
+    const int i     = threadIdx.x;
+    const int lane  = i % WARP_SIZE;
+    const int w     = i / WARP_SIZE;
+    const int n_all = n_tokens*n_used;
+
+    if (w < n_tokens) {
+        float wt[MH_ROUTE_EPT];
+        const float * lg = logits + (int64_t) w*MH_ROUTE_EXPERTS;
+#pragma unroll
+        for (int q = 0; q < MH_ROUTE_EPT; ++q) {
+            wt[q] = lg[lane + q*WARP_SIZE];
+        }
+        float mx = wt[0];
+#pragma unroll
+        for (int q = 1; q < MH_ROUTE_EPT; ++q) {
+            mx = fmaxf(mx, wt[q]);
+        }
+        mx = warp_reduce_max(mx);
+        float sum = 0.0f;
+#pragma unroll
+        for (int q = 0; q < MH_ROUTE_EPT; ++q) {
+            wt[q] = expf(wt[q] - mx);
+            sum  += wt[q];
+        }
+        sum = warp_reduce_sum(sum);
+        const float inv = 1.0f/sum;
+#pragma unroll
+        for (int q = 0; q < MH_ROUTE_EPT; ++q) {
+            wt[q] *= inv;
+            if (__isnanf(wt[q])) {
+                wt[q] = -FLT_MAX; // the rounds below then still find distinct experts
+            }
+        }
+        float wsum = 0.0f;
+        for (int k = 0; k < n_used; ++k) {
+            float mv = wt[0];
+            int   me = lane;
+#pragma unroll
+            for (int q = 1; q < MH_ROUTE_EPT; ++q) {
+                if (wt[q] > mv) {
+                    mv = wt[q];
+                    me = lane + q*WARP_SIZE;
+                }
+            }
+#pragma unroll
+            for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+                const float v = __shfl_xor_sync(0xffffffff, mv, o);
+                const int   e = __shfl_xor_sync(0xffffffff, me, o);
+                if (v > mv || (v == mv && e < me)) {
+                    mv = v;
+                    me = e;
+                }
+            }
+            if ((me & (WARP_SIZE - 1)) == lane) {
+                wt[me / WARP_SIZE] = -INFINITY;
+            }
+            wsum += mv;
+            if (lane == 0) {
+                s_e[w*n_used + k]  = me;
+                s_wt[w*n_used + k] = mv;
+            }
+        }
+        if (lane == 0) {
+            s_norm[w] = 1.0f/fmaxf(wsum, clamp_val);
+        }
+    }
+    __syncthreads();
+
+    int  e    = 0;
+    bool cold = false;
+    if (i < n_all) {
+        const int t  = i / n_used;
+        const int k  = i - t*n_used;
+        const int ex = s_e[i];
+        e = ex;
+        if (perm != nullptr) {
+            e = perm[ex];
+            atomicAdd(counts + ex, 1u);
+        }
+        ids[t*si1 + k]         = e;
+        weights[t*n_used + k]  = s_wt[i]*s_norm[t];
+        cold = e >= n_hot;
+    }
+    const unsigned int m = __ballot_sync(0xffffffff, cold);
+    if (lane == 0) {
+        wcount[w] = __popc(m);
+    }
+    __syncthreads();
+    int base = 0;
+    int np   = 0;
+    for (int j = 0; j < MH_PUBLISH_THREADS/WARP_SIZE; ++j) {
+        base += j < w ? wcount[j] : 0;
+        np   += wcount[j];
+    }
+    if (cold) {
+        const int pos = base + __popc(m & ((1u << lane) - 1));
+        mh_pair_idx(mb)[pos] = i;
+        mh_pair_exp(mb)[pos] = e - n_hot;
+        dstate[MH_DSTATE_PAIR + pos] = i;
+    }
+    if (i == 0) {
+        dstate[MH_DSTATE_NEED] = np;
+    }
+    if (np == 0) {
+        return;
+    }
+    __shared__ mh_act_block s_blk[MH_PUBLISH_THREADS/WARP_SIZE];
+    const int nb_t = n_embd/64;
+    for (int b0 = 0; b0 < n_tokens*nb_t; b0 += MH_PUBLISH_THREADS/WARP_SIZE) {
+        const int bi = b0 + w;
+        if (bi < n_tokens*nb_t) {
+            mh_quantize_block(x + (bi / nb_t)*sx_tok + 64*(bi % nb_t), s_blk[w], mh_xq(mb) + bi, lane);
+        }
+    }
+    if (i == 0) {
+        mb->slot     = slot;
+        mb->n_tokens = n_tokens;
+        mb->n_used   = n_used;
+        mb->n_pairs  = np;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (i == 0) {
+        const uint32_t s = dstate[MH_DSTATE_SEQ] + 1;
+        dstate[MH_DSTATE_SEQ] = s;
+        mb->req = s;
+    }
+}
+
 static __global__ void mh_collect(
         const mh_mailbox * mb, const uint32_t * __restrict__ dstate, float * __restrict__ dst,
         const int64_t sd_slot, const int64_t sd_tok, const int n_used, const int n_embd, unsigned long long * dbg) {
@@ -428,14 +573,16 @@ void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgr
     ggml_cuda_expert_cache_register(ctx, up, gate, down, c_up, c_gate, c_down, n_cold);
 }
 
-bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+// what the publish of a triple needs
+struct mh_open_args {
+    const ggml_tensor * ids;
+    const ggml_tensor * x;
+    int                 n_used, n_tokens, n_hot, n_embd, slot;
+};
+
+// Opens the triple of the MUL_MAT_ID node i (its publish is then due); false: the node keeps the GPU path.
+static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i, mh_open_args & a) {
     const ggml_tensor * node = cgraph->nodes[i];
-    if (node->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(node)) {
-        return false;
-    }
-    if (ggml_cuda_moe_host_active(ctx, node)) {
-        return true;
-    }
     if (!ggml_cuda_moe_host_enabled()) {
         return false;
     }
@@ -482,28 +629,90 @@ bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     d.down_nb2 = down->src[0]->nb[2];
     d.n_embd   = (int) n_embd;
     d.n_ff     = (int) n_ff;
-    const int slot = mh_pool_register(d);
 
-    const int     si1    = (int) (ids->nb[1]/sizeof(int32_t));
-    const int64_t sx_tok = (int64_t) (x->nb[2]/sizeof(float));
-    if (n_tokens <= MH_SMALL_TOK && n_tokens*n_used <= MH_PUBLISH_THREADS) {
-        mh_publish<<<1, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
-            (const int32_t *) ids->data, si1, n_used, n_tokens, (int) n_hot, (const float *) x->data, sx_tok, (int) n_embd,
-            ctx.moe_host_mb, ctx.moe_host_dstate, slot);
-    } else {
-        const int nblk = n_tokens*(int) (n_embd/64);
-        const int wpb  = MH_PUBLISH_THREADS/WARP_SIZE;
-        mh_quantize_rows<<<(nblk + wpb - 1)/wpb, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
-            (const float *) x->data, sx_tok, (int) n_embd, n_tokens, ctx.moe_host_mb);
-        mh_ring<<<1, MH_RING_THREADS, 0, ctx.stream()>>>(
-            (const int32_t *) ids->data, si1, n_used, n_tokens, (int) n_hot, ctx.moe_host_mb, ctx.moe_host_dstate, slot);
-    }
-    CUDA_CHECK(cudaGetLastError());
+    a.ids      = ids;
+    a.x        = x;
+    a.n_used   = n_used;
+    a.n_tokens = n_tokens;
+    a.n_hot    = (int) n_hot;
+    a.n_embd   = (int) n_embd;
+    a.slot     = mh_pool_register(d);
 
     ctx.moe_host.ids  = ids;
     ctx.moe_host.up   = up;
     ctx.moe_host.gate = gate;
     ctx.moe_host.down = down;
+    return true;
+}
+
+bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(node)) {
+        return false;
+    }
+    if (ggml_cuda_moe_host_active(ctx, node)) {
+        return true;
+    }
+    mh_open_args a;
+    if (!mh_open(ctx, cgraph, i, a)) {
+        return false;
+    }
+    const int     si1    = (int) (a.ids->nb[1]/sizeof(int32_t));
+    const int64_t sx_tok = (int64_t) (a.x->nb[2]/sizeof(float));
+    if (a.n_tokens <= MH_SMALL_TOK && a.n_tokens*a.n_used <= MH_PUBLISH_THREADS) {
+        mh_publish<<<1, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
+            (const int32_t *) a.ids->data, si1, a.n_used, a.n_tokens, a.n_hot, (const float *) a.x->data, sx_tok, a.n_embd,
+            ctx.moe_host_mb, ctx.moe_host_dstate, a.slot);
+    } else {
+        const int nblk = a.n_tokens*(a.n_embd/64);
+        const int wpb  = MH_PUBLISH_THREADS/WARP_SIZE;
+        mh_quantize_rows<<<(nblk + wpb - 1)/wpb, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
+            (const float *) a.x->data, sx_tok, a.n_embd, a.n_tokens, ctx.moe_host_mb);
+        mh_ring<<<1, MH_RING_THREADS, 0, ctx.stream()>>>(
+            (const int32_t *) a.ids->data, si1, a.n_used, a.n_tokens, a.n_hot, ctx.moe_host_mb, ctx.moe_host_dstate, a.slot);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i_first, const ggml_tensor * logits,
+                              ggml_tensor * weights, ggml_tensor * ids, const float clamp_val) {
+    static const bool enabled = getenv("GGML_CUDA_MOE_HOST_ROUTE") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_ROUTE")) != 0;
+    const int n_used   = (int) weights->ne[1];
+    const int n_tokens = (int) logits->ne[1];
+    if (!enabled || !ggml_cuda_moe_host_enabled() || ctx.moe_host.ids != nullptr || logits->ne[0] != MH_ROUTE_EXPERTS ||
+        logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) || weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights) ||
+        ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->nb[1] != MH_ROUTE_EXPERTS*sizeof(int32_t) ||
+        ids->ne[0] != n_used || ids->ne[1] != n_tokens || ggml_nelements(weights) != (int64_t) n_used*n_tokens ||
+        n_tokens > MH_SMALL_TOK || n_tokens*n_used > MH_PUBLISH_THREADS || n_used > WARP_SIZE) {
+        return false;
+    }
+    // the triple that these ids route
+    int j = -1;
+    for (int q = i_first; q < std::min(cgraph->n_nodes, i_first + 8) && j < 0; ++q) {
+        const ggml_tensor * n = cgraph->nodes[q];
+        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == ids) {
+            j = q;
+        }
+    }
+    if (j < 0 || !ggml_cuda_mmid_cold(cgraph->nodes[j])) {
+        return false;
+    }
+    const ggml_tensor * node = cgraph->nodes[j];
+    ggml_cuda_moe_host_register(ctx, cgraph, j);
+    mh_open_args a;
+    if (!mh_open(ctx, cgraph, j, a)) {
+        return false;
+    }
+    GGML_ASSERT(a.ids == ids && a.n_used == n_used && a.n_tokens == n_tokens);
+    const int32_t * perm   = nullptr;
+    uint32_t *      counts = nullptr;
+    ggml_cuda_expert_cache_take(ctx, node, &perm, &counts);
+    mh_route<<<1, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
+        (const float *) logits->data, (float *) weights->data, (int32_t *) ids->data, MH_ROUTE_EXPERTS, n_used, n_tokens, clamp_val,
+        perm, counts, a.n_hot, (const float *) a.x->data, (int64_t) (a.x->nb[2]/sizeof(float)), a.n_embd,
+        ctx.moe_host_mb, ctx.moe_host_dstate, a.slot);
+    CUDA_CHECK(cudaGetLastError());
     return true;
 }
 

@@ -15,12 +15,13 @@
 // R rows per tile: 8, or 4 where 8 rows of T tokens exceed the registers, the 48 KB of shared memory of a block or
 // the R*T/2 gathering threads a row has. BPS: blocks per SM; minBlocksPerMultiprocessor caps the registers so that
 // nsm*BPS blocks are resident together, and is chosen so that no instantiation spills under that cap
-// (cuobjdump --dump-resource-usage).
+// (cuobjdump --dump-resource-usage). A tight cap without a spill still costs: T = 3 in 64 registers (BPS 6) was
+// 11-19% slower than in 96 (BPS 4).
 //                     T  R20 B20 R40 B40 R160 B160 R192 B192 R384 B384
 #define FN_DENSE_TABLE(X)                                   \
                     X(1,  8,  7,  8,  7,  8,   8,   8,   6,   8,   3)  \
                     X(2,  8,  6,  8,  6,  8,   6,   8,   5,   8,   2)  \
-                    X(3,  8,  6,  8,  6,  8,   6,   8,   5,   8,   2)  \
+                    X(3,  8,  5,  8,  5,  8,   4,   8,   4,   8,   2)  \
                     X(4,  8,  4,  8,  4,  8,   4,   8,   3,   8,   2)  \
                     X(5,  8,  4,  8,  4,  8,   4,   8,   3,   8,   1)  \
                     X(6,  4,  4,  8,  3,  8,   3,   8,   2,   4,   1)  \
@@ -1342,6 +1343,160 @@ static __global__ void fn_qsa_sel(const int32_t * sel_idx, const int64_t s_sel, 
     }
 }
 
+// block-wide maximum or sum of one value per thread, for blocks of up to 32 whole warps; two barriers
+static __device__ __forceinline__ float fn_block_fold(float v, const bool is_max, float * s_w, float * s_tot) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        const float o = __shfl_xor_sync(0xffffffff, v, off);
+        v = is_max ? fmaxf(v, o) : v + o;
+    }
+    if (lane == 0) {
+        s_w[warp] = v;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float x = lane < nw ? s_w[lane] : (is_max ? -INFINITY : 0.0f);
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            const float o = __shfl_xor_sync(0xffffffff, x, off);
+            x = is_max ? fmaxf(x, o) : x + o;
+        }
+        if (lane == 0) {
+            s_tot[0] = x;
+        }
+    }
+    __syncthreads();
+    return s_tot[0];
+}
+
+// QSA attention over the selected cells only: the cells of fn_qsa_sel, then for a head's query q
+//   s[j] = scale*(q . K[cell_j]) + kq_mask[cell_j],   out = sum over j of softmax(s)[j]*V[cell_j]
+// One block per (head, token). Thread j owns slot j; in the sum over V a warp takes the slots w, w + nw, ... and a
+// lane eight values. The cost does not depend on the size of the cache.
+#define FN_QSA_ATTN_D       256
+#define FN_QSA_ATTN_MAX_SEL 512
+
+struct fn_qsa_attn_args {
+    const int32_t * cells;    // [nt][n_sel] staged by fn_qsa_cells (-1: none), or null: from the next three
+    const int32_t * sel_idx;
+    const float *   score;
+    const int32_t * top_k;
+    const half *    kq_mask;
+    const float *   q;        // [nt][n_head][D], sq_t and sq_h apart
+    const half *    K;        // rows of D values, sk apart
+    const half *    V;
+    float *         out;      // [nt][n_head][D], so_t and so_h apart
+    int             s_sel, s_score, s_topk, s_kq, sq_t, sq_h, sk, sv, so_t, so_h;
+    int             n_sel, n_top, kpool, n_kv;
+    float           scale;
+};
+
+// the cell of slot j of token t, as fn_qsa_sel computes it; -1 if the slot is dead
+static __device__ __forceinline__ int fn_qsa_cell(const int32_t * sel_idx, const int s_sel, const int n_top, const int kpool,
+                                                  const float * score, const int s_score, const int32_t * top_k, const int s_topk,
+                                                  const int n_kv, const int t, const int j) {
+    const float idx = (float) sel_idx[t*s_sel + j];
+    float live;
+    if (j < n_top) {
+        live = fminf(fmaxf(score[t*s_score + top_k[t*s_topk + j/kpool]] + 1.0f, 0.0f), 1.0f);
+    } else {
+        live = fminf(fmaxf((float) n_kv - idx, 0.0f), 1.0f);
+    }
+    const float dump = (float) (n_kv + j);
+    const int   c    = (int) ((idx - dump)*live + dump);
+    return c < n_kv ? c : -1;
+}
+
+// The cells of all slots, for an attention whose output shares memory with the selection: its blocks cannot read
+// the selection while other blocks write their output.
+static __global__ void fn_qsa_cells(const fn_qsa_attn_args a, const int nt, int32_t * cells) {
+    for (int e = threadIdx.x; e < nt*a.n_sel; e += blockDim.x) {
+        const int t = e/a.n_sel;
+        const int j = e - t*a.n_sel;
+        cells[e] = fn_qsa_cell(a.sel_idx, a.s_sel, a.n_top, a.kpool, a.score, a.s_score, a.top_k, a.s_topk, a.n_kv, t, j);
+    }
+}
+
+static __global__ void fn_qsa_attn(const fn_qsa_attn_args a) {
+    constexpr int D = FN_QSA_ATTN_D;
+    __shared__ float s_q[D];
+    __shared__ float s_p[FN_QSA_ATTN_MAX_SEL];
+    __shared__ int   s_cell[FN_QSA_ATTN_MAX_SEL];
+    __shared__ float s_w[FN_QSA_ATTN_MAX_SEL/WARP_SIZE];
+    __shared__ float s_tot[1];
+    __shared__ float s_acc[FN_QSA_ATTN_MAX_SEL/WARP_SIZE][D];
+    const int h    = blockIdx.x;
+    const int t    = blockIdx.y;
+    const int j    = threadIdx.x;
+    const int lane = j % WARP_SIZE;
+    const int warp = j / WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+
+    if (j < D/4) {
+        *(float4 *) (s_q + 4*j) = *(const float4 *) (a.q + (int64_t) t*a.sq_t + (int64_t) h*a.sq_h + 4*j);
+    }
+    int   cell = -1;
+    float m    = -INFINITY;
+    if (j < a.n_sel) {
+        cell = a.cells != nullptr ? a.cells[t*a.n_sel + j]
+                                  : fn_qsa_cell(a.sel_idx, a.s_sel, a.n_top, a.kpool, a.score, a.s_score, a.top_k, a.s_topk, a.n_kv, t, j);
+        if (cell >= 0) {
+            m = __half2float(a.kq_mask[(int64_t) t*a.s_kq + cell]);
+        }
+    }
+    __syncthreads();
+    float s = -INFINITY;
+    if (cell >= 0 && m > -INFINITY) {
+        const uint4 * kr  = (const uint4 *) (a.K + (int64_t) cell*a.sk);
+        float         acc = 0.0f;
+#pragma unroll 4
+        for (int b = 0; b < D/8; ++b) {
+            const uint4   u  = kr[b];
+            const float2  k0 = __half22float2(fn_h2((int) u.x));
+            const float2  k1 = __half22float2(fn_h2((int) u.y));
+            const float2  k2 = __half22float2(fn_h2((int) u.z));
+            const float2  k3 = __half22float2(fn_h2((int) u.w));
+            const float * qb = s_q + 8*b;
+            acc += k0.x*qb[0] + k0.y*qb[1] + k1.x*qb[2] + k1.y*qb[3] + k2.x*qb[4] + k2.y*qb[5] + k3.x*qb[6] + k3.y*qb[7];
+        }
+        s = acc*a.scale + m;
+    }
+    const float smax = fn_block_fold(s, true, s_w, s_tot);
+    const float e    = s > -INFINITY ? expf(s - smax) : 0.0f;
+    const float sum  = fn_block_fold(e, false, s_w, s_tot);
+    // a slot without a cell reads row 0 with the weight 0: the loads below are unconditional
+    s_p[j]    = cell >= 0 && sum > 0.0f ? e/sum : 0.0f;
+    s_cell[j] = cell >= 0 ? cell : 0;
+    __syncthreads();
+    float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll 4
+    for (int i = 0; i < WARP_SIZE; ++i) {
+        const int    c  = warp + i*nw;
+        const float  p  = s_p[c];
+        const uint4  u  = *(const uint4 *) (a.V + (int64_t) s_cell[c]*a.sv + 8*lane);
+        const float2 v0 = __half22float2(fn_h2((int) u.x));
+        const float2 v1 = __half22float2(fn_h2((int) u.y));
+        const float2 v2 = __half22float2(fn_h2((int) u.z));
+        const float2 v3 = __half22float2(fn_h2((int) u.w));
+        acc[0] += p*v0.x; acc[1] += p*v0.y; acc[2] += p*v1.x; acc[3] += p*v1.y;
+        acc[4] += p*v2.x; acc[5] += p*v2.y; acc[6] += p*v3.x; acc[7] += p*v3.y;
+    }
+    *(float4 *) (s_acc[warp] + 8*lane)     = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    *(float4 *) (s_acc[warp] + 8*lane + 4) = make_float4(acc[4], acc[5], acc[6], acc[7]);
+    __syncthreads();
+    if (j < D/4) {
+        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int w = 0; w < nw; ++w) {
+            const float4 v = *(const float4 *) (s_acc[w] + 4*j);
+            o = make_float4(o.x + v.x, o.y + v.y, o.z + v.z, o.w + v.w);
+        }
+        *(float4 *) (a.out + (int64_t) t*a.so_t + (int64_t) h*a.so_h + 4*j) = o;
+    }
+}
+
 // The pooled indexer keys of a QSA attention layer (qwen4exp build_qsa_sel), one block:
 //   the raw keys of the new tokens go to the first half of their cache rows (the second half is zeroed), then the
 //   mean over the kpool member rows of each block to re-pool is taken from the cache.
@@ -1862,7 +2017,7 @@ fn_moe_down(const char * __restrict__ wd, const int64_t nb1, const int64_t nb2,
 // (a RESHAPE of an input, which nothing elides) and a cast (a CPY whose destination is the node itself and counts
 // as a use).
 // GGML_CUDA_FN_OFF: a bit mask of the fused patterns below that are left to the generic ops
-enum fn_pattern_bit { FN_PAT_GDN_OUT, FN_PAT_GATE_OUT, FN_PAT_QSA_SEL, FN_PAT_QSA_POOL, FN_PAT_NORM_ROPE, FN_PAT_GDN_PRE };
+enum fn_pattern_bit { FN_PAT_GDN_OUT, FN_PAT_GATE_OUT, FN_PAT_QSA_SEL, FN_PAT_QSA_POOL, FN_PAT_NORM_ROPE, FN_PAT_GDN_PRE, FN_PAT_QSA_ATTN };
 
 static bool fn_pattern_on(const fn_pattern_bit bit) {
     static const int off = getenv("GGML_CUDA_FN_OFF") != nullptr ? atoi(getenv("GGML_CUDA_FN_OFF")) : 0;
@@ -2512,9 +2667,7 @@ static bool fn_gdn_pre_match(ggml_backend_cuda_context & ctx, const ggml_cgraph 
 }
 
 int ggml_cuda_fn_gdn_pre_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    // not validated yet (written after the last tested build): opt-in with GGML_CUDA_FN_GDN_PRE=1
-    static const bool enabled = getenv("GGML_CUDA_FN_GDN_PRE") != nullptr && atoi(getenv("GGML_CUDA_FN_GDN_PRE")) != 0;
-    if (!enabled || !fn_pattern_on(FN_PAT_GDN_PRE) || cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+    if (!fn_pattern_on(FN_PAT_GDN_PRE) || cgraph->nodes[i]->op != GGML_OP_CONCAT) {
         return 0;
     }
     fn_gdn_pre_args a;
@@ -2630,35 +2783,48 @@ int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     return n_ops - 1;
 }
 
-// The selection mask of a QSA layer, from the FILL of its first node: 28 nodes -> fn_qsa_sel
-int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    static const ggml_op ops[] = {
-        GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE,                                     // the zeros of the selection
-        GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_CLAMP,      // slots as floats; live blocks
-        GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_CLAMP,        // ... per slot; live tail
-        GGML_OP_CONCAT, GGML_OP_FILL, GGML_OP_CUMSUM, GGML_OP_SCALE,                       // live; the dump rows
-        GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_CPY, GGML_OP_RESHAPE,               // dump + live*(slot - dump)
-        GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_SET_ROWS, GGML_OP_VIEW,     // the scatter into -inf
-        GGML_OP_ADD,                                                                        // + kq_mask
-    };
-    constexpr int n_ops = sizeof(ops)/sizeof(ops[0]);
-    if (!fn_pattern_on(FN_PAT_QSA_SEL) || cgraph->nodes[i]->op != GGML_OP_FILL) {
-        return 0;
-    }
-    if (!fn_pattern_closed(cgraph, i, ops, n_ops)) {
-        fn_pattern_why("qsa_sel", cgraph, i, ops, n_ops);
-        return 0;
-    }
+// The 28 nodes of the selection mask of a QSA layer, from the FILL of its first node
+static const ggml_op fn_qsa_sel_ops[] = {
+    GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE,                                     // the zeros of the selection
+    GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_CLAMP,      // slots as floats; live blocks
+    GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_CLAMP,        // ... per slot; live tail
+    GGML_OP_CONCAT, GGML_OP_FILL, GGML_OP_CUMSUM, GGML_OP_SCALE,                       // live; the dump rows
+    GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_CPY, GGML_OP_RESHAPE,               // dump + live*(slot - dump)
+    GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_SET_ROWS, GGML_OP_VIEW,     // the scatter into -inf
+    GGML_OP_ADD,                                                                        // + kq_mask
+};
+#define FN_QSA_SEL_N_OPS ((int) (sizeof(fn_qsa_sel_ops)/sizeof(fn_qsa_sel_ops[0])))
+
+struct fn_qsa_sel_nodes {
+    const ggml_tensor * sel_idx;
+    const ggml_tensor * score;
+    const ggml_tensor * top_k;
+    const ggml_tensor * kq_mask;
+    ggml_tensor *       out;
+    int64_t             n_sel, nt, kpool, n_kv;
+};
+
+// the wiring and the shapes of a selection whose ops matched
+static bool fn_qsa_sel_wiring(const ggml_cgraph * cgraph, const int i, fn_qsa_sel_nodes & s) {
     ggml_tensor * const * n = cgraph->nodes + i;
-    const ggml_tensor * sel_idx = n[3]->src[0];
-    const ggml_tensor * score   = n[4]->src[0];
-    const ggml_tensor * top_k   = n[5]->src[1];
-    ggml_tensor *       out     = n[27];
-    const ggml_tensor * kq_mask = out->src[0] == n[26] ? out->src[1] : out->src[0];
-    const int64_t n_sel = sel_idx->ne[0];
-    const int64_t nt    = sel_idx->ne[1];
-    const int64_t kpool = n[8]->ne[0];
-    const int64_t n_kv  = out->ne[0];
+    s.sel_idx = n[3]->src[0];
+    s.score   = n[4]->src[0];
+    s.top_k   = n[5]->src[1];
+    s.out     = n[27];
+    s.kq_mask = s.out->src[0] == n[26] ? s.out->src[1] : s.out->src[0];
+    s.n_sel   = s.sel_idx->ne[0];
+    s.nt      = s.sel_idx->ne[1];
+    s.kpool   = n[8]->ne[0];
+    s.n_kv    = s.out->ne[0];
+    const ggml_tensor * sel_idx = s.sel_idx;
+    const ggml_tensor * score   = s.score;
+    const ggml_tensor * top_k   = s.top_k;
+    const ggml_tensor * out     = s.out;
+    const ggml_tensor * kq_mask = s.kq_mask;
+    const int64_t n_sel = s.n_sel;
+    const int64_t nt    = s.nt;
+    const int64_t kpool = s.kpool;
+    const int64_t n_kv  = s.n_kv;
     auto params = [](const ggml_tensor * t, const float a, const float b) {
         return ggml_get_op_params_f32(t, 0) == a && ggml_get_op_params_f32(t, 1) == b;
     };
@@ -2674,8 +2840,7 @@ int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
         ggml_get_op_params_f32(n[22], 0) > 0.0f ||
         !params(n[6], 1.0f, 1.0f) || !params(n[7], 0.0f, 1.0f) || !params(n[11], -1.0f, (float) n_kv) || !params(n[12], 0.0f, 1.0f) ||
         !params(n[16], 1.0f, (float) (n_kv - 1))) {
-        fn_decline("qsa_sel: wiring", i);
-        return 0;
+        return fn_decline("qsa_sel: wiring", i);
     }
     if (sel_idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(sel_idx) || score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) ||
         score->ne[1] != nt || top_k->type != GGML_TYPE_I32 || top_k->nb[0] != sizeof(int32_t) || top_k->ne[1] != nt ||
@@ -2683,19 +2848,129 @@ int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
         out->type != GGML_TYPE_F16 || !ggml_is_contiguous(out) || out->ne[1]*out->ne[2]*out->ne[3] != nt ||
         kq_mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(kq_mask) || kq_mask->ne[0] != n_kv ||
         kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] != nt || n[25]->ne[1] != n_kv + n_sel) {
-        fn_decline("qsa_sel: shapes", i);
+        return fn_decline("qsa_sel: shapes", i);
+    }
+    return true;
+}
+
+// The selection mask of a QSA layer -> fn_qsa_sel
+int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    constexpr int n_ops = FN_QSA_SEL_N_OPS;
+    if (!fn_pattern_on(FN_PAT_QSA_SEL) || cgraph->nodes[i]->op != GGML_OP_FILL) {
+        return 0;
+    }
+    if (!fn_pattern_closed(cgraph, i, fn_qsa_sel_ops, n_ops)) {
+        fn_pattern_why("qsa_sel", cgraph, i, fn_qsa_sel_ops, n_ops);
+        return 0;
+    }
+    fn_qsa_sel_nodes s;
+    if (!fn_qsa_sel_wiring(cgraph, i, s)) {
         return 0;
     }
     // the slots are staged as 16-bit cells in shared memory; the mask is a graph input
-    const size_t smem = (size_t) nt*n_sel*sizeof(unsigned short);
-    if (n_kv >= (int64_t) FN_QSA_SEL_DEAD || smem > 40000 || fn_overlap(out, kq_mask)) {
+    const size_t smem = (size_t) s.nt*s.n_sel*sizeof(unsigned short);
+    if (s.n_kv >= (int64_t) FN_QSA_SEL_DEAD || smem > 40000 || fn_overlap(s.out, s.kq_mask)) {
         fn_decline("qsa_sel: size", i);
         return 0;
     }
     fn_qsa_sel<<<1, FN_QSA_SEL_THREADS, smem, ctx.stream()>>>(
-        (const int32_t *) sel_idx->data, sel_idx->nb[1]/sizeof(int32_t), (int) n_sel, (int) (kpool*top_k->ne[0]), (int) kpool,
-        (const float *) score->data, score->nb[1]/sizeof(float), (const int32_t *) top_k->data, top_k->nb[1]/sizeof(int32_t),
-        (int) n_kv, (int) nt, (const half *) kq_mask->data, n_kv, (half *) out->data, n_kv);
+        (const int32_t *) s.sel_idx->data, s.sel_idx->nb[1]/sizeof(int32_t), (int) s.n_sel, (int) (s.kpool*s.top_k->ne[0]), (int) s.kpool,
+        (const float *) s.score->data, s.score->nb[1]/sizeof(float), (const int32_t *) s.top_k->data, s.top_k->nb[1]/sizeof(int32_t),
+        (int) s.n_kv, (int) s.nt, (const half *) s.kq_mask->data, s.n_kv, (half *) s.out->data, s.n_kv);
+    CUDA_CHECK(cudaGetLastError());
+    return n_ops - 1;
+}
+
+// The selection and the attention over it: the nodes of the selection, RESHAPE (the mask), FLASH_ATTN_EXT -> fn_qsa_attn
+int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    constexpr int n_sel_ops = FN_QSA_SEL_N_OPS;
+    constexpr int n_ops     = n_sel_ops + 2;
+    if (!fn_pattern_on(FN_PAT_QSA_ATTN) || cgraph->nodes[i]->op != GGML_OP_FILL || i + n_ops > cgraph->n_nodes ||
+        cgraph->nodes[i + n_ops - 1]->op != GGML_OP_FLASH_ATTN_EXT) {
+        return 0;
+    }
+    ggml_op ops[n_ops];
+    std::copy(fn_qsa_sel_ops, fn_qsa_sel_ops + n_sel_ops, ops);
+    ops[n_sel_ops]     = GGML_OP_RESHAPE;
+    ops[n_sel_ops + 1] = GGML_OP_FLASH_ATTN_EXT;
+    if (!fn_pattern_closed(cgraph, i, ops, n_ops)) {
+        fn_pattern_why("qsa_attn", cgraph, i, ops, n_ops);
+        return 0;
+    }
+    fn_qsa_sel_nodes s;
+    if (!fn_qsa_sel_wiring(cgraph, i, s)) {
+        return 0;
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * mask = n[n_sel_ops];
+    ggml_tensor *       out  = n[n_sel_ops + 1];
+    const ggml_tensor * q    = out->src[0];
+    const ggml_tensor * k    = out->src[1];
+    const ggml_tensor * v    = out->src[2];
+    const int64_t d      = FN_QSA_ATTN_D;
+    const int64_t n_head = q->ne[2];
+    auto row16 = [](const ggml_tensor * t, const size_t nb) {
+        return ((uintptr_t) t->data & 0xF) == 0 && nb % 16 == 0;
+    };
+    if (mask->src[0] != s.out || out->src[3] != mask || ggml_get_op_params_f32(out, 1) != 0.0f || ggml_get_op_params_f32(out, 2) != 0.0f ||
+        q->type != GGML_TYPE_F32 || q->ne[0] != d || q->ne[1] != s.nt || q->ne[3] != 1 || q->nb[0] != sizeof(float) ||
+        !row16(q, q->nb[1]) || q->nb[2] % 16 != 0 || n_head < 1 || s.nt > FN_MAX_T ||
+        k->type != GGML_TYPE_F16 || k->ne[0] != d || k->ne[1] != s.n_kv || k->ne[2] != 1 || k->nb[0] != sizeof(half) || !row16(k, k->nb[1]) ||
+        v->type != GGML_TYPE_F16 || v->ne[0] != d || v->ne[1] != s.n_kv || v->ne[2] != 1 || v->nb[0] != sizeof(half) || !row16(v, v->nb[1]) ||
+        out->type != GGML_TYPE_F32 || out->ne[0] != d || out->ne[1] != n_head || out->ne[2] != s.nt || !ggml_is_contiguous(out) ||
+        !fn_hc_aligned(out) || s.n_sel > FN_QSA_ATTN_MAX_SEL || s.n_kv < 1 || s.n_kv + s.n_sel >= ((int64_t) 1 << 24)) {
+        if (fn_debug()) {
+            fprintf(stderr, "fn-decline: qsa_attn at %d: shapes: q [%lld,%lld,%lld] k %s [%lld,%lld,%lld] nb1 %zu out [%lld,%lld,%lld] n_sel %lld n_kv %lld nt %lld\n", i,
+                    (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], ggml_type_name(k->type), (long long) k->ne[0],
+                    (long long) k->ne[1], (long long) k->ne[2], k->nb[1], (long long) out->ne[0], (long long) out->ne[1], (long long) out->ne[2],
+                    (long long) s.n_sel, (long long) s.n_kv, (long long) s.nt);
+        }
+        return 0;
+    }
+    // a block writes its output while other blocks still read: the output may share memory with the selection
+    // only (its buffers are free by then), which is then staged first
+    for (const ggml_tensor * x : { q->view_src != nullptr ? q->view_src : q, s.kq_mask }) {
+        if (fn_overlap(out, x)) {
+            fn_decline("qsa_attn: overlap", i);
+            return 0;
+        }
+    }
+    const bool stage = fn_overlap(out, s.sel_idx) || fn_overlap(out, s.score) || fn_overlap(out, s.top_k);
+    fn_qsa_attn_args a;
+    a.cells   = nullptr;
+    a.sel_idx = (const int32_t *) s.sel_idx->data;
+    a.score   = (const float *) s.score->data;
+    a.top_k   = (const int32_t *) s.top_k->data;
+    a.kq_mask = (const half *) s.kq_mask->data;
+    a.q       = (const float *) q->data;
+    a.K       = (const half *) k->data;
+    a.V       = (const half *) v->data;
+    a.out     = (float *) out->data;
+    a.s_sel   = (int) (s.sel_idx->nb[1]/sizeof(int32_t));
+    a.s_score = (int) (s.score->nb[1]/sizeof(float));
+    a.s_topk  = (int) (s.top_k->nb[1]/sizeof(int32_t));
+    a.s_kq    = (int) s.n_kv;
+    a.sq_t    = (int) (q->nb[1]/sizeof(float));
+    a.sq_h    = (int) (q->nb[2]/sizeof(float));
+    a.sk      = (int) (k->nb[1]/sizeof(half));
+    a.sv      = (int) (v->nb[1]/sizeof(half));
+    a.so_t    = (int) (out->nb[2]/sizeof(float));
+    a.so_h    = (int) (out->nb[1]/sizeof(float));
+    a.n_sel   = (int) s.n_sel;
+    a.n_top   = (int) (s.kpool*s.top_k->ne[0]);
+    a.kpool   = (int) s.kpool;
+    a.n_kv    = (int) s.n_kv;
+    a.scale   = ggml_get_op_params_f32(out, 0);
+    if (stage) {
+        if (ctx.fn_qsa_cells == nullptr) {
+            ggml_cuda_set_device(ctx.device);
+            CUDA_CHECK(cudaMalloc((void **) &ctx.fn_qsa_cells, (size_t) FN_MAX_T*FN_QSA_ATTN_MAX_SEL*sizeof(int32_t)));
+        }
+        fn_qsa_cells<<<1, 1024, 0, ctx.stream()>>>(a, (int) s.nt, ctx.fn_qsa_cells);
+        a.cells = ctx.fn_qsa_cells;
+    }
+    const int nw = std::max(2, (int) ((s.n_sel + WARP_SIZE - 1)/WARP_SIZE)); // 64 threads store the output
+    fn_qsa_attn<<<dim3((unsigned) n_head, (unsigned) s.nt, 1), nw*WARP_SIZE, 0, ctx.stream()>>>(a);
     CUDA_CHECK(cudaGetLastError());
     return n_ops - 1;
 }

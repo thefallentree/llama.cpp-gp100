@@ -768,6 +768,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (fn_moe_mem != nullptr) {
         cudaFree(fn_moe_mem);
     }
+    if (fn_qsa_cells != nullptr) {
+        cudaFree(fn_qsa_cells);
+    }
     for (void * mem : retired_mem) {
         cudaFree(mem);
     }
@@ -4116,6 +4119,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
     // the selection mask and the pooled keys of a QSA attention layer
     if (node->op == GGML_OP_FILL) {
+        const int n_attn = ggml_cuda_fn_qsa_attn(*cuda_ctx, cgraph, i);
+        if (n_attn > 0) {
+            return n_attn;
+        }
         const int n_sel = ggml_cuda_fn_qsa_sel(*cuda_ctx, cgraph, i);
         if (n_sel > 0) {
             return n_sel;
@@ -4387,7 +4394,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    // a decode window of a hot/cold layer: the routing, the expert positions and the publish as one kernel
+                    const bool route = node->op == GGML_OP_SOFT_MAX && clamp != nullptr && scale == nullptr && bias == nullptr &&
+                        ggml_cuda_moe_host_route(*cuda_ctx, cgraph, i + (int) ops.size(), logits, weights, ids, ggml_get_op_params_f32(clamp, 0));
+                    if (!route) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    }
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {

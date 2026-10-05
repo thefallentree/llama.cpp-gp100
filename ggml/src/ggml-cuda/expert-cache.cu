@@ -208,23 +208,42 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+// the row of the layer that the MUL_MAT_ID node computes with, or -1
+static int ec_row_of(ec_device & d, const ggml_tensor * node) {
+    if (d.n_layers.load(std::memory_order_acquire) == 0) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(d.mtx);
+    const char * w = (const char *) node->src[0]->data;
+    for (size_t i = 0; i < d.layers.size(); ++i) {
+        const ec_layer & l = d.layers[i];
+        if (!l.dead && (l.hot[0] == w || l.hot[1] == w || l.hot[2] == w)) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+bool ggml_cuda_expert_cache_take(ggml_backend_cuda_context & ctx, const ggml_tensor * node, const int32_t ** perm, uint32_t ** counts) {
+    const ggml_tensor * ids = node->src[2];
+    ec_device & d = g_ec[ctx.device];
+    const int row = ec_row_of(d, node);
+    if (row < 0 || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) {
+        return false;
+    }
+    ctx.ec_last_ids = ids;
+    *perm   = d.perm_dev + (size_t) row*EC_MAX_EXPERTS;
+    *counts = d.counts_dev + (size_t) row*EC_MAX_EXPERTS;
+    return true;
+}
+
 void ggml_cuda_expert_cache_remap(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
     const ggml_tensor * ids = node->src[2];
     ec_device & d = g_ec[ctx.device];
-    if (ctx.ec_last_ids == ids || d.n_layers.load(std::memory_order_acquire) == 0) {
+    if (ctx.ec_last_ids == ids) {
         return;
     }
-    int row = -1;
-    {
-        std::lock_guard<std::mutex> lock(d.mtx);
-        const char * w = (const char *) node->src[0]->data;
-        for (size_t i = 0; i < d.layers.size() && row < 0; ++i) {
-            const ec_layer & l = d.layers[i];
-            if (!l.dead && (l.hot[0] == w || l.hot[1] == w || l.hot[2] == w)) {
-                row = (int) i;
-            }
-        }
-    }
+    const int row = ec_row_of(d, node);
     if (row < 0) {
         return;
     }

@@ -160,8 +160,15 @@ int main(int argc, char ** argv) {
     const auto t_dec_start = ggml_time_us();
 
     int64_t t_tgt_us = 0, t_smpl_us = 0, n_tgt = 0, n_tgt_tok = 0;
+    // temporary: per-round trace (LLAMA_SPEC_TIMING=2): start, target window and accepted tokens of every round
+    const bool spec_trace = getenv("LLAMA_SPEC_TIMING") != nullptr && atoi(getenv("LLAMA_SPEC_TIMING")) >= 2;
+    std::vector<int64_t> trace_t0, trace_tgt;
+    std::vector<int>     trace_acc;
 
     while (true) {
+        if (spec_trace) {
+            trace_t0.push_back(ggml_time_us());
+        }
         // generate or reuse draft tokens
         //
         // this is the most important part of the speculation. the more probable tokens that are provided here
@@ -237,6 +244,9 @@ int main(int argc, char ** argv) {
                 llama_synchronize(ctx_tgt);
             }
             t_tgt_us += ggml_time_us() - t0;
+            if (spec_trace) {
+                trace_tgt.push_back(ggml_time_us() - t0);
+            }
             n_tgt++;
             n_tgt_tok += batch_tgt.size();
         }
@@ -305,6 +315,9 @@ int main(int argc, char ** argv) {
         n_past    += ids.size() - 1;
         n_drafted += n_draft; // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
+        if (spec_trace) {
+            trace_acc.push_back((int) ids.size());
+        }
         n_predict += ids.size();
 
         // process the accepted tokens and update contexts
@@ -362,6 +375,15 @@ int main(int argc, char ** argv) {
     if (getenv("LLAMA_SPEC_TIMING") != nullptr && n_tgt > 0) {
         LOG_INF("spec-timing: %d rounds, %.2f ms/round; target %.2f ms/window (%.2f tokens), sample+accept %.2f ms/round\n",
                 (int) n_tgt, (t_dec_end - t_dec_start)/1e3/n_tgt, t_tgt_us/1e3/n_tgt, (double) n_tgt_tok/n_tgt, t_smpl_us/1e3/n_tgt);
+    }
+
+    if (spec_trace) {
+        // round i: its length (to the start of the next round), its target window, tokens it produced; in 0.01 ms
+        fprintf(stderr, "spec-trace:");
+        for (size_t i = 0; i + 1 < trace_t0.size() && i < trace_tgt.size() && i < trace_acc.size(); ++i) {
+            fprintf(stderr, " %lld/%lld/%d", (long long) (trace_t0[i + 1] - trace_t0[i])/10, (long long) trace_tgt[i]/10, trace_acc[i]);
+        }
+        fprintf(stderr, "\n");
     }
 
     LOG_INF("\n");

@@ -52,6 +52,10 @@ void ggml_cuda_fn_dequantize(const ggml_tensor * src0, void * dst, ggml_type dst
 bool ggml_cuda_fn_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_fn_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// The logits of a router (the MUL_MAT node) are the node's data plus this, or null: where the router ran as two
+// segments of a launch, the second one's output is here until the next router runs.
+const float * ggml_cuda_fn_router_rest(ggml_backend_cuda_context & ctx, const ggml_tensor * logits);
+
 // n >= 2 consecutive MUL_MAT nodes from node i that read the same vector with planar weights of the same row width
 // are one launch (0: there is no such run); graph_optimize makes the MUL_MATs of a vector neighbours
 int  ggml_cuda_fn_mul_mat_run_match(const ggml_cgraph * cgraph, int i);
@@ -61,6 +65,12 @@ void ggml_cuda_fn_reorder(ggml_cgraph * cgraph);
 // the shared expert (shexp-fuse.cuh) on planar weights, up to FN_MAX_T tokens
 bool ggml_cuda_fn_shexp_supported(const ggml_cuda_shexp_args & args);
 void ggml_cuda_fn_shexp(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & args);
+
+// Its last five nodes from the GLU node i (SwiGLU, down, gate scalar, sigmoid, product), where gate and up were
+// computed before: ggml_cuda_fn_reorder moves them into the launch of the layer's router, which reads the same vector
+// (GGML_CUDA_FN_ROUTER=0: the router stays an F32 mat-vec of its own).
+bool ggml_cuda_fn_shexp_tail_match(const ggml_cgraph * cgraph, int i, ggml_cuda_shexp_args & args);
+void ggml_cuda_fn_shexp_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & args);
 
 // The output of a gated delta net layer before its projection, from node i: RMS_NORM, MUL (norm weights), RESHAPE,
 // UNARY (SiLU of the gate), MUL, RESHAPE as one kernel that also leaves the activations for the projection.

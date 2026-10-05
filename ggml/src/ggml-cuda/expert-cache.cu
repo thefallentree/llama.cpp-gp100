@@ -449,7 +449,7 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     if (d.owner != &ctx || d.frozen) {
         return;
     }
-    static const int   n_swaps_max = getenv("GGML_CUDA_EXPERT_CACHE_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_SWAPS")) : 16;
+    static const int   n_swaps_max = getenv("GGML_CUDA_EXPERT_CACHE_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_SWAPS")) : 128;
     static const float decay       = getenv("GGML_CUDA_EXPERT_CACHE_DECAY") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_DECAY")) : 0.98f;
 
     ggml_cuda_set_device(ctx.device);

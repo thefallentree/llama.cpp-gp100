@@ -218,7 +218,7 @@ static __global__ void mh_publish(
 // their clamped sum, as topk_moe_cuda does), a thread per pair then writes the expert's position (expert-cache.cuh)
 // and its weight, and the block goes on as mh_publish. logits, weights and ids may share memory.
 static __global__ void mh_route(
-        const float * logits, float * weights, int32_t * ids, const int si1, const int n_used, const int n_tokens,
+        const float * logits, const float * __restrict__ logits2, float * weights, int32_t * ids, const int si1, const int n_used, const int n_tokens,
         const float clamp_val, const int32_t * __restrict__ perm, uint32_t * counts, const int n_hot,
         const float * __restrict__ x, const int64_t sx_tok, const int n_embd,
         mh_mailbox * mb, uint32_t * dstate, const int slot) {
@@ -238,6 +238,12 @@ static __global__ void mh_route(
 #pragma unroll
         for (int q = 0; q < MH_ROUTE_EPT; ++q) {
             wt[q] = lg[lane + q*WARP_SIZE];
+        }
+        if (logits2 != nullptr) {
+#pragma unroll
+            for (int q = 0; q < MH_ROUTE_EPT; ++q) {
+                wt[q] += logits2[(int64_t) w*MH_ROUTE_EXPERTS + lane + q*WARP_SIZE];
+            }
         }
         float mx = wt[0];
 #pragma unroll
@@ -709,7 +715,8 @@ bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     uint32_t *      counts = nullptr;
     ggml_cuda_expert_cache_take(ctx, node, &perm, &counts);
     mh_route<<<1, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
-        (const float *) logits->data, (float *) weights->data, (int32_t *) ids->data, MH_ROUTE_EXPERTS, n_used, n_tokens, clamp_val,
+        (const float *) logits->data, ggml_cuda_fn_router_rest(ctx, logits), (float *) weights->data, (int32_t *) ids->data,
+        MH_ROUTE_EXPERTS, n_used, n_tokens, clamp_val,
         perm, counts, a.n_hot, (const float *) a.x->data, (int64_t) (a.x->nb[2]/sizeof(float)), a.n_embd,
         ctx.moe_host_mb, ctx.moe_host_dstate, a.slot);
     CUDA_CHECK(cudaGetLastError());

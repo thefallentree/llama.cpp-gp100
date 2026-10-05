@@ -2094,6 +2094,10 @@ struct ggml_backend_meta_context {
     comm_window_launch_t    comm_window_launch    = nullptr;
     comm_window_free_t      comm_window_free      = nullptr;
 
+    // optional: the backend puts what it holds back (staged inputs) on its stream, without waiting
+    using backend_flush_t = void (*)(ggml_backend_t backend);
+    backend_flush_t backend_flush = nullptr;
+
     struct window_entry {
         uint64_t uid       = 0;
         void *   window    = nullptr; // captured
@@ -2155,6 +2159,7 @@ struct ggml_backend_meta_context {
                 comm_window_end       = (comm_window_end_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_end");
                 comm_window_launch    = (comm_window_launch_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_launch");
                 comm_window_free      = (comm_window_free_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_window_free");
+                backend_flush         = (backend_flush_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_flush");
                 if (comm_window_begin == nullptr || comm_window_end == nullptr || comm_window_launch == nullptr || comm_window_free == nullptr) {
                     comm_window_supported = nullptr;
                 }
@@ -2353,6 +2358,11 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
+    // the devices work on what they hold while the first one is waited for
+    for (size_t i = 0; i < n_backends && backend_ctx->backend_flush != nullptr; i++) {
+        backend_ctx->backend_flush(ggml_backend_meta_simple_backend(backend, i));
+    }
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
@@ -3214,6 +3224,17 @@ static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, struct ggml
     }
 }
 
+static bool ggml_backend_meta_inputs_staged(ggml_backend_t backend) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, i);
+        if (simple->iface.inputs_staged == nullptr || !simple->iface.inputs_staged(simple)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -3231,6 +3252,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
+    /* .inputs_staged           = */ ggml_backend_meta_inputs_staged,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

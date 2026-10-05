@@ -15,8 +15,9 @@
 //     device): everything downstream keeps reading "position < n_hot is in VRAM, the others are host slots";
 //   - the same kernel counts the routed experts;
 //   - when the context's stream is synchronized (the window is done), the experts that were routed but cold take
-//     the VRAM slots of the experts with the lowest decayed use count: one kernel exchanges the slices over PCIe
-//     (the host slices are mapped), ordered on the stream before the next graph.
+//     the VRAM slots of the experts with the lowest decayed use count: a kernel pairs them from the counts, the host
+//     picks the best pairs, a kernel exchanges their slices over PCIe (the host slices are mapped) on a stream of
+//     its own, and the next graph waits for it.
 // The exchange is in place, in the model's weights: a layer is only changed by the context that registered it, and
 // no more once a second context uses it.
 //
@@ -43,6 +44,10 @@ bool ggml_cuda_expert_cache_take(ggml_backend_cuda_context & ctx, const ggml_ten
 
 // after the context's stream was synchronized
 void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx);
+
+// before the context's next graph is put on its stream (outside a capture): the stream waits for the exchanges
+// that the last update started
+void ggml_cuda_expert_cache_wait(ggml_backend_cuda_context & ctx);
 
 void ggml_cuda_expert_cache_context_free(ggml_backend_cuda_context & ctx);
 

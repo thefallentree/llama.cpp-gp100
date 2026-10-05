@@ -710,6 +710,19 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// temporary: the time from the last fused AllReduce of a window to its end
+static __global__ void k_fn_mark_end(unsigned long long * dbg, unsigned int * probe) {
+    const unsigned long long now = (unsigned long long) clock64();
+    if (probe != nullptr) {
+        probe[1] = (unsigned int) dbg[261];
+    }
+    if (dbg[4] != 0) {
+        dbg[256] += now - dbg[4];
+        dbg[257] += 1;
+    }
+    dbg[258] = now;
+}
+
 static __global__ void k_fn_clock(unsigned long long * out) {
     *out = (unsigned long long) clock64();
 }
@@ -726,8 +739,29 @@ unsigned long long * ggml_backend_cuda_context::fn_dbg_get() {
             return nullptr;
         }
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaMalloc((void **) &fn_dbg, 8*sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMemset(fn_dbg, 0, 8*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMalloc((void **) &fn_dbg, 264*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(fn_dbg, 0, 264*sizeof(unsigned long long)));
+        // temporary: the first context of device 0 gets the probe; a thread stamps the changes of its two words
+        static std::atomic<bool> probe_taken { false };
+        if (getenv("GGML_CUDA_FN_PROBE") != nullptr && device == atoi(getenv("GGML_CUDA_FN_PROBE")) - 1 && !probe_taken.exchange(true)) {
+            CUDA_CHECK(cudaHostAlloc((void **) &fn_probe, 64, cudaHostAllocMapped | cudaHostAllocPortable));
+            memset(fn_probe, 0, 64);
+            const volatile unsigned int * p = fn_probe;
+            std::thread([p] {
+                unsigned int last0 = 0, last1 = 0;
+                while (true) {
+                    const unsigned int v0 = p[0], v1 = p[1];
+                    if (v0 != last0) {
+                        last0 = v0;
+                        ggml_fn_probe_ns[0] = fn_prof_now();
+                    }
+                    if (v1 != last1) {
+                        last1 = v1;
+                        ggml_fn_probe_ns[1] = fn_prof_now();
+                    }
+                }
+            }).detach();
+        }
     }
     return fn_dbg;
 }
@@ -737,7 +771,7 @@ void ggml_backend_cuda_context::fn_dbg_report() {
         return;
     }
     ggml_cuda_set_device(device);
-    unsigned long long v[8], c0 = 0, c1 = 0;
+    unsigned long long v[264], c0 = 0, c1 = 0;
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(v, fn_dbg, sizeof(v), cudaMemcpyDeviceToHost));
     // ticks per microsecond
@@ -754,6 +788,19 @@ void ggml_backend_cuda_context::fn_dbg_report() {
     const double tpu = (double) (c1 - c0)/(double) (t1 - t0);
     fprintf(stderr, "fn-waits dev%d: %.1f ticks/us; collect: n %llu, mean wait %.1f us, total %.1f ms; allreduce: n %llu, mean wait %.1f us, total %.1f ms\n",
             device, tpu, v[1], v[1] ? v[0]/tpu/v[1] : 0.0, v[0]/tpu/1000.0, v[3], v[3] ? v[2]/tpu/v[3] : 0.0, v[2]/tpu/1000.0);
+    // the segments between the AllReduce sites of a window: mean us since the site before (temporary)
+    std::string seg;
+    for (int site = 1; site < 126; ++site) {
+        if (v[9 + 2*site] > 20) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), " %d:%.0f", site, v[8 + 2*site]/tpu/v[9 + 2*site]);
+            seg += buf;
+        }
+    }
+    if (!seg.empty()) {
+        fprintf(stderr, "fn-sites dev%d: start to site 0: %.0f us (n %llu); last site to the end of the window: %.0f us (n %llu); end to the next window's start: %.0f us (n %llu);%s\n", device,
+                v[9] ? v[8]/tpu/v[9] : 0.0, v[9], v[257] ? v[256]/tpu/v[257] : 0.0, v[257], v[260] ? v[259]/tpu/v[260] : 0.0, v[260], seg.c_str());
+    }
     CUDA_CHECK(cudaFree(fn_dbg));
     fn_dbg = nullptr;
 }
@@ -2919,10 +2966,14 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    FN_PROF_T(t_sy0);
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    FN_PROF_ADD("cuda.sync", t_sy0);
 
     // the graphs are done: the experts they routed to may take the VRAM slots of idle ones
+    FN_PROF_T(t_sy1);
     ggml_cuda_expert_cache_update(*cuda_ctx);
+    FN_PROF_ADD("cuda.sync.ec_update", t_sy1);
 
     GGML_UNUSED(backend);
 }
@@ -5423,6 +5474,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->ec_pending  = true;
     cuda_ctx->fn_moe_down = nullptr;
     cuda_ctx->fn_gdn_pre_conv = nullptr;
+    ggml_cuda_expert_cache_wait(*cuda_ctx); // no capture is open when an exchange is pending: it was started at a synchronize
     ggml_cuda_expert_cache_prepare(*cuda_ctx, cgraph);
     {
         // temporary: the nodes of the first graphs of device 0 (GGML_CUDA_FN_DUMP=<number of graphs>)
@@ -6950,6 +7002,7 @@ static void ggml_backend_cuda_comm_window_begin(void * comm_ctx_v, bool capture)
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
         cuda_ctx->window_active = true;
         cuda_ctx->fn_act_clear();
+        ggml_cuda_expert_cache_wait(*cuda_ctx);
 #ifdef USE_CUDA_GRAPH
         if (capture) {
             ggml_cuda_set_device(cuda_ctx->device);
@@ -6980,6 +7033,9 @@ static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
             ggml_cuda_set_device(cuda_ctx->device);
             cudaGraph_t     graph = nullptr;
             cudaGraphExec_t exec  = nullptr;
+            if (cuda_ctx->fn_dbg != nullptr) {
+                k_fn_mark_end<<<1, 1, 0, cuda_ctx->stream()>>>(cuda_ctx->fn_dbg, cuda_ctx->fn_probe); // temporary: the end of the window
+            }
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph));
             CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
             window->graphs.push_back(graph);
@@ -7025,7 +7081,23 @@ static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * windo
     static const bool threaded = getenv("GGML_CUDA_WINDOW_THREADS") == nullptr || atoi(getenv("GGML_CUDA_WINDOW_THREADS")) != 0;
     for (ggml_backend_t backend : comm_ctx->backends) {
         ((ggml_backend_cuda_context *) backend->context)->ec_pending = true;
+        ggml_cuda_expert_cache_wait(*(ggml_backend_cuda_context *) backend->context);
     }
+    bool probe = false;
+    for (ggml_backend_t backend : comm_ctx->backends) {
+        probe = probe || ((ggml_backend_cuda_context *) backend->context)->fn_probe != nullptr;
+    }
+    if (probe) {
+        ggml_fn_probe_ns[2] = fn_prof_now();
+    }
+    struct probe_end {
+        bool on;
+        ~probe_end() {
+            if (on) {
+                ggml_fn_probe_ns[3] = fn_prof_now();
+            }
+        }
+    } probe_end_guard { probe };
     if (threaded && comm_ctx->backends.size() == 2) {
         if (!comm_ctx->launcher) {
             comm_ctx->launcher = std::make_unique<ggml_backend_cuda_comm_context::window_launcher>();

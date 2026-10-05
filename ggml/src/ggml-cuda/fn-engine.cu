@@ -1756,8 +1756,20 @@ static __global__ void fn_ar_hc(
     }
     const uint4 u = make_uint4(q[0], q[1], q[2], 0);
     if (dbg != nullptr && i == 0 && t == 0) {
-        atomicAdd(dbg + 2, (unsigned long long) (clock64() - t_poll));
+        const long long now = clock64();
+        atomicAdd(dbg + 2, (unsigned long long) (now - t_poll));
         atomicAdd(dbg + 3, 1ull);
+        // the time since the site before this one: a segment of the window (temporary)
+        const unsigned long long prev = dbg[4];
+        dbg[4] = (unsigned long long) now;
+        // not the windows that the host paces (first executions, captures): they are ms per segment
+        if (site > 0 && site < 126 && prev != 0 && (unsigned long long) now - prev < 4000000ull) {
+            dbg[8 + 2*site] += (unsigned long long) now - prev;
+            dbg[9 + 2*site] += 1;
+        } else if (site == 0 && dbg[5] != 0 && (unsigned long long) now - dbg[5] < 4000000ull) {
+            dbg[8] += (unsigned long long) now - dbg[5]; // since the window's first kernel
+            dbg[9] += 1;
+        }
     }
 
     const float4 o4  = fn_ar_unpack(u);

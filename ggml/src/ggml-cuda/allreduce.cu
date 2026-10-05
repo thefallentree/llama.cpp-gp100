@@ -80,8 +80,28 @@ static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 // arguments cannot carry a call number. A device counts the windows it has started in its own memory (the epoch,
 // advanced by ggml_cuda_ar_window_tick at the top of each window) and a reduction's token is epoch * MAX_SITES + its
 // index in the window: both devices start the same windows and run the same reductions in the same order.
-static __global__ void ggml_cuda_ar_window_tick(unsigned int * epoch) {
+static __global__ void ggml_cuda_ar_window_tick(unsigned int * epoch, unsigned long long * dbg, unsigned int * probe) {
     *epoch = *epoch + 1;
+    if (probe != nullptr) {
+        probe[0] = *epoch;
+        dbg[261] = *epoch;
+    }
+    if (dbg != nullptr) {
+        // temporary: the time since the last fused AllReduce of the window before this one, and this window's start
+        const unsigned long long now = (unsigned long long) clock64();
+        if (dbg[4] != 0) {
+            dbg[6] += now - dbg[4];
+            dbg[7] += 1;
+        }
+        if (dbg[258] != 0) {
+            if (now - dbg[258] < 26000000ull) { // since the end of the window before; not the stalls of a rebuild (~20 ms)
+                dbg[259] += now - dbg[258];
+                dbg[260] += 1;
+            }
+            dbg[258] = 0;
+        }
+        dbg[5] = now;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,7 +1180,8 @@ void ggml_cuda_ar_window_begin(ggml_cuda_ar_pipeline * p, ggml_backend_t * backe
     for (int i = 0; i < p->n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
-        ggml_cuda_ar_window_tick<<<1, 1, 0, cuda_ctx->stream()>>>(p->win_epoch[i]);
+        unsigned long long * dbg = cuda_ctx->fn_dbg_get();
+        ggml_cuda_ar_window_tick<<<1, 1, 0, cuda_ctx->stream()>>>(p->win_epoch[i], dbg, dbg != nullptr ? cuda_ctx->fn_probe : nullptr);
         CUDA_CHECK(cudaGetLastError());
     }
 }

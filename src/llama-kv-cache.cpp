@@ -1291,15 +1291,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
-    // temporary switch (LLAMA_KV_PAD_GEOM=1): sizes that double, so that a long generation rebuilds its graph a few times, not every 256 tokens
-    static const bool geom = getenv("LLAMA_KV_PAD_GEOM") != nullptr && atoi(getenv("LLAMA_KV_PAD_GEOM")) != 0;
+    // temporary switch (LLAMA_KV_PAD_GEOM=N): sizes that double from N times the pad, so that a long generation rebuilds its graph a few times, not every 256 tokens
+    static const uint32_t geom = getenv("LLAMA_KV_PAD_GEOM") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_PAD_GEOM"))) : 0;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
         uint32_t n = std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur));
         if (geom) {
-            uint32_t g = n_pad_cur;
+            uint32_t g = n_pad_cur*geom;
             while (g < n) {
                 g *= 2;
             }

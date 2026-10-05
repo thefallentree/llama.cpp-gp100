@@ -1572,10 +1572,13 @@ struct ggml_backend_cuda_context {
     // graphs ran since the last update
     const ggml_tensor * ec_last_ids = nullptr;
     bool                ec_pending  = false;
+    cudaEvent_t         ec_event    = nullptr; // the end of the last exchange, on its own stream
+    bool                ec_wait     = false;   // the next graph has to wait for it
 
     // temporary (GGML_CUDA_FN_WAITS=1): device counters of the waits inside kernels, in clock64() ticks:
     // [0] host-tier collect wait, [1] collects, [2] AllReduce wait, [3] AllReduces
     unsigned long long * fn_dbg = nullptr;
+    unsigned int *       fn_probe = nullptr; // mapped host memory that a window's first and last kernel write (temporary)
     unsigned long long * fn_dbg_get();
     void                 fn_dbg_report();
 

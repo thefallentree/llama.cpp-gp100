@@ -2211,6 +2211,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+        FN_PROF_T(t_x0);
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -2231,6 +2232,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        FN_PROF_ADD("extract.logits", t_x0);
+        FN_PROF_T(t_x1);
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_active(), t_embd);
@@ -2291,8 +2294,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        FN_PROF_ADD("extract.embd", t_x1);
+        FN_PROF_T(t_x2);
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
         bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        FN_PROF_ADD("extract.layer_inputs", t_x2);
+        FN_PROF_T(t_x3);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2321,6 +2328,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
         }
 
+        FN_PROF_ADD("extract.h_nextn", t_x3);
+        FN_PROF_T(t_x4);
         if (has_samplers) {
             const auto stride = n_vocab;
 
@@ -2331,9 +2340,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched_active(), &sampling.candidates_count);
         }
 
+        FN_PROF_ADD("extract.sampled", t_x4);
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
         FN_PROF_ADD("decode.extract", t_d5);
+        if (g_fn_prof.on && ggml_fn_prof_tag == 0 && ubatch.n_tokens == 3 && ggml_fn_probe_ns[2] > t_d4 && ggml_fn_probe_ns[0] > ggml_fn_probe_ns[2] &&
+            ggml_fn_probe_ns[1] > ggml_fn_probe_ns[0]) {
+            // temporary (GGML_CUDA_FN_PROBE=1): where a decode window's wall time goes around the device's own
+            g_fn_prof.add("probe.decode_start..launch",   ggml_fn_probe_ns[2] - t_d0);
+            g_fn_prof.add("probe.launch..gpu_start",      ggml_fn_probe_ns[0] - ggml_fn_probe_ns[2]);
+            g_fn_prof.add("probe.launch_call",            ggml_fn_probe_ns[3] - ggml_fn_probe_ns[2]);
+            g_fn_prof.add("probe.gpu_start..gpu_end",     ggml_fn_probe_ns[1] - ggml_fn_probe_ns[0]);
+            g_fn_prof.add("probe.gpu_end..extract_end",   fn_prof_now() - ggml_fn_probe_ns[1]);
+        }
     } while (mctx->next());
     FN_PROF_T(t_d6);
 

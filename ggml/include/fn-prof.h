@@ -15,8 +15,10 @@ extern "C" {
 // 0: target context, 1: draft/MTP context (set by llama_context::decode)
 #if defined(_WIN32)
 extern int ggml_fn_prof_tag;
+extern int64_t ggml_fn_probe_ns[4];
 #else
 extern __attribute__((visibility("default"))) int ggml_fn_prof_tag;
+extern __attribute__((visibility("default"))) int64_t ggml_fn_probe_ns[4];
 #endif
 #ifdef __cplusplus
 }

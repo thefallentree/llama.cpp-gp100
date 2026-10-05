@@ -385,9 +385,9 @@ namespace {
 // The last padded pool is always unused.
 uint32_t kpool_pad(uint32_t n_pool) {
     // temporary switch, see llama_kv_cache::get_n_kv
-    static const bool geom = getenv("LLAMA_KV_PAD_GEOM") != nullptr && atoi(getenv("LLAMA_KV_PAD_GEOM")) != 0;
+    static const uint32_t geom = getenv("LLAMA_KV_PAD_GEOM") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_PAD_GEOM"))) : 0;
     if (geom) {
-        uint32_t g = 64;
+        uint32_t g = 64*geom;
         while (g < n_pool + 1) {
             g *= 2;
         }

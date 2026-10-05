@@ -526,6 +526,9 @@ const char * ggml_commit(void) {
 
 
 int ggml_fn_prof_tag = 0; // temporary profiling tag (fn-prof.h)
+// temporary probe of a decode window on the first device (GGML_CUDA_FN_PROBE=1), host times in ns:
+// [0] its first kernel was seen, [1] its last kernel was seen, [2] the launch call began, [3] the launch call returned
+int64_t ggml_fn_probe_ns[4] = { 0, 0, 0, 0 };
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 static int64_t timer_freq, timer_start;

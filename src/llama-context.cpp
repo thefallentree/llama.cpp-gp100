@@ -1602,7 +1602,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        FN_PROF_T(t_bg);
         gf = model.build_graph(gparams);
+        FN_PROF_ADD("pu.build_graph", t_bg);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1612,18 +1614,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        FN_PROF_T(t_al);
         bool allocated = ggml_backend_sched_alloc_graph(sch, gf);
+        FN_PROF_ADD(allocated ? "pu.alloc(ok)" : "pu.alloc(fail)", t_al);
 
         if (!allocated && use_slot) {
             // the slot's compute buffers are not large enough for this graph yet (first use or a larger shape):
             // reserve them for this graph and try again
             ggml_backend_sched_reset(sch);
 
-            if (ggml_backend_sched_reserve(sch, gf)) {
+            FN_PROF_T(t_rs);
+            const bool reserved = ggml_backend_sched_reserve(sch, gf);
+            FN_PROF_ADD("pu.reserve", t_rs);
+            if (reserved) {
                 ggml_backend_sched_reset(sch);
                 ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
 
+                FN_PROF_T(t_al2);
                 allocated = ggml_backend_sched_alloc_graph(sch, gf);
+                FN_PROF_ADD("pu.alloc(2)", t_al2);
             }
 
             if (!allocated) {

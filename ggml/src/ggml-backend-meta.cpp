@@ -19,6 +19,7 @@ FN_PROF_DECL("meta");
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -449,7 +450,7 @@ struct ggml_backend_meta_simple_tensor_container {
     ggml_init_params params = {};
     std::vector<ggml_context_ptr> ctxs;      // current context per simple buffer
     std::vector<ggml_context_ptr> ctxs_full; // exhausted contexts, kept alive until the next reset
-    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) : params(params) {
         ctxs.reserve(n_simple);
@@ -501,7 +502,13 @@ struct ggml_backend_meta_buffer_context {
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+    struct split_state_key_hash {
+        size_t operator()(const std::pair<const ggml_tensor *, bool> & key) const {
+            return std::hash<const ggml_tensor *>()(key.first) ^ (size_t) key.second;
+        }
+    };
+    // hashed: a graph asks ten thousand times, and the nodes of a tree this large are a cache miss per level
+    std::unordered_map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>, split_state_key_hash> split_state_cache;
 
     int debug;
 
@@ -1290,8 +1297,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
-        memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+        const ggml_backend_meta_split_state calculated = calculate_split_state();
+        auto & entry = buf_ctx->split_state_cache[key];
+        entry.first = calculated;
+        memcpy(entry.second, tensor, sizeof(entry.second));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1327,7 +1336,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
     }
 
-    ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
+    if (it == buf_ctx->split_state_cache.end()) {
+        it = buf_ctx->split_state_cache.find(key);
+    }
+    ggml_backend_meta_split_state ret = it->second.first;
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
@@ -2086,6 +2098,9 @@ struct ggml_backend_meta_context {
     };
     static constexpr size_t   max_windows = 8;
     std::vector<window_entry> windows;
+    // nodes and leafs of the graphs that were captured: a graph of the same shape (the same graph with larger caches,
+    // or with another number of tokens) has nothing left to set up, its first compute can be the capture
+    std::vector<std::pair<int, int>> window_shapes;
     uint64_t                  window_clock    = 0;
     size_t                    max_partial_cur = 0; // largest reduced tensor of the graph built last
 
@@ -2364,6 +2379,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    FN_PROF_T(t_gc_enter);
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
     static const int meta_debug = getenv("GGML_META_DEBUG") ? atoi(getenv("GGML_META_DEBUG")) : 0;
@@ -3019,6 +3035,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    if (needs_rebuild) { FN_PROF_ADD("meta.rebuild", t_gc_enter); }
     // Open a window for this graph: its first compute runs as submitted (memory pools grow, weights are repacked),
     // the second one is captured.
     bool window_capture = false;
@@ -3026,7 +3043,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if (win == nullptr) {
             ggml_backend_meta_context::window_entry entry;
             entry.uid       = cgraph->uid;
+            FN_PROF_T(t_sup);
             entry.supported = backend_ctx->comm_window_supported(backend_ctx->comm_ctx, cgraph, backend_ctx->max_partial_cur);
+            FN_PROF_ADD("meta.window_supported", t_sup);
             entry.last_use  = ++backend_ctx->window_clock;
             if (backend_ctx->windows.size() < backend_ctx->max_windows) {
                 backend_ctx->windows.push_back(entry);
@@ -3039,7 +3058,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
                 if (win->window != nullptr) {
+                    FN_PROF_T(t_free);
                     backend_ctx->comm_window_free(backend_ctx->comm_ctx, win->window);
+                    FN_PROF_ADD("meta.window_free", t_free);
                 }
                 *win = entry;
             }
@@ -3048,8 +3069,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             win = nullptr;
         }
     }
+    const std::pair<int, int> window_shape = { cgraph->n_nodes, cgraph->n_leafs };
+    if (meta_debug >= 1 && win != nullptr && win->n_compute == 0) {
+        GGML_LOG_WARN("meta-debug: new window: %d nodes, %d leafs, %zu windows, shape known %d\n", cgraph->n_nodes, cgraph->n_leafs, backend_ctx->windows.size(),
+            (int) (std::find(backend_ctx->window_shapes.begin(), backend_ctx->window_shapes.end(), window_shape) != backend_ctx->window_shapes.end()));
+    }
     if (win != nullptr) {
-        window_capture = win->n_compute >= 1;
+        static const bool capture_first = getenv("GGML_META_WINDOW_CAPTURE_FIRST") == nullptr || atoi(getenv("GGML_META_WINDOW_CAPTURE_FIRST")) != 0;
+        window_capture = win->n_compute >= 1 || (capture_first &&
+            std::find(backend_ctx->window_shapes.begin(), backend_ctx->window_shapes.end(), window_shape) != backend_ctx->window_shapes.end());
         backend_ctx->comm_window_begin(backend_ctx->comm_ctx, window_capture);
     }
 
@@ -3157,6 +3185,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         win->n_compute++;
         if (window_capture) {
             win->window = window;
+            if (std::find(backend_ctx->window_shapes.begin(), backend_ctx->window_shapes.end(), window_shape) == backend_ctx->window_shapes.end()) {
+                backend_ctx->window_shapes.push_back(window_shape);
+            }
             backend_ctx->comm_window_launch(backend_ctx->comm_ctx, window);
         }
     }

@@ -777,6 +777,22 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t n_pool_max = idx->get_size() / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+
+    // temporary (LLAMA_KPOOL_DEBUG=1): when the sizes of the graph change
+    static const bool debug = getenv("LLAMA_KPOOL_DEBUG") != nullptr;
+    if (debug) {
+        static uint32_t last_kv[2] = {}, last_pad[2] = {};
+        static const void * who[2] = {};
+        const int w = who[0] == mem || who[0] == nullptr ? 0 : 1;
+        who[w] = mem;
+        const uint32_t n_kv = get_idx()->get_n_kv(), pad = kpool_pad(st.n_pool_real);
+        if (n_kv != last_kv[w] || pad != last_pad[w]) {
+            fprintf(stderr, "\nkpool-sizes: mem %d n_tokens %u n_kv %u -> %u, n_pool_real %u pad %u -> %u, n_new %u\n", w, ubatch.n_tokens,
+                    last_kv[w], n_kv, st.n_pool_real, last_pad[w], pad, st.n_new);
+            last_kv[w]  = n_kv;
+            last_pad[w] = pad;
+        }
+    }
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {

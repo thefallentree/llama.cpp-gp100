@@ -1277,7 +1277,9 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        uint32_t n = std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur));
+        // with one cell to spare the size changes in the same decode as the pool count of the indexer
+        // (llama-memory-hybrid-idx.cpp, kpool_pad): one new graph instead of two
+        uint32_t n = std::max(n_pad_cur, GGML_PAD(cells.used_max_p1() + (geom ? 1 : 0), n_pad_cur));
         if (geom) {
             uint32_t g = n_pad_cur*geom;
             while (g < n) {

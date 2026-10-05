@@ -7010,8 +7010,12 @@ static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
             if (cuda_ctx->fn_dbg != nullptr) {
                 k_fn_mark_end<<<1, 1, 0, cuda_ctx->stream()>>>(cuda_ctx->fn_dbg, cuda_ctx->fn_probe); // temporary: the end of the window
             }
+            FN_PROF_T(t_ec);
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph));
+            FN_PROF_ADD("window.end_capture", t_ec);
+            FN_PROF_T(t_in);
             CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
+            FN_PROF_ADD("window.instantiate", t_in);
             window->graphs.push_back(graph);
             window->execs.push_back(exec);
 

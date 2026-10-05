@@ -129,6 +129,40 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+// Rows of a few elements: a thread per row. The kernels above give every row a block, which for the 524K one-element
+// rows of an indexer selection over a 1024-token batch is 524K blocks (11 ms on a P100).
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_narrow(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int ne00, const uint32_t ne10, const uint32_t ne12, const uint32_t n_rows,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    const src0_t  * GGML_CUDA_RESTRICT src0 = src0_ptr;
+    const int32_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    ggml_cuda_pdl_sync();
+    const uint32_t i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_rows) {
+        return;
+    }
+    const uint32_t i10 = i % ne10;
+    const uint32_t z   = i / ne10;
+    const uint32_t i11 = z / ne12;
+    const uint32_t i12 = z % ne12;
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+    dst_t * GGML_CUDA_RESTRICT dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+    const src0_t * GGML_CUDA_RESTRICT src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+
+    for (int i00 = 0; i00 < ne00; ++i00) {
+        dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -253,6 +287,19 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    const int64_t n_rows = ne10*ne11*ne12;
+    if (ne00 <= 16 && n_rows >= CUDA_GET_ROWS_BLOCK_SIZE && n_rows < (int64_t) 1 << 31) {
+        const dim3 block_nums((n_rows + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_float_narrow<src0_t, dst_t>, launch_params,
+            src0_d, src1_d, dst_d,
+            (int) ne00, (uint32_t) ne10, (uint32_t) ne12, (uint32_t) n_rows,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);

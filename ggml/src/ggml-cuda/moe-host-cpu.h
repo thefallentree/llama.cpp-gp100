@@ -87,7 +87,8 @@ struct mh_slot_desc {
 };
 
 bool mh_cpu_supported();
-// Starts the workers on first call; later calls only attach the context's mailbox.
-void mh_pool_attach(int index, mh_mailbox * mb);
+// Starts the workers on first call; later calls only attach the context's mailbox (index: 0, 1, ... in the order of
+// the calls). n_devices: how many devices compute a layer together; each gets a pool of its own.
+void mh_pool_attach(int index, mh_mailbox * mb, int n_devices);
 // Returns the slot id of the layer (registered once, looked up by its down tensor afterwards).
 int  mh_pool_register(const mh_slot_desc & d);

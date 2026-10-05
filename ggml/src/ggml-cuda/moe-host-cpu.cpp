@@ -20,6 +20,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #define MH_X86 1
@@ -218,6 +223,24 @@ static inline void mh_prefetch(const void * p) {
 #endif
 }
 
+#if MH_X86
+// A core leaves the frequency license of wide vector multiplies about 2 ms after the last one, and the next ones then
+// run throttled for up to half a millisecond: longer than a job. The spinning threads keep the license with these.
+__attribute__((target("avx512f")))
+static void keep_warm_avx512() {
+    static thread_local float v = 1.0f;
+    const __m512 a = _mm512_set1_ps(v);
+    v = _mm512_cvtss_f32(_mm512_fmadd_ps(a, _mm512_set1_ps(0.999f), _mm512_set1_ps(0.001f)));
+}
+
+__attribute__((target("avx2,fma")))
+static void keep_warm_avx2() {
+    static thread_local float v = 1.0f;
+    const __m256 a = _mm256_set1_ps(v);
+    v = _mm256_cvtss_f32(_mm256_fmadd_ps(a, _mm256_set1_ps(0.999f), _mm256_set1_ps(0.001f)));
+}
+#endif
+
 typedef void (*dot2_fn)(const q2_block *, const q2_block *, const act_block *, int, float *, float *);
 typedef void (*quant_fn)(const float *, int, act_block *);
 
@@ -252,20 +275,67 @@ struct group {
     int first;              // its pairs: pair_of[first .. first + n), tok_of[...]
 };
 
+// the layers, shared by the pools
+struct slot_table {
+    std::mutex       mtx;
+    std::atomic<int> n { 0 };
+    mh_slot_desc     tab[1024];
+};
+
+slot_table g_slots;
+
+// The CPUs this process may run on, one per physical core first (hyperthreads of cores already listed last).
+std::vector<int> cpu_list() {
+    std::vector<int> first, rest;
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+        return first;
+    }
+    std::vector<std::pair<int, int>> seen; // (package, core)
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &set)) {
+            continue;
+        }
+        int ids[2] = { -1, -1 };
+        const char * files[2] = { "physical_package_id", "core_id" };
+        for (int k = 0; k < 2; ++k) {
+            char path[128];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/%s", c, files[k]);
+            if (FILE * f = fopen(path, "r")) {
+                if (fscanf(f, "%d", &ids[k]) != 1) {
+                    ids[k] = -1;
+                }
+                fclose(f);
+            }
+        }
+        const std::pair<int, int> key(ids[0], ids[1]);
+        if (ids[1] >= 0 && std::find(seen.begin(), seen.end(), key) != seen.end()) {
+            rest.push_back(c);
+        } else {
+            seen.push_back(key);
+            first.push_back(c);
+        }
+    }
+#endif
+    first.insert(first.end(), rest.begin(), rest.end());
+    return first;
+}
+
 struct pool {
     int          n_threads = 0;
+    int          id        = 0;
     dot2_fn      dot2  = nullptr;
     quant_fn     quant = nullptr;
     const char * isa   = nullptr;
+    void (*keep_warm)() = nullptr; // called by the spinning threads
+    bool spin_pause = true;
 
     std::vector<std::thread> threads;
     mh_mailbox * mb[MH_MAX_DEVICES] = {};
     uint32_t     seen[MH_MAX_DEVICES] = {};
     std::atomic<int> n_mb { 0 };
-
-    std::mutex                slots_mtx;
-    std::atomic<int>          n_slots { 0 };
-    mh_slot_desc              slot_tab[1024];
 
     // the current job, written by the leader before job_gen is bumped
     const mh_slot_desc * js = nullptr;
@@ -310,16 +380,43 @@ struct pool {
     // phase 1: gate/up in chunks of CH1 rows (small, so that the threads finish together); the thread that completes
     // a block of 64 rows of h = silu(gate) * up quantizes it, so phase 3 reads ready activations.
     // phase 3: down in chunks of CH3 rows.
-    static constexpr int CH1 = 16;
-    static constexpr int CH3 = 32;
+    int CH1 = 16;
+    int CH3 = 160;
+    int pf_rows = 0; // gate/up: prefetch this many rows ahead (down: 16 times as many); measured: no gain
+
+#ifdef MH_TRACE
+    // per-thread timeline of a job, relative to its start: when the thread saw the job, its time in gate/up chunks,
+    // waiting for an expert's activations, in down chunks, and when it reached the barrier
+    struct trace { double seen = 0, p1 = 0, wait = 0, p3 = 0, end = 0; long n = 0; };
+    static constexpr int MAX_TR = 64;
+    trace            tr[MAX_TR];
+    std::atomic<int> tr_ids { 0 };
+    std::atomic<int64_t> t_job_ns { 0 };
+    static int64_t tns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    int tr_id() { static thread_local int id = -1; static thread_local pool * owner = nullptr; if (owner != this) { owner = this; id = tr_ids.fetch_add(1) % MAX_TR; } return id; }
+    void tr_print() {
+        for (int i = 0; i < std::min(MAX_TR, tr_ids.load()); ++i) {
+            const trace & t = tr[i];
+            if (t.n > 0) {
+                fprintf(stderr, "trace pool %d thread %2d: %ld jobs, saw the job at %6.1f us, gate/up %6.1f us, waiting %6.1f us, down %6.1f us, at the barrier at %6.1f us\n",
+                        id, i, t.n, t.seen/t.n/1e3, t.p1/t.n/1e3, t.wait/t.n/1e3, t.p3/t.n/1e3, t.end/t.n/1e3);
+            }
+        }
+    }
+#define MH_TR(x) x
+#else
+#define MH_TR(x)
+#endif
 
     void work() {
         const mh_slot_desc & s = *js;
+        MH_TR(trace & T = tr[tr_id()]; const int64_t t_job = t_job_ns.load(); int64_t t_prev = tns(); T.seen += t_prev - t_job; T.n++;)
         const int nb_e = s.n_embd/QK;
         const int nb_f = s.n_ff/QK;
         const int rb1  = s.n_ff/CH1;
         const int n1   = n_groups*rb1;
-        const int rb3  = s.n_embd/CH3;
+        const int ch3  = s.n_embd % CH3 == 0 ? CH3 : 32;
+        const int rb3  = s.n_embd/ch3;
         const int n3   = n_groups*rb3;
         // one queue: the gate/up chunks of all experts, then their down chunks. A down chunk waits for its own
         // expert's activations only, so the threads that finish early start on the down projections of the experts
@@ -333,15 +430,29 @@ struct pool {
                 const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
                 const int * gp = pair_of.data() + g.first;
                 const int * gt = tok_of.data()  + g.first;
-                for (int r = r0; r < r0 + CH1; ++r) {
-                    const q2_block * wg = (const q2_block *) (gate + (size_t) r*s.gate_nb1);
-                    const q2_block * wu = (const q2_block *) (up   + (size_t) r*s.up_nb1);
-                    for (int i = 0; i < g.n; ++i) {
+                // the rows of a chunk are collected here: neighbouring chunks of h are other threads' and share its cache lines
+                float hl[64];
+                for (int i = 0; i < g.n; ++i) {
+                    const act_block * xq = jxq + (size_t) gt[i]*nb_e;
+                    for (int r = r0; r < r0 + CH1; ++r) {
+                        const q2_block * wg = (const q2_block *) (gate + (size_t) r*s.gate_nb1);
+                        const q2_block * wu = (const q2_block *) (up   + (size_t) r*s.up_nb1);
+                        if (i == 0 && pf_rows > 0 && r + pf_rows < r0 + CH1) {
+                            // the rows are in memory that no cache holds, and 4 KB pages stop the hardware prefetchers
+                            const char * pg = (const char *) wg + (size_t) pf_rows*s.gate_nb1;
+                            const char * pu = (const char *) wu + (size_t) pf_rows*s.up_nb1;
+                            for (size_t o = 0; o < s.gate_nb1; o += 64) {
+                                mh_prefetch(pg + o);
+                                mh_prefetch(pu + o);
+                            }
+                        }
                         float vg, vu;
-                        dot2(wg, wu, jxq + (size_t) gt[i]*nb_e, nb_e, &vg, &vu);
-                        h[(size_t) gp[i]*s.n_ff + r] = vg/(1.0f + expf(-vg))*vu;
+                        dot2(wg, wu, xq, nb_e, &vg, &vu);
+                        hl[r - r0] = vg/(1.0f + expf(-vg))*vu;
                     }
+                    memcpy(h.data() + (size_t) gp[i]*s.n_ff + r0, hl, CH1*sizeof(float));
                 }
+                MH_TR({ const int64_t t = tns(); T.p1 += t - t_prev; t_prev = t; })
                 const int kb = r0/QK;
                 if (blk_cnt[(size_t) gi*nb_f + kb].fetch_add(1, std::memory_order_acq_rel) == QK/CH1 - 1) {
                     for (int i = 0; i < g.n; ++i) {
@@ -349,23 +460,34 @@ struct pool {
                         quant(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hq.data() + (size_t) p*nb_f + kb);
                     }
                     grp_ready[gi].fetch_add(1, std::memory_order_release);
+                    if (stat_every > 0 && p1_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        t_p1_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                    }
                 }
                 continue;
             }
             const int       c3 = c - n1;
             const int       gi = c3/rb3;
             const group &   g  = groups[gi];
-            const int       r0 = (c3 % rb3)*CH3;
+            const int       r0 = (c3 % rb3)*ch3;
             const uint8_t * down = s.down + (size_t) g.c*s.down_nb2;
+            MH_TR({ const int64_t t = tns(); T.p1 += t - t_prev; t_prev = t; })
             while (grp_ready[gi].load(std::memory_order_acquire) < nb_f) {
 #if MH_X86
                 _mm_pause();
 #endif
             }
+            MH_TR({ const int64_t t = tns(); T.wait += t - t_prev; t_prev = t; })
             const int * gp = pair_of.data() + g.first;
-            for (int r = r0; r < r0 + CH3; r += 2) {
+            for (int r = r0; r < r0 + ch3; r += 2) {
                 const q2_block * w0 = (const q2_block *) (down + (size_t) (r + 0)*s.down_nb1);
                 const q2_block * w1 = (const q2_block *) (down + (size_t) (r + 1)*s.down_nb1);
+                if (pf_rows > 0) {
+                    const char * pd = (const char *) w0 + (size_t) 16*pf_rows*s.down_nb1;
+                    for (size_t o = 0; o < 2*s.down_nb1; o += 64) {
+                        mh_prefetch(pd + o);
+                    }
+                }
                 for (int i = 0; i < g.n; ++i) {
                     const int p = gp[i];
                     float v0, v1;
@@ -375,7 +497,9 @@ struct pool {
                     y[r + 1] = v1;
                 }
             }
+            MH_TR({ const int64_t t = tns(); T.p3 += t - t_prev; t_prev = t; })
         }
+        MH_TR(T.end += tns() - t_job;)
     }
 
     void helper() {
@@ -390,8 +514,13 @@ struct pool {
                     });
                 } else {
 #if MH_X86
-                    _mm_pause();
+                    if (spin_pause) {
+                        _mm_pause();
+                    }
 #endif
+                    if (keep_warm != nullptr) {
+                        keep_warm();
+                    }
                 }
                 continue;
             }
@@ -403,17 +532,19 @@ struct pool {
 
     // GGML_CUDA_MOE_HOST_STATS=N: every N jobs, print the mean job time, cold pairs and distinct experts per job
     int64_t stat_every = 0, stat_jobs = 0, stat_pairs = 0, stat_groups = 0;
-    double  stat_us = 0.0, stat_quant_us = 0.0;
+    double  stat_us = 0.0, stat_quant_us = 0.0, stat_p1_us = 0.0, stat_work_us = 0.0;
+    std::atomic<int>     p1_left { 0 };
+    std::atomic<int64_t> t_p1_ns { 0 };
 
     void run_job(mh_mailbox * m) {
         const auto t_start = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_acquire);
         const int slot = m->slot;
-        if (slot < 0 || slot >= n_slots.load(std::memory_order_acquire)) {
+        if (slot < 0 || slot >= g_slots.n.load(std::memory_order_acquire)) {
             GGML_LOG_ERROR("%s: bad slot %d\n", __func__, slot);
             return;
         }
-        js = &slot_tab[slot];
+        js = &g_slots.tab[slot];
         jm = m;
         const int n_used  = m->n_used;
         const int n_pairs = std::min<int>(m->n_pairs, m->cap_pairs);
@@ -469,23 +600,28 @@ struct pool {
         jxq = mh_xq(m);
         jy  = mh_y(m);
         const auto t_quant = std::chrono::steady_clock::now();
+        p1_left.store(n_groups*nb_f, std::memory_order_relaxed);
+        MH_TR(t_job_ns.store(tns());)
         chunk1.store(0, std::memory_order_relaxed);
         job_gen.fetch_add(1, std::memory_order_acq_rel);
         work();
+        const auto t_work = std::chrono::steady_clock::now();
         barrier();
         std::atomic_thread_fence(std::memory_order_release);
         if (stat_every > 0) {
             const auto t_end = std::chrono::steady_clock::now();
             stat_us       += std::chrono::duration<double, std::micro>(t_end - t_start).count();
             stat_quant_us += std::chrono::duration<double, std::micro>(t_quant - t_start).count();
+            stat_work_us  += std::chrono::duration<double, std::micro>(t_work - t_start).count();
+            stat_p1_us    += (t_p1_ns.load() - std::chrono::duration_cast<std::chrono::nanoseconds>(t_start.time_since_epoch()).count())/1e3;
             stat_pairs    += n_pairs;
             stat_groups   += n_groups;
             if (++stat_jobs == stat_every) {
-                fprintf(stderr, "moe-host: %lld jobs: %.1f us/job (setup %.1f us), %.2f cold pairs, %.2f experts per job\n",
-                              (long long) stat_jobs, stat_us/stat_jobs, stat_quant_us/stat_jobs,
+                fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs, %.2f experts per job\n",
+                              id, (long long) stat_jobs, stat_us/stat_jobs, stat_quant_us/stat_jobs, stat_p1_us/stat_jobs, stat_work_us/stat_jobs,
                               (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs);
                 stat_jobs = stat_pairs = stat_groups = 0;
-                stat_us = stat_quant_us = 0.0;
+                stat_us = stat_quant_us = stat_p1_us = stat_work_us = 0.0;
             }
         }
     }
@@ -525,8 +661,13 @@ struct pool {
                     hot.store(false);
                 }
 #if MH_X86
-                _mm_pause();
+                if (spin_pause) {
+                    _mm_pause();
+                }
 #endif
+                if (keep_warm != nullptr) {
+                    keep_warm();
+                }
             } else {
                 // idle: nap, so an idle server does not burn a core; the first layer after it waits for the nap
                 nap_us = std::min(nap_us + 10, 200);
@@ -535,21 +676,57 @@ struct pool {
         }
     }
 
-    void start() {
+    // n_pools pools share the threads: pool i serves the mailboxes i, i + n_pools, ...
+    void start(const int pool_id, const int n_pools) {
+        id = pool_id;
         pick_kernels(dot2, quant, isa);
         stat_every = getenv("GGML_CUDA_MOE_HOST_STATS") ? atoll(getenv("GGML_CUDA_MOE_HOST_STATS")) : 0;
         const char * env = getenv("GGML_CUDA_MOE_HOST_THREADS");
         const int hw = (int) std::thread::hardware_concurrency();
-        n_threads = env != nullptr ? atoi(env) : std::max(1, std::min(16, hw - 4));
-        n_threads = std::max(1, n_threads);
+        const int total = env != nullptr ? atoi(env) : std::max(1, std::min(16, hw - 4));
+        n_threads = std::max(1, total/n_pools);
+        if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH1")) {
+            const int v = atoi(e);
+            if (v == 4 || v == 8 || v == 16 || v == 32 || v == 64) {
+                CH1 = v;
+            }
+        }
+        if (const char * e = getenv("GGML_CUDA_MOE_HOST_PREFETCH")) {
+            pf_rows = std::max(0, atoi(e));
+        }
+        if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH3")) {
+            const int v = atoi(e);
+            if (v >= 2 && v % 2 == 0) {
+                CH3 = v;
+            }
+        }
+        spin_pause = getenv("GGML_CUDA_MOE_HOST_SPIN_PAUSE") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_SPIN_PAUSE")) != 0;
+#if MH_X86
+        if (getenv("GGML_CUDA_MOE_HOST_KEEP_WARM") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_KEEP_WARM")) != 0) {
+            keep_warm = dot2 == dot2_avx512 ? keep_warm_avx512 : dot2 == dot2_avx2 ? keep_warm_avx2 : nullptr;
+        }
+#endif
         threads.emplace_back(&pool::leader, this);
         for (int t = 1; t < n_threads; ++t) {
             threads.emplace_back(&pool::helper, this);
         }
-        GGML_LOG_INFO("%s: %d host threads compute the cold experts (%s)\n", __func__, n_threads, isa);
+#if defined(__linux__)
+        // GGML_CUDA_MOE_HOST_PIN=1: one core per thread, so that two spinning threads never share a core
+        if (getenv("GGML_CUDA_MOE_HOST_PIN") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_PIN")) != 0) {
+            const std::vector<int> cpus = cpu_list();
+            for (int t = 0; t < n_threads && !cpus.empty(); ++t) {
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                CPU_SET(cpus[(size_t) (pool_id*n_threads + t) % cpus.size()], &set);
+                pthread_setaffinity_np(threads[t].native_handle(), sizeof(set), &set);
+            }
+        }
+#endif
+        GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s)\n", __func__, pool_id, n_pools, n_threads, isa);
     }
 
     ~pool() {
+        MH_TR(tr_print();)
         quit.store(true);
         {
             std::lock_guard<std::mutex> lock(cv_mtx);
@@ -561,12 +738,15 @@ struct pool {
     }
 };
 
-pool * g_pool() {
-    static pool p;
-    return &p;
+constexpr int MH_MAX_POOLS = 4;
+
+pool * g_pool(const int i) {
+    static pool p[MH_MAX_POOLS];
+    return &p[i];
 }
 
 std::mutex g_start_mtx;
+int        g_n_pools = 0;
 
 } // namespace
 
@@ -574,32 +754,39 @@ bool mh_cpu_supported() {
     return true;
 }
 
-void mh_pool_attach(int device, mh_mailbox * m) {
-    GGML_ASSERT(device >= 0 && device < MH_MAX_DEVICES);
-    pool * p = g_pool();
+void mh_pool_attach(int index, mh_mailbox * m, int n_devices) {
+    GGML_ASSERT(index >= 0 && index < MH_MAX_POOLS*MH_MAX_DEVICES);
     std::lock_guard<std::mutex> lock(g_start_mtx);
-    if (p->threads.empty()) {
-        p->start();
+    if (g_n_pools == 0) {
+        // The devices of a tensor split publish the cold pairs of a layer at the same time: with one pool the second
+        // device waits for the job of the first, and the first then waits for it at the AllReduce.
+        const char * env = getenv("GGML_CUDA_MOE_HOST_POOLS");
+        g_n_pools = std::max(1, std::min(MH_MAX_POOLS, env != nullptr ? atoi(env) : n_devices));
     }
-    if (p->mb[device] == nullptr) {
-        p->seen[device] = m->req;
-        p->mb[device]   = m;
-        p->n_mb.store(std::max(p->n_mb.load(), device + 1), std::memory_order_release);
+    const int ip = index % g_n_pools;
+    const int im = index / g_n_pools;
+    pool * p = g_pool(ip);
+    if (p->threads.empty()) {
+        p->start(ip, g_n_pools);
+    }
+    if (p->mb[im] == nullptr) {
+        p->seen[im] = m->req;
+        p->mb[im]   = m;
+        p->n_mb.store(std::max(p->n_mb.load(), im + 1), std::memory_order_release);
     }
 }
 
 int mh_pool_register(const mh_slot_desc & d) {
-    pool * p = g_pool();
-    std::lock_guard<std::mutex> lock(p->slots_mtx);
-    const int n = p->n_slots.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_slots.mtx);
+    const int n = g_slots.n.load(std::memory_order_relaxed);
     for (int i = 0; i < n; ++i) {
-        if (p->slot_tab[i].down == d.down) {
+        if (g_slots.tab[i].down == d.down) {
             return i;
         }
     }
-    GGML_ASSERT(n < (int) (sizeof(p->slot_tab)/sizeof(p->slot_tab[0])));
+    GGML_ASSERT(n < (int) (sizeof(g_slots.tab)/sizeof(g_slots.tab[0])));
     GGML_ASSERT(d.n_embd % 64 == 0 && d.n_embd <= MH_MAX_EMBD && d.n_ff % 64 == 0 && d.n_ff <= MH_MAX_FF);
-    p->slot_tab[n] = d;
-    p->n_slots.store(n + 1, std::memory_order_release);
+    g_slots.tab[n] = d;
+    g_slots.n.store(n + 1, std::memory_order_release);
     return n;
 }

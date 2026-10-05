@@ -863,6 +863,37 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
     return *weight;
 }
 
+bool llama_model_loader::resplit(const std::string & first, const std::string & second, const int64_t n_first, const int axis) {
+    const auto it_a = weights_map.find(first);
+    const auto it_b = weights_map.find(second);
+    if (it_a == weights_map.end() || it_b == weights_map.end() || axis < 1 || axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    llama_tensor_weight & a = it_a->second;
+    llama_tensor_weight & b = it_b->second;
+    ggml_tensor * ta = a.tensor;
+    ggml_tensor * tb = b.tensor;
+    const int64_t n_a   = ta->ne[axis];
+    const int64_t n_b   = tb->ne[axis];
+    const size_t  slice = ta->nb[axis];
+    bool ok = a.idx == b.idx && ta->type == tb->type && tb->nb[axis] == slice && n_first >= 1 && n_first < n_a + n_b &&
+              b.offs == a.offs + (size_t) n_a*slice;
+    for (int d = 0; d < GGML_MAX_DIMS && ok; ++d) {
+        ok = d == axis ? true : d < axis ? ta->ne[d] == tb->ne[d] : ta->ne[d] == 1 && tb->ne[d] == 1;
+    }
+    if (!ok) {
+        return false;
+    }
+    ta->ne[axis] = n_first;
+    tb->ne[axis] = n_a + n_b - n_first;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        ta->nb[d] = ta->nb[d - 1]*ta->ne[d - 1];
+        tb->nb[d] = tb->nb[d - 1]*tb->ne[d - 1];
+    }
+    b.offs = a.offs + (size_t) n_first*slice;
+    return true;
+}
+
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
     const auto * weight = get_weight(name);
     if (!weight) {

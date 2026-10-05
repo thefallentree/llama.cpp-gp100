@@ -179,6 +179,29 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
+    const bool mtp_only   = (trunk_flags & TENSOR_NOT_REQUIRED) != 0;
+
+    // temporary switch (LLAMA_EXPERT_HOT=N): fewer experts per layer in the hot tensors (VRAM) than the file's split has,
+    // the others join the cold ones. The file stores a layer's experts hot first and the two tensors one after the other.
+    if (hparams.n_expert_hot > 0 && !mtp_only && getenv("LLAMA_EXPERT_HOT") != nullptr) {
+        const int64_t n_hot_new = std::max(1, atoi(getenv("LLAMA_EXPERT_HOT")));
+        if (n_hot_new < (int64_t) hparams.n_expert_hot) {
+            static const llm_tensor pairs[3][2] = {
+                { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
+                { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
+                { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
+            };
+            for (int il = 0; il < n_layer; ++il) {
+                for (const auto & pair : pairs) {
+                    if (!ml.resplit(tn(pair[0], "weight", il).str(), tn(pair[1], "weight", il).str(), n_hot_new, 2)) {
+                        throw std::runtime_error(format("LLAMA_EXPERT_HOT: the hot and cold expert tensors of layer %d are not one array in the file", il));
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: %d of the file's %u hot experts per layer stay hot\n", __func__, (int) n_hot_new, hparams.n_expert_hot);
+            hparams.n_expert_hot = (uint32_t) n_hot_new;
+        }
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 

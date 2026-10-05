@@ -226,6 +226,11 @@ struct llama_model_loader {
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
+    // Moves the boundary between two tensors of the file that are one array cut in two along `axis` (the hot and the
+    // cold experts of a MoE layer): the first keeps n_first slices, the second gets the others. Call it before the
+    // tensors are created. False, and nothing changed, if the two are not stored one after the other.
+    bool resplit(const std::string & first, const std::string & second, int64_t n_first, int axis);
+
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 
     const struct ggml_tensor * check_tensor_dims(

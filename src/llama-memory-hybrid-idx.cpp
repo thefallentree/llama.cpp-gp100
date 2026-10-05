@@ -1,5 +1,8 @@
 #include "llama-memory-hybrid-idx.h"
 
+#include "fn-prof.h"
+FN_PROF_DECL("mem");
+
 #include <algorithm>
 #include <cmath>
 #include <type_traits>
@@ -429,16 +432,30 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
-                sq.pos_min == sp.begin()->first) {
+        const llama_pos stale = mem_idx_stale[s];
+
+        bool keep = !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first;
+        if (keep && stale != POS_CLEAN) {
+            // an edit above the first position leaves the cells below it and their pools as they are
+            // (a sequence that loses cells to another sequence's edit is staled at 0 and rebuilds)
+            keep = stale > sq.pos_min;
+            if (keep) {
+                sq.cells.erase(std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(stale, (uint32_t) 0)), sq.cells.end());
+                while (!sq.pools.empty() && sq.pools.back() + kpool > sq.cells.size()) {
+                    sq.pools.pop_back();
+                }
+                sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+            }
+        }
+
+        if (keep) {
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        // the appended tail accounts for every cell only if nothing before it was dropped
+        if (sq.cells.size() != sp.size() || (stale != POS_CLEAN && !keep)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -552,19 +569,27 @@ bool llama_memory_hybrid_idx_context::next() {
 }
 
 bool llama_memory_hybrid_idx_context::apply() {
+    FN_PROF_T(t_a0);
     bool res = llama_memory_hybrid_context::apply();
+    FN_PROF_ADD("apply.hybrid", t_a0);
 
     if (ctx_idx) {
+        FN_PROF_T(t_a1);
         res = res & ctx_idx->apply();
+        FN_PROF_ADD("apply.idx", t_a1);
     }
 
     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
     if (res && kpool_track()) {
+        FN_PROF_T(t_a2);
         mem->kpool_layout_update();
+        FN_PROF_ADD("apply.kpool_layout", t_a2);
         if (!kpool_st) {
             kpool_st = std::make_unique<kpool_state>();
         }
+        FN_PROF_T(t_a3);
         kpool_build_state(get_ubatch());
+        FN_PROF_ADD("apply.kpool_state", t_a3);
         i_kpool  = i_cur;
     }
 

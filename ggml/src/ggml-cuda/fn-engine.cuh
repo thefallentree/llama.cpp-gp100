@@ -91,6 +91,8 @@ int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
 // The selection mask of a QSA attention layer (qwen4exp build_qsa_sel) from node i, the first of the 28 nodes that
 // scatter the selected cells into a row of -inf: one kernel. Returns the number of nodes to skip or 0.
 int ggml_cuda_fn_qsa_sel(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+// The same with the attention that reads the mask (FLASH_ATTN_EXT): attention over the selected cells only.
+int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 
 // The routed experts of a MoE layer with Q2_0 weights, for a decode window of up to FN_MAX_T tokens:
 //   up:   gate, up and SwiGLU of the (token, expert) pairs (MUL_MAT_ID, MUL_MAT_ID, GLU)

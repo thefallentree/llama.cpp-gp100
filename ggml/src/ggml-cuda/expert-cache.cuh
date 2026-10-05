@@ -37,6 +37,10 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
 // before a MUL_MAT_ID node is computed: its ids become positions (once per ids tensor and graph)
 void ggml_cuda_expert_cache_remap(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
 
+// The same for a caller that writes the positions itself (ggml_cuda_moe_host_route): the layer's table of positions
+// and its routing counts, indexed by expert. The node's ids then count as remapped. False: the layer is not registered.
+bool ggml_cuda_expert_cache_take(ggml_backend_cuda_context & ctx, const ggml_tensor * node, const int32_t ** perm, uint32_t ** counts);
+
 // after the context's stream was synchronized
 void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx);
 

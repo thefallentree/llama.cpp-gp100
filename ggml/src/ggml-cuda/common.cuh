@@ -1562,6 +1562,7 @@ struct ggml_backend_cuda_context {
     // the SSM_CONV of a recurrent layer whose input side the fused engine computes there, and the kernel's arguments
     const ggml_tensor * fn_gdn_pre_conv = nullptr;
     char                fn_gdn_pre_args[192];
+    int32_t *           fn_qsa_cells = nullptr; // staged cells of fn_qsa_attn
 
     const ggml_tensor * fn_moe_down = nullptr;
     ggml_tensor *       fn_moe_dst  = nullptr;

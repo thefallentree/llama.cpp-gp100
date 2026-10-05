@@ -82,6 +82,52 @@ static std::mutex                                        g_fn_mutex;
 static std::unordered_map<const void *, fn_plane_entry> g_fn_planes;
 static std::atomic<int>                                  g_fn_n_planes { 0 };
 
+// A small F32 matrix (the router of a MoE layer) gets planar Q8 copies of its own, by the data of the tensor: codes,
+// then the scale plane. Its mat-vec then is two segments of the launch that reads the same vector: the copy and the
+// copy of what the first one left out (with 8 bits alone the routing changed enough to cost 0.0009 of KLD).
+struct fn_copy_entry {
+    char *  w         = nullptr;
+    float * rowscale  = nullptr;
+    char *  w2        = nullptr;
+    float * rowscale2 = nullptr;
+    int     device    = 0;
+};
+static std::unordered_map<const void *, fn_copy_entry> g_fn_copies;
+static std::atomic<int>                                 g_fn_n_copies { 0 };
+
+// The copies of a device are carved from a few large allocations: a device allocation of their own size (1.4 MB)
+// took 2 MB each. They are freed when the device has no copy left.
+#define FN_COPY_CHUNK ((size_t) 32 << 20)
+struct fn_copy_arena {
+    std::vector<char *> chunks;
+    size_t              used = FN_COPY_CHUNK; // of the last chunk
+};
+static fn_copy_arena g_fn_copy_arena[GGML_CUDA_MAX_DEVICES];
+
+// under g_fn_mutex; null if the device has no memory left
+static char * fn_copy_alloc(const int device, size_t size) {
+    fn_copy_arena & a = g_fn_copy_arena[device];
+    size = (size + 255) & ~(size_t) 255;
+    GGML_ASSERT(size <= FN_COPY_CHUNK);
+    if (a.used + size > FN_COPY_CHUNK) {
+        char * chunk = nullptr;
+        if (cudaMalloc((void **) &chunk, FN_COPY_CHUNK) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        a.chunks.push_back(chunk);
+        a.used = 0;
+    }
+    char * p = a.chunks.back() + a.used;
+    a.used += size;
+    return p;
+}
+
+static bool fn_router_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_FN_ROUTER") == nullptr || atoi(getenv("GGML_CUDA_FN_ROUTER")) != 0;
+    return enabled;
+}
+
 bool ggml_cuda_fn_enabled() {
     static const bool enabled = getenv("GGML_CUDA_FN") == nullptr || atoi(getenv("GGML_CUDA_FN")) != 0;
     return enabled;
@@ -102,11 +148,71 @@ bool ggml_cuda_fn_planar(const ggml_tensor * t, ggml_cuda_fn_plane * plane) {
     return true;
 }
 
+// the planar weights that a MUL_MAT with these weights reads: the tensor itself (Q8_0, repacked) or its copy (F32)
+static bool fn_plane_of(const ggml_tensor * t, const char ** w, ggml_cuda_fn_plane * plane) {
+    if (ggml_cuda_fn_planar(t, plane)) {
+        *w = (const char *) t->data;
+        return true;
+    }
+    if (t->type != GGML_TYPE_F32 || t->data == nullptr || g_fn_n_copies.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_fn_mutex);
+    const auto it = g_fn_copies.find(t->data);
+    if (it == g_fn_copies.end()) {
+        return false;
+    }
+    *w              = it->second.w;
+    plane->rowscale = it->second.rowscale;
+    return true;
+}
+
+// the second copy of a router: its output is added to the first one's
+static bool fn_plane_rest(const ggml_tensor * t, const char ** w, ggml_cuda_fn_plane * plane) {
+    if (t->type != GGML_TYPE_F32 || t->data == nullptr || g_fn_n_copies.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_fn_mutex);
+    const auto it = g_fn_copies.find(t->data);
+    if (it == g_fn_copies.end() || it->second.w2 == nullptr) {
+        return false;
+    }
+    *w              = it->second.w2;
+    plane->rowscale = it->second.rowscale2;
+    return true;
+}
+
 void ggml_cuda_fn_planes_release(const void * base, const size_t size) {
-    if (g_fn_n_planes.load(std::memory_order_relaxed) == 0) {
+    if (g_fn_n_planes.load(std::memory_order_relaxed) == 0 && g_fn_n_copies.load(std::memory_order_relaxed) == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(g_fn_mutex);
+    bool erased = false;
+    for (auto it = g_fn_copies.begin(); it != g_fn_copies.end();) {
+        const char * p = (const char *) it->first;
+        if (p >= (const char *) base && p < (const char *) base + size) {
+            it     = g_fn_copies.erase(it);
+            erased = true;
+        } else {
+            ++it;
+        }
+    }
+    g_fn_n_copies.store((int) g_fn_copies.size(), std::memory_order_relaxed);
+    for (int dev = 0; dev < GGML_CUDA_MAX_DEVICES && erased; ++dev) {
+        bool live = false;
+        for (const auto & kv : g_fn_copies) {
+            live = live || kv.second.device == dev;
+        }
+        fn_copy_arena & a = g_fn_copy_arena[dev];
+        if (!live && !a.chunks.empty()) {
+            ggml_cuda_set_device(dev);
+            for (char * chunk : a.chunks) {
+                cudaFree(chunk);
+            }
+            a.chunks.clear();
+            a.used = FN_COPY_CHUNK;
+        }
+    }
     for (auto it = g_fn_planes.begin(); it != g_fn_planes.end();) {
         const char * p = (const char *) it->first;
         if (p >= (const char *) base && p < (const char *) base + size) {
@@ -175,6 +281,129 @@ static __global__ void fn_p8_repack_scales(const half * __restrict__ d, const in
     dst[i] = __float2half(rs > 0.0f ? __half2float(d[i])/rs : 0.0f);
 }
 
+// F32 rows to the planar layout, one thread per block of FN_QK weights: its scale as Q8_0 has it (max/127 as fp16)
+// and the codes round(w/scale) + 128. With `prev` (the planar copy of the same rows, nb blocks per row) the rows are
+// what that copy left out.
+static __global__ void fn_f32_p8(const float * __restrict__ w, const int64_t nblk, half * __restrict__ d, char * __restrict__ codes,
+                                 const char * __restrict__ prev, const float * __restrict__ prev_rowscale, const int nb) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nblk) {
+        return;
+    }
+    float x[FN_QK];
+    for (int k = 0; k < FN_QK; ++k) {
+        x[k] = w[i*FN_QK + k];
+    }
+    if (prev != nullptr) {
+        const float s = __half2float(((const half *) (prev + nblk*FN_QK))[i])*prev_rowscale[i / nb];
+        for (int k = 0; k < FN_QK; ++k) {
+            x[k] -= s*(float) ((int) (unsigned char) prev[i*FN_QK + k] - 128);
+        }
+    }
+    float amax = 0.0f;
+    for (int k = 0; k < FN_QK; ++k) {
+        amax = fmaxf(amax, fabsf(x[k]));
+    }
+    const half  dh = __float2half(amax/127.0f);
+    const float df = __half2float(dh);
+    const float id = df > 0.0f ? 1.0f/df : 0.0f;
+    d[i] = dh;
+    uint32_t * out = (uint32_t *) (codes + i*FN_QK);
+    for (int k = 0; k < FN_QK/4; ++k) {
+        uint32_t v = 0;
+        for (int j = 0; j < 4; ++j) {
+            const int q = max(-127, min(127, (int) roundf(x[4*k + j]*id)));
+            v |= (uint32_t) ((q + 128) & 0xff) << (8*j);
+        }
+        out[k] = v;
+    }
+}
+
+// Node i is the MUL_MAT of a MoE router: a small F32 matrix whose logits go to the softmax of the routing. Its
+// neighbours may be the MUL_MATs that ggml_cuda_fn_reorder moved behind it.
+static bool fn_router_like(const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!fn_router_enabled() || node->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * w = node->src[0];
+    const ggml_tensor * x = node->src[1];
+    fn_dense_geom gm;
+    if (w->type != GGML_TYPE_F32 || w->ne[2] != 1 || w->ne[3] != 1 || w->ne[1] > 1024 || w->ne[0] % FN_QK != 0 ||
+        !fn_dense_geometry(w->ne[0], &gm) || gm.s != 1 || w->ne[1] % fn_dense_tile_rows(w->ne[0]) != 0 ||
+        x->type != GGML_TYPE_F32 || x->ne[1] > FN_MAX_T || x->ne[2] != 1 || x->ne[3] != 1) {
+        return false;
+    }
+    // behind it at most the other segments of its launch
+    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 5); ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_SOFT_MAX && cgraph->nodes[j]->src[0] == node) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the planar copies of the routers that the graph reads on this device
+static void fn_copies_optimize(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    bool         synced = false;
+    cudaStream_t stream = ctx.stream();
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (!fn_router_like(cgraph, i)) {
+            continue;
+        }
+        const ggml_tensor * w = cgraph->nodes[i]->src[0];
+        if (w->data == nullptr || w->buffer == nullptr || w->view_src != nullptr || !ggml_is_contiguous(w) ||
+            ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            ggml_backend_buffer_get_type(w->buffer) != ggml_backend_cuda_buffer_type(ctx.device)) {
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_fn_mutex);
+            if (g_fn_copies.count(w->data) != 0) {
+                continue;
+            }
+        }
+        if (!synced) {
+            ggml_cuda_set_device(ctx.device);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            synced = true;
+        }
+        const int64_t rows = w->ne[1];
+        const int     nb   = (int) (w->ne[0]/FN_QK);
+        const int64_t nblk = rows*nb;
+        fn_copy_entry e;
+        e.device = ctx.device;
+        half *       dtmp  = nullptr;
+        const size_t nbyte = nblk*FN_QK + nblk*sizeof(half);
+        {
+            std::lock_guard<std::mutex> lock(g_fn_mutex);
+            char * mem = fn_copy_alloc(ctx.device, 2*nbyte + 2*rows*sizeof(float));
+            if (mem == nullptr) {
+                return; // no memory left: the routers stay F32
+            }
+            e.w         = mem;
+            e.w2        = mem + nbyte;
+            e.rowscale  = (float *) (mem + 2*nbyte);
+            e.rowscale2 = e.rowscale + rows;
+        }
+        CUDA_CHECK(cudaMalloc((void **) &dtmp, nblk*sizeof(half)));
+        const unsigned grid = (unsigned) ((nblk + 255)/256);
+        fn_f32_p8<<<grid, 256, 0, stream>>>((const float *) w->data, nblk, dtmp, e.w, nullptr, nullptr, nb);
+        fn_p8_rowmax<<<(unsigned) rows, WARP_SIZE, 0, stream>>>(dtmp, nb, e.rowscale);
+        fn_p8_repack_scales<<<grid, 256, 0, stream>>>(dtmp, nb, nblk, e.rowscale, (half *) (e.w + nblk*FN_QK));
+        fn_f32_p8<<<grid, 256, 0, stream>>>((const float *) w->data, nblk, dtmp, e.w2, e.w, e.rowscale, nb);
+        fn_p8_rowmax<<<(unsigned) rows, WARP_SIZE, 0, stream>>>(dtmp, nb, e.rowscale2);
+        fn_p8_repack_scales<<<grid, 256, 0, stream>>>(dtmp, nb, nblk, e.rowscale2, (half *) (e.w2 + nblk*FN_QK));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaFree(dtmp));
+
+        std::lock_guard<std::mutex> lock(g_fn_mutex);
+        g_fn_copies[w->data] = e;
+        g_fn_n_copies.store((int) g_fn_copies.size(), std::memory_order_relaxed);
+    }
+}
+
 static bool fn_planar_eligible(const ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
     if (node->op != GGML_OP_MUL_MAT) {
         return false;
@@ -200,6 +429,10 @@ static bool fn_planar_eligible(const ggml_backend_cuda_context & ctx, const ggml
 void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
     if (!ggml_cuda_fn_enabled()) {
         return;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_DP4A) {
+        fn_copies_optimize(ctx, cgraph);
     }
     bool         synced = false;
     cudaStream_t stream = ctx.stream();
@@ -825,10 +1058,11 @@ static __global__ void fn_sum_parts(const float * __restrict__ parts, const int 
 // ---------------------------------------------------------------------------------------------------------------
 // MUL_MAT
 
+// codes: the planar weights where they are a copy (fn_plane_of), the tensor's own data otherwise
 static fn_dense_part fn_dense_part_of(const ggml_tensor * w, const ggml_cuda_fn_plane & plane, const int part,
-                                      const fn_act_slot & x, float * dst, const int64_t dst_stride) {
+                                      const fn_act_slot & x, float * dst, const int64_t dst_stride, const char * codes = nullptr) {
     fn_dense_part pt;
-    pt.w          = (const char *) w->data;
+    pt.w          = codes != nullptr ? codes : (const char *) w->data;
     pt.rows       = w->ne[1];
     pt.cols       = w->ne[0];
     pt.rowscale   = plane.rowscale;
@@ -864,17 +1098,53 @@ static void fn_dense_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * w
 }
 
 bool ggml_cuda_fn_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    fn_dense_geom gm;
-    return ggml_cuda_fn_planar(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    fn_dense_geom      gm;
+    ggml_cuda_fn_plane plane;
+    const char *       codes = nullptr;
+    if (!fn_plane_of(src0, &codes, &plane)) {
+        return false;
+    }
+    // a copy is for decode windows only: a wider batch reads the F32 weights
+    if (src0->type == GGML_TYPE_F32 && src1->ne[1] > FN_MAX_T) {
+        return false;
+    }
+    return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] <= 4*FN_MAX_T && src1->ne[2] == 1 && src1->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
            src1->nb[0] == sizeof(float) && src1->ne[0] == src0->ne[0] && ggml_is_contiguous(dst) &&
            fn_dense_geometry(src0->ne[0], &gm) && (gm.s == 1 || (src0->ne[1] <= 2*FN_ACT_TPB && src1->ne[1] <= FN_MAX_T));
 }
 
+// The segment of a router's second copy, if node is a router's MUL_MAT. Its output goes to a buffer of the context
+// that the routing kernel adds to the node's (ggml_cuda_fn_router_rest); returns the number of segments (0 or 1).
+static int fn_router_rest(ggml_backend_cuda_context & ctx, const ggml_tensor * node, const fn_act_slot & x, fn_dense_part * pt) {
+    ggml_cuda_fn_plane plane;
+    const char *       codes = nullptr;
+    if (!fn_plane_rest(node->src[0], &codes, &plane)) {
+        return 0;
+    }
+    const int64_t rows = node->src[0]->ne[1];
+    if (ctx.fn_router_mem == nullptr || ctx.fn_router_rows < rows) {
+        ggml_cuda_set_device(ctx.device);
+        if (ctx.fn_router_mem != nullptr) {
+            ctx.retired_mem.push_back(ctx.fn_router_mem); // captured graphs may still write it
+        }
+        CUDA_CHECK(cudaMalloc((void **) &ctx.fn_router_mem, (size_t) FN_MAX_T*rows*sizeof(float)));
+        ctx.fn_router_rows = rows;
+    }
+    *pt = fn_dense_part_of(node->src[0], plane, 0, x, ctx.fn_router_mem, rows, codes);
+    ctx.fn_router_node = node;
+    return 1;
+}
+
+const float * ggml_cuda_fn_router_rest(ggml_backend_cuda_context & ctx, const ggml_tensor * logits) {
+    return ctx.fn_router_node == logits ? ctx.fn_router_mem : nullptr;
+}
+
 void ggml_cuda_fn_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_cuda_fn_plane plane;
     fn_dense_geom      gm;
-    GGML_ASSERT(ggml_cuda_fn_planar(src0, &plane) && fn_dense_geometry(src0->ne[0], &gm));
+    const char *       codes = nullptr;
+    GGML_ASSERT(fn_plane_of(src0, &codes, &plane) && fn_dense_geometry(src0->ne[0], &gm));
     const int     cols = (int) src0->ne[0];
     const int     nsm  = ggml_cuda_info().devices[ctx.device].nsm;
     const int64_t s1   = src1->nb[1]/sizeof(float);
@@ -887,8 +1157,8 @@ void ggml_cuda_fn_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             fn_dense_wide(ctx, src0, x, nt, FN_EPI_NONE, 0.0f, 0.0f, (float *) dst->data, sd, nullptr, nullptr);
             return;
         }
-        const fn_dense_part pt = fn_dense_part_of(src0, plane, 0, x, (float *) dst->data, sd);
-        fn_dense(nt, &pt, 1, nsm, ctx.stream());
+        fn_dense_part pt[2] = { fn_dense_part_of(src0, plane, 0, x, (float *) dst->data, sd, codes) };
+        fn_dense(nt, pt, 1 + fn_router_rest(ctx, dst, x, pt + 1), nsm, ctx.stream());
         return;
     }
     // wider batches in passes; their activations are not kept
@@ -911,16 +1181,24 @@ int ggml_cuda_fn_mul_mat_run_match(const ggml_cgraph * cgraph, const int i) {
         return 0;
     }
     const ggml_tensor * first = cgraph->nodes[i];
-    int n = 0;
-    while (n < FN_MAX_SEG && i + n < cgraph->n_nodes) {
+    int n     = 0;
+    int n_seg = 0; // a router is two
+    while (i + n < cgraph->n_nodes) {
         const ggml_tensor * node = cgraph->nodes[i + n];
-        fn_dense_geom gm;
+        fn_dense_geom      gm;
+        ggml_cuda_fn_plane plane;
+        const char *       codes = nullptr;
         if (node->op != GGML_OP_MUL_MAT || node->src[1] != first->src[1] || node->src[0]->ne[0] != first->src[0]->ne[0] ||
             node->src[1]->ne[1] > FN_MAX_T || node->flags != first->flags || ggml_is_empty(node) ||
             !ggml_cuda_fn_mul_mat_supported(node->src[0], node->src[1], node) ||
             !fn_dense_geometry(node->src[0]->ne[0], &gm) || gm.s != 1) {
             break;
         }
+        const int segs = fn_plane_rest(node->src[0], &codes, &plane) ? 2 : 1;
+        if (n_seg + segs > FN_MAX_SEG) {
+            break;
+        }
+        n_seg += segs;
         ++n;
     }
     return n >= 2 ? n : 0;
@@ -930,13 +1208,17 @@ void ggml_cuda_fn_mul_mat_run(ggml_backend_cuda_context & ctx, ggml_tensor * con
     const ggml_tensor * src1 = nodes[0]->src[1];
     const int    nt = (int) src1->ne[1];
     const auto & x  = fn_act_get(ctx, src1, (const float *) src1->data, src1->nb[1]/sizeof(float), (int) src1->ne[0], nt);
-    fn_dense_part pt[FN_MAX_SEG];
+    fn_dense_part pt[FN_MAX_SEG + 1];
+    int n_seg = 0;
     for (int j = 0; j < n; ++j) {
         ggml_cuda_fn_plane plane;
-        GGML_ASSERT(ggml_cuda_fn_planar(nodes[j]->src[0], &plane));
-        pt[j] = fn_dense_part_of(nodes[j]->src[0], plane, 0, x, (float *) nodes[j]->data, nodes[j]->nb[1]/sizeof(float));
+        const char *       codes = nullptr;
+        GGML_ASSERT(fn_plane_of(nodes[j]->src[0], &codes, &plane) && n_seg < FN_MAX_SEG);
+        pt[n_seg++] = fn_dense_part_of(nodes[j]->src[0], plane, 0, x, (float *) nodes[j]->data, nodes[j]->nb[1]/sizeof(float), codes);
+        n_seg += fn_router_rest(ctx, nodes[j], x, pt + n_seg);
     }
-    fn_dense(nt, pt, n, ggml_cuda_info().devices[ctx.device].nsm, ctx.stream());
+    GGML_ASSERT(n_seg <= FN_MAX_SEG);
+    fn_dense(nt, pt, n_seg, ggml_cuda_info().devices[ctx.device].nsm, ctx.stream());
 }
 
 // graph_optimize: the MUL_MAT nodes that read the same vector become neighbours (a later one moves up behind the
@@ -953,8 +1235,15 @@ void ggml_cuda_fn_reorder(ggml_cgraph * cgraph) {
                x->type == GGML_TYPE_F32 && x->ne[1] <= FN_MAX_T && x->ne[2] == 1 && x->ne[3] == 1 &&
                fn_dense_geometry(w->ne[0]) && w->ne[0]/16 != 640;
     };
+    // A router takes the shared expert's gate and up into its launch. Not in a prompt graph, where only the last
+    // layer is decode-sized: its order would differ from the graph the allocation was reserved with.
+    bool routers = true;
+    for (int i = 0; i < cgraph->n_nodes && routers; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        routers = node->op != GGML_OP_MUL_MAT_ID || node->src[2]->ne[1] <= FN_MAX_T;
+    }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (!candidate(cgraph->nodes[i])) {
+        if (!candidate(cgraph->nodes[i]) && !(routers && fn_router_like(cgraph, i))) {
             continue;
         }
         const ggml_tensor * first = cgraph->nodes[i];
@@ -2391,46 +2680,108 @@ static __global__ void fn_swiglu_h16(const float * __restrict__ g, const float *
     }
 }
 
-void ggml_cuda_fn_shexp(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & a) {
+// g, u: gate and up of the nt tokens, n_ff apart
+static void fn_shexp_down(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & a, const float * g, const float * u) {
     const ggml_tensor * x   = a.gate->src[1];
-    const ggml_tensor * wg  = a.gate->src[0];
-    const ggml_tensor * wu  = a.up->src[0];
     const ggml_tensor * wd  = a.down->src[0];
     const ggml_tensor * wgi = a.ginp->src[0];
-    const int     n_embd = (int) wg->ne[0];
-    const int     n_ff   = (int) wg->ne[1];
+    const int     n_embd = (int) wd->ne[1];
+    const int     n_ff   = (int) wd->ne[0];
     const int     nt     = (int) x->ne[1];
     const int64_t sx     = x->nb[1]/sizeof(float);
-    const int     nsm    = ggml_cuda_info().devices[ctx.device].nsm;
     cudaStream_t  stream = ctx.stream();
 
-    ggml_cuda_fn_plane pg, pu, pd;
-    GGML_ASSERT(ggml_cuda_fn_planar(wg, &pg) && ggml_cuda_fn_planar(wu, &pu) && ggml_cuda_fn_planar(wd, &pd));
+    ggml_cuda_fn_plane pd;
+    GGML_ASSERT(ggml_cuda_fn_planar(wd, &pd));
 
-    ggml_cuda_pool_alloc<float> gu(ctx.pool(), (size_t) 2*nt*n_ff);
-    ggml_cuda_pool_alloc<char>  hm(ctx.pool(), (size_t) FN_MAX_T*n_ff*sizeof(half) + FN_MAX_T*sizeof(float));
+    ggml_cuda_pool_alloc<char> hm(ctx.pool(), (size_t) FN_MAX_T*n_ff*sizeof(half) + FN_MAX_T*sizeof(float));
     fn_act_slot h;
     h.mem = hm.get();
     h.n   = n_ff;
 
-    const fn_act_slot & sxa = fn_act_get(ctx, x, (const float *) x->data, sx, n_embd, nt);
-    const fn_dense_part pt[2] = {
-        fn_dense_part_of(wg, pg, 0, sxa, gu.get(), n_ff),
-        fn_dense_part_of(wu, pu, 0, sxa, gu.get() + (size_t) nt*n_ff, n_ff),
-    };
-    fn_dense(nt, pt, 2, nsm, stream);
-
     if (wgi->type == GGML_TYPE_F32) {
-        fn_swiglu_h16<float><<<nt, FN_ACT_TPB, 0, stream>>>(gu.get(), gu.get() + (size_t) nt*n_ff, n_ff, (const float *) x->data, sx,
+        fn_swiglu_h16<float><<<nt, FN_ACT_TPB, 0, stream>>>(g, u, n_ff, (const float *) x->data, sx,
             n_embd, (const float *) wgi->data, fn_gain(n_ff), fn_act_X(h), fn_act_xs(h));
     } else {
-        fn_swiglu_h16<nv_bfloat16><<<nt, FN_ACT_TPB, 0, stream>>>(gu.get(), gu.get() + (size_t) nt*n_ff, n_ff, (const float *) x->data, sx,
+        fn_swiglu_h16<nv_bfloat16><<<nt, FN_ACT_TPB, 0, stream>>>(g, u, n_ff, (const float *) x->data, sx,
             n_embd, (const nv_bfloat16 *) wgi->data, fn_gain(n_ff), fn_act_X(h), fn_act_xs(h));
     }
     CUDA_CHECK(cudaGetLastError());
 
     const fn_dense_part pdn = fn_dense_part_of(wd, pd, 0, h, (float *) a.mul->data, a.mul->nb[1]/sizeof(float));
-    fn_dense(nt, &pdn, 1, nsm, stream);
+    fn_dense(nt, &pdn, 1, ggml_cuda_info().devices[ctx.device].nsm, stream);
+}
+
+void ggml_cuda_fn_shexp(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & a) {
+    const ggml_tensor * x   = a.gate->src[1];
+    const ggml_tensor * wg  = a.gate->src[0];
+    const ggml_tensor * wu  = a.up->src[0];
+    const int     n_embd = (int) wg->ne[0];
+    const int     n_ff   = (int) wg->ne[1];
+    const int     nt     = (int) x->ne[1];
+    const int64_t sx     = x->nb[1]/sizeof(float);
+
+    ggml_cuda_fn_plane pg, pu;
+    GGML_ASSERT(ggml_cuda_fn_planar(wg, &pg) && ggml_cuda_fn_planar(wu, &pu));
+
+    ggml_cuda_pool_alloc<float> gu(ctx.pool(), (size_t) 2*nt*n_ff);
+    const fn_act_slot & sxa = fn_act_get(ctx, x, (const float *) x->data, sx, n_embd, nt);
+    const fn_dense_part pt[2] = {
+        fn_dense_part_of(wg, pg, 0, sxa, gu.get(), n_ff),
+        fn_dense_part_of(wu, pu, 0, sxa, gu.get() + (size_t) nt*n_ff, n_ff),
+    };
+    fn_dense(nt, pt, 2, ggml_cuda_info().devices[ctx.device].nsm, ctx.stream());
+    fn_shexp_down(ctx, a, gu.get(), gu.get() + (size_t) nt*n_ff);
+}
+
+bool ggml_cuda_fn_shexp_tail_match(const ggml_cgraph * cgraph, const int i, ggml_cuda_shexp_args & a) {
+    static const ggml_op ops[] = { GGML_OP_GLU, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL };
+    if (!ggml_cuda_fn_enabled() || i + 4 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_GLU) {
+        return false;
+    }
+    const int outputs[] = { i + 4 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 5, ops, outputs, 1)) {
+        return false;
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    a.glu  = n[0];
+    a.gate = a.glu->src[0];
+    a.up   = a.glu->src[1];
+    a.down = n[1];
+    a.ginp = n[2];
+    a.sig  = n[3];
+    a.mul  = n[4];
+    if (a.gate->op != GGML_OP_MUL_MAT || a.up->op != GGML_OP_MUL_MAT ||
+        ggml_get_glu_op(a.glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(a.glu, 1) != 0 ||
+        ggml_get_unary_op(a.sig) != GGML_UNARY_OP_SIGMOID || a.sig->src[0] != a.ginp ||
+        a.down->src[1] != a.glu || a.mul->src[0] != a.down || a.mul->src[1] != a.sig) {
+        return false;
+    }
+    const ggml_tensor * x   = a.gate->src[1];
+    const ggml_tensor * wg  = a.gate->src[0];
+    const ggml_tensor * wu  = a.up->src[0];
+    const ggml_tensor * wd  = a.down->src[0];
+    const ggml_tensor * wgi = a.ginp->src[0];
+    const int64_t n_embd = wg->ne[0];
+    const int64_t n_ff   = wg->ne[1];
+    const int64_t nt     = x->ne[1];
+    // gate and up as the launch of their MUL_MATs left them
+    for (const ggml_tensor * t : { a.gate, a.up }) {
+        if (t->type != GGML_TYPE_F32 || t->ne[0] != n_ff || t->ne[1] != nt || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    if (a.up->src[1] != x || a.ginp->src[1] != x || x->type != GGML_TYPE_F32 || x->ne[2] != 1 || x->ne[3] != 1 ||
+        x->nb[0] != sizeof(float) || x->nb[1] % 16 != 0 || !ggml_are_same_shape(wg, wu) || wd->ne[0] != n_ff || wd->ne[1] != n_embd ||
+        wd->ne[2] != 1 || wgi->ne[0] != n_embd || ggml_nrows(wgi) != 1 || !ggml_is_contiguous(wgi) ||
+        a.mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(a.mul) || a.mul->ne[0] != n_embd || a.mul->ne[1] != nt) {
+        return false;
+    }
+    return ggml_cuda_fn_shexp_supported(a);
+}
+
+void ggml_cuda_fn_shexp_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_args & a) {
+    fn_shexp_down(ctx, a, (const float *) a.gate->data, (const float *) a.up->data);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

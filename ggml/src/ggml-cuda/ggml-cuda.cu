@@ -818,6 +818,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (fn_qsa_cells != nullptr) {
         cudaFree(fn_qsa_cells);
     }
+    if (fn_router_mem != nullptr) {
+        cudaFree(fn_router_mem);
+    }
     for (void * mem : retired_mem) {
         cudaFree(mem);
     }
@@ -4150,6 +4153,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // the rest of a shared expert whose gate and up went into the launch of the router
+    if (node->op == GGML_OP_GLU) {
+        ggml_cuda_shexp_args sx_args;
+        if (ggml_cuda_fn_shexp_tail_match(cgraph, i, sx_args)) {
+            ggml_cuda_fn_shexp_tail(*cuda_ctx, sx_args);
+            return 4;
+        }
+    }
+
     // qwen4exp hyper-connection read: norm, down, scale, silu, up, gated mean -> three kernels
     if (node->op == GGML_OP_RMS_NORM) {
         ggml_cuda_hc_mix_args hc_args;
@@ -5472,6 +5484,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->moe_host = {};
     cuda_ctx->ec_last_ids = nullptr;
     cuda_ctx->ec_pending  = true;
+    cuda_ctx->fn_router_node = nullptr;
     cuda_ctx->fn_moe_down = nullptr;
     cuda_ctx->fn_gdn_pre_conv = nullptr;
     ggml_cuda_expert_cache_wait(*cuda_ctx); // no capture is open when an exchange is pending: it was started at a synchronize

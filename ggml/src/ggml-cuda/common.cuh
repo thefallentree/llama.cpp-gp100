@@ -1563,6 +1563,9 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * fn_gdn_pre_conv = nullptr;
     char                fn_gdn_pre_args[192];
     int32_t *           fn_qsa_cells = nullptr; // staged cells of fn_qsa_attn
+    float *             fn_router_mem  = nullptr; // the output of a router's second copy: [FN_MAX_T][fn_router_rows]
+    int64_t             fn_router_rows = 0;
+    const ggml_tensor * fn_router_node = nullptr; // the MUL_MAT node it belongs to
 
     const ggml_tensor * fn_moe_down = nullptr;
     ggml_tensor *       fn_moe_dst  = nullptr;

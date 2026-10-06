@@ -2799,7 +2799,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the drafter alternates between injecting target features (embd ubatches) and drafting (token ubatches);
     // with a single cached graph every call would rebuild it, so keep a few
-    cparams.n_graph_slots = 4;
+    cparams.n_graph_slots = 8; // the shapes of the catch-up batches, the draft steps and the short prompts
 
     std::string model_path;
     if (has_draft) {

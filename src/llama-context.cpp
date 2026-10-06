@@ -2119,8 +2119,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // temporary switch: a short prompt in ubatches of a decode window's size, LLAMA_UBATCH_SMALL=<n> (0 = off), for prompts
+    // of up to LLAMA_UBATCH_SMALL_MAX tokens. A prompt of 19 tokens took 1.1-1.6 s as one ubatch: a graph of its own,
+    // every cold expert it routes to streamed to the devices, the batched kernels; the windows take ~40 ms each
+    static const uint32_t ub_small     = getenv("LLAMA_UBATCH_SMALL") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_UBATCH_SMALL"))) : 8;
+    static const uint32_t ub_small_max = getenv("LLAMA_UBATCH_SMALL_MAX") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_UBATCH_SMALL_MAX"))) : 256;
+    const uint32_t n_ubatch_eff = ub_small > 0 && n_tokens_all > ub_small && n_tokens_all <= ub_small_max ? ub_small : cparams.n_ubatch;
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
         if (!mctx) {
             return -2;
         }

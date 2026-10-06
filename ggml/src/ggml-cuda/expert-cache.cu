@@ -86,6 +86,8 @@ struct ec_device {
     bool         frozen      = false;    // another context uses them too
     uint64_t     n_updates   = 0;
     uint64_t     n_swaps     = 0;
+    int          n_used      = 0; // experts per token, from the routing
+    int          last_prompt_tokens = 0; // tokens of the last update if it was a prompt ubatch
     uint64_t     n_pairs     = 0;
     uint64_t     n_pairs_cold = 0;
 };
@@ -137,9 +139,13 @@ static __global__ void ec_swap(const ec_job * __restrict__ jobs, const int n_job
 // One block per layer: the use counts of its experts since the last update, and which cold experts that were routed to
 // could take the VRAM slot of which idle one. The host only reads the result: its own copies of these tables were
 // 400 KB per device that had left its caches by the end of every window.
+// The frequency of an expert is its count per update, decayed per update. After a prompt ubatch the counts are those
+// of a thousand tokens and a decode window adds one to three: the decode spent a hundred windows at 12-19% cold pairs
+// before its own counts mattered (16K prompt). So the frequencies are scaled down by the ratio of the window sizes
+// when a decode follows a prompt (the shares of the prompt's tokens stay, in the decode's units).
 static __global__ void ec_scan(const ec_row * __restrict__ rows, const uint32_t * __restrict__ counts, uint32_t * __restrict__ seen,
                                float * __restrict__ freq, const int32_t * __restrict__ perm, const float decay, const float min_gain,
-                               ec_res * __restrict__ res, ec_cand * __restrict__ more) {
+                               const float rescale, ec_res * __restrict__ res, ec_cand * __restrict__ more) {
     __shared__ float    s_freq[EC_MAX_EXPERTS];
     __shared__ uint32_t s_delta[EC_MAX_EXPERTS];
     __shared__ int32_t  s_in[EC_MAX_EXPERTS];   // rank -> expert
@@ -179,7 +185,7 @@ static __global__ void ec_scan(const ec_row * __restrict__ rows, const uint32_t 
     uint32_t cold = 0, n_in = 0, n_out = 0;
     for (int e = tid; e < r.n_all; e += blockDim.x) {
         const uint32_t d = s_delta[e];
-        const float    f = freq[base + e]*decay + (float) d;
+        const float    f = freq[base + e]*decay*rescale + (float) d;
         freq[base + e]  = f;
         seen[base + e] += d;
         s_freq[e] = f;
@@ -412,6 +418,7 @@ bool ggml_cuda_expert_cache_take(ggml_backend_cuda_context & ctx, const ggml_ten
         return false;
     }
     ctx.ec_last_ids = ids;
+    d.n_used = (int) ids->ne[0];
     *perm   = d.perm_dev + (size_t) row*EC_MAX_EXPERTS;
     *counts = d.counts_dev + (size_t) row*EC_MAX_EXPERTS;
     return true;
@@ -431,6 +438,7 @@ void ggml_cuda_expert_cache_remap(ggml_backend_cuda_context & ctx, const ggml_te
     ctx.ec_last_ids = ids;
     const int n_used = (int) ids->ne[0];
     const int n      = (int) (ids->ne[0]*ids->ne[1]);
+    d.n_used = n_used;
     ec_remap<<<(n + 255)/256, 256, 0, ctx.stream()>>>((int32_t *) ids->data, (int) (ids->nb[1]/sizeof(int32_t)), n_used, n,
         d.perm_dev + (size_t) row*EC_MAX_EXPERTS, d.counts_dev + (size_t) row*EC_MAX_EXPERTS);
     CUDA_CHECK(cudaGetLastError());
@@ -449,7 +457,7 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     if (d.owner != &ctx || d.frozen) {
         return;
     }
-    static const int   n_swaps_max = getenv("GGML_CUDA_EXPERT_CACHE_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_SWAPS")) : 128;
+    static const int   n_swaps_max = getenv("GGML_CUDA_EXPERT_CACHE_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_SWAPS")) : 48;
     static const float decay       = getenv("GGML_CUDA_EXPERT_CACHE_DECAY") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_DECAY")) : 0.98f;
 
     ggml_cuda_set_device(ctx.device);
@@ -457,8 +465,12 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     const size_t n_rows = d.layers.size();
     FN_PROF_T(t_ec0);
     ec_rows_sync(d);
-    ec_scan<<<(unsigned int) n_rows, EC_SCAN_TPB, 0, stream>>>(d.rows_dev, d.counts_dev, d.seen_dev, d.freq_dev, d.perm_dev, decay, 0.25f,
-        d.res_dev, d.more_dev);
+    static const float min_gain = getenv("GGML_CUDA_EXPERT_CACHE_GAIN") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_GAIN")) : 0.25f;
+    // the update after a prompt ubatch: its counts in the units of a decode window (3 tokens)
+    static const bool rescale_on = getenv("GGML_CUDA_EXPERT_CACHE_RESCALE") == nullptr || atoi(getenv("GGML_CUDA_EXPERT_CACHE_RESCALE")) != 0;
+    const float rescale = rescale_on && d.last_prompt_tokens > 3 ? 3.0f/(float) d.last_prompt_tokens : 1.0f;
+    ec_scan<<<(unsigned int) n_rows, EC_SCAN_TPB, 0, stream>>>(d.rows_dev, d.counts_dev, d.seen_dev, d.freq_dev, d.perm_dev, decay, min_gain,
+        rescale, d.res_dev, d.more_dev);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(d.res_host, d.res_dev, n_rows*sizeof(ec_res), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -472,11 +484,13 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     };
     std::vector<swap>    swaps;
     std::vector<ec_cand> more;
-    bool prompt = false;
+    bool     prompt    = false;
+    uint32_t total_max = 0;
     for (size_t row = 0; row < n_rows; ++row) {
         const ec_res & r = d.res_host[row];
         d.n_pairs      += r.total;
         d.n_pairs_cold += r.cold;
+        total_max = std::max(total_max, r.total);
         prompt = prompt || r.total > 100; // more than a decode window routes
         if (r.n_cand > EC_RES_CAND) {
             more.resize(r.n_cand);
@@ -489,6 +503,19 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
         }
     }
     d.n_updates++;
+    d.last_prompt_tokens = prompt ? (int) (total_max/std::max(1, d.n_used)) : 0;
+    {
+        // temporary: GGML_CUDA_EXPERT_CACHE_STATS=<n> prints the cold share of every n updates
+        static const int every = getenv("GGML_CUDA_EXPERT_CACHE_STATS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_STATS")) : 0;
+        static uint64_t  pairs_last = 0, cold_last = 0, swaps_last = 0;
+        if (every > 0 && d.n_updates % every == 0 && ctx.device == 0) {
+            fprintf(stderr, "ec-stats dev%d: updates %llu-%llu: %.2f%% of %llu routed pairs cold, %llu exchanges\n", ctx.device,
+                    (unsigned long long) (d.n_updates - every + 1), (unsigned long long) d.n_updates,
+                    100.0*(double) (d.n_pairs_cold - cold_last)/(double) std::max<uint64_t>(1, d.n_pairs - pairs_last),
+                    (unsigned long long) (d.n_pairs - pairs_last), (unsigned long long) (d.n_swaps - swaps_last));
+            pairs_last = d.n_pairs; cold_last = d.n_pairs_cold; swaps_last = d.n_swaps;
+        }
+    }
     // after a prompt every cold expert it routed to comes in; in a decode the best of the last window
     const size_t budget = prompt ? (size_t) EC_MAX_SWAPS : (size_t) std::max(0, n_swaps_max);
     if (swaps.size() > budget) {

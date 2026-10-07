@@ -27,6 +27,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_EXPERT_HOT_COUNT,                  hparams.n_expert_hot, false);
+    ml.get_key(LLM_KV_NEXTN_EXPERT_COUNT,                hparams.n_expert_nextn, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -298,14 +299,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // with expert_hot_count the routed experts are ordered hot-first and split into two tensors per weight
         // (trunk layers only: an MTP block merged into the file keeps its experts in one tensor)
-        const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) && il < n_layer ? (int64_t) hparams.n_expert_hot : n_expert;
-        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
+        // with nextn.expert_count the MTP block has its own expert count (an expert-pruned trunk, the vendor's draft block)
+        const int64_t n_expert_l = il >= n_layer && hparams.n_expert_nextn > 0 ? (int64_t) hparams.n_expert_nextn : n_expert;
+        const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) && il < n_layer ? (int64_t) hparams.n_expert_hot : n_expert_l;
+        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert_l }, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_hot }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_hot, flags);
-        if (n_hot < n_expert) {
-            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", il), { n_ff_exp, n_embd, n_expert - n_hot }, flags);
-            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", il), { n_embd, n_ff_exp, n_expert - n_hot }, flags);
-            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", il), { n_embd, n_ff_exp, n_expert - n_hot }, flags);
+        if (n_hot < n_expert_l) {
+            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", il), { n_ff_exp, n_embd, n_expert_l - n_hot }, flags);
+            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", il), { n_embd, n_ff_exp, n_expert_l - n_hot }, flags);
+            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", il), { n_embd, n_ff_exp, n_expert_l - n_hot }, flags);
             GGML_ASSERT(layer.ffn_gate_exps && layer.ffn_up_exps && "cold experts need separate gate and up tensors");
             exps_cold[layer.ffn_down_exps] = layer.ffn_down_exps_cold;
             exps_cold[layer.ffn_gate_exps] = layer.ffn_gate_exps_cold;
@@ -1217,6 +1220,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // the router's rows are the layer's expert count (an MTP block can keep more experts than a pruned trunk)
+    const int64_t n_expert_l = model.layers[il].ffn_gate_inp->ne[1];
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1224,7 +1230,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_gate_exps,
             model.layers[il].ffn_down_exps,
             nullptr,
-            n_expert, n_expert_used,
+            n_expert_l, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,

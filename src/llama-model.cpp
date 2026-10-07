@@ -2994,6 +2994,26 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }
 
+int32_t llama_model_n_vocab_draft(const llama_model * model) {
+    return model->d2t ? (int32_t) model->d2t->ne[0] : (int32_t) model->vocab.n_tokens();
+}
+
+bool llama_model_draft_logits_reduced(const llama_model * model) {
+    return model->d2t != nullptr && model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+}
+
+const int64_t * llama_model_d2t(const llama_model * model) {
+    if (model->d2t == nullptr) {
+        return nullptr;
+    }
+    if (model->d2t_host.empty()) {
+        GGML_ASSERT(model->d2t->type == GGML_TYPE_I64 && model->d2t->buffer != nullptr);
+        model->d2t_host.resize(model->d2t->ne[0]);
+        ggml_backend_tensor_get(model->d2t, model->d2t_host.data(), 0, ggml_nbytes(model->d2t));
+    }
+    return model->d2t_host.data();
+}
+
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }

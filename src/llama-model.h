@@ -714,6 +714,7 @@ struct llama_model {
     struct ggml_tensor * fc   = nullptr;
     struct ggml_tensor * fc_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+    mutable std::vector<int64_t> d2t_host; // its host copy, read once on demand (llama_model_d2t)
 
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;

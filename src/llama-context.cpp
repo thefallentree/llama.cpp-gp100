@@ -2276,7 +2276,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                const int64_t n_vocab_t = t_logits->ne[0];
+                if (n_vocab_t == n_vocab) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                } else {
+                    // a draft head of a reduced vocabulary (see llama_model_draft_logits_reduced): its rows at the
+                    // stride of the full vocabulary, the columns past it -inf
+                    GGML_ASSERT(n_vocab_t < n_vocab && ggml_is_contiguous(t_logits));
+                    for (int64_t i = 0; i < n_outputs; ++i) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + i*n_vocab, i*n_vocab_t*sizeof(float), n_vocab_t*sizeof(float));
+                        std::fill(logits_out + i*n_vocab + n_vocab_t, logits_out + (i + 1)*n_vocab, -INFINITY);
+                    }
+                }
             }
         }
 

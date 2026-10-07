@@ -337,8 +337,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, mtp_flags | TENSOR_ALLOW_RESHAPE);
         nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mtp_flags);
         nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mtp_flags);
-        // optional LM head of the MTP block (e.g. a smaller quantization than the trunk's output for drafting)
-        nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, mtp_flags | TENSOR_NOT_REQUIRED);
+        // optional LM head of the MTP block (e.g. a smaller quantization than the trunk's output for drafting);
+        // with a d2t map it holds the rows of a reduced draft vocabulary (the trunk verifies every draft token)
+        int64_t n_vocab_draft = n_vocab;
+        if (const ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t")) {
+            n_vocab_draft = d2t_meta->ne[0];
+            d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_draft }, mtp_flags);
+            LLAMA_LOG_INFO("%s: MTP draft vocabulary of %lld tokens (d2t)\n", __func__, (long long) n_vocab_draft);
+        }
+        nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab_draft }, mtp_flags | TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -662,6 +669,25 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     if (layer.nextn.shared_head_head) {
         cur = build_lora_mm(layer.nextn.shared_head_head, cur);
+        // a reduced draft vocabulary (d2t): on a tensor-split model the logits stay in the draft vocabulary (they are
+        // sharded, a scatter cannot be expressed; the backend sampler's argmax is a draft id that the drafter maps);
+        // on one device they are scattered to their target token ids, the rest -inf, so that any sampler works
+        bool vocab_sharded = false;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+            vocab_sharded |= dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+        }
+        if (model.d2t && !vocab_sharded) {
+            const int64_t n_vocab_draft = cur->ne[0];
+            const int64_t n_outputs     = cur->ne[1];
+            const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
+            GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_vocab_draft);
+            ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+            cur = ggml_set_rows(ctx0, logits,
+                    ggml_reshape_3d(ctx0, cur,       1,             n_vocab_draft, n_outputs),
+                    ggml_reshape_3d(ctx0, model.d2t, n_vocab_draft, 1,             1));
+            cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+        }
     } else {
         cur = build_lora_mm(model.output, cur, model.output_s);
     }

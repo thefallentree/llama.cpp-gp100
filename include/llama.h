@@ -604,6 +604,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    // the draft (MTP) head's reduced vocabulary: its size and its map to the target token ids (NULL: the full vocabulary)
+    LLAMA_API int32_t         llama_model_n_vocab_draft(const struct llama_model * model);
+    LLAMA_API const int64_t * llama_model_d2t          (const struct llama_model * model);
+    // true when the draft logits of this model stay in the draft vocabulary (a tensor-split model: the backend
+    // sampler's argmax is a draft id to map through d2t); false when they are scattered to the full vocabulary
+    LLAMA_API bool            llama_model_draft_logits_reduced(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);

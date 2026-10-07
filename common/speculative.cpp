@@ -1426,6 +1426,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // a reduced draft vocabulary: with sampling on the backend the draft logits stay in it, the ids map through d2t
+    const int64_t * d2t     = nullptr;
+    int32_t         n_vocab_draft = 0;
+
     // The catch-up rows of a verification batch are not decoded by process(): they wait for the decode of the
     // first draft step, which follows right after, and run in its batch. A decode costs a few milliseconds
     // whatever its size, so this removes one of the three decodes of a round with two draft tokens.
@@ -1541,6 +1545,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        {
+            const llama_model * model_dft = llama_get_model(ctx_dft);
+            n_vocab_draft = llama_model_n_vocab_draft(model_dft);
+            if (n_vocab_draft != llama_vocab_n_tokens(llama_model_get_vocab(model_dft))) {
+                bool on_backend = true;
+                for (auto * chain : backend_chains) {
+                    on_backend = on_backend && chain != nullptr;
+                }
+                if (on_backend && llama_model_draft_logits_reduced(model_dft)) {
+                    d2t = llama_model_d2t(model_dft);
+                    SPC_TRC("- draft vocabulary of %d tokens, the sampled ids map through d2t\n", (int) n_vocab_draft);
+                } else {
+                    // the graph scatters the logits to the full vocabulary itself (one device)
+                    n_vocab_draft = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+                }
+            }
+        }
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -1892,7 +1914,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const int64_t t_s0 = timing ? ggml_time_us() : 0;
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const int64_t t_s1 = timing ? ggml_time_us() : 0;
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 if (timing) {
@@ -1900,7 +1922,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     t_phase_us[6] += ggml_time_us() - t_s1;
                 }
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                if (d2t != nullptr) {
+                    // the backend sampled in the draft vocabulary: the ids become target token ids
+                    GGML_ASSERT(id_sampled >= 0 && id_sampled < n_vocab_draft);
+                    id_sampled = (llama_token) d2t[id_sampled];
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id >= 0 && cur_p->data[k].id < n_vocab_draft) {
+                            cur_p->data[k].id = (llama_token) d2t[cur_p->data[k].id];
+                        }
+                    }
+                }
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",

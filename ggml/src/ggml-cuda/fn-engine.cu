@@ -10,8 +10,8 @@
 #define FN_QK 32 // weights per Q8_0 block
 
 // Geometry by row width (TPR = columns/16): rows of up to 2560 columns in blocks of 160 threads, several rows per
-// block when they are narrower; 3072 and 6144 columns in blocks of 192 and 384 threads. Rows of 10240 columns are
-// read as four parts of 2560 (S = 4, see fn_dense_p8).
+// block when they are narrower; 3072 and 6144 columns in blocks of 192 and 384 threads. Rows of 10240 and 5120
+// columns are read as four or two parts of 2560 (S = 4 / 2, see fn_dense_p8).
 // R rows per tile: 8, or 4 where 8 rows of T tokens exceed the registers, the 48 KB of shared memory of a block or
 // the R*T/2 gathering threads a row has. BPS: blocks per SM; minBlocksPerMultiprocessor caps the registers so that
 // nsm*BPS blocks are resident together, and is chosen so that no instantiation spills under that cap
@@ -38,7 +38,7 @@ struct fn_dense_geom {
 
 // the row widths the mat-vec is instantiated for
 static bool fn_dense_geometry(const int64_t cols, fn_dense_geom * gm = nullptr, const int nt = 1) {
-    const int s   = cols/16 == 640 ? 4 : 1;
+    const int s   = cols/16 == 640 ? 4 : cols/16 == 320 ? 2 : 1; // rows of 10240 or 5120 columns: parts of 2560
     const int tpr = (int) (cols/(16*s));
     if (cols % (16*s) != 0 || (tpr != 20 && tpr != 40 && tpr != 160 && tpr != 192 && tpr != 384)) {
         return false;
@@ -905,6 +905,8 @@ static void fn_dense_launch(const int nt, const fn_dense_geom & gm, const fn_den
                 case 160:                                                                                             \
                     if (gm.s == 1) {                                                                                  \
                         fn_dense_p8<N, R160, 160, 1, B160, 1><<<grid, 160, 0, stream>>>(job);                         \
+                    } else if (gm.s == 2) {                                                                           \
+                        fn_dense_p8<N, R160, 160, 1, B160, 2><<<grid, 160, 0, stream>>>(job);                         \
                     } else {                                                                                          \
                         fn_dense_p8<N, R160, 160, 1, B160, 4><<<grid, 160, 0, stream>>>(job);                         \
                     }                                                                                                 \
@@ -1003,26 +1005,22 @@ static void fn_dense(const int nt, const fn_dense_part * parts, const int n, con
 }
 
 // out[t][i] = epilogue(sum over the np parts of parts[p][t][i]), one block per token: as floats, and as fp16
-// activations with their scale if X is not null. n <= 2*FN_ACT_TPB.
+// activations with their scale if X is not null.
 static __global__ void fn_sum_parts(const float * __restrict__ parts, const int np, const int n, const int epi, const float es,
                                     const float eb, float * __restrict__ dst, const int dst_stride, const float gain,
                                     half * __restrict__ X, float * __restrict__ xscale) {
     __shared__ float s_red[FN_ACT_TPB/WARP_SIZE];
     const int t  = blockIdx.x;
     const int nt = gridDim.x;
-    float v[2] = { 0.0f, 0.0f };
-    float m    = 0.0f;
-#pragma unroll
-    for (int j = 0; j < 2; ++j) {
-        const int i = threadIdx.x + j*FN_ACT_TPB;
-        if (i < n) {
-            for (int q = 0; q < np; ++q) {
-                v[j] += parts[((int64_t) q*nt + t)*n + i];
-            }
-            v[j] = fn_epilogue(v[j], epi, es, eb);
-            dst[t*dst_stride + i] = v[j];
-            m = fmaxf(m, fabsf(v[j]));
+    float m = 0.0f;
+    for (int i = threadIdx.x; i < n; i += FN_ACT_TPB) {
+        float v = 0.0f;
+        for (int q = 0; q < np; ++q) {
+            v += parts[((int64_t) q*nt + t)*n + i];
         }
+        v = fn_epilogue(v, epi, es, eb);
+        dst[t*dst_stride + i] = v;
+        m = fmaxf(m, fabsf(v));
     }
     if (X == nullptr) {
         return;
@@ -1041,12 +1039,8 @@ static __global__ void fn_sum_parts(const float * __restrict__ parts, const int 
         m = fmaxf(m, s_red[w]);
     }
     const float sc = m > 0.0f ? gain/m : 0.0f;
-#pragma unroll
-    for (int j = 0; j < 2; ++j) {
-        const int i = threadIdx.x + j*FN_ACT_TPB;
-        if (i < n) {
-            X[(int64_t) t*n + i] = __float2half_rn(v[j]*sc);
-        }
+    for (int i = threadIdx.x; i < n; i += FN_ACT_TPB) {
+        X[(int64_t) t*n + i] = __float2half_rn(dst[t*dst_stride + i]*sc);
     }
     if (threadIdx.x == 0) {
         xscale[t] = m > 0.0f ? m/gain : 0.0f;
@@ -1084,7 +1078,7 @@ static void fn_dense_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * w
     fn_dense_geom      gm;
     GGML_ASSERT(ggml_cuda_fn_planar(w, &plane) && fn_dense_geometry(w->ne[0], &gm, nt) && gm.s <= FN_MAX_SEG);
     const int rows = (int) w->ne[1];
-    GGML_ASSERT(rows <= 2*FN_ACT_TPB && x.n == w->ne[0]);
+    GGML_ASSERT(x.n == w->ne[0]);
     ggml_cuda_pool_alloc<float> parts(ctx.pool(), (size_t) gm.s*nt*rows);
     fn_dense_part pt[FN_MAX_SEG];
     for (int c = 0; c < gm.s; ++c) {
@@ -1108,10 +1102,14 @@ bool ggml_cuda_fn_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor 
     if (src0->type == GGML_TYPE_F32 && src1->ne[1] > FN_MAX_T) {
         return false;
     }
+    // a batch of vectors beyond ne[1] (the hyper-connection streams of a token) is one 2D batch when both sides are
+    // contiguous: the weights are not batched, so every vector multiplies the same matrix
+    const int64_t n_vec = src1->ne[1]*src1->ne[2]*src1->ne[3];
+    const bool    flat  = src1->ne[2] == 1 && src1->ne[3] == 1 ? true : ggml_is_contiguous(src1) && src0->ne[2] == 1 && src0->ne[3] == 1;
     return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src1->ne[1] <= 4*FN_MAX_T && src1->ne[2] == 1 && src1->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+           n_vec <= 4*FN_MAX_T && flat && dst->ne[2] == src1->ne[2] && dst->ne[3] == src1->ne[3] &&
            src1->nb[0] == sizeof(float) && src1->ne[0] == src0->ne[0] && ggml_is_contiguous(dst) &&
-           fn_dense_geometry(src0->ne[0], &gm) && (gm.s == 1 || (src0->ne[1] <= 2*FN_ACT_TPB && src1->ne[1] <= FN_MAX_T));
+           fn_dense_geometry(src0->ne[0], &gm);
 }
 
 // The segment of a router's second copy, if node is a router's MUL_MAT. Its output goes to a buffer of the context
@@ -1145,13 +1143,14 @@ void ggml_cuda_fn_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     fn_dense_geom      gm;
     const char *       codes = nullptr;
     GGML_ASSERT(fn_plane_of(src0, &codes, &plane) && fn_dense_geometry(src0->ne[0], &gm));
-    const int     cols = (int) src0->ne[0];
-    const int     nsm  = ggml_cuda_info().devices[ctx.device].nsm;
-    const int64_t s1   = src1->nb[1]/sizeof(float);
-    const int64_t sd   = dst->nb[1]/sizeof(float);
+    const int     cols  = (int) src0->ne[0];
+    const int     nsm   = ggml_cuda_info().devices[ctx.device].nsm;
+    const int64_t s1    = src1->nb[1]/sizeof(float);
+    const int64_t sd    = dst->nb[1]/sizeof(float);
+    const int64_t n_vec = src1->ne[1]*src1->ne[2]*src1->ne[3]; // contiguous beyond ne[1], see ggml_cuda_fn_mul_mat_supported
 
-    if (src1->ne[1] <= FN_MAX_T) {
-        const int    nt = (int) src1->ne[1];
+    if (n_vec <= FN_MAX_T) {
+        const int    nt = (int) n_vec;
         const auto & x  = fn_act_get(ctx, src1, (const float *) src1->data, s1, cols, nt);
         if (gm.s > 1) {
             fn_dense_wide(ctx, src0, x, nt, FN_EPI_NONE, 0.0f, 0.0f, (float *) dst->data, sd, nullptr, nullptr);
@@ -1166,9 +1165,13 @@ void ggml_cuda_fn_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     ggml_cuda_pool_alloc<char> xm(ctx.pool(), (size_t) FN_MAX_T*cols*sizeof(half) + FN_MAX_T*sizeof(float));
     x.mem = xm.get();
     x.n   = cols;
-    for (int64_t c0 = 0; c0 < src1->ne[1]; c0 += FN_MAX_T) {
-        const int nt = (int) std::min<int64_t>(FN_MAX_T, src1->ne[1] - c0);
+    for (int64_t c0 = 0; c0 < n_vec; c0 += FN_MAX_T) {
+        const int nt = (int) std::min<int64_t>(FN_MAX_T, n_vec - c0);
         fn_act_h16<<<nt, FN_ACT_TPB, 0, ctx.stream()>>>((const float *) src1->data + c0*s1, s1, cols, fn_gain(cols), fn_act_X(x), fn_act_xs(x));
+        if (gm.s > 1) {
+            fn_dense_wide(ctx, src0, x, nt, FN_EPI_NONE, 0.0f, 0.0f, (float *) dst->data + c0*sd, sd, nullptr, nullptr);
+            continue;
+        }
         const fn_dense_part pt = fn_dense_part_of(src0, plane, 0, x, (float *) dst->data + c0*sd, sd);
         fn_dense(nt, &pt, 1, nsm, ctx.stream());
     }

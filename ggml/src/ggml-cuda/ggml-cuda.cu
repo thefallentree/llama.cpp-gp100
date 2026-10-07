@@ -2280,6 +2280,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         if (ggml_cuda_fn_mul_mat_supported(src0, src1, dst)) {
             ggml_cuda_fn_mul_mat(ctx, src0, src1, dst);
         } else {
+            static const bool dbg = getenv("GGML_CUDA_FN_DEBUG") != nullptr;
+            if (dbg && src1->ne[1] <= 64) {
+                fprintf(stderr, "fn-decline: planar %s [%lld x %lld] x %s [%lld, %lld, %lld] nb0 %zu cont %d -> cuBLAS\n", src0->name,
+                    (long long) src0->ne[0], (long long) src0->ne[1], src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2],
+                    src1->nb[0], (int) ggml_is_contiguous(dst));
+            }
             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         }
         return;

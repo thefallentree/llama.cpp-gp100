@@ -1430,6 +1430,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     const int64_t * d2t     = nullptr;
     int32_t         n_vocab_draft = 0;
 
+    // LLAMA_SPEC_MTP_EVAL=1: the teacher-forced accuracy of the draft head over the prompt batches (its argmax at
+    // row k against the token of row k + 1), printed when the drafter is freed
+    const bool eval    = getenv("LLAMA_SPEC_MTP_EVAL") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_EVAL")) != 0;
+    int64_t    eval_n  = 0;
+    int64_t    eval_ok = 0;
+
     // The catch-up rows of a verification batch are not decoded by process(): they wait for the decode of the
     // first draft step, which follows right after, and run in its batch. A decode costs a few milliseconds
     // whatever its size, so this removes one of the three decodes of a round with two draft tokens.
@@ -1606,6 +1612,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     t_phase_us[0]/1000.0/n_draft, t_phase_us[1]/1000.0/n_draft, t_phase_us[2]/1000.0/n_draft, t_phase_us[3]/1000.0/n_draft,
                     t_phase_us[4]/1000.0/n_draft, t_phase_us[5]/1000.0/n_draft, t_phase_us[6]/1000.0/n_draft);
         }
+        if (eval && eval_n > 0) {
+            fprintf(stderr, "mtp-eval: top-1 of the draft head over the prompt: %lld of %lld (%.2f%%)\n",
+                    (long long) eval_ok, (long long) eval_n, 100.0*eval_ok/eval_n);
+        }
         if (getenv("LLAMA_SPEC_TIMING") != nullptr && n_draft > 0) {
             fprintf(stderr, "spec-timing: mtp process %.2f ms/call (%lld calls), draft %.2f ms/call (%lld calls, %.2f steps/call)\n",
                     t_process_us/1000.0/std::max<int64_t>(1, n_process), (long long) n_process,
@@ -1757,7 +1767,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                // at most 256 rows of a batch (their logits are a vocabulary each)
+                const int  eval_step = std::max(1, (n_tokens + 255)/256);
+                const bool eval_row  = eval && !defer_now && k % eval_step == 0 && k + 1 < n_tokens && batch_in.tokens[k + 1].seq_id == seq_id;
+                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, eval_row);
 
                 batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
             }
@@ -1793,6 +1806,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             if (!ok) {
                 return false;
+            }
+            if (eval && !defer_now) {
+                const int eval_step = std::max(1, (n_tokens + 255)/256);
+                int32_t i_out = 0;
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+                    if (!(k % eval_step == 0 && k + 1 < n_tokens && batch_in.tokens[k + 1].seq_id == seq_id)) {
+                        continue;
+                    }
+                    llama_token id = llama_get_sampled_token_ith(ctx_dft, i_out++);
+                    if (id == LLAMA_TOKEN_NULL) {
+                        // no backend sampler: the argmax of the row's logits
+                        const float * logits = llama_get_logits_ith(ctx_dft, i_out - 1);
+                        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                        id = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+                    } else if (d2t != nullptr) {
+                        id = (llama_token) d2t[id];
+                    }
+                    eval_n  += 1;
+                    eval_ok += id == batch_in.tokens[k + 1].id;
+                }
             }
         }
 

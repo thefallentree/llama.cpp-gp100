@@ -1767,10 +1767,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                // at most 256 rows of a batch (their logits are a vocabulary each)
-                const int  eval_step = std::max(1, (n_tokens + 255)/256);
-                const bool eval_row  = eval && !defer_now && k % eval_step == 0 && k + 1 < n_tokens && batch_in.tokens[k + 1].seq_id == seq_id;
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, eval_row);
+                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
 
                 batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
             }
@@ -1778,6 +1775,62 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
+            if (eval && !defer_now && !chain_heads && n_tokens > 1) {
+                // the prompt in pieces of eval_step rows, the last row of each with its logits: the draft context
+                // has one output per decode, and the prompt's rows are what the catch-up decodes anyway
+                const int eval_step = std::max(1, (n_tokens + 255)/256);
+                const int32_t n_batch_rows = batch.size();
+                std::vector<float> h_rows((size_t) n_batch_rows * n_embd);
+                std::vector<llama_token> ids(n_batch_rows);
+                std::vector<llama_pos>   poss(n_batch_rows);
+                std::vector<llama_seq_id> seqs(n_batch_rows);
+                for (int32_t r = 0; r < n_batch_rows; ++r) {
+                    const auto & t = batch.tokens[r];
+                    ids[r] = t.id; poss[r] = t.pos[0]; seqs[r] = t.seq_id;
+                    if (t.embd.data == nullptr) {
+                        fprintf(stderr, "mtp-eval: row %d has no embedding\n", (int) r);
+                        ok = false;
+                        break;
+                    }
+                    std::memcpy(h_rows.data() + (size_t) r * n_embd, t.embd.data, row_bytes);
+                }
+                for (int32_t r0 = 0; r0 < n_batch_rows && ok; r0 += eval_step) {
+                    const int32_t r1 = std::min(n_batch_rows, r0 + eval_step);
+                    const bool    has_next = r1 < n_batch_rows && seqs[r1 - 1] == seqs[r1];
+                    batch.clear();
+                    for (int32_t r = r0; r < r1; ++r) {
+                        const int32_t idx = batch.add(ids[r], poss[r], seqs[r], r == r1 - 1 && has_next);
+                        batch.set_embd(idx, { h_rows.data() + (size_t) r * n_embd, 1, (size_t) n_embd });
+                    }
+                    if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                        SPC_ERR("%s", "llama_process(ctx_dft) failed in the eval decode\n");
+                        ok = false;
+                        break;
+                    }
+                    if (has_next) {
+                        // the output is the last row of the piece
+                        llama_token id = llama_get_sampled_token_ith(ctx_dft, -1);
+                        if (id == LLAMA_TOKEN_NULL) {
+                            const float * logits = llama_get_logits_ith(ctx_dft, -1);
+                            if (logits == nullptr) {
+                                SPC_ERR("%s", "mtp-eval: no logits and no backend sampler for the draft\n");
+                                ok = false;
+                                break;
+                            }
+                            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                            id = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+                        } else if (d2t != nullptr) {
+                            id = (llama_token) d2t[id];
+                        }
+                        eval_n  += 1;
+                        eval_ok += id == ids[r1];
+                    }
+                }
+                batch.clear();
+                if (!ok) {
+                    return false;
+                }
+            } else
             for (int head = 0; head < n_mtp_layers && !defer_now; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
@@ -1806,27 +1859,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             if (!ok) {
                 return false;
-            }
-            if (eval && !defer_now) {
-                const int eval_step = std::max(1, (n_tokens + 255)/256);
-                int32_t i_out = 0;
-                for (int k = 0; k < n_tokens; ++k) {
-                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
-                    if (!(k % eval_step == 0 && k + 1 < n_tokens && batch_in.tokens[k + 1].seq_id == seq_id)) {
-                        continue;
-                    }
-                    llama_token id = llama_get_sampled_token_ith(ctx_dft, i_out++);
-                    if (id == LLAMA_TOKEN_NULL) {
-                        // no backend sampler: the argmax of the row's logits
-                        const float * logits = llama_get_logits_ith(ctx_dft, i_out - 1);
-                        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-                        id = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
-                    } else if (d2t != nullptr) {
-                        id = (llama_token) d2t[id];
-                    }
-                    eval_n  += 1;
-                    eval_ok += id == batch_in.tokens[k + 1].id;
-                }
             }
         }
 

@@ -556,7 +556,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
 
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        GGML_ABORT("%s: tensor %s (op %s, buffer %s, view of %s) is not in a meta buffer", __func__, tensor->name, ggml_op_name(tensor->op),
+            tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "none", tensor->view_src ? tensor->view_src->name : "-");
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
@@ -607,6 +610,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
@@ -1361,6 +1367,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        // a tensor of another backend that reached a meta graph (a view of the token embeddings the CPU computes):
+        // not split, every device sees the same data through the scheduler's input copies
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
@@ -2487,9 +2498,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (node->view_src != nullptr && node->view_src->buffer != nullptr && !ggml_backend_buffer_is_meta(node->view_src->buffer)) {
                     // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
                     // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                    // The same for a view of a tensor another backend computes (the token embeddings' reshape): the
+                    // scheduler feeds its readers an input copy, the view itself is a no-op here.
                     bcj.nodes[i] = node;
                     continue;
                 }

@@ -446,6 +446,8 @@ static bool top_k_partial_cuda(ggml_cuda_pool & pool, const float * src, int * d
 // Of the columns equal to the k-th key the first ones are taken, as a stable sort does.
 #define CUDA_TOP_K_SEL_WARPS 32
 
+// PART > 32 (rows of up to 64K columns): the registers of a 1024-thread block hold 32 keys per thread, the keys of
+// the other columns are read again from the row (L2) at every step of the search.
 template <int PART>
 static __global__ void __launch_bounds__(CUDA_TOP_K_SEL_WARPS*WARP_SIZE)
 k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
@@ -453,6 +455,8 @@ k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int
     __shared__ int      s_eq[CUDA_TOP_K_SEL_WARPS];
     __shared__ uint32_t s_thr;
     __shared__ int      s_need;
+    constexpr int REG = PART < 32 ? PART : 32;   // keys in registers
+    constexpr int EXT = PART - REG;              // keys read from the row at every step
 
     const float * row  = src + (size_t) blockIdx.x*ncols;
     int *         out  = dst + (size_t) blockIdx.x*k;
@@ -462,9 +466,9 @@ k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int
     const int     c0   = threadIdx.x*PART;
 
     // a column past the row gets key 0, no candidate is that low
-    uint32_t key[PART];
+    uint32_t key[REG];
 #pragma unroll
-    for (int i = 0; i < PART; ++i) {
+    for (int i = 0; i < REG; ++i) {
         key[i] = c0 + i < ncols ? top_k_key(row[c0 + i]) : 0u;
     }
 
@@ -476,8 +480,14 @@ k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int
         const uint32_t t = thr | (1u << bit);
         int n = 0;
 #pragma unroll
-        for (int i = 0; i < PART; ++i) {
+        for (int i = 0; i < REG; ++i) {
             n += key[i] >= t;
+        }
+        if (EXT > 0) {
+#pragma unroll 8
+            for (int i = REG; i < PART; ++i) {
+                n += c0 + i < ncols && top_k_key(row[c0 + i]) >= t;
+            }
         }
         n = warp_reduce_sum(n);
         if (lane == 0) {
@@ -497,9 +507,17 @@ k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int
     int n_gt = 0;
     int n_eq = 0;
 #pragma unroll
-    for (int i = 0; i < PART; ++i) {
+    for (int i = 0; i < REG; ++i) {
         n_gt += key[i] > thr;
         n_eq += key[i] == thr && c0 + i < ncols;
+    }
+    if (EXT > 0) {
+#pragma unroll 8
+        for (int i = REG; i < PART; ++i) {
+            const uint32_t kc = c0 + i < ncols ? top_k_key(row[c0 + i]) : 0u;
+            n_gt += kc > thr;
+            n_eq += kc == thr && c0 + i < ncols;
+        }
     }
     const int gi = warp_prefix_inclusive_sum(n_gt);
     const int ei = warp_prefix_inclusive_sum(n_eq);
@@ -544,17 +562,20 @@ k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int
 static bool top_k_select_cuda(const float * src, int * dst, const int ncols, const int nrows, const int k, cudaStream_t stream) {
     static const bool enabled = getenv("GGML_CUDA_TOP_K_SELECT") == nullptr || atoi(getenv("GGML_CUDA_TOP_K_SELECT")) != 0;
     const int max_threads = CUDA_TOP_K_SEL_WARPS*WARP_SIZE;
-    // the keys of a thread stay in registers, a block of 1024 threads has 63 per thread
+    // the keys of a thread stay in registers, a block of 1024 threads has 63 per thread; past 32 per thread (rows of
+    // more than 32K columns, a 128K context) the rest are read from the row at every step
     // k == ncols stays with the sort: its order is the order the consumer sums in, and nothing is saved there
-    if (!enabled || k <= CUDA_TOP_K_MAX_K || k >= ncols || nrows < 1 || ncols > 32*max_threads) {
+    if (!enabled || k <= CUDA_TOP_K_MAX_K || k >= ncols || nrows < 1 || ncols > 64*max_threads) {
         return false;
     }
-    const int part    = ncols <= 16*max_threads ? 16 : 32;
+    const int part    = ncols <= 16*max_threads ? 16 : ncols <= 32*max_threads ? 32 : 64;
     const int threads = GGML_PAD((ncols + part - 1)/part, WARP_SIZE);
     if (part == 16) {
         k_top_k_select<16><<<nrows, threads, 0, stream>>>(src, dst, ncols, k);
-    } else {
+    } else if (part == 32) {
         k_top_k_select<32><<<nrows, threads, 0, stream>>>(src, dst, ncols, k);
+    } else {
+        k_top_k_select<64><<<nrows, threads, 0, stream>>>(src, dst, ncols, k);
     }
     return true;
 }

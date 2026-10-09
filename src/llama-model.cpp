@@ -829,9 +829,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
-            return {blck_size_perf};
+            // slices of 128 columns for the mat-vec kernels where that divides the rows evenly, else the quant
+            // block (64 for the 640-wide experts of Qwen3.8-Flash-Next on two devices: 320 + 320 instead of
+            // 256 + 384, whose larger half every layer waits for)
+            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            const int64_t blck_size_min  = std::lcm(blck_size, 64);
+            return {segments[0].first % (blck_size_perf*(int64_t) ud->n_devices) == 0 ? blck_size_perf : blck_size_min};
         }
 
         // everything else

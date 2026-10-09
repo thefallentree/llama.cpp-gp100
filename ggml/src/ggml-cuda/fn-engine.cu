@@ -1937,7 +1937,9 @@ static __global__ void fn_ar_hc(
 // decode produces (pair j of a 16-code word holds its elements j and j + 8).
 // The blocks are read where they are, with aligned 4-byte loads: an even block starts on a word, its codes two
 // bytes into it; the codes of an odd block are words themselves and its scale ends the word before them. So every
-// block is five words from an aligned address, and __byte_perm puts the codes together.
+// block is five words from an aligned address, and __byte_perm puts the codes together. A row of an odd number
+// of blocks (320 columns: 90 bytes) starts on a word every other row only, so the parity of a block is that of
+// its address (fn_q2_par), not of its index.
 //   fn_moe_up:   block (row tile, pair): h = silu(w_gate . x)*(w_up . x) for 16 rows of the pair's expert
 //   fn_moe_down: block (row tile, token): y = sum over the token's pairs of weight * (w_down . h), in registers
 // Pairs whose expert is not in VRAM (position >= n_hot) are left to the host threads (moe-host.cuh).
@@ -1948,8 +1950,13 @@ struct fn_q2_raw {
     uint32_t w[5];
 };
 
-static __device__ __forceinline__ void fn_q2_load(const char * __restrict__ row, const int kb, fn_q2_raw & r) {
-    const uint32_t * p = (const uint32_t *) (row + kb*18 - 2*(kb & 1));
+// the parity of block kb of a row: 1 when its scale ends a word
+static __device__ __forceinline__ int fn_q2_par(const char * __restrict__ row, const int kb) {
+    return (int) ((((uintptr_t) row) >> 1) ^ (uintptr_t) kb) & 1;
+}
+
+static __device__ __forceinline__ void fn_q2_load(const char * __restrict__ row, const int kb, const int par, fn_q2_raw & r) {
+    const uint32_t * p = (const uint32_t *) (row + kb*18 - 2*par);
 #pragma unroll
     for (int j = 0; j < 5; ++j) {
         r.w[j] = p[j];
@@ -2001,9 +2008,9 @@ static __device__ __forceinline__ void fn_q2_load_act(const half2 * __restrict__
     }
 }
 
-// the dot product of one block with the thread's activations, times the block's scale
-static __device__ __forceinline__ float fn_q2_dot(const fn_q2_raw & r, const int kb, const half2 a[32]) {
-    const int sel = (kb & 1) ? 0x7654 : 0x5432;
+// the dot product of one block (of parity par) with the thread's activations, times the block's scale
+static __device__ __forceinline__ float fn_q2_dot(const fn_q2_raw & r, const int par, const half2 a[32]) {
+    const int sel = par ? 0x7654 : 0x5432;
     half2 acc = make_half2(0.0f, 0.0f);
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
@@ -2015,7 +2022,7 @@ static __device__ __forceinline__ float fn_q2_dot(const fn_q2_raw & r, const int
         }
     }
     // the scale and the sum of the two halves of acc, converted as one pair
-    const uint32_t db  = (r.w[0] >> ((kb & 1)*16)) & 0xffffu;
+    const uint32_t db  = (r.w[0] >> (par*16)) & 0xffffu;
     const uint32_t sum = (uint32_t) __half_as_ushort(__hadd(__low2half(acc), __high2half(acc)));
     const float2   f   = __half22float2(fn_h2((int) (db | (sum << 16))));
     return f.x*f.y;
@@ -2062,13 +2069,15 @@ fn_moe_up(const char * __restrict__ wg, const char * __restrict__ wu, const int6
     for (int m = 0; m < 2; ++m) {
         const char * w = (m == 0 ? wg : wu) + (int64_t) e*nb2 + row0*nb1;
         fn_q2_raw raw[R];
+        int       par[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            fn_q2_load(w + (int64_t) r*G*nb1, k, raw[r]);
+            par[r] = fn_q2_par(w + (int64_t) r*G*nb1, k);
+            fn_q2_load(w + (int64_t) r*G*nb1, k, par[r], raw[r]);
         }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            s_part[m*R + r][tid] = fn_q2_dot(raw[r], k, a);
+            s_part[m*R + r][tid] = fn_q2_dot(raw[r], par[r], a);
         }
     }
     __syncthreads();
@@ -2096,11 +2105,11 @@ fn_moe_up(const char * __restrict__ wg, const char * __restrict__ wu, const int6
 #define FN_MOE_NU     10  // pairs of a token that a block of fn_moe_down has threads for
 #define FN_MOE_DOWN_R 8   // rows per row group of a tile, in two passes
 
-// grid: (n_embd/(G*R), tokens). Block: G row groups x FN_MOE_NU pairs x TPR = n_ff/64 threads (4, 6, 8 or 12): thread (g, s, k) owns
+// grid: (n_embd/(G*R), tokens). Block: G row groups x FN_MOE_NU pairs x TPR = n_ff/64 threads (4, 5, 6, 8 or 12): thread (g, s, k) owns
 // block k of the rows g, g + G, ... of the tile in the expert of the token's pair s, so the pairs of a token are
 // computed side by side (one after the other, a block waits for memory once per pair) and summed like the threads
 // of a row. Xh: the activations of h [pairs][n_ff halves] with the scales xsh [pairs]. y: [tokens][sy].
-// row groups of a block by TPR: blocks of 120 or 160 threads
+// row groups of a block by TPR: blocks of 100, 120 or 160 threads
 static constexpr __host__ __device__ int fn_moe_down_groups(const int tpr) {
     return tpr == 4 ? 4 : tpr <= 8 ? 2 : 1;
 }
@@ -2136,13 +2145,15 @@ fn_moe_down(const char * __restrict__ wd, const int64_t nb1, const int64_t nb2,
 #pragma unroll
         for (int b = 0; b < R; b += 4) {
             fn_q2_raw raw[4];
+            int       par[4];
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                fn_q2_load(w + (int64_t) (b + r)*G*nb1, k, raw[r]);
+                par[r] = fn_q2_par(w + (int64_t) (b + r)*G*nb1, k);
+                fn_q2_load(w + (int64_t) (b + r)*G*nb1, k, par[r], raw[r]);
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                s_part[b + r][tid] = ws*fn_q2_dot(raw[r], k, a);
+                s_part[b + r][tid] = ws*fn_q2_dot(raw[r], par[r], a);
             }
         }
     } else {
@@ -3177,7 +3188,8 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
 
 static bool fn_moe_q2(const ggml_tensor * w, const int64_t cols, const int64_t rows) {
     return w->type == GGML_TYPE_Q2_0 && w->ne[0] == cols && w->ne[1] == rows && w->ne[3] == 1 &&
-           w->nb[1] == (size_t) cols/64*18 && w->nb[2] == w->nb[1]*rows && ((uintptr_t) w->data & 0x3) == 0;
+           w->nb[1] == (size_t) cols/64*18 && w->nb[2] == w->nb[1]*rows && ((uintptr_t) w->data & 0x3) == 0 &&
+           w->nb[2] % 4 == 0;
 }
 
 bool ggml_cuda_fn_moe_supported(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
@@ -3194,7 +3206,7 @@ bool ggml_cuda_fn_moe_supported(const ggml_tensor * gate, const ggml_tensor * up
     const int64_t nt     = ids->ne[1];
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_DP4A &&
-           n_embd == 64*FN_Q2_TPR && (n_ff == 256 || n_ff == 384 || n_ff == 512 || n_ff == 768) &&
+           n_embd == 64*FN_Q2_TPR && (n_ff == 256 || n_ff == 320 || n_ff == 384 || n_ff == 512 || n_ff == 768) &&
            n_embd % (4*FN_MOE_DOWN_R) == 0 && n_used <= FN_MOE_NU &&
            nt >= 1 && nt <= FN_MAX_T &&
            fn_moe_q2(gate->src[0], n_embd, n_ff) && fn_moe_q2(up->src[0], n_embd, n_ff) && fn_moe_q2(down->src[0], n_ff, n_embd) &&
@@ -3283,6 +3295,7 @@ void ggml_cuda_fn_moe_down(ggml_backend_cuda_context & ctx, const ggml_tensor * 
                 (float *) dst->data, dst->nb[1]/sizeof(float));                                                       \
             break;
         FN_CASE(4)
+        FN_CASE(5)
         FN_CASE(6)
         FN_CASE(8)
         FN_CASE(12)

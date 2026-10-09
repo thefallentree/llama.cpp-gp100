@@ -1241,6 +1241,9 @@ struct ggml_backend_cuda_comm_context {
         bool                    pending = false;
         bool                    done    = false;
         bool                    stop    = false;
+        // the hand-off and the wait, spinning (ggml_backend_cuda_window_spin)
+        std::atomic<int>        spin_pending { 0 };
+        std::atomic<int>        spin_done    { 0 };
     };
     std::unique_ptr<window_launcher> launcher;
 
@@ -7425,7 +7428,32 @@ static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// GGML_CUDA_WINDOW_SPIN=0: the hand-off to the second device's launcher and the wait for it through a condition
+// variable instead of spinning. On the P100 box a woken thread runs slowly for a while: with the condition variable
+// the target window's launch took 1.38 ms of wall time and the MTP window's 0.24 for 0.95 and 0.125 spinning (the
+// 1K round 32.3 -> 30.9 ms).
+static bool ggml_backend_cuda_window_spin() {
+    static const bool spin = getenv("GGML_CUDA_WINDOW_SPIN") == nullptr || atoi(getenv("GGML_CUDA_WINDOW_SPIN")) != 0;
+    return spin;
+}
+
 static void ggml_backend_cuda_comm_window_launcher_main(ggml_backend_cuda_comm_context::window_launcher * l) {
+    if (ggml_backend_cuda_window_spin()) {
+        while (true) {
+            while (l->spin_pending.load(std::memory_order_acquire) == 0) {
+                if (*(volatile bool *) &l->stop) {
+                    return;
+                }
+#if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+#endif
+            }
+            l->spin_pending.store(0, std::memory_order_relaxed);
+            ggml_cuda_set_device(l->device);
+            CUDA_CHECK(cudaGraphLaunch(l->exec, l->stream));
+            l->spin_done.store(1, std::memory_order_release);
+        }
+    }
     std::unique_lock<std::mutex> lock(l->mutex);
     while (true) {
         l->cv.wait(lock, [l] { return l->pending || l->stop; });
@@ -7477,6 +7505,21 @@ static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * windo
         ggml_backend_cuda_context * ctx0 = (ggml_backend_cuda_context *) comm_ctx->backends[0]->context;
         ggml_backend_cuda_context * ctx1 = (ggml_backend_cuda_context *) comm_ctx->backends[1]->context;
         cudaStream_t stream1 = ctx1->stream();
+        if (ggml_backend_cuda_window_spin()) {
+            l->exec   = window->execs[1];
+            l->stream = stream1;
+            l->device = ctx1->device;
+            l->spin_done.store(0, std::memory_order_relaxed);
+            l->spin_pending.store(1, std::memory_order_release);
+            ggml_cuda_set_device(ctx0->device);
+            CUDA_CHECK(cudaGraphLaunch(window->execs[0], ctx0->stream()));
+            while (l->spin_done.load(std::memory_order_acquire) == 0) {
+#if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+#endif
+            }
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(l->mutex);
             l->exec    = window->execs[1];

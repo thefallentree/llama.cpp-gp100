@@ -4387,6 +4387,63 @@ static int ggml_cuda_fn_moe(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * 
     return 2;
 }
 
+// The same for a MoE layer whose experts are all in VRAM (the MTP block): gate, up, SwiGLU, down and the weighted
+// sum of the pairs on the fused engine, without a host triple. The weighted sum is what the down kernel writes.
+static int ggml_cuda_fn_moe_hot(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node == cuda_ctx->fn_moe_down) {
+        ggml_cuda_fn_moe_down(*cuda_ctx, node, cuda_ctx->fn_moe_dst);
+        const int n_skip = cuda_ctx->fn_moe_skip;
+        cuda_ctx->fn_moe_down = nullptr;
+        return n_skip;
+    }
+    if (node->op != GGML_OP_MUL_MAT_ID || cuda_ctx->fn_moe_down != nullptr || i + 2 >= cgraph->n_nodes || ggml_cuda_mmid_cold(node)) {
+        return 0;
+    }
+    const ggml_tensor * second = cgraph->nodes[i + 1];
+    const ggml_tensor * glu    = cgraph->nodes[i + 2];
+    if (second->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!((node == gate && second == up) || (node == up && second == gate)) || gate->src[1] != up->src[1] || gate->src[2] != up->src[2]) {
+        return 0;
+    }
+    int j = -1;
+    for (int k = i + 3; k < std::min(cgraph->n_nodes, i + 40) && j < 0; ++k) {
+        const ggml_tensor * d = cgraph->nodes[k];
+        if (d->op == GGML_OP_MUL_MAT_ID && d->src[1] == glu) {
+            j = k;
+        }
+    }
+    if (j < 0 || j + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * down = cgraph->nodes[j];
+    ggml_cuda_moe_weighted_reduction_match match;
+    if (ggml_cuda_mmid_cold(down) || down->src[2] != gate->src[2] || !ggml_cuda_match_moe_weighted_reduction(cgraph, j + 1, match) ||
+        match.experts != down || match.expert_scale != nullptr || ggml_is_empty(match.dst) ||
+        !ggml_cuda_fn_moe_supported(gate, up, down, match.weights, match.dst)) {
+        return 0;
+    }
+    for (const ggml_tensor * x : { gate, up, glu, down }) {
+        if (x->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+        ggml_node_get_use_count(cgraph, i + 2) != 1 || ggml_node_get_use_count(cgraph, j) != 1) {
+        return 0;
+    }
+    ggml_cuda_fn_moe_up(*cuda_ctx, gate, up, match.weights);
+    cuda_ctx->fn_moe_down = down;
+    cuda_ctx->fn_moe_dst  = match.dst;
+    cuda_ctx->fn_moe_skip = match.node_count;
+    return 2;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool allow_defer) {
@@ -5616,7 +5673,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // cold experts of a hot/cold MoE layer on the host: rings the doorbell before the triple's first node
                 const bool moe_host = ggml_cuda_moe_host_begin(*cuda_ctx, cgraph, i);
 
-                int nodes_to_skip = moe_host ? ggml_cuda_fn_moe(cuda_ctx, cgraph, i) : ggml_cuda_try_fuse(cuda_ctx, cgraph, i, allow_defer);
+                int nodes_to_skip = moe_host ? ggml_cuda_fn_moe(cuda_ctx, cgraph, i) : ggml_cuda_fn_moe_hot(cuda_ctx, cgraph, i);
+                if (nodes_to_skip == 0 && !moe_host) {
+                    nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, allow_defer);
+                }
 
                 if (nodes_to_skip == GGML_CUDA_FUSE_DEFERRED) {
                     // This node is executed folded into a later node (or has been already)

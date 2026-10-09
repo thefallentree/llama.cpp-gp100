@@ -26,6 +26,11 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <cerrno>
+#include <cstring>
+#endif
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -1973,6 +1978,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+#if defined(__linux__)
+    // LLAMA_PLE_MLOCK=0 to leave it: the PLE n-gram table (28.8 GB for Qwen3.8-Flash-Next) stays a mapping in host memory
+    // that every decode window reads a few dozen random rows of; with 5% of it out of the page cache, those reads
+    // cost 0.6 ms per window at a 64K context (77 us at 1K, where the n-grams repeat). Locked, nothing is ever read
+    // from the disk again. The load touches what was not resident (seconds).
+    if (per_layer_tok_embd != nullptr && per_layer_tok_embd->data != nullptr && per_layer_tok_embd->buffer != nullptr &&
+            ggml_backend_buffer_is_host(per_layer_tok_embd->buffer) &&
+            (getenv("LLAMA_PLE_MLOCK") == nullptr || atoi(getenv("LLAMA_PLE_MLOCK")) != 0)) {
+        const size_t size = ggml_nbytes(per_layer_tok_embd);
+        const int64_t t0  = ggml_time_us();
+        if (mlock(per_layer_tok_embd->data, size) == 0) {
+            LLAMA_LOG_INFO("%s: the PLE table (%.1f GB) locked in memory in %.1f s\n", __func__, size/1e9, (ggml_time_us() - t0)/1e6);
+        } else {
+            LLAMA_LOG_WARN("%s: mlock of the PLE table (%.1f GB) failed: %s\n", __func__, size/1e9, strerror(errno));
+        }
+    }
+#endif
 
     return true;
 }

@@ -2076,6 +2076,96 @@ static __device__ __forceinline__ float fn_q2_dot(const fn_q2_raw & r, const int
     return f.x*f.y;
 }
 
+// A Q4_0 block is { half d; 16 bytes of 4-bit codes }: 32 weights (code - 8)*d, 18 bytes; byte i holds the codes of
+// weights i (low nibble) and i + 16 (high). A thread's 64 columns are two blocks = nine words, read from the row
+// where they are (rows of 320 or 2560 columns are a multiple of four bytes, so no parity): the first block's codes
+// start two bytes into its first word, the second block's are words of their own. A word decodes to four half2
+// pairs: (0, 2), (1, 3) of its low nibbles and (16, 18), (17, 19) of its high ones, elements of the block, and the
+// activations are loaded in that order (fn_q4_load_act). The MTP block's experts are Q4_0 (the vendor's draft
+// block); the trunk's are Q2_0.
+struct fn_q4_raw {
+    uint32_t w[9];
+};
+
+static __device__ __forceinline__ void fn_q4_load(const char * __restrict__ row, const int kb, fn_q4_raw & r) {
+    const uint32_t * p = (const uint32_t *) (row + kb*36);
+#pragma unroll
+    for (int j = 0; j < 9; ++j) {
+        r.w[j] = p[j];
+    }
+}
+
+// 8 codes (one word) -> 4 half2 holding code - 8
+static __device__ __forceinline__ void fn_q4_decode8(const uint32_t q, half2 * h) {
+    const uint32_t lo = q & 0x0F0F0F0Fu;
+    const uint32_t hi = (q >> 4) & 0x0F0F0F0Fu;
+    const half2 m = __float2half2_rn(1032.0f); // 1024 (the exponent) + 8
+    h[0] = __hsub2(fn_h2((int) ((lo & 0x00FF00FFu) | 0x64006400u)), m);
+    h[1] = __hsub2(fn_h2((int) (((lo >> 8) & 0x00FF00FFu) | 0x64006400u)), m);
+    h[2] = __hsub2(fn_h2((int) ((hi & 0x00FF00FFu) | 0x64006400u)), m);
+    h[3] = __hsub2(fn_h2((int) (((hi >> 8) & 0x00FF00FFu) | 0x64006400u)), m);
+}
+
+// the 64 activations of a thread (16 words of natural pairs) in the decode order of fn_q4_decode8
+static __device__ __forceinline__ void fn_q4_load_act(const half2 * __restrict__ X, half2 a[32]) {
+    const int2 * ap = (const int2 *) X; // 4 halves
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const int2 lo = ap[8*q + w];     // elements 32q + 4w .. + 3
+            const int2 hi = ap[8*q + 4 + w]; // elements 32q + 4w + 16 .. + 19
+            a[8*q + 4*w + 0] = fn_h2(__byte_perm(lo.x, lo.y, 0x5410));
+            a[8*q + 4*w + 1] = fn_h2(__byte_perm(lo.x, lo.y, 0x7632));
+            a[8*q + 4*w + 2] = fn_h2(__byte_perm(hi.x, hi.y, 0x5410));
+            a[8*q + 4*w + 3] = fn_h2(__byte_perm(hi.x, hi.y, 0x7632));
+        }
+    }
+}
+
+// the dot product of a thread's two blocks with its activations, times the blocks' scales
+static __device__ __forceinline__ float fn_q4_dot(const fn_q4_raw & r, const half2 a[32]) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+        half2 acc = make_half2(0.0f, 0.0f);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t codes = q == 0 ? __byte_perm(r.w[w], r.w[w + 1], 0x5432) : r.w[5 + w];
+            half2 h[4];
+            fn_q4_decode8(codes, h);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                acc = __hfma2(h[j], a[8*q + 4*w + j], acc);
+            }
+        }
+        const uint32_t db  = q == 0 ? r.w[0] & 0xffffu : r.w[4] >> 16;
+        const uint32_t sm  = (uint32_t) __half_as_ushort(__hadd(__low2half(acc), __high2half(acc)));
+        const float2   f   = __half22float2(fn_h2((int) (db | (sm << 16))));
+        sum += f.x*f.y;
+    }
+    return sum;
+}
+
+// the quantization of the experts' weights, for the kernels below
+struct fn_moe_q2 {
+    typedef fn_q2_raw raw_t;
+    static constexpr int BPS_UP = 5; // blocks per SM of fn_moe_up
+    static __device__ __forceinline__ void load_act(const half2 * __restrict__ X, half2 a[32]) { fn_q2_load_act(X, a); }
+    static __device__ __forceinline__ int  par(const char * __restrict__ row, const int kb) { return fn_q2_par(row, kb); }
+    static __device__ __forceinline__ void load(const char * __restrict__ row, const int kb, const int par, raw_t & r) { fn_q2_load(row, kb, par, r); }
+    static __device__ __forceinline__ float dot(const raw_t & r, const int par, const half2 a[32]) { return fn_q2_dot(r, par, a); }
+};
+
+struct fn_moe_q4 {
+    typedef fn_q4_raw raw_t;
+    static constexpr int BPS_UP = 5;
+    static __device__ __forceinline__ void load_act(const half2 * __restrict__ X, half2 a[32]) { fn_q4_load_act(X, a); }
+    static __device__ __forceinline__ int  par(const char * __restrict__, const int) { return 0; }
+    static __device__ __forceinline__ void load(const char * __restrict__ row, const int kb, const int, raw_t & r) { fn_q4_load(row, kb, r); }
+    static __device__ __forceinline__ float dot(const raw_t & r, const int, const half2 a[32]) { return fn_q4_dot(r, a); }
+};
+
 typedef ggml_cuda_fn_moe_route fn_moe_route;
 
 #define FN_MOE_UP_G 4
@@ -2084,7 +2174,8 @@ typedef ggml_cuda_fn_moe_route fn_moe_route;
 // grid: (n_ff/16, pairs). h: [pairs][n_ff].
 // route (may be null): the pairs' positions and weights, copied for fn_moe_down, whose output may share memory with
 // the ids and the weights.
-static __global__ void __launch_bounds__(FN_MOE_UP_G*FN_Q2_TPR, 5)
+template <class Q>
+static __global__ void __launch_bounds__(FN_MOE_UP_G*FN_Q2_TPR, Q::BPS_UP)
 fn_moe_up(const char * __restrict__ wg, const char * __restrict__ wu, const int64_t nb1, const int64_t nb2,
           const half2 * __restrict__ X, const int xstride, const float * __restrict__ xscale,
           const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_hot,
@@ -2109,23 +2200,23 @@ fn_moe_up(const char * __restrict__ wg, const char * __restrict__ wu, const int6
         return;
     }
     half2 a[32];
-    fn_q2_load_act(X + (int64_t) t*xstride + k*32, a);
+    Q::load_act(X + (int64_t) t*xstride + k*32, a);
 
     // row (r, g) of the tile is tile*G*R + r*G + g
     const int64_t row0 = (int64_t) blockIdx.x*(G*R) + g;
 #pragma unroll
     for (int m = 0; m < 2; ++m) {
         const char * w = (m == 0 ? wg : wu) + (int64_t) e*nb2 + row0*nb1;
-        fn_q2_raw raw[R];
-        int       par[R];
+        typename Q::raw_t raw[R];
+        int               par[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            par[r] = fn_q2_par(w + (int64_t) r*G*nb1, k);
-            fn_q2_load(w + (int64_t) r*G*nb1, k, par[r], raw[r]);
+            par[r] = Q::par(w + (int64_t) r*G*nb1, k);
+            Q::load(w + (int64_t) r*G*nb1, k, par[r], raw[r]);
         }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            s_part[m*R + r][tid] = fn_q2_dot(raw[r], par[r], a);
+            s_part[m*R + r][tid] = Q::dot(raw[r], par[r], a);
         }
     }
     __syncthreads();
@@ -2162,7 +2253,7 @@ static constexpr __host__ __device__ int fn_moe_down_groups(const int tpr) {
     return tpr == 4 ? 4 : tpr <= 8 ? 2 : 1;
 }
 
-template <int TPR>
+template <class Q, int TPR>
 static __global__ void __launch_bounds__(fn_moe_down_groups(TPR)*FN_MOE_NU*TPR, 5)
 fn_moe_down(const char * __restrict__ wd, const int64_t nb1, const int64_t nb2,
             const half2 * __restrict__ Xh, const float * __restrict__ xsh, const fn_moe_route * __restrict__ route,
@@ -2187,21 +2278,21 @@ fn_moe_down(const char * __restrict__ wd, const int64_t nb1, const int64_t nb2,
     }
     if (rt.e < n_hot) {
         half2 a[32];
-        fn_q2_load_act(Xh + (int64_t) c*(TPR*32) + k*32, a);
+        Q::load_act(Xh + (int64_t) c*(TPR*32) + k*32, a);
         const float  ws = rt.w*xsh[c];
         const char * w  = wd + (int64_t) rt.e*nb2 + ((int64_t) blockIdx.x*(G*R) + g)*nb1;
 #pragma unroll
         for (int b = 0; b < R; b += 4) {
-            fn_q2_raw raw[4];
-            int       par[4];
+            typename Q::raw_t raw[4];
+            int               par[4];
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                par[r] = fn_q2_par(w + (int64_t) (b + r)*G*nb1, k);
-                fn_q2_load(w + (int64_t) (b + r)*G*nb1, k, par[r], raw[r]);
+                par[r] = Q::par(w + (int64_t) (b + r)*G*nb1, k);
+                Q::load(w + (int64_t) (b + r)*G*nb1, k, par[r], raw[r]);
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                s_part[b + r][tid] = ws*fn_q2_dot(raw[r], par[r], a);
+                s_part[b + r][tid] = ws*Q::dot(raw[r], par[r], a);
             }
         }
     } else {
@@ -3229,10 +3320,17 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
 // ---------------------------------------------------------------------------------------------------------------
 // MoE experts: the nodes
 
-static bool fn_moe_q2(const ggml_tensor * w, const int64_t cols, const int64_t rows) {
-    return w->type == GGML_TYPE_Q2_0 && w->ne[0] == cols && w->ne[1] == rows && w->ne[3] == 1 &&
-           w->nb[1] == (size_t) cols/64*18 && w->nb[2] == w->nb[1]*rows && ((uintptr_t) w->data & 0x3) == 0 &&
-           w->nb[2] % 4 == 0;
+// an expert tensor in a layout the kernels read: Q2_0 rows of 64-blocks, or Q4_0 rows of 32-blocks that start on words
+static bool fn_moe_quant(const ggml_tensor * w, const int64_t cols, const int64_t rows, const ggml_type type) {
+    if (w->type != type || w->ne[0] != cols || w->ne[1] != rows || w->ne[3] != 1 || ((uintptr_t) w->data & 0x3) != 0 ||
+        w->nb[2] != w->nb[1]*rows || w->nb[2] % 4 != 0) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q2_0: return w->nb[1] == (size_t) cols/64*18;
+        case GGML_TYPE_Q4_0: return cols % 64 == 0 && w->nb[1] == (size_t) cols/32*18 && w->nb[1] % 4 == 0;
+        default:             return false;
+    }
 }
 
 bool ggml_cuda_fn_moe_supported(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down,
@@ -3252,7 +3350,9 @@ bool ggml_cuda_fn_moe_supported(const ggml_tensor * gate, const ggml_tensor * up
            n_embd == 64*FN_Q2_TPR && (n_ff == 256 || n_ff == 320 || n_ff == 384 || n_ff == 512 || n_ff == 768) &&
            n_embd % (4*FN_MOE_DOWN_R) == 0 && n_used <= FN_MOE_NU &&
            nt >= 1 && nt <= FN_MAX_T &&
-           fn_moe_q2(gate->src[0], n_embd, n_ff) && fn_moe_q2(up->src[0], n_embd, n_ff) && fn_moe_q2(down->src[0], n_ff, n_embd) &&
+           (gate->src[0]->type == GGML_TYPE_Q2_0 || gate->src[0]->type == GGML_TYPE_Q4_0) &&
+           fn_moe_quant(gate->src[0], n_embd, n_ff, gate->src[0]->type) && fn_moe_quant(up->src[0], n_embd, n_ff, gate->src[0]->type) &&
+           fn_moe_quant(down->src[0], n_ff, n_embd, gate->src[0]->type) &&
            gate->src[0]->ne[2] == up->src[0]->ne[2] && gate->src[0]->ne[2] == down->src[0]->ne[2] &&
            up->src[1] == x && up->src[2] == ids && down->src[2] == ids &&
            x->type == GGML_TYPE_F32 && x->ne[0] == n_embd && x->ne[1] == 1 && x->ne[2] == nt && x->nb[0] == sizeof(float) &&
@@ -3307,12 +3407,19 @@ void ggml_cuda_fn_moe_up(ggml_backend_cuda_context & ctx, const ggml_tensor * ga
     const ggml_tensor * key = x->view_src != nullptr && x->view_offs == 0 ? x->view_src : x;
     const fn_act_slot & sx  = fn_act_get(ctx, key, (const float *) x->data, x->nb[2]/sizeof(float), n_embd, nt);
 
-    fn_moe_up<<<dim3(n_ff/(FN_MOE_UP_G*FN_MOE_UP_R), np, 1), FN_MOE_UP_G*FN_Q2_TPR, 0, ctx.stream()>>>(
-        (const char *) gate->src[0]->data, (const char *) up->src[0]->data, gate->src[0]->nb[1], gate->src[0]->nb[2],
-        (const half2 *) fn_act_X(sx), n_embd/2, fn_act_xs(sx),
-        (const int32_t *) ids->data, (int) (ids->nb[1]/sizeof(int32_t)), n_used, (int) gate->src[0]->ne[2],
-        (const float *) weights->data, (int) (weights->nb[2]/sizeof(float)),
-        fn_moe_h(ctx), n_ff, fn_moe_route_ptr(ctx));
+#define FN_UP(Q)                                                                                                      \
+    fn_moe_up<Q><<<dim3(n_ff/(FN_MOE_UP_G*FN_MOE_UP_R), np, 1), FN_MOE_UP_G*FN_Q2_TPR, 0, ctx.stream()>>>(            \
+        (const char *) gate->src[0]->data, (const char *) up->src[0]->data, gate->src[0]->nb[1], gate->src[0]->nb[2], \
+        (const half2 *) fn_act_X(sx), n_embd/2, fn_act_xs(sx),                                                        \
+        (const int32_t *) ids->data, (int) (ids->nb[1]/sizeof(int32_t)), n_used, (int) gate->src[0]->ne[2],           \
+        (const float *) weights->data, (int) (weights->nb[2]/sizeof(float)),                                          \
+        fn_moe_h(ctx), n_ff, fn_moe_route_ptr(ctx))
+    if (gate->src[0]->type == GGML_TYPE_Q4_0) {
+        FN_UP(fn_moe_q4);
+    } else {
+        FN_UP(fn_moe_q2);
+    }
+#undef FN_UP
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3328,14 +3435,17 @@ void ggml_cuda_fn_moe_down(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 
     // |sum of n_ff products of weights up to 2| stays far inside fp16 with activations up to 16
     fn_act_h16<<<np, FN_ACT_TPB, 0, stream>>>(fn_moe_h(ctx), n_ff, n_ff, 16.0f, fn_moe_Xh(ctx), fn_moe_xsh(ctx));
+    const bool q4 = down->src[0]->type == GGML_TYPE_Q4_0;
     switch (n_ff/64) {
-#define FN_CASE(TPR)                                                                                                  \
-        case TPR:                                                                                                     \
-            fn_moe_down<TPR><<<dim3(n_embd/(fn_moe_down_groups(TPR)*FN_MOE_DOWN_R), nt, 1),                           \
+#define FN_LAUNCH(Q, TPR)                                                                                             \
+            fn_moe_down<Q, TPR><<<dim3(n_embd/(fn_moe_down_groups(TPR)*FN_MOE_DOWN_R), nt, 1),                        \
                                fn_moe_down_groups(TPR)*FN_MOE_NU*TPR, 0, stream>>>(                                   \
                 (const char *) down->src[0]->data, down->src[0]->nb[1], down->src[0]->nb[2],                          \
                 (const half2 *) fn_moe_Xh(ctx), fn_moe_xsh(ctx), fn_moe_route_ptr(ctx), n_used, (int) down->src[0]->ne[2], \
-                (float *) dst->data, dst->nb[1]/sizeof(float));                                                       \
+                (float *) dst->data, dst->nb[1]/sizeof(float))
+#define FN_CASE(TPR)                                                                                                  \
+        case TPR:                                                                                                     \
+            if (q4) { FN_LAUNCH(fn_moe_q4, TPR); } else { FN_LAUNCH(fn_moe_q2, TPR); }                                \
             break;
         FN_CASE(4)
         FN_CASE(5)
@@ -3343,6 +3453,7 @@ void ggml_cuda_fn_moe_down(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         FN_CASE(8)
         FN_CASE(12)
 #undef FN_CASE
+#undef FN_LAUNCH
         default:
             GGML_ABORT("fatal error");
     }

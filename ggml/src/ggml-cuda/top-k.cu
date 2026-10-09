@@ -54,8 +54,7 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
-
+// the grid-over-rows radix select (upstream's HIP path), for the indexer's few long rows, see ggml_cuda_op_top_k
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
     const uint32_t mask = (uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U;
@@ -213,8 +212,6 @@ static void top_k_radix_cuda(
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
             src, dst, states, ncols, k, blocks_per_row);
 }
-
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
 // Partial selection for small k.  Where cub::DeviceTopK (CCCL >= 3.2) is unavailable, the
 // caller below falls back to fully sorting the row and taking the first k -- but obtaining k
@@ -678,6 +675,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // 3.7 ms -> 0.09 ms for 4 rows x 248k on a P100 (k = 16)
     if (ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX &&
         top_k_partial_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
+        return;
+    }
+    // a large k over long rows: the grid-over-rows radix select (a dozen launches, up to 64 blocks per row) from
+    // GGML_CUDA_TOP_K_GRID columns (32K; 0 never), the one-block-per-row select below it: measured on a P100 for 3
+    // rows and k = 512, 64 / 77 us (grid) against 49 / 173 us (one block) at 16K / 64K columns
+    static const int64_t grid_min = getenv("GGML_CUDA_TOP_K_GRID") != nullptr ? atoll(getenv("GGML_CUDA_TOP_K_GRID")) : 32768;
+    if (grid_min > 0 && ncols >= grid_min && ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX && k > CUDA_TOP_K_MAX_K && k < ncols) {
+        top_k_radix_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
         return;
     }
     if (ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX &&

@@ -4452,7 +4452,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
     // the pooled keys of a QSA attention layer
-    if (node->op == GGML_OP_FILL) {
+    if (node->op == GGML_OP_SET_ROWS) {
         const int n_pool = ggml_cuda_fn_qsa_pool(*cuda_ctx, cgraph, i);
         if (n_pool > 0) {
             return n_pool;

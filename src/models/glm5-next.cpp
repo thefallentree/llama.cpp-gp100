@@ -905,10 +905,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     ggml_tensor * ig = ggml_mul_mat(ctx0, layer.indexer_kpool_gate, cur);
     cb(ig, "indexer_gate", il);
 
-    // Cache rows store key | gate | pooled
-    ggml_tensor * pzero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_indexer, n_tokens), 0.0f);
-    ggml_tensor * packed = ggml_concat(ctx0, ggml_concat(ctx0, ik, ig, 0), pzero, 0);
-    packed = ggml_reshape_3d(ctx0, packed, 3*n_embd_indexer, 1, n_tokens);
+    // Cache rows store key | gate; the pooled keys live in the pooled table, by slot
+    ggml_tensor * packed = ggml_concat(ctx0, ik, ig, 0);
+    packed = ggml_reshape_3d(ctx0, packed, 2*n_embd_indexer, 1, n_tokens);
     ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
 
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, n_embd_indexer);

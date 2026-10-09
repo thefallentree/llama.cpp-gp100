@@ -1645,16 +1645,16 @@ static __global__ void fn_qsa_cells(const fn_qsa_cells_args a, const int nt, int
 }
 
 // The pooled indexer keys of a QSA attention layer (qwen4exp build_qsa_sel), one block:
-//   the raw keys of the new tokens go to the first half of their cache rows (the second half is zeroed), then the
-//   mean over the kpool member rows of each block to re-pool is taken from the cache.
+//   the raw keys of the new tokens go to their cache rows, then the mean over the kpool member rows of each block
+//   to re-pool is taken from the cache.
 static __global__ void fn_qsa_pool(const float * __restrict__ k_raw, const int64_t sk_t, const int d, const int nt,
                                    const int64_t * __restrict__ k_idxs, half * cache, const int64_t s_cell,
                                    const int32_t * __restrict__ pool_idx, const int kpool, const int n_new, const float scale,
                                    float * __restrict__ out, const int64_t so) {
-    for (int e = threadIdx.x; e < nt*2*d; e += blockDim.x) {
-        const int t = e/(2*d);
-        const int c = e - t*(2*d);
-        cache[k_idxs[t]*s_cell + c] = c < d ? __float2half(k_raw[t*sk_t + c]) : __float2half(0.0f);
+    for (int e = threadIdx.x; e < nt*d; e += blockDim.x) {
+        const int t = e/d;
+        const int c = e - t*d;
+        cache[k_idxs[t]*s_cell + c] = __float2half(k_raw[t*sk_t + c]);
     }
     __syncthreads();
     for (int e = threadIdx.x; e < n_new*d; e += blockDim.x) {
@@ -2960,75 +2960,84 @@ int ggml_cuda_fn_gdn_pre(ggml_backend_cuda_context & ctx, const ggml_cgraph * cg
     return 13;
 }
 
-// The pooled keys of a QSA layer, from the FILL of its first node: FILL, CONCAT, RESHAPE, VIEW, SET_ROWS (the raw
-// keys into the cache), VIEW, GET_ROWS, RESHAPE (the members of the blocks to re-pool), VIEW, CONT, kpool - 1 times
-// VIEW, ADD and the SCALE of their mean -> fn_qsa_pool
+// The pooled keys of a QSA layer, from the SET_ROWS that writes the raw keys of the new tokens into the cache:
+// SET_ROWS, the VIEWs of the cache, GET_ROWS, RESHAPE (the members of the blocks to re-pool), VIEW, CONT, kpool - 1
+// times VIEW, ADD and the SCALE of their mean -> fn_qsa_pool
 int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    if (!fn_pattern_on(FN_PAT_QSA_POOL) || i + 11 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_FILL) {
+    if (!fn_pattern_on(FN_PAT_QSA_POOL) || i + 12 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_SET_ROWS) {
         return 0;
     }
     ggml_tensor * const * n = cgraph->nodes + i;
-    if (n[7]->op != GGML_OP_RESHAPE || n[7]->ne[1] < 2 || n[7]->ne[1] > 8) {
-        if (fn_debug() && n[1]->op == GGML_OP_CONCAT && n[2]->op == GGML_OP_RESHAPE) {
-            fprintf(stderr, "fn-decline: qsa_pool at %d:", i);
-            for (int k = 0; k < 24 && i + k < cgraph->n_nodes; ++k) {
-                fprintf(stderr, " %s[%lld,%lld,%lld]", ggml_op_name(n[k]->op), (long long) n[k]->ne[0], (long long) n[k]->ne[1], (long long) n[k]->ne[2]);
-            }
-            fprintf(stderr, "\n");
-        }
+    // the views between the cache write and the gather: the key rows, and the pooled table of the scatter
+    int n_view = 0;
+    while (n_view < 3 && i + 1 + n_view < cgraph->n_nodes && n[1 + n_view]->op == GGML_OP_VIEW) {
+        ++n_view;
+    }
+    const int i_gr = 1 + n_view;
+    if (n_view < 1 || n[i_gr]->op != GGML_OP_GET_ROWS || n[i_gr + 1]->op != GGML_OP_RESHAPE || n[i_gr + 1]->ne[1] < 2 || n[i_gr + 1]->ne[1] > 8) {
         return 0;
     }
-    const int64_t kpool = n[7]->ne[1];
-    ggml_op ops[32] = { GGML_OP_FILL, GGML_OP_CONCAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_VIEW,
-                        GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONT };
-    int n_ops = 10;
+    const int64_t kpool = n[i_gr + 1]->ne[1];
+    ggml_op ops[32] = { GGML_OP_SET_ROWS };
+    int n_ops = 1;
+    for (int v = 0; v < n_view; ++v) {
+        ops[n_ops++] = GGML_OP_VIEW;
+    }
+    ops[n_ops++] = GGML_OP_GET_ROWS;
+    ops[n_ops++] = GGML_OP_RESHAPE;
+    ops[n_ops++] = GGML_OP_VIEW;
+    ops[n_ops++] = GGML_OP_CONT;
     for (int m = 1; m < kpool; ++m) {
         ops[n_ops++] = GGML_OP_VIEW;
         ops[n_ops++] = GGML_OP_ADD;
     }
     ops[n_ops++] = GGML_OP_SCALE;
-    if (!fn_pattern_closed(cgraph, i, ops, n_ops)) {
+    // the set_rows is read by nothing (a cache write) and the views of the cache may be read later: open
+    uint64_t open = 1;
+    for (int v = 0; v < n_view; ++v) {
+        open |= 1ull << (1 + v);
+    }
+    if (!ggml_cuda_fn_pattern_closed(cgraph, i, ops, n_ops, open)) {
         fn_pattern_why("qsa_pool", cgraph, i, ops, n_ops);
         return 0;
     }
-    const ggml_tensor * concat   = n[1];
-    const ggml_tensor * k_raw    = concat->src[0];
-    const ggml_tensor * set_rows = n[4];
+    const ggml_tensor * set_rows = n[0];
+    const ggml_tensor * k_cur    = set_rows->src[0];      // the raw keys of the new tokens, a view
     const ggml_tensor * k_idxs   = set_rows->src[1];
     const ggml_tensor * cache    = set_rows->src[2];
-    const ggml_tensor * keys     = n[5];              // the cells' raw keys: the first half of the rows
-    const ggml_tensor * get_rows = n[6];
+    const ggml_tensor * get_rows = n[i_gr];
+    const ggml_tensor * keys     = get_rows->src[0];      // the cells' raw keys: the rows of the cache
     const ggml_tensor * pool_idx = get_rows->src[1];
+    const ggml_tensor * rows     = n[i_gr + 1];
+    const int           i_cont   = i_gr + 3;
     ggml_tensor *       out      = n[n_ops - 1];
-    const int64_t d     = k_raw->ne[0];
-    const int64_t nt    = k_raw->ne[1];
-    const int64_t n_new = n[7]->ne[2];
-    // the wiring: [k_raw | 0] rows scattered at k_idxs, the member rows gathered from the same cache, summed in order
-    bool ok = concat->src[1] == n[0] && ggml_get_op_params_f32(n[0], 0) == 0.0f && ((const int32_t *) concat->op_params)[0] == 0 &&
-              n[2]->src[0] == concat && n[3]->view_src != nullptr && n[3]->data == concat->data && set_rows->src[0] == n[3] &&
-              keys->view_src == cache && keys->data == cache->data && get_rows->src[0] == keys &&
-              n[7]->src[0] == get_rows && n[9]->src[0] == n[8] && n[8]->data == get_rows->data &&
+    const ggml_tensor * k_raw    = k_cur->view_src != nullptr ? k_cur->view_src : k_cur;
+    const int64_t d     = cache->ne[0];
+    const int64_t nt    = k_cur->ne[1];
+    const int64_t n_new = rows->ne[2];
+    // the wiring: the raw keys scattered at k_idxs, the member rows gathered from the same cache, summed in order
+    bool ok = k_cur->data == k_raw->data && k_cur->ne[0] == d && keys->view_src == cache && keys->data == cache->data &&
+              rows->src[0] == get_rows && n[i_cont]->src[0] == n[i_cont - 1] && n[i_cont - 1]->data == get_rows->data &&
               out->src[0] == n[n_ops - 2] && ggml_get_op_params_f32(out, 1) == 0.0f;
     for (int m = 1; m < kpool && ok; ++m) {
-        const ggml_tensor * view = n[8 + 2*m];
-        const ggml_tensor * add  = n[9 + 2*m];
-        ok = view->data == (const char *) get_rows->data + m*get_rows->nb[1] && add->src[0] == n[m == 1 ? 9 : 7 + 2*m] && add->src[1] == view;
+        const ggml_tensor * view = n[i_cont + 2*m - 1];
+        const ggml_tensor * add  = n[i_cont + 2*m];
+        ok = view->data == (const char *) get_rows->data + m*get_rows->nb[1] && add->src[0] == n[i_cont + 2*m - 2] && add->src[1] == view;
     }
     if (!ok) {
         fn_decline("qsa_pool: wiring", i);
     }
-    ok = ok && k_raw->type == GGML_TYPE_F32 && ggml_is_contiguous(k_raw) && d <= 256 && nt >= 1 && nt <= FN_MAX_T &&
-         n[0]->ne[0] == d && n[3]->ne[0] == 2*d && n[3]->ne[1] == nt &&
-         k_idxs->type == GGML_TYPE_I64 && ggml_nelements(k_idxs) == nt && cache->type == GGML_TYPE_F16 && cache->ne[0] == 2*d &&
+    ok = ok && k_raw->type == GGML_TYPE_F32 && k_cur->nb[0] == sizeof(float) && d <= 256 && nt >= 1 && nt <= FN_MAX_T &&
+         k_idxs->type == GGML_TYPE_I64 && ggml_nelements(k_idxs) == nt && cache->type == GGML_TYPE_F16 &&
          cache->nb[0] == sizeof(half) && keys->ne[0] == d && keys->nb[1] == cache->nb[1] &&
          pool_idx->type == GGML_TYPE_I32 && ggml_nelements(pool_idx) == kpool*n_new && ggml_is_contiguous(pool_idx) &&
          get_rows->type == GGML_TYPE_F32 && get_rows->ne[0] == d && get_rows->ne[1] == kpool*n_new &&
          out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && out->ne[0] == d && out->ne[1] == n_new && n_new <= 64;
     if (!ok) {
         if (fn_debug()) {
-            fprintf(stderr, "fn-decline: qsa_pool at %d: k_raw %s [%lld,%lld] cont %d, idxs %s n %lld, cache %s [%lld,%lld] nb0 %zu, keys [%lld] nb1 %zu/%zu, "
+            fprintf(stderr, "fn-decline: qsa_pool at %d: k_cur %s [%lld,%lld] nb1 %zu, idxs %s n %lld, cache %s [%lld,%lld] nb0 %zu, keys [%lld] nb1 %zu/%zu, "
                     "pool_idx %s n %lld, rows %s [%lld,%lld], out %s [%lld,%lld], kpool %lld n_new %lld\n", i,
-                    ggml_type_name(k_raw->type), (long long) k_raw->ne[0], (long long) k_raw->ne[1], ggml_is_contiguous(k_raw),
+                    ggml_type_name(k_cur->type), (long long) k_cur->ne[0], (long long) k_cur->ne[1], k_cur->nb[1],
                     ggml_type_name(k_idxs->type), (long long) ggml_nelements(k_idxs),
                     ggml_type_name(cache->type), (long long) cache->ne[0], (long long) cache->ne[1], cache->nb[0],
                     (long long) keys->ne[0], keys->nb[1], cache->nb[1],
@@ -3039,7 +3048,7 @@ int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         return 0;
     }
     fn_qsa_pool<<<1, 256, 0, ctx.stream()>>>(
-        (const float *) k_raw->data, k_raw->nb[1]/sizeof(float), (int) d, (int) nt, (const int64_t *) k_idxs->data,
+        (const float *) k_cur->data, k_cur->nb[1]/sizeof(float), (int) d, (int) nt, (const int64_t *) k_idxs->data,
         (half *) cache->data, cache->nb[1]/sizeof(half), (const int32_t *) pool_idx->data, (int) kpool, (int) n_new,
         ggml_get_op_params_f32(out, 0), (float *) out->data, out->nb[1]/sizeof(float));
     CUDA_CHECK(cudaGetLastError());

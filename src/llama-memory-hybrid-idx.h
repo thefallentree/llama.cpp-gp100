@@ -78,8 +78,23 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // The pooled keys of a k-pool indexer, one row per pool slot (see kpool_slot); nullptr without a k-pool
+    llama_kv_cache * get_mem_pool() const;
+
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
+
+    // The pooled key of pool k of sequence seq_id lives in row kpool_slot(seq_id, k) of the pooled table: a
+    // sequence's pools are consecutive rows, so the indexer reads the table in place, with no gather. Each
+    // sequence owns kpool_slot_cap() rows (its share of the table: with a unified cache the table splits evenly
+    // between the n_seq_max sequences, otherwise every stream has a table of its own), and the top
+    // KPOOL_PAD_SLOTS rows of the table are spare, for the padded entries of a scatter.
+    static constexpr uint32_t KPOOL_PAD_SLOTS = 64;
+
+    uint32_t kpool_slot_cap() const { return kpool_cap; }
+    uint32_t kpool_slot(llama_seq_id seq_id, uint32_t k) const;
+    uint32_t kpool_slot_pad(uint32_t i) const; // the i-th spare row (they are shared when there are more)
+    uint32_t kpool_slot_top() const;           // one past the highest slot any layout can use
 
     // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
     bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
@@ -118,6 +133,12 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
+    // the pooled keys as rows of a second cache of kpool_cap*n_seq rows per stream (its cells stay unused:
+    // it is addressed by slot); shaped by its own hparams like mem_idx
+    llama_hparams hparams_pool;
+    uint32_t      kpool_cap = 0;
+    const std::unique_ptr<llama_kv_cache> mem_pool;
+
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
 
@@ -135,13 +156,14 @@ public:
     class kpool_access {
     public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
-        ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
-        ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const; // idxs: slots
+        ggml_tensor * gather_pooled(ggml_tensor * idxs) const;                        // idxs: slots
+        ggml_tensor * pooled_rows(int64_t n_pool) const;                              // the first n_pool slots in place
 
     private:
         friend class llama_memory_hybrid_idx_context;
 
-        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+        kpool_access(ggml_context * ctx, ggml_tensor * k, ggml_tensor * p, int64_t n_embd);
 
         ggml_context * ctx;
         ggml_tensor  * key_gate;
@@ -189,10 +211,14 @@ public:
     uint32_t get_n_stream() const;
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
-    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+    // Pools are addressed by their slot in the pooled table (llama_memory_hybrid_idx::kpool_slot): the pool inputs
+    // cover the slots up to the last one in use, padded, where unused slots carry the sentinel members and are masked.
+    uint32_t get_n_kpool    () const; // Padded slot count, where the last slot is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
+    // pool_cells (I32 [n_pool], can be null): the slot of each pool, for a gather of the pooled keys
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
+    // new_pool_rep (I64 [n_new]): the slot each re-pooled key is scattered to
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,

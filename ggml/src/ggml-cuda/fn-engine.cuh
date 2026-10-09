@@ -93,8 +93,8 @@ bool ggml_cuda_fn_pattern_closed(const ggml_cgraph * cgraph, int i, const ggml_o
 int ggml_cuda_fn_gdn_pre_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 int ggml_cuda_fn_gdn_pre(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 
-// The pooled indexer keys of a QSA attention layer from node i (the FILL that pads the raw keys): the scatter of the
-// raw keys into the cache and the mean of the members of the blocks to re-pool as one kernel. Returns the number of
+// The pooled indexer keys of a QSA attention layer from node i (the SET_ROWS of the raw keys into the cache): the
+// scatter of the raw keys and the mean of the members of the blocks to re-pool as one kernel. Returns the number of
 // nodes to skip or 0.
 int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 

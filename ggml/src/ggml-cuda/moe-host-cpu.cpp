@@ -711,15 +711,28 @@ struct pool {
             threads.emplace_back(&pool::helper, this);
         }
 #if defined(__linux__)
-        // GGML_CUDA_MOE_HOST_PIN=1: one core per thread, so that two spinning threads never share a core
-        if (getenv("GGML_CUDA_MOE_HOST_PIN") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_PIN")) != 0) {
-            const std::vector<int> cpus = cpu_list();
-            for (int t = 0; t < n_threads && !cpus.empty(); ++t) {
-                cpu_set_t set;
-                CPU_ZERO(&set);
-                CPU_SET(cpus[(size_t) (pool_id*n_threads + t) % cpus.size()], &set);
-                pthread_setaffinity_np(threads[t].native_handle(), sizeof(set), &set);
+        // GGML_CUDA_MOE_HOST_PIN=1: one core per thread, so that two spinning threads never share a core;
+        // GGML_CUDA_MOE_HOST_CPUS=c,c,...: the threads on these CPUs (one each, in order; the GPUs' NUMA node where
+        // the process may run on both: the cold slices are read from memory next to it, GGML_CUDA_HOST_NUMA)
+        std::vector<int> cpus;
+        if (const char * e = getenv("GGML_CUDA_MOE_HOST_CPUS")) {
+            for (const char * p = e; *p != 0;) {
+                char * end = nullptr;
+                const long c = strtol(p, &end, 10);
+                if (end == p) {
+                    break;
+                }
+                cpus.push_back((int) c);
+                p = *end == ',' ? end + 1 : end;
             }
+        } else if (getenv("GGML_CUDA_MOE_HOST_PIN") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_PIN")) != 0) {
+            cpus = cpu_list();
+        }
+        for (int t = 0; t < n_threads && !cpus.empty(); ++t) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpus[(size_t) (pool_id*n_threads + t) % cpus.size()], &set);
+            pthread_setaffinity_np(threads[t].native_handle(), sizeof(set), &set);
         }
 #endif
         GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s)\n", __func__, pool_id, n_pools, n_threads, isa);

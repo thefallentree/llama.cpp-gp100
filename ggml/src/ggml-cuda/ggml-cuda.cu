@@ -1605,13 +1605,35 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+// GGML_CUDA_HOST_NUMA=<node>: the pinned host buffers (the cold experts) on that NUMA node, where the process may
+// run on several (MPOL_BIND around the allocation; pinned pages are placed when they are allocated)
+static void ggml_cuda_host_numa_bind(const bool on) {
+    static const int node = getenv("GGML_CUDA_HOST_NUMA") != nullptr ? atoi(getenv("GGML_CUDA_HOST_NUMA")) : -1;
+    if (node < 0 || node >= 64) {
+        return;
+    }
+    const unsigned long mask = on ? 1ul << node : 0;
+    // MPOL_DEFAULT 0, MPOL_BIND 2
+    if (syscall(SYS_set_mempolicy, on ? 2 : 0, on ? &mask : nullptr, on ? 64 : 0) != 0) {
+        GGML_LOG_WARN("%s: set_mempolicy failed for NUMA node %d\n", __func__, node);
+    }
+}
+#else
+static void ggml_cuda_host_numa_bind(const bool) {}
+#endif
+
 static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
 
     void * ptr = nullptr;
+    ggml_cuda_host_numa_bind(true);
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    ggml_cuda_host_numa_bind(false);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();

@@ -1991,6 +1991,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const int64_t t0  = ggml_time_us();
         if (mlock(per_layer_tok_embd->data, size) == 0) {
             LLAMA_LOG_INFO("%s: the PLE table (%.1f GB) locked in memory in %.1f s\n", __func__, size/1e9, (ggml_time_us() - t0)/1e6);
+            // nothing to page in any more: the madvise per row of a prompt ubatch (2.5 us each, ~60 ms per 1024 tokens) is spared
+            can_prefetch.erase(per_layer_tok_embd);
         } else {
             LLAMA_LOG_WARN("%s: mlock of the PLE table (%.1f GB) failed: %s\n", __func__, size/1e9, strerror(errno));
         }

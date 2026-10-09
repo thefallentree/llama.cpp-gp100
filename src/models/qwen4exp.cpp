@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "fn-prof.h"
+FN_PROF_DECL("qwen4exp");
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
@@ -1359,7 +1361,10 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+    FN_PROF_T(t_p0);
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
+    FN_PROF_ADD("ple.prev_tokens", t_p0);
+    FN_PROF_T(t_p1);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
@@ -1389,6 +1394,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    FN_PROF_ADD("ple.hash", t_p1);
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
@@ -1407,6 +1413,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         const int64_t       head_dim = ple->ne[0];
         const auto *        traits   = ggml_get_type_traits(ple->type);
 
+        FN_PROF_T(t_p2);
         emb_buf.resize(idx.size() * head_dim);
         // the rows are spread over a table of tens of GB: start all the cache misses before the first row is read
         for (size_t k = 0; k < idx.size(); ++k) {
@@ -1423,7 +1430,10 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
                 traits->to_float(row, emb_buf.data() + k*head_dim, head_dim);
             }
         }
+        FN_PROF_ADD("ple.rows", t_p2);
+        FN_PROF_T(t_p3);
         ggml_backend_tensor_set(emb, emb_buf.data(), 0, emb_buf.size()*sizeof(float));
+        FN_PROF_ADD("ple.tensor_set", t_p3);
         return;
     }
 

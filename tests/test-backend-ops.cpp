@@ -11828,6 +11828,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // decode windows of a 4-head indexer (lane-per-key kernel)
+    for (int bs : { 1, 2, 3, 5, 8 }) {
+        for (int kv : { 200, 16384 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F16));
+        }
+    }
+
     // flash_attn_sel: a decode window, its chunk blocks, a prompt
     for (int64_t nt : { 1, 4, 8, 16, 100, 1024 }) {
         for (int64_t nsel : { 35, 259, 2051 }) {
@@ -12305,6 +12312,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // flash_attn_sel: a decode window and a prompt ubatch of a QSA layer (one kv head per device)
     for (int64_t nt : { 1, 8, 1024 }) {
         test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 65536, 2051, false));
+    }
+    // the indexer of a decode window over the pools of a 64K and a 200K context
+    for (int kv : { 16384, 65536 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 3, 1, 1, GGML_TYPE_F16));
     }
 
     // lightning_indexer

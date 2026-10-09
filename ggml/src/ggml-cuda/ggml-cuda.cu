@@ -922,6 +922,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (fn_qsa_cells != nullptr) {
         cudaFree(fn_qsa_cells);
     }
+    if (fn_gdn_pre_mem != nullptr) {
+        cudaFree(fn_gdn_pre_mem);
+    }
     if (fn_router_mem != nullptr) {
         cudaFree(fn_router_mem);
     }

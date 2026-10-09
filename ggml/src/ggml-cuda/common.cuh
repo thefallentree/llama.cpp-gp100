@@ -1562,6 +1562,8 @@ struct ggml_backend_cuda_context {
     // the SSM_CONV of a recurrent layer whose input side the fused engine computes there, and the kernel's arguments
     const ggml_tensor * fn_gdn_pre_conv = nullptr;
     char                fn_gdn_pre_args[192];
+    float *             fn_gdn_pre_mem = nullptr; // the staged inputs of fn_gdn_pre (fn_gdn_pre_stage)
+    size_t              fn_gdn_pre_cap = 0;       // floats
     int32_t *           fn_qsa_cells = nullptr; // staged cells of fn_qsa_attn
     float *             fn_qsa_part  = nullptr; // partial softmax states of its chunks
     float *             fn_router_mem  = nullptr; // the output of a router's second copy: [FN_MAX_T][fn_router_rows]

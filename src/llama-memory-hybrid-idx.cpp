@@ -74,8 +74,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // the indexer keys stay f16 whatever the attention cache's type: their kernels (the pooling, the decode
+        // window's scoring) read f16 rows, and they are a small part of the cache
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, GGML_TYPE_F16, GGML_TYPE_F16, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()),
@@ -92,7 +94,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer pool table, size = %u slots (%u per sequence)\n", __func__, n_slot, kpool_cap);
 
         return new llama_kv_cache(
-            model, hparams_pool, type_k, type_v, v_trans, offload, unified,
+            model, hparams_pool, GGML_TYPE_F16, GGML_TYPE_F16, v_trans, offload, unified,
             n_slot, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_pool_");
     }()) {}
@@ -427,9 +429,15 @@ uint32_t kpool_pad(uint32_t n_pool) {
     // temporary switch, see llama_kv_cache::get_n_kv
     static const uint32_t geom = getenv("LLAMA_KV_PAD_GEOM") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_PAD_GEOM"))) : 0;
     if (geom) {
+        // doubling up to 16384 pools (a 64K context of 4-cell pools), then steps of 4096: every pool the indexer
+        // scores and the top-k sifts costs the same at every window, a doubling past 16384 wastes up to half of them
+        // for a graph rebuild saved every 16K generated tokens
         uint32_t g = 64*geom;
-        while (g < n_pool + 1) {
+        while (g < n_pool + 1 && g < 16384) {
             g *= 2;
+        }
+        if (g < n_pool + 1) {
+            g = GGML_PAD(n_pool + 1, 4096);
         }
         return g;
     }

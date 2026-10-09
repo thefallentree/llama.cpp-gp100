@@ -1351,7 +1351,10 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        const bool prefetch = model.can_prefetch.count(ple);
+        // a madvise per row: ~2.5 us each, 340 us for a decode window of 8 tokens, where the rows of a resident table
+        // are read in a tenth of that; LLAMA_PLE_PREFETCH_MIN (default 64) is the ubatch size from which it pays
+        static const int64_t prefetch_min = getenv("LLAMA_PLE_PREFETCH_MIN") != nullptr ? atoll(getenv("LLAMA_PLE_PREFETCH_MIN")) : 64;
+        const bool prefetch = model.can_prefetch.count(ple) && n_tokens >= prefetch_min;
         if (prefetch) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
         }

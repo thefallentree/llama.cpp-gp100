@@ -733,8 +733,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(nullptr, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
-                              ubatch, new_pool_pos);
+        mctx->set_input_kpool(nullptr, nullptr, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
+                              ubatch, new_pool_pos, new_pool_cells);
 
         GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_rows->buffer));
         memcpy(new_pool_rows->data, new_pool_idxs->data, ggml_nbytes(new_pool_idxs));
@@ -751,7 +751,7 @@ public:
         bool res = true;
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
-        res &= pool_idxs->ne[1]  == mctx->get_n_kpool();
+        res &= pool_mask->ne[0]  == mctx->get_n_kpool();
         res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // the scatter mask shape follows n_kv
@@ -762,8 +762,6 @@ public:
     }
 
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
-    ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block (a slot of the pooled table), n_kv
-                                           //                      sentinel for the padded blocks
     ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
@@ -771,6 +769,8 @@ public:
                                            //                      in every layer would be a host node and a copy each
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          slot of the pooled table to write each new pooled key into
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
+    ggml_tensor * new_pool_cells = nullptr; // F32 [kpool, n_new]  the member cells of the new blocks, for the device's
+                                            //                     member table (the selection gathers from it)
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
@@ -789,15 +789,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
-    ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
 
     // set_input fills them all, so keep them allocated even when no op reads them
-    ggml_build_forward_expand(gf, inp->pool_idxs);
     ggml_build_forward_expand(gf, inp->pool_mask);
     ggml_build_forward_expand(gf, inp->tail_idxs);
 
@@ -816,6 +813,13 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
+    inp->new_pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kpool, inp->n_new);
+    ggml_set_input(inp->new_pool_cells);
+
+    // the member cells of the new blocks into the device's member table, once for all layers (the first indexer
+    // layer's access carries it)
+    auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, mctx_hyb->kpool_cells_layer(), hparams.indexer_head_size);
+    ggml_build_forward_expand(gf, kpool_cache.scatter_members(inp->new_pool_cells, inp->new_pool_rep));
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
@@ -834,7 +838,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     const int64_t idx_dim = hparams.indexer_head_size;
     const int64_t n_idx_h = hparams.indexer_n_head;
     const int64_t kpool   = inp_kpool->kpool;
-    const int64_t n_pool  = inp_kpool->pool_idxs->ne[1];
+    const int64_t n_pool  = inp_kpool->pool_mask->ne[0];
     const int64_t n_new   = inp_kpool->n_new;
 
     GGML_ASSERT(hparams.dsv4_compress_ratios[il] == kpool);
@@ -895,33 +899,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
-    // the top blocks, then the incomplete tail with n_kv for missing cells
-    ggml_tensor * sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
+    // the top blocks' member cells, from the device's member table (as floats: exact up to 2^24), then the
+    // incomplete tail with n_kv for missing cells
+    ggml_tensor * idx_f = ggml_get_rows(ctx0, kpool_cache.member_rows(n_pool),
             ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens)); // [kpool, n_top_pool*n_tokens]
-    sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool*n_top_pool, n_tokens);
-    sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
-    const int64_t n_sel = sel_idx->ne[0];
+    idx_f = ggml_reshape_2d(ctx0, idx_f, kpool*n_top_pool, n_tokens);
+    ggml_tensor * tail_f = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
+    idx_f = ggml_concat(ctx0, idx_f, tail_f, 0);
+    const int64_t n_sel = idx_f->ne[0];
     GGML_ASSERT(n_sel == inp_kpool->n_sel);
 
-    ggml_build_forward_expand(gf, sel_idx);
+    ggml_build_forward_expand(gf, idx_f);
 
     // the attention skips the cells at or beyond n_kv: send every dead slot there, idx = n_kv + live*(idx - n_kv).
-    // the padded pools and the missing tail cells already carry the n_kv sentinel, but top_k fills a short
-    // selection with invisible pools: a picked pool is live when visible, that is when its rectified score is
-    // not -inf (a visible score is a sum >= 0)
+    // the missing tail cells carry the n_kv sentinel, but top_k fills a short selection with invisible pools
+    // (padded slots among them): a picked pool is live when visible, that is when its rectified score is not
+    // -inf (a visible score is a sum >= 0)
     const int64_t n_kv = inp_kpool->n_kv;
 
     ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
     ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
     live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
     // a tail cell is live unless it is the n_kv sentinel
-    ggml_tensor * live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
-    live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
+    ggml_tensor * live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, tail_f, -1.0f, (float) n_kv), 0.0f, 1.0f);
     ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
 
-    ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
-    idx_f   = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, idx_f, 1.0f, (float) -n_kv), live), 1.0f, (float) n_kv);
-    sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+    idx_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, idx_f, 1.0f, (float) -n_kv), live), 1.0f, (float) n_kv);
+    ggml_tensor * sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
     cb(sel_idx, "indexer_sel", il);
 
     return sel_idx;

@@ -4445,7 +4445,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
     // the selection of a QSA attention layer and the attention over it
-    if (node->op == GGML_OP_CPY) {
+    if (node->op == GGML_OP_SCALE) {
         const int n_attn = ggml_cuda_fn_qsa_attn(*cuda_ctx, cgraph, i);
         if (n_attn > 0) {
             return n_attn;

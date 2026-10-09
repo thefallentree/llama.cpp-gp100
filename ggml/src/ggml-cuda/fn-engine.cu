@@ -1619,7 +1619,7 @@ static __global__ void fn_gate_out(const float * __restrict__ x, const int64_t s
 // a tail slot if its cell is not the sentinel n_kv; -1 for a dead slot. Three dependent reads per slot, spread over
 // the device.
 struct fn_qsa_cells_args {
-    const int32_t * sel_idx;
+    const float *   sel_idx;  // the cells as floats (the member table and the cast tail)
     const float *   score;
     const int32_t * top_k;
     int             s_sel, s_score, s_topk;
@@ -1631,7 +1631,7 @@ static __global__ void fn_qsa_cells(const fn_qsa_cells_args a, const int nt, int
     if (e < nt*a.n_sel) {
         const int   t   = e/a.n_sel;
         const int   j   = e - t*a.n_sel;
-        const float idx = (float) a.sel_idx[t*a.s_sel + j];
+        const float idx = a.sel_idx[t*a.s_sel + j];
         float live;
         if (j < a.n_top) {
             live = fminf(fmaxf(a.score[t*a.s_score + a.top_k[t*a.s_topk + j/a.kpool]] + 1.0f, 0.0f), 1.0f);
@@ -3055,14 +3055,15 @@ int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     return n_ops - 1;
 }
 
-// The 16 nodes of the selection of a QSA layer (qwen4exp build_qsa_sel), from the cast of its cells to floats to
-// the attention over them: the cells of the top blocks and the tail with every dead slot sent to n_kv, FLASH_ATTN_SEL
+// The 14 nodes of the selection of a QSA layer (qwen4exp build_qsa_sel), from the shift of its cells (floats, from
+// the member table and the cast tail) to the attention over them: the cells of the top blocks and the tail with
+// every dead slot sent to n_kv, FLASH_ATTN_SEL
 #define FN_QSA_ATTN_MAX_HEAD 32 // heads per device of the partial state buffer
 
 static const ggml_op fn_qsa_attn_ops[] = {
-    GGML_OP_CPY, GGML_OP_SCALE,                                                        // the cells as floats, - n_kv
+    GGML_OP_SCALE,                                                                     // the cells - n_kv
     GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_CLAMP, GGML_OP_REPEAT, GGML_OP_RESHAPE, // live blocks per slot
-    GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_CLAMP,                                         // live tail
+    GGML_OP_SCALE, GGML_OP_CLAMP,                                                      // live tail
     GGML_OP_CONCAT, GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_CPY,                           // live; n_kv + live*(cell - n_kv)
     GGML_OP_FLASH_ATTN_SEL,
 };
@@ -3071,7 +3072,7 @@ static const ggml_op fn_qsa_attn_ops[] = {
 // The selection and the attention over it, for a window of up to FN_MAX_T tokens -> fn_qsa_cells, fattn_sel
 int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     constexpr int n_ops = FN_QSA_ATTN_N_OPS;
-    if (!fn_pattern_on(FN_PAT_QSA_ATTN) || cgraph->nodes[i]->op != GGML_OP_CPY || i + n_ops > cgraph->n_nodes ||
+    if (!fn_pattern_on(FN_PAT_QSA_ATTN) || cgraph->nodes[i]->op != GGML_OP_SCALE || i + n_ops > cgraph->n_nodes ||
         cgraph->nodes[i + n_ops - 1]->op != GGML_OP_FLASH_ATTN_SEL) {
         return 0;
     }
@@ -3081,32 +3082,32 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     }
     ggml_tensor * const * n = cgraph->nodes + i;
     const ggml_tensor * sel_idx = n[0]->src[0];
-    const ggml_tensor * score   = n[2]->src[0];
-    const ggml_tensor * top_k   = n[3]->src[1];
-    ggml_tensor *       out     = n[15];
+    const ggml_tensor * score   = n[1]->src[0];
+    const ggml_tensor * top_k   = n[2]->src[1];
+    const ggml_tensor * tail_f  = n[7]->src[0];
+    ggml_tensor *       out     = n[13];
     const ggml_tensor * q       = out->src[0];
     const ggml_tensor * k       = out->src[1];
     const ggml_tensor * v       = out->src[2];
     const int64_t n_sel = sel_idx->ne[0];
     const int64_t nt    = sel_idx->ne[1];
-    const int64_t kpool = n[6]->ne[0];
+    const int64_t kpool = n[5]->ne[0];
     const int64_t n_kv  = k->ne[1];
     auto params = [](const ggml_tensor * t, const float a, const float b) {
         return ggml_get_op_params_f32(t, 0) == a && ggml_get_op_params_f32(t, 1) == b;
     };
     // the wiring that the values depend on; the rest follows from the op sequence
-    if (n[1]->src[0] != n[0] || n[3]->src[0] != n[2] || n[4]->src[0] != n[3] || n[5]->src[0] != n[4] || n[6]->src[0] != n[5] ||
-        n[7]->src[0] != n[6] || n[9]->src[0] != n[8] || n[10]->src[0] != n[9] || n[8]->src[0]->type != GGML_TYPE_I32 ||
-        n[11]->src[0] != n[7] || n[11]->src[1] != n[10] || n[12]->src[0] != n[1] || n[12]->src[1] != n[11] ||
-        n[13]->src[0] != n[12] || n[14]->src[0] != n[13] || out->src[3] != n[14] ||
-        !params(n[1], 1.0f, (float) -n_kv) || !params(n[4], 1.0f, 1.0f) || !params(n[5], 0.0f, 1.0f) ||
-        !params(n[9], -1.0f, (float) n_kv) || !params(n[10], 0.0f, 1.0f) || !params(n[13], 1.0f, (float) n_kv) ||
-        n[0]->type != GGML_TYPE_F32 || n[8]->type != GGML_TYPE_F32 || n[14]->type != GGML_TYPE_I32) {
+    if (n[2]->src[0] != n[1] || n[3]->src[0] != n[2] || n[4]->src[0] != n[3] || n[5]->src[0] != n[4] || n[6]->src[0] != n[5] ||
+        n[8]->src[0] != n[7] || n[9]->src[0] != n[6] || n[9]->src[1] != n[8] || n[10]->src[0] != n[0] || n[10]->src[1] != n[9] ||
+        n[11]->src[0] != n[10] || n[12]->src[0] != n[11] || out->src[3] != n[12] ||
+        !params(n[0], 1.0f, (float) -n_kv) || !params(n[3], 1.0f, 1.0f) || !params(n[4], 0.0f, 1.0f) ||
+        !params(n[7], -1.0f, (float) n_kv) || !params(n[8], 0.0f, 1.0f) || !params(n[11], 1.0f, (float) n_kv) ||
+        sel_idx->type != GGML_TYPE_F32 || tail_f->type != GGML_TYPE_F32 || n[12]->type != GGML_TYPE_I32) {
         return fn_decline("qsa_attn: wiring", i);
     }
-    if (sel_idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(sel_idx) || score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) ||
+    if (!ggml_is_contiguous(sel_idx) || score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) ||
         score->ne[1] != nt || top_k->type != GGML_TYPE_I32 || top_k->nb[0] != sizeof(int32_t) || top_k->ne[1] != nt ||
-        n_sel != kpool*top_k->ne[0] + kpool - 1 || n[8]->src[0]->ne[0] != kpool - 1 || n[14]->ne[0] != n_sel || n[14]->ne[1] != nt ||
+        n_sel != kpool*top_k->ne[0] + kpool - 1 || tail_f->ne[0] != kpool - 1 || n[12]->ne[0] != n_sel || n[12]->ne[1] != nt ||
         q->ne[2] != nt || nt > FN_MAX_T || n_sel > FATTN_SEL_MAX_SEL || q->ne[1] > FN_QSA_ATTN_MAX_HEAD ||
         !ggml_cuda_flash_attn_sel_supported(out) || !fn_hc_aligned(q) || !fn_hc_aligned(out) ||
         (k->type == GGML_TYPE_F16 && (!fn_hc_aligned(k) || !fn_hc_aligned(v)))) {
@@ -3118,10 +3119,10 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         return fn_decline("qsa_attn: overlap", i);
     }
     fn_qsa_cells_args c;
-    c.sel_idx = (const int32_t *) sel_idx->data;
+    c.sel_idx = (const float *) sel_idx->data;
     c.score   = (const float *) score->data;
     c.top_k   = (const int32_t *) top_k->data;
-    c.s_sel   = (int) (sel_idx->nb[1]/sizeof(int32_t));
+    c.s_sel   = (int) (sel_idx->nb[1]/sizeof(float));
     c.s_score = (int) (score->nb[1]/sizeof(float));
     c.s_topk  = (int) (top_k->nb[1]/sizeof(int32_t));
     c.n_sel   = (int) n_sel;

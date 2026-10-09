@@ -182,26 +182,58 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int mtp_flags   = nf.mtp;
     const bool mtp_only   = (trunk_flags & TENSOR_NOT_REQUIRED) != 0;
 
-    // temporary switch (LLAMA_EXPERT_HOT=N): fewer experts per layer in the hot tensors (VRAM) than the file's split has,
-    // the others join the cold ones. The file stores a layer's experts hot first and the two tensors one after the other.
-    if (hparams.n_expert_hot > 0 && !mtp_only && getenv("LLAMA_EXPERT_HOT") != nullptr) {
-        const int64_t n_hot_new = std::max(1, atoi(getenv("LLAMA_EXPERT_HOT")));
-        if (n_hot_new < (int64_t) hparams.n_expert_hot) {
-            static const llm_tensor pairs[3][2] = {
-                { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
-                { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
-                { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
-            };
-            for (int il = 0; il < n_layer; ++il) {
-                for (const auto & pair : pairs) {
-                    if (!ml.resplit(tn(pair[0], "weight", il).str(), tn(pair[1], "weight", il).str(), n_hot_new, 2)) {
-                        throw std::runtime_error(format("LLAMA_EXPERT_HOT: the hot and cold expert tensors of layer %d are not one array in the file", il));
-                    }
+    // temporary switch (LLAMA_EXPERT_HOT=N): N experts per layer in the hot tensors (VRAM) instead of the file's split,
+    // the others are cold. The file stores a layer's experts hot first and the two tensors one after the other, so the
+    // border moves either way. LLAMA_EXPERT_HOT_LAYERS="il:n,..." (or n,n,... by layer) sets layers apart: the
+    // routing of the layers differs (at 240 hot per layer the cold pairs of decode windows ranged from 2% to 21% by
+    // layer), and a layer's cold pairs are what the host tier makes the window wait for.
+    std::vector<int64_t> n_hot_layer(n_layer, hparams.n_expert_hot > 0 ? (int64_t) hparams.n_expert_hot : 0);
+    if (hparams.n_expert_hot > 0 && !mtp_only && (getenv("LLAMA_EXPERT_HOT") != nullptr || getenv("LLAMA_EXPERT_HOT_LAYERS") != nullptr)) {
+        if (getenv("LLAMA_EXPERT_HOT") != nullptr) {
+            std::fill(n_hot_layer.begin(), n_hot_layer.end(), std::max(1, atoi(getenv("LLAMA_EXPERT_HOT"))));
+        }
+        if (getenv("LLAMA_EXPERT_HOT_LAYERS") != nullptr) {
+            std::string spec = getenv("LLAMA_EXPERT_HOT_LAYERS");
+            size_t pos = 0;
+            int    il_next = 0;
+            while (pos < spec.size()) {
+                size_t end = spec.find(',', pos);
+                if (end == std::string::npos) {
+                    end = spec.size();
+                }
+                const std::string tok = spec.substr(pos, end - pos);
+                pos = end + 1;
+                if (tok.empty()) {
+                    continue;
+                }
+                const size_t colon = tok.find(':');
+                const int il = colon == std::string::npos ? il_next : atoi(tok.substr(0, colon).c_str());
+                const int n  = atoi(tok.substr(colon == std::string::npos ? 0 : colon + 1).c_str());
+                if (il < 0 || il >= n_layer || n < 1 || n >= (int) n_expert) {
+                    throw std::runtime_error(format("LLAMA_EXPERT_HOT_LAYERS: bad entry '%s'", tok.c_str()));
+                }
+                n_hot_layer[il] = n;
+                il_next = il + 1;
+            }
+        }
+        static const llm_tensor pairs[3][2] = {
+            { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
+            { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
+            { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
+        };
+        int64_t total = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            total += n_hot_layer[il];
+            if (n_hot_layer[il] == (int64_t) hparams.n_expert_hot) {
+                continue;
+            }
+            for (const auto & pair : pairs) {
+                if (!ml.resplit(tn(pair[0], "weight", il).str(), tn(pair[1], "weight", il).str(), n_hot_layer[il], 2)) {
+                    throw std::runtime_error(format("LLAMA_EXPERT_HOT: the hot and cold expert tensors of layer %d are not one array in the file", il));
                 }
             }
-            LLAMA_LOG_INFO("%s: %d of the file's %u hot experts per layer stay hot\n", __func__, (int) n_hot_new, hparams.n_expert_hot);
-            hparams.n_expert_hot = (uint32_t) n_hot_new;
         }
+        LLAMA_LOG_INFO("%s: %.1f hot experts per layer on average (the file's split: %u)\n", __func__, (double) total/n_layer, hparams.n_expert_hot);
     }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
@@ -301,7 +333,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // (trunk layers only: an MTP block merged into the file keeps its experts in one tensor)
         // with nextn.expert_count the MTP block has its own expert count (an expert-pruned trunk, the vendor's draft block)
         const int64_t n_expert_l = il >= n_layer && hparams.n_expert_nextn > 0 ? (int64_t) hparams.n_expert_nextn : n_expert;
-        const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) && il < n_layer ? (int64_t) hparams.n_expert_hot : n_expert_l;
+        const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) && il < n_layer ? n_hot_layer[il] : n_expert_l;
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert_l }, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_hot }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_hot, flags);

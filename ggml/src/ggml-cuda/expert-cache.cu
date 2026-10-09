@@ -90,6 +90,7 @@ struct ec_device {
     int          last_prompt_tokens = 0; // tokens of the last update if it was a prompt ubatch
     uint64_t     n_pairs     = 0;
     uint64_t     n_pairs_cold = 0;
+    std::vector<uint64_t> row_pairs, row_cold; // per layer (GGML_CUDA_EXPERT_CACHE_STATS)
 };
 
 static ec_device g_ec[GGML_CUDA_MAX_DEVICES];
@@ -486,10 +487,18 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     std::vector<ec_cand> more;
     bool     prompt    = false;
     uint32_t total_max = 0;
+    if (d.row_pairs.size() < n_rows) {
+        d.row_pairs.resize(n_rows, 0);
+        d.row_cold.resize(n_rows, 0);
+    }
     for (size_t row = 0; row < n_rows; ++row) {
         const ec_res & r = d.res_host[row];
         d.n_pairs      += r.total;
         d.n_pairs_cold += r.cold;
+        if (r.total <= 100) { // decode windows only: a prompt ubatch routes to most experts
+            d.row_pairs[row] += r.total;
+            d.row_cold[row]  += r.cold;
+        }
         total_max = std::max(total_max, r.total);
         prompt = prompt || r.total > 100; // more than a decode window routes
         if (r.n_cand > EC_RES_CAND) {
@@ -578,6 +587,16 @@ void ggml_cuda_expert_cache_context_free(ggml_backend_cuda_context & ctx) {
         fprintf(stderr, "%s: device %d: %llu updates, %llu expert exchanges, %.2f%% of %llu routed pairs were cold\n", __func__, ctx.device,
                 (unsigned long long) d.n_updates, (unsigned long long) d.n_swaps, 100.0*(double) d.n_pairs_cold/(double) d.n_pairs,
                 (unsigned long long) d.n_pairs);
+        if (getenv("GGML_CUDA_EXPERT_CACHE_STATS") != nullptr && ctx.device == 0) {
+            // the cold share by layer, for a hot budget per layer
+            fprintf(stderr, "ec-layers dev0, decode windows (hot/all: cold%%):");
+            for (size_t row = 0; row < d.row_pairs.size(); ++row) {
+                const ec_layer & l = d.layers[row];
+                fprintf(stderr, " %zu:%d/%d:%.1f", row, l.n_hot, l.n_hot + l.n_cold,
+                        100.0*(double) d.row_cold[row]/(double) std::max<uint64_t>(1, d.row_pairs[row]));
+            }
+            fprintf(stderr, "\n");
+        }
     }
     // the exchanges it queued must be done before another context computes with the layers
     ggml_cuda_set_device(ctx.device);

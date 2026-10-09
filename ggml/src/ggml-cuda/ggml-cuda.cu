@@ -5733,7 +5733,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->fn_router_node = nullptr;
     cuda_ctx->fn_moe_down = nullptr;
     cuda_ctx->fn_gdn_pre_conv = nullptr;
-    ggml_cuda_expert_cache_wait(*cuda_ctx); // no capture is open when an exchange is pending: it was started at a synchronize
+    // a graph that reads the hot expert slices (or streams the cold ones) waits for a pending exchange; the draft
+    // context's graphs and the dense parts of a window do not, so the exchange overlaps them. A captured part of a
+    // window marks the window instead: its launches wait (ggml_backend_cuda_comm_window_launch).
+    {
+        bool needs_ec = false;
+        for (int i = 0; i < cgraph->n_nodes && !needs_ec; ++i) {
+            needs_ec = ggml_cuda_mmid_cold(cgraph->nodes[i]);
+        }
+        if (needs_ec && cuda_ctx->window_active) {
+            cuda_ctx->window_needs_ec = true;
+        }
+        if (needs_ec && !ggml_cuda_capturing) {
+            ggml_cuda_expert_cache_wait(*cuda_ctx);
+        }
+    }
     ggml_cuda_expert_cache_prepare(*cuda_ctx, cgraph);
     {
         // temporary: the nodes of the first graphs of device 0 (GGML_CUDA_FN_DUMP=<number of graphs>)
@@ -7222,6 +7236,7 @@ static bool ggml_backend_cuda_comm_allreduce_epilogue(void * comm_ctx_v, struct 
 struct ggml_backend_cuda_comm_window {
     std::vector<cudaGraph_t>     graphs;
     std::vector<cudaGraphExec_t> execs;
+    bool                         needs_ec = false; // reads the hot expert slices: a launch waits for a pending exchange
 };
 
 static bool ggml_backend_cuda_comm_window_supported(void * comm_ctx_v, struct ggml_cgraph * cgraph, size_t max_bytes) {
@@ -7262,10 +7277,10 @@ static void ggml_backend_cuda_comm_window_begin(void * comm_ctx_v, bool capture)
     GGML_ASSERT(!comm_ctx->window_active);
     for (ggml_backend_t backend : comm_ctx->backends) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-        cuda_ctx->window_active = true;
+        cuda_ctx->window_active   = true;
+        cuda_ctx->window_needs_ec = false;
         cuda_ctx->fn_act_clear();
         ggml_cuda_in_flush(*cuda_ctx);
-        ggml_cuda_expert_cache_wait(*cuda_ctx);
 #ifdef USE_CUDA_GRAPH
         if (capture) {
             ggml_cuda_set_device(cuda_ctx->device);
@@ -7309,6 +7324,7 @@ static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
             ggml_cuda_mem_checkpoint(cuda_ctx->device, "window instantiate", "");
             window->graphs.push_back(graph);
             window->execs.push_back(exec);
+            window->needs_ec = window->needs_ec || cuda_ctx->window_needs_ec;
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -7351,7 +7367,9 @@ static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * windo
     for (ggml_backend_t backend : comm_ctx->backends) {
         ((ggml_backend_cuda_context *) backend->context)->ec_pending = true;
         ggml_cuda_in_flush(*(ggml_backend_cuda_context *) backend->context);
-        ggml_cuda_expert_cache_wait(*(ggml_backend_cuda_context *) backend->context);
+        if (window->needs_ec) {
+            ggml_cuda_expert_cache_wait(*(ggml_backend_cuda_context *) backend->context);
+        }
     }
     bool probe = false;
     for (ggml_backend_t backend : comm_ctx->backends) {

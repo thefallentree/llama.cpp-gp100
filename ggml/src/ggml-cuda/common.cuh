@@ -1552,6 +1552,8 @@ struct ggml_backend_cuda_context {
 
     // part of a tensor-split window: graph_compute runs the nodes on the stream without a CUDA graph of its own
     bool window_active = false;
+    // a part of the window being captured reads the hot expert slices: its launches wait for a pending exchange
+    bool window_needs_ec = false;
 
     // fn-engine MoE experts: the pairs, the SwiGLU outputs and their activations between the up and the down kernels
     char *  fn_moe_mem = nullptr;

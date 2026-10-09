@@ -8788,9 +8788,10 @@ struct test_flash_attn_sel : public test_case {
     const int64_t kv;    // cache rows
     const int64_t nsel;  // selected rows per token
     const bool    dead;  // some selected rows out of range
+    const ggml_type type_kv;
 
     std::string vars() override {
-        return VARS_TO_STR7(hs, nh, nhk, nt, kv, nsel, dead);
+        return VARS_TO_STR8(hs, nh, nhk, nt, kv, nsel, dead, type_kv);
     }
 
     double max_nmse_err() override {
@@ -8802,17 +8803,18 @@ struct test_flash_attn_sel : public test_case {
         return 4*hs*nsel*nh*nt;
     }
 
-    test_flash_attn_sel(int64_t hs = 256, int64_t nh = 12, int64_t nhk = 1, int64_t nt = 4, int64_t kv = 1024, int64_t nsel = 259, bool dead = true)
-        : hs(hs), nh(nh), nhk(nhk), nt(nt), kv(kv), nsel(nsel), dead(dead) {}
+    test_flash_attn_sel(int64_t hs = 256, int64_t nh = 12, int64_t nhk = 1, int64_t nt = 4, int64_t kv = 1024, int64_t nsel = 259, bool dead = true,
+                        ggml_type type_kv = GGML_TYPE_F16)
+        : hs(hs), nh(nh), nhk(nhk), nt(nt), kv(kv), nsel(nsel), dead(dead), type_kv(type_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nt);
         ggml_set_name(q, "q");
 
         // the cache: [hs, nhk, kv] rows of all kv heads, viewed by head
-        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nhk, kv);
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_kv, hs, nhk, kv);
         ggml_set_name(k, "k");
-        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nhk, kv);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_kv, hs, nhk, kv);
         ggml_set_name(v, "v");
 
         ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nsel, nt);
@@ -11843,6 +11845,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_sel(256, 24, 2, 8, 4096, 2051, true));
     test_cases.emplace_back(new test_flash_attn_sel(256,  8, 2, 8, 1024,  259, false));
+    for (int64_t nt : { 1, 8, 100 }) {
+        test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 4096, 2051, true, GGML_TYPE_Q8_0));
+    }
+    test_cases.emplace_back(new test_flash_attn_sel(256, 24, 2, 3, 1024,  259, false, GGML_TYPE_Q8_0));
 
     return test_cases;
 }
@@ -12250,8 +12256,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
         }
     }
-    // the pools of a qwen4exp decode window at a 64K and a 200K context (k = top_k/kpool)
-    for (auto cols : {16384, 65536}) {
+    // the pools of a qwen4exp decode window at a 4K, a 64K and a 200K context (k = top_k/kpool)
+    for (auto cols : {1024, 16384, 65536}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 3, 1, 1}, 512));
     }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
@@ -12313,9 +12319,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
-    // flash_attn_sel: a decode window and a prompt ubatch of a QSA layer (one kv head per device)
-    for (int64_t nt : { 1, 8, 1024 }) {
-        test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 65536, 2051, false));
+    // flash_attn_sel: a decode window and a prompt ubatch of a QSA layer (one kv head per device), f16 and q8_0 caches
+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t nt : { 1, 8, 1024 }) {
+            test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 65536, 2051, false, type_kv));
+        }
     }
     // the indexer of a decode window over the pools of a 64K and a 200K context
     for (int kv : { 16384, 65536 }) {

@@ -641,9 +641,14 @@ static bool top_k_select_cuda(const float * src, int * dst, const int ncols, con
     if (!enabled || k <= CUDA_TOP_K_MAX_K || k >= ncols || nrows < 1 || ncols > 64*max_threads) {
         return false;
     }
-    const int part    = ncols <= 16*max_threads ? 16 : ncols <= 32*max_threads ? 32 : 64;
+    // short rows over more threads: the passes have a fixed cost in zeroing, summing and scanning the bins
+    const int part    = ncols <= 4*max_threads ? 4 : ncols <= 8*max_threads ? 8 : ncols <= 16*max_threads ? 16 : ncols <= 32*max_threads ? 32 : 64;
     const int threads = GGML_PAD((ncols + part - 1)/part, WARP_SIZE);
-    if (part == 16) {
+    if (part == 4) {
+        k_top_k_select<4><<<nrows, threads, 0, stream>>>(src, dst, ncols, k);
+    } else if (part == 8) {
+        k_top_k_select<8><<<nrows, threads, 0, stream>>>(src, dst, ncols, k);
+    } else if (part == 16) {
         k_top_k_select<16><<<nrows, threads, 0, stream>>>(src, dst, ncols, k);
     } else if (part == 32) {
         k_top_k_select<32><<<nrows, threads, 0, stream>>>(src, dst, ncols, k);

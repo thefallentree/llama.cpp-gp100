@@ -1604,7 +1604,27 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <map>
+// the pinned host buffers that are registered mappings of 2 MB pages (ggml_cuda_host_malloc), by address
+static std::mutex                           ggml_cuda_host_huge_mtx;
+static std::map<void *, size_t>             ggml_cuda_host_huge;
+#endif
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+#if defined(__linux__)
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_host_huge_mtx);
+        auto it = ggml_cuda_host_huge.find(buffer->context);
+        if (it != ggml_cuda_host_huge.end()) {
+            CUDA_CHECK(cudaHostUnregister(it->first));
+            munmap(it->first, it->second);
+            ggml_cuda_host_huge.erase(it);
+            return;
+        }
+    }
+#endif
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1628,12 +1648,75 @@ static void ggml_cuda_host_numa_bind(const bool on) {
 static void ggml_cuda_host_numa_bind(const bool) {}
 #endif
 
+#if defined(__linux__)
+// GGML_CUDA_HOST_HUGE=1: a large pinned buffer as a registered anonymous mapping of transparent 2 MB pages instead
+// of cudaMallocHost (the pages are touched here so that they are placed under the NUMA policy and faulted in
+// before cudaHostRegister pins them). Measured for the cold experts on the P100 box: the host tier's jobs take the
+// same 45 us per pair on 2 MB pages as on 4 KB ones (its kernel is instruction-bound, not TLB- or
+// prefetch-bound), so this is off by default.
+static void * ggml_cuda_host_malloc_huge(const size_t size) {
+    static const bool huge = getenv("GGML_CUDA_HOST_HUGE") != nullptr && atoi(getenv("GGML_CUDA_HOST_HUGE")) != 0;
+    const size_t align = (size_t) 2 << 20;
+    if (!huge || size < (size_t) 64 << 20) {
+        return nullptr;
+    }
+    const size_t len  = (size + align - 1)/align*align;
+    void *       base = mmap(nullptr, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        return nullptr;
+    }
+    // the mapping aligned to 2 MB: the head and tail of the overallocation are returned
+    char * p = (char *) (((uintptr_t) base + align - 1) & ~(uintptr_t) (align - 1));
+    if (p != base) {
+        munmap(base, p - (char *) base);
+    }
+    if (p + len != (char *) base + len + align) {
+        munmap(p + len, (char *) base + len + align - (p + len));
+    }
+    madvise(p, len, MADV_HUGEPAGE);
+    ggml_cuda_host_numa_bind(true);
+    // touch every page from a few threads: the first touch allocates it under the policy (9 GB per device here)
+    {
+        const size_t n_threads = 4;
+        std::vector<std::thread> workers;
+        for (size_t t = 0; t < n_threads; ++t) {
+            workers.emplace_back([=] {
+                const size_t a = len*t/n_threads, b = len*(t + 1)/n_threads;
+                for (size_t o = a; o < b; o += 4096) {
+                    p[o] = 0;
+                }
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+    ggml_cuda_host_numa_bind(false);
+    const cudaError_t err = cudaHostRegister(p, len, cudaHostRegisterDefault);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: cudaHostRegister of %.1f GB of 2 MB pages failed (%s), falling back to cudaMallocHost\n", __func__,
+                      len/1e9, cudaGetErrorString(err));
+        munmap(p, len);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_huge_mtx);
+    ggml_cuda_host_huge[p] = len;
+    return p;
+}
+#else
+static void * ggml_cuda_host_malloc_huge(size_t) { return nullptr; }
+#endif
+
 static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
 
-    void * ptr = nullptr;
+    void * ptr = ggml_cuda_host_malloc_huge(size);
+    if (ptr != nullptr) {
+        return ptr;
+    }
     ggml_cuda_host_numa_bind(true);
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     ggml_cuda_host_numa_bind(false);

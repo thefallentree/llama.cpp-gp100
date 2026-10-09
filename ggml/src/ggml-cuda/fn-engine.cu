@@ -1,5 +1,6 @@
 #include "fn-engine.cuh"
 #include "convert.cuh"
+#include "fattn-sel.cuh"
 
 #include <atomic>
 #include <cmath>
@@ -1591,379 +1592,33 @@ static __global__ void fn_gate_out(const float * __restrict__ x, const int64_t s
     *(uint2 *) (X + (int64_t) t*n + 4*threadIdx.x) = make_uint2((unsigned int) fn_i2(h0), (unsigned int) fn_i2(h1));
 }
 
-// The selection mask of a QSA attention layer (the top blocks of the indexer plus the tail):
-//   out[cell] = kq_mask[cell] if the cell is selected, -inf otherwise
-// slot s of a token selects the cell sel_idx[s] if it is live: a slot of a top block if the block's score is not
-// -inf, a tail slot if its cell is not the sentinel n_kv. A dead slot goes to its own row n_kv + s, beyond the mask.
-// One block for all the tokens: the cells of the slots are staged in shared memory before the first store, because
-// the output usually shares memory with the scores and the top blocks (their buffers are free by then).
-#define FN_QSA_SEL_THREADS 1024
-#define FN_QSA_SEL_DEAD    0xFFFFu
-
-static __global__ void fn_qsa_sel(const int32_t * sel_idx, const int64_t s_sel, const int n_sel, const int n_top,
-                                  const int kpool, const float * score, const int64_t s_score,
-                                  const int32_t * top_k, const int64_t s_topk, const int n_kv, const int nt,
-                                  const half * __restrict__ kq_mask, const int64_t s_kq, half * out, const int64_t s_out) {
-    extern __shared__ unsigned short s_cell[];
-    for (int e = threadIdx.x; e < nt*n_sel; e += blockDim.x) {
-        const int t = e/n_sel;
-        const int s = e - t*n_sel;
-        const float idx = (float) sel_idx[t*s_sel + s];
-        float live;
-        if (s < n_top) {
-            live = fminf(fmaxf(score[t*s_score + top_k[t*s_topk + s/kpool]] + 1.0f, 0.0f), 1.0f);
-        } else {
-            live = fminf(fmaxf((float) n_kv - idx, 0.0f), 1.0f);
-        }
-        const float dump = (float) (n_kv + s);
-        const int   cell = (int) ((idx - dump)*live + dump);
-        s_cell[e] = cell < n_kv ? (unsigned short) cell : (unsigned short) FN_QSA_SEL_DEAD;
-    }
-    __syncthreads();
-    const half ninf = __ushort_as_half((unsigned short) 0xFC00);
-    for (int e = threadIdx.x; e < nt*n_kv; e += blockDim.x) {
-        const int t = e/n_kv;
-        out[t*s_out + (e - t*n_kv)] = ninf;
-    }
-    __syncthreads();
-    for (int e = threadIdx.x; e < nt*n_sel; e += blockDim.x) {
-        const int t = e/n_sel;
-        const unsigned int cell = s_cell[e];
-        if (cell != FN_QSA_SEL_DEAD) {
-            out[t*s_out + cell] = kq_mask[t*s_kq + cell];
-        }
-    }
-}
-
-// block-wide maximum or sum of one value per thread, for blocks of up to 32 whole warps; two barriers
-static __device__ __forceinline__ float fn_block_fold(float v, const bool is_max, float * s_w, float * s_tot) {
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int warp = threadIdx.x / WARP_SIZE;
-    const int nw   = blockDim.x / WARP_SIZE;
-#pragma unroll
-    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-        const float o = __shfl_xor_sync(0xffffffff, v, off);
-        v = is_max ? fmaxf(v, o) : v + o;
-    }
-    if (lane == 0) {
-        s_w[warp] = v;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        float x = lane < nw ? s_w[lane] : (is_max ? -INFINITY : 0.0f);
-#pragma unroll
-        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-            const float o = __shfl_xor_sync(0xffffffff, x, off);
-            x = is_max ? fmaxf(x, o) : x + o;
-        }
-        if (lane == 0) {
-            s_tot[0] = x;
-        }
-    }
-    __syncthreads();
-    return s_tot[0];
-}
-
-// QSA attention over the selected cells only: the cells of fn_qsa_sel, then for a head's query q
-//   s[j] = scale*(q . K[cell_j]) + kq_mask[cell_j],   out = sum over j of softmax(s)[j]*V[cell_j]
-// The heads share the key and value rows (one KV head), so a block takes all NH heads of a token over a chunk of the
-// slots and reads every row once. Scores: a lane per slot walks its key row against the queries in shared memory (no
-// reductions). Values: a warp per slot and half the heads, a lane eight values. With several chunks a block leaves the
-// softmax state and the unnormalized sum to part, and fn_qsa_attn_join adds the chunks up. The cost does not depend
-// on the size of the cache. (A block per (head, token) read every row NH times: 137 us at 2051 slots.)
-#define FN_QSA_ATTN_D         256
-#define FN_QSA_ATTN_NW        8
-#define FN_QSA_ATTN_CHUNK     64   // slots per block at most
-#define FN_QSA_ATTN_MAX_CHUNK 40
-#define FN_QSA_ATTN_MAX_HEAD  32   // heads per device of the partial state
-#define FN_QSA_ATTN_MAX_SEL   (FN_QSA_ATTN_CHUNK*FN_QSA_ATTN_MAX_CHUNK) // slots: the cells of the indexer's top blocks (2048) and the tail
-
-struct fn_qsa_attn_args {
-    const int32_t * cells;    // [nt][n_sel] staged by fn_qsa_cells (-1: none)
+// The cells of the selection of a QSA attention layer (qwen4exp build_qsa_sel), as the ops of the graph map them:
+// slot j of token t is the cell sel_idx[j] if it is live, a slot of a top block if the block's score is not -inf,
+// a tail slot if its cell is not the sentinel n_kv; -1 for a dead slot. Three dependent reads per slot, spread over
+// the device.
+struct fn_qsa_cells_args {
     const int32_t * sel_idx;
     const float *   score;
     const int32_t * top_k;
-    const half *    kq_mask;
-    const float *   q;        // [nt][n_head][D], sq_t and sq_h apart
-    const half *    K;        // rows of D values, sk apart
-    const half *    V;
-    float *         out;      // [nt][n_head][D], so_t and so_h apart
-    float *         part;     // [nt][n_head][n_chunk][D + 4]: o, m, l
-    int             s_sel, s_score, s_topk, s_kq, sq_t, sq_h, sk, sv, so_t, so_h;
-    int             n_sel, n_top, kpool, n_kv, n_head, n_chunk, c_len;
-    float           scale;
+    int             s_sel, s_score, s_topk;
+    int             n_sel, n_top, kpool, n_kv;
 };
 
-// the cell of slot j of token t, as fn_qsa_sel computes it; -1 if the slot is dead
-static __device__ __forceinline__ int fn_qsa_cell(const int32_t * sel_idx, const int s_sel, const int n_top, const int kpool,
-                                                  const float * score, const int s_score, const int32_t * top_k, const int s_topk,
-                                                  const int n_kv, const int t, const int j) {
-    const float idx = (float) sel_idx[t*s_sel + j];
-    float live;
-    if (j < n_top) {
-        live = fminf(fmaxf(score[t*s_score + top_k[t*s_topk + j/kpool]] + 1.0f, 0.0f), 1.0f);
-    } else {
-        live = fminf(fmaxf((float) n_kv - idx, 0.0f), 1.0f);
-    }
-    const float dump = (float) (n_kv + j);
-    const int   c    = (int) ((idx - dump)*live + dump);
-    return c < n_kv ? c : -1;
-}
-
-// The cells of all slots: three dependent reads per slot, spread over the device. The attention's blocks could not read
-// the selection anyway while other blocks write their output (they can share memory).
-static __global__ void fn_qsa_cells(const fn_qsa_attn_args a, const int nt, int32_t * cells) {
+static __global__ void fn_qsa_cells(const fn_qsa_cells_args a, const int nt, int32_t * cells) {
     const int e = blockIdx.x*blockDim.x + threadIdx.x;
     if (e < nt*a.n_sel) {
-        const int t = e/a.n_sel;
-        const int j = e - t*a.n_sel;
-        cells[e] = fn_qsa_cell(a.sel_idx, a.s_sel, a.n_top, a.kpool, a.score, a.s_score, a.top_k, a.s_topk, a.n_kv, t, j);
-    }
-}
-
-// block (token, chunk): heads h0 .. h0 + NH - 1 over the slots [chunk*c_len, +c_len)
-#ifdef FN_QSA_MARKS
-__device__ long long fn_qsa_marks[8];
-#define FN_QSA_MARK(i) if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) { fn_qsa_marks[i] = clock64(); }
-#else
-#define FN_QSA_MARK(i)
-#endif
-
-template <int NH>
-static __global__ void __launch_bounds__(FN_QSA_ATTN_NW*WARP_SIZE, 3)
-fn_qsa_attn(const fn_qsa_attn_args a, const int h0) {
-    FN_QSA_MARK(0)
-    constexpr int D  = FN_QSA_ATTN_D;
-    constexpr int NW = FN_QSA_ATTN_NW;
-    constexpr int C  = FN_QSA_ATTN_CHUNK;
-    constexpr int HW = NH/2;                 // heads per warp in the sum over the values
-    __shared__ float s_q[NH][D];             // then the output
-    __shared__ float s_part[NH][NW*WARP_SIZE]; // the warps' parts of 32 scores
-    __shared__ float s_s[NH][C];             // scores, then the weights
-    __shared__ int   s_cell[C];
-    __shared__ float s_mk[C];                // the mask of each slot
-    __shared__ float s_m[NH];
-    __shared__ float s_l[NH];
-    float (* const s_o)[D] = s_q;
-    const int t     = blockIdx.x;
-    const int chunk = blockIdx.y;
-    const int lane  = threadIdx.x % WARP_SIZE;
-    const int warp  = threadIdx.x / WARP_SIZE;
-    const int c_lo  = chunk*a.c_len;
-    const int n_c   = min(a.c_len, a.n_sel - c_lo);  // slots of this chunk
-    const int32_t * cells = a.cells + (int64_t) t*a.n_sel + c_lo;
-    const half *    mask  = a.kq_mask + (int64_t) t*a.s_kq;
-
-    for (int e = threadIdx.x; e < NH*D/4; e += NW*WARP_SIZE) {
-        const int h = e/(D/4);
-        const int d = 4*(e - h*(D/4));
-        *(float4 *) (s_q[h] + d) = *(const float4 *) (a.q + (int64_t) t*a.sq_t + (int64_t) (h0 + h)*a.sq_h + d);
-    }
-    __syncthreads();
-    FN_QSA_MARK(1)
-    // scores: 32 slots at a time, a lane per slot and a warp per 32 values of the key row, the queries read as
-    // broadcasts; the warps' parts are added through shared memory
-    for (int cg = 0; cg < a.c_len; cg += WARP_SIZE) {
-        const int     c    = cg + lane;
-        const int     cell = c < n_c ? cells[c] : -1;
-        const uint4 * kr   = (const uint4 *) (a.K + (int64_t) (cell >= 0 ? cell : 0)*a.sk) + 4*warp;
-        uint4 u[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            u[i] = kr[i];
-        }
-        if (warp == 0 && c < C) {
-            s_cell[c] = cell >= 0 ? cell : 0; // a dead slot reads row 0 with the weight 0
-            s_mk[c]   = cell >= 0 ? __half2float(mask[cell]) : -INFINITY;
-        }
-        float acc[NH];
-#pragma unroll
-        for (int h = 0; h < NH; ++h) {
-            acc[h] = 0.0f;
-        }
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float2 k0 = __half22float2(fn_h2((int) u[i].x));
-            const float2 k1 = __half22float2(fn_h2((int) u[i].y));
-            const float2 k2 = __half22float2(fn_h2((int) u[i].z));
-            const float2 k3 = __half22float2(fn_h2((int) u[i].w));
-#pragma unroll
-            for (int h = 0; h < NH; ++h) {
-                const float4 q0 = *(const float4 *) (s_q[h] + 32*warp + 8*i);
-                const float4 q1 = *(const float4 *) (s_q[h] + 32*warp + 8*i + 4);
-                acc[h] += k0.x*q0.x + k0.y*q0.y + k1.x*q0.z + k1.y*q0.w + k2.x*q1.x + k2.y*q1.y + k3.x*q1.z + k3.y*q1.w;
-            }
-        }
-#pragma unroll
-        for (int h = 0; h < NH; ++h) {
-            s_part[h][32*warp + lane] = acc[h];
-        }
-        __syncthreads();
-        for (int e = threadIdx.x; e < NH*WARP_SIZE; e += NW*WARP_SIZE) {
-            const int h  = e/WARP_SIZE;
-            const int sl = e - h*WARP_SIZE;
-            const int cs = cg + sl;
-            float sum = 0.0f;
-#pragma unroll
-            for (int w = 0; w < NW; ++w) {
-                sum += s_part[h][32*w + sl];
-            }
-            if (cs < C) {
-                const float m = cs < n_c ? s_mk[cs] : -INFINITY;
-                s_s[h][cs] = m > -INFINITY ? sum*a.scale + m : -INFINITY;
-            }
-        }
-        __syncthreads();
-    }
-    __syncthreads();
-    FN_QSA_MARK(2)
-    // softmax state per head: a warp per head
-    for (int h = warp; h < NH; h += NW) {
-        float mx = -INFINITY;
-        for (int c = lane; c < n_c; c += WARP_SIZE) {
-            mx = fmaxf(mx, s_s[h][c]);
-        }
-#pragma unroll
-        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
-        }
-        float l = 0.0f;
-        for (int c = lane; c < n_c; c += WARP_SIZE) {
-            const float e = s_s[h][c] > -INFINITY ? expf(s_s[h][c] - mx) : 0.0f;
-            s_s[h][c] = e;
-            l += e;
-        }
-#pragma unroll
-        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-            l += __shfl_xor_sync(0xffffffff, l, off);
-        }
-        if (lane == 0) {
-            s_m[h] = mx;
-            s_l[h] = l;
-        }
-    }
-    __syncthreads();
-    FN_QSA_MARK(3)
-    // the values: a warp per slot and half the heads
-    const int hg = warp % 2;
-    float acc[HW][8];
-#pragma unroll
-    for (int h = 0; h < HW; ++h) {
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            acc[h][i] = 0.0f;
-        }
-    }
-    for (int c0 = warp/2; c0 < n_c; c0 += 4*(NW/2)) {
-        uint4 u[4];
-#pragma unroll
-        for (int b = 0; b < 4; ++b) {
-            const int c = c0 + b*(NW/2);
-            u[b] = *(const uint4 *) (a.V + (int64_t) s_cell[c < n_c ? c : 0]*a.sv + 8*lane);
-        }
-#pragma unroll
-        for (int b = 0; b < 4; ++b) {
-            const int c = c0 + b*(NW/2);
-            if (c < n_c) {
-                const float2 v0 = __half22float2(fn_h2((int) u[b].x));
-                const float2 v1 = __half22float2(fn_h2((int) u[b].y));
-                const float2 v2 = __half22float2(fn_h2((int) u[b].z));
-                const float2 v3 = __half22float2(fn_h2((int) u[b].w));
-#pragma unroll
-                for (int h = 0; h < HW; ++h) {
-                    const float p = s_s[hg*HW + h][c];
-                    acc[h][0] += p*v0.x; acc[h][1] += p*v0.y; acc[h][2] += p*v1.x; acc[h][3] += p*v1.y;
-                    acc[h][4] += p*v2.x; acc[h][5] += p*v2.y; acc[h][6] += p*v3.x; acc[h][7] += p*v3.y;
-                }
-            }
-        }
-    }
-    FN_QSA_MARK(4)
-    // the warps of a head group add up in turn (the queries are no longer needed)
-    for (int w = 0; w < NW/2; ++w) {
-        if (w == warp/2) {
-#pragma unroll
-            for (int h = 0; h < HW; ++h) {
-                float4 * o0 = (float4 *) (s_o[hg*HW + h] + 8*lane);
-                float4 * o1 = (float4 *) (s_o[hg*HW + h] + 8*lane + 4);
-                if (w == 0) {
-                    *o0 = make_float4(acc[h][0], acc[h][1], acc[h][2], acc[h][3]);
-                    *o1 = make_float4(acc[h][4], acc[h][5], acc[h][6], acc[h][7]);
-                } else {
-                    const float4 p0 = *o0;
-                    const float4 p1 = *o1;
-                    *o0 = make_float4(p0.x + acc[h][0], p0.y + acc[h][1], p0.z + acc[h][2], p0.w + acc[h][3]);
-                    *o1 = make_float4(p1.x + acc[h][4], p1.y + acc[h][5], p1.z + acc[h][6], p1.w + acc[h][7]);
-                }
-            }
-        }
-        __syncthreads();
-    }
-    FN_QSA_MARK(5)
-    // out, or the partial state of the chunk
-    for (int e = threadIdx.x; e < NH*D/4; e += NW*WARP_SIZE) {
-        const int    h = e/(D/4);
-        const int    d = 4*(e - h*(D/4));
-        const float4 o = *(const float4 *) (s_o[h] + d);
-        if (a.n_chunk == 1) {
-            const float inv = s_l[h] > 0.0f ? 1.0f/s_l[h] : 0.0f;
-            *(float4 *) (a.out + (int64_t) t*a.so_t + (int64_t) (h0 + h)*a.so_h + d) = make_float4(o.x*inv, o.y*inv, o.z*inv, o.w*inv);
+        const int   t   = e/a.n_sel;
+        const int   j   = e - t*a.n_sel;
+        const float idx = (float) a.sel_idx[t*a.s_sel + j];
+        float live;
+        if (j < a.n_top) {
+            live = fminf(fmaxf(a.score[t*a.s_score + a.top_k[t*a.s_topk + j/a.kpool]] + 1.0f, 0.0f), 1.0f);
         } else {
-            float * p = a.part + ((int64_t) (t*a.n_head + h0 + h)*a.n_chunk + chunk)*(D + 4);
-            *(float4 *) (p + d) = o;
-            if (d == 0) {
-                p[D]     = s_m[h];
-                p[D + 1] = s_l[h];
-            }
+            live = fminf(fmaxf((float) a.n_kv - idx, 0.0f), 1.0f);
         }
-    }
-    FN_QSA_MARK(6)
-}
-
-// the chunks of a (head, token): out = sum over chunks of exp(m_c - m)*o_c / sum over chunks of exp(m_c - m)*l_c
-static __global__ void fn_qsa_attn_join(const fn_qsa_attn_args a) {
-    constexpr int D = FN_QSA_ATTN_D;
-    const int h = blockIdx.x;
-    const int t = blockIdx.y;
-    const float * p0 = a.part + ((int64_t) (t*a.n_head + h)*a.n_chunk)*(D + 4);
-    float m = -INFINITY;
-    for (int c = 0; c < a.n_chunk; ++c) {
-        m = fmaxf(m, p0[c*(D + 4) + D]);
-    }
-    float o = 0.0f, l = 0.0f;
-    for (int c = 0; c < a.n_chunk; ++c) {
-        const float * p = p0 + c*(D + 4);
-        const float   w = p[D] > -INFINITY ? expf(p[D] - m) : 0.0f;
-        o += w*p[threadIdx.x];
-        l += w*p[D + 1];
-    }
-    a.out[(int64_t) t*a.so_t + (int64_t) h*a.so_h + threadIdx.x] = l > 0.0f ? o/l : 0.0f;
-}
-
-// all heads of a token over its chunks; a.c_len and a.n_chunk are set here
-static void fn_qsa_attn_launch(fn_qsa_attn_args & a, const int nt, cudaStream_t stream) {
-    // small selections in small chunks, so that the device is used
-    a.c_len   = a.n_sel <= 512 ? 32 : FN_QSA_ATTN_CHUNK;
-    a.n_chunk = (a.n_sel + a.c_len - 1)/a.c_len;
-    const dim3 grid((unsigned) nt, (unsigned) a.n_chunk, 1);
-    for (int h0 = 0; h0 < a.n_head; ) {
-        const int nh = a.n_head - h0;
-        if (nh >= 16) {
-            fn_qsa_attn<16><<<grid, FN_QSA_ATTN_NW*WARP_SIZE, 0, stream>>>(a, h0);
-            h0 += 16;
-        } else if (nh >= 12) {
-            fn_qsa_attn<12><<<grid, FN_QSA_ATTN_NW*WARP_SIZE, 0, stream>>>(a, h0);
-            h0 += 12;
-        } else if (nh >= 8) {
-            fn_qsa_attn<8><<<grid, FN_QSA_ATTN_NW*WARP_SIZE, 0, stream>>>(a, h0);
-            h0 += 8;
-        } else {
-            fn_qsa_attn<4><<<grid, FN_QSA_ATTN_NW*WARP_SIZE, 0, stream>>>(a, h0);
-            h0 += 4;
-        }
-    }
-    if (a.n_chunk > 1) {
-        fn_qsa_attn_join<<<dim3((unsigned) a.n_head, (unsigned) nt, 1), FN_QSA_ATTN_D, 0, stream>>>(a);
+        const float dump = (float) a.n_kv;
+        const int   c    = (int) ((idx - dump)*live + dump);
+        cells[e] = c < a.n_kv ? c : -1;
     }
 }
 
@@ -3221,6 +2876,36 @@ int ggml_cuda_fn_gdn_pre_begin(ggml_backend_cuda_context & ctx, const ggml_cgrap
         return 0;
     }
     static_assert(sizeof(a) <= sizeof(ctx.fn_gdn_pre_args), "fn_gdn_pre_args");
+    // the inputs to the scratch, at the first use sized for FN_MAX_T tokens of this layer width (no capture is open then)
+    const int    C    = (int) cgraph->nodes[i]->ne[1];
+    const size_t need = (size_t) FN_MAX_T*C + 3*(size_t) C + (size_t) FN_MAX_T*a.n_gate;
+    if (ctx.fn_gdn_pre_mem == nullptr || ctx.fn_gdn_pre_cap < need) {
+        cudaStreamCaptureStatus status;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            return fn_decline("gdn_pre: no scratch", i);
+        }
+        ggml_cuda_set_device(ctx.device);
+        if (ctx.fn_gdn_pre_mem != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            CUDA_CHECK(cudaFree(ctx.fn_gdn_pre_mem));
+        }
+        CUDA_CHECK(cudaMalloc((void **) &ctx.fn_gdn_pre_mem, need*sizeof(float)));
+        ctx.fn_gdn_pre_cap = need;
+    }
+    float * x_out  = ctx.fn_gdn_pre_mem;
+    float * st_out = x_out + (size_t) FN_MAX_T*C;
+    float * al_out = st_out + 3*(size_t) C;
+    const int n_stage = a.nt*C + 3*C + a.nt*a.n_gate;
+    fn_gdn_pre_stage<<<(unsigned) ((n_stage + 255)/256), 256, 0, ctx.stream()>>>(a, C, x_out, st_out, al_out);
+    CUDA_CHECK(cudaGetLastError());
+    a.x     = x_out;
+    a.sx_t  = C;
+    a.cache = st_out;
+    a.rows  = nullptr;
+    a.crow  = 0;
+    a.alpha = al_out;
+    a.sa_t  = a.n_gate;
     memcpy(ctx.fn_gdn_pre_args, &a, sizeof(a));
     ctx.fn_gdn_pre_conv = cgraph->nodes[i_conv];
     if (ctx.gdn_gather_owner == cgraph->nodes[i]) {

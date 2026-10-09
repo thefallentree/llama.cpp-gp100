@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_FLASH_ATTN_SEL,
 
         GGML_OP_UNARY,
 
@@ -2726,6 +2727,25 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // attention of every token over its own selection of cache rows (sparse attention)
+    //
+    // q:   [n_embd, n_head, n_tokens]   f32
+    // k:   [n_embd, n_kv,   n_head_kv]  f16, rows may be strided; head h reads kv head h/(n_head/n_head_kv)
+    // v:   [n_embd, n_kv,   n_head_kv]  f16
+    // sel: [n_sel,  n_tokens]           i32 rows of k and v per token; a row outside [0, n_kv) is skipped
+    // res: [n_embd, n_head, n_tokens]   f32
+    //
+    //   res[:, h, t] = sum_s softmax_s(scale*q[:, h, t] . k[:, sel[s, t], hk]) v[:, sel[s, t], hk]
+    //
+    // a token without a row in range gets zeros
+    GGML_API struct ggml_tensor * ggml_flash_attn_sel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * sel,
+            float                 scale);
 
     // custom operators
 

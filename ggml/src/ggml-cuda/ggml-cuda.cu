@@ -38,6 +38,7 @@
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/fn-engine.cuh"
+#include "ggml-cuda/fattn-sel.cuh"
 #include "ggml-cuda/expert-cache.cuh"
 #include "fn-prof.h"
 FN_PROF_DECL("cuda");
@@ -2958,6 +2959,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_SEL:
+            ggml_cuda_flash_attn_sel(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -4437,16 +4441,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n_gate;
         }
     }
-    // the selection mask and the pooled keys of a QSA attention layer
-    if (node->op == GGML_OP_FILL) {
+    // the selection of a QSA attention layer and the attention over it
+    if (node->op == GGML_OP_CPY) {
         const int n_attn = ggml_cuda_fn_qsa_attn(*cuda_ctx, cgraph, i);
         if (n_attn > 0) {
             return n_attn;
         }
-        const int n_sel = ggml_cuda_fn_qsa_sel(*cuda_ctx, cgraph, i);
-        if (n_sel > 0) {
-            return n_sel;
-        }
+    }
+    // the pooled keys of a QSA attention layer
+    if (node->op == GGML_OP_FILL) {
         const int n_pool = ggml_cuda_fn_qsa_pool(*cuda_ctx, cgraph, i);
         if (n_pool > 0) {
             return n_pool;
@@ -6995,6 +6998,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_FLASH_ATTN_SEL:
+            return ggml_cuda_flash_attn_sel_supported(op);
 
         default:
             return false;

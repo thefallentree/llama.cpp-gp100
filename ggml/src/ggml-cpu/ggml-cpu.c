@@ -2111,6 +2111,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_FLASH_ATTN_SEL:
+            {
+                ggml_compute_forward_flash_attn_sel(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2294,6 +2298,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_FLASH_ATTN_SEL:
             {
                 n_tasks = n_threads;
             } break;
@@ -2989,6 +2994,11 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TOP_K:
                     {
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                    } break;
+                case GGML_OP_FLASH_ATTN_SEL:
+                    {
+                        // per thread: the scores of a token, a key row and a value row as floats
+                        cur += sizeof(float)*(node->src[3]->ne[0] + 2*node->src[0]->ne[0] + 2*CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {

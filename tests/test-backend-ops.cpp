@@ -8779,6 +8779,74 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_SEL
+struct test_flash_attn_sel : public test_case {
+    const int64_t hs;    // head size
+    const int64_t nh;    // query heads
+    const int64_t nhk;   // kv heads
+    const int64_t nt;    // tokens
+    const int64_t kv;    // cache rows
+    const int64_t nsel;  // selected rows per token
+    const bool    dead;  // some selected rows out of range
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, nhk, nt, kv, nsel, dead);
+    }
+
+    double max_nmse_err() override {
+        return 5e-5;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4*hs*nsel*nh*nt;
+    }
+
+    test_flash_attn_sel(int64_t hs = 256, int64_t nh = 12, int64_t nhk = 1, int64_t nt = 4, int64_t kv = 1024, int64_t nsel = 259, bool dead = true)
+        : hs(hs), nh(nh), nhk(nhk), nt(nt), kv(kv), nsel(nsel), dead(dead) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nt);
+        ggml_set_name(q, "q");
+
+        // the cache: [hs, nhk, kv] rows of all kv heads, viewed by head
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nhk, kv);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nhk, kv);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nsel, nt);
+        ggml_set_name(sel, "sel");
+
+        ggml_tensor * out = ggml_flash_attn_sel(ctx, q,
+                ggml_permute(ctx, k, 0, 2, 1, 3), ggml_permute(ctx, v, 0, 2, 1, 3), sel, 1.0f/sqrtf((float) hs));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                // the rows of a token: in range, the dead ones at kv, the first token all dead
+                std::vector<int> data(ggml_nelements(t));
+                for (int64_t i = 0; i < nt; i++) {
+                    for (int64_t j = 0; j < nsel; j++) {
+                        const bool out = dead && ((i == 0 && nt > 1) || rand() % 5 == 0);
+                        data[i*nsel + j] = out ? (rand() % 2 ? (int) kv : -1) : rand() % (int) kv;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -11760,6 +11828,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // flash_attn_sel: a decode window, its chunk blocks, a prompt
+    for (int64_t nt : { 1, 4, 8, 16, 100, 1024 }) {
+        for (int64_t nsel : { 35, 259, 2051 }) {
+            test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 4096, nsel, true));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_sel(256, 24, 2, 8, 4096, 2051, true));
+    test_cases.emplace_back(new test_flash_attn_sel(256,  8, 2, 8, 1024,  259, false));
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -12224,6 +12301,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // flash_attn_sel: a decode window and a prompt ubatch of a QSA layer (one kv head per device)
+    for (int64_t nt : { 1, 8, 1024 }) {
+        test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 65536, 2051, false));
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {

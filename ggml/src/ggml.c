@@ -1098,6 +1098,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "FLASH_ATTN_SEL",
 
     "UNARY",
 
@@ -1115,7 +1116,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,6 +1214,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "flash_attn_sel(q, k, v, sel)",
 
     "unary(x)",
 
@@ -1230,7 +1232,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6627,6 +6629,45 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_flash_attn_sel
+
+struct ggml_tensor * ggml_flash_attn_sel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * sel,
+        float                 scale) {
+    GGML_ASSERT(  q->type == GGML_TYPE_F32);
+    GGML_ASSERT(  k->type == GGML_TYPE_F16);
+    GGML_ASSERT(  v->type == GGML_TYPE_F16);
+    GGML_ASSERT(sel->type == GGML_TYPE_I32);
+
+    const int64_t n_embd    = q->ne[0];
+    const int64_t n_head    = q->ne[1];
+    const int64_t n_tokens  = q->ne[2];
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_head_kv = k->ne[2];
+
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] == n_embd && k->ne[3] == 1);
+    GGML_ASSERT(v->ne[0] == n_embd && v->ne[1] == n_kv && v->ne[2] == n_head_kv && v->ne[3] == 1);
+    GGML_ASSERT(n_head_kv > 0 && n_head % n_head_kv == 0);
+    GGML_ASSERT(sel->ne[1] == n_tokens && sel->ne[2] == 1 && sel->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_head, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_FLASH_ATTN_SEL;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = sel;
 
     return result;
 }

@@ -442,120 +442,193 @@ static bool top_k_partial_cuda(ggml_cuda_pool & pool, const float * src, int * d
 }
 
 // The k largest of each row, in column order, for a k too large for top_k_partial_cuda, where the fallback sorts the whole row.
-// One block per row, PART columns per thread. A binary search over the 32 key bits finds the k-th largest key, each step counts the keys at or above a candidate.
-// Of the columns equal to the k-th key the first ones are taken, as a stable sort does.
+// One block per row. A thread owns PART columns in groups of 4: group j of thread t is the columns 4*(j*blockDim + t)
+// .. + 3, so the loads of a warp are consecutive; the first REG keys of a thread stay in registers, the rest are read
+// again from the row (L2) at every pass.
+// A radix select over the 32 key bits, a byte per pass, finds the k-th largest key: each pass histograms the next
+// byte of the keys that share the prefix found so far, one histogram per warp, and takes the byte at which the
+// count from the top reaches the rank. (A bit-by-bit search, 32 counts over the row, took 1070 us at 64K columns.)
+// Of the columns equal to the k-th key the first ones are taken, as a stable sort does: the output walks the groups
+// in column order with a prefix count per group.
 #define CUDA_TOP_K_SEL_WARPS 32
 
-// PART > 32 (rows of up to 64K columns): the registers of a 1024-thread block hold 32 keys per thread, the keys of
-// the other columns are read again from the row (L2) at every step of the search.
 template <int PART>
 static __global__ void __launch_bounds__(CUDA_TOP_K_SEL_WARPS*WARP_SIZE)
 k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    __shared__ int      s_hist[CUDA_TOP_K_SEL_WARPS][256];
+    __shared__ int      s_sum[256];
     __shared__ int      s_gt[CUDA_TOP_K_SEL_WARPS];
     __shared__ int      s_eq[CUDA_TOP_K_SEL_WARPS];
+    __shared__ int      s_base[2]; // selected columns, and columns equal to the threshold, before the group
     __shared__ uint32_t s_thr;
-    __shared__ int      s_need;
-    constexpr int REG = PART < 32 ? PART : 32;   // keys in registers
-    constexpr int EXT = PART - REG;              // keys read from the row at every step
+    __shared__ int      s_above;
+    constexpr int NQ  = PART/4;                 // groups of 4 columns per thread
+    constexpr int REG = PART < 32 ? PART : 32;  // keys in registers
+    constexpr int NQR = REG/4;                  // their groups
 
     const float * row  = src + (size_t) blockIdx.x*ncols;
     int *         out  = dst + (size_t) blockIdx.x*k;
     const int     lane = threadIdx.x % WARP_SIZE;
     const int     warp = threadIdx.x / WARP_SIZE;
     const int     nw   = blockDim.x / WARP_SIZE;
-    const int     c0   = threadIdx.x*PART;
+    const int     nt   = blockDim.x;
 
-    // a column past the row gets key 0, no candidate is that low
-    uint32_t key[REG];
+    // the keys of group j; a column past the row gets key 0, no candidate is that low
+    auto load = [&](const int j, uint32_t (&kk)[4]) {
+        const int c = 4*(j*nt + (int) threadIdx.x);
+        if (c + 3 < ncols) {
+            kk[0] = top_k_key(row[c]);
+            kk[1] = top_k_key(row[c + 1]);
+            kk[2] = top_k_key(row[c + 2]);
+            kk[3] = top_k_key(row[c + 3]);
+        } else {
 #pragma unroll
-    for (int i = 0; i < REG; ++i) {
-        key[i] = c0 + i < ncols ? top_k_key(row[c0 + i]) : 0u;
-    }
-
-    if (threadIdx.x == 0) {
-        s_thr = 0;
-    }
-    uint32_t thr = 0;
-    for (int bit = 31; bit >= 0; --bit) {
-        const uint32_t t = thr | (1u << bit);
-        int n = 0;
-#pragma unroll
-        for (int i = 0; i < REG; ++i) {
-            n += key[i] >= t;
-        }
-        if (EXT > 0) {
-#pragma unroll 8
-            for (int i = REG; i < PART; ++i) {
-                n += c0 + i < ncols && top_k_key(row[c0 + i]) >= t;
+            for (int e = 0; e < 4; ++e) {
+                kk[e] = c + e < ncols ? top_k_key(row[c + e]) : 0u;
             }
         }
-        n = warp_reduce_sum(n);
-        if (lane == 0) {
-            s_gt[warp] = n;
+    };
+    uint32_t key[REG];
+#pragma unroll
+    for (int j = 0; j < NQR; ++j) {
+        uint32_t kk[4];
+        load(j, kk);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            key[4*j + e] = kk[e];
+        }
+    }
+
+    uint32_t thr     = 0; // the prefix found so far, in the high bits
+    int      k_above = 0; // keys above every key of the prefix
+    for (int pass = 0; pass < 4; ++pass) {
+        const int      shift = 24 - 8*pass;
+        const uint32_t pmask = pass == 0 ? 0u : ~0u << (shift + 8);
+        for (int b = lane; b < 256; b += WARP_SIZE) {
+            s_hist[warp][b] = 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < REG; ++i) {
+            if ((key[i] & pmask) == thr) {
+                atomicAdd(&s_hist[warp][(key[i] >> shift) & 0xFF], 1);
+            }
+        }
+#pragma unroll 4
+        for (int j = NQR; j < NQ; ++j) {
+            uint32_t kk[4];
+            load(j, kk);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                if ((kk[e] & pmask) == thr) {
+                    atomicAdd(&s_hist[warp][(kk[e] >> shift) & 0xFF], 1);
+                }
+            }
+        }
+        __syncthreads();
+        // the bins over the warps, then the count from the top: the first bin at which it reaches the rank
+        for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+            int n = 0;
+            for (int w = 0; w < nw; ++w) {
+                n += s_hist[w][b];
+            }
+            s_sum[b] = n;
         }
         __syncthreads();
         if (warp == 0) {
-            n = warp_reduce_sum(lane < nw ? s_gt[lane] : 0);
-            if (lane == 0 && n >= k) {
-                s_thr = t;
+            const int rank  = k - k_above;
+            int       above = 0; // keys in the bins above the chunk
+            int       found = -1;
+            // a descending prefix over the 256 bins: 8 chunks of 32 from the top, lane 0 at the highest bin
+            for (int ch = 7; ch >= 0 && found < 0; --ch) {
+                const int b    = 32*ch + (WARP_SIZE - 1 - lane);
+                const int n    = s_sum[b];
+                const int incl = warp_prefix_inclusive_sum(n);   // keys in this bin and the bins above it within the chunk
+                const int tot  = __shfl_sync(0xffffffff, incl, WARP_SIZE - 1);
+                const bool hit = above + incl >= rank && above + incl - n < rank;
+                const unsigned m = __ballot_sync(0xffffffff, hit);
+                if (m != 0) {
+                    const int l = __ffs(m) - 1;
+                    found = 32*ch + (WARP_SIZE - 1 - l);
+                    const int before = __shfl_sync(0xffffffff, above + incl - n, l);
+                    if (lane == 0) {
+                        s_thr   = thr | ((uint32_t) found << shift);
+                        s_above = k_above + before;
+                    }
+                }
+                above += tot;
             }
         }
         __syncthreads();
-        thr = s_thr;
+        thr     = s_thr;
+        k_above = s_above;
     }
-
-    int n_gt = 0;
-    int n_eq = 0;
+    // thr is the k-th largest key; k_above keys are larger, k - k_above of the keys equal to it are taken, the first
+    // ones in column order: the groups in column order, a prefix count of the selected and the equal keys per group
+    const int need = k - k_above;
+    if (threadIdx.x == 0) {
+        s_base[0] = 0;
+        s_base[1] = 0;
+    }
+    __syncthreads();
+    // the register groups unrolled (a runtime index into key[] would put it in local memory), then the rest
 #pragma unroll
-    for (int i = 0; i < REG; ++i) {
-        n_gt += key[i] > thr;
-        n_eq += key[i] == thr && c0 + i < ncols;
-    }
-    if (EXT > 0) {
-#pragma unroll 8
-        for (int i = REG; i < PART; ++i) {
-            const uint32_t kc = c0 + i < ncols ? top_k_key(row[c0 + i]) : 0u;
-            n_gt += kc > thr;
-            n_eq += kc == thr && c0 + i < ncols;
-        }
-    }
-    const int gi = warp_prefix_inclusive_sum(n_gt);
-    const int ei = warp_prefix_inclusive_sum(n_eq);
-    if (lane == WARP_SIZE - 1) {
-        s_gt[warp] = gi;
-        s_eq[warp] = ei;
-    }
-    __syncthreads();
-    // warp totals -> what the warps before hold
-    if (warp == 0) {
-        const int g  = lane < nw ? s_gt[lane] : 0;
-        const int e  = lane < nw ? s_eq[lane] : 0;
-        const int gs = warp_prefix_inclusive_sum(g);
-        const int es = warp_prefix_inclusive_sum(e);
-        if (lane < nw) {
-            s_gt[lane] = gs - g;
-            s_eq[lane] = es - e;
-        }
-        if (lane == WARP_SIZE - 1) {
-            s_need = k - gs;
-        }
-    }
-    __syncthreads();
-    const int need = s_need;
-    int eq_before  = s_eq[warp] + ei - n_eq;
-    int pos        = s_gt[warp] + gi - n_gt + min(eq_before, need);
-    // not from key[]: an unrolled copy of this loop takes the registers of the search
-    const int c1 = min(ncols, c0 + PART);
-    for (int c = c0; c < c1; ++c) {
-        const uint32_t kc = top_k_key(row[c]);
-        if (kc > thr) {
-            out[pos++] = c;
-        } else if (kc == thr) {
-            if (eq_before < need) {
-                out[pos++] = c;
+    for (int j = 0; j < NQ; ++j) {
+        uint32_t kk[4];
+        if (j < NQR) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                kk[e] = key[(j < NQR ? j : 0)*4 + e];
             }
-            eq_before++;
+        } else {
+            load(j, kk);
         }
+        const int c = 4*(j*nt + (int) threadIdx.x);
+        int n_gt = 0;
+        int n_eq = 0;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            n_gt += kk[e] > thr;
+            n_eq += kk[e] == thr && c + e < ncols;
+        }
+        const int gi = warp_prefix_inclusive_sum(n_gt);
+        const int ei = warp_prefix_inclusive_sum(n_eq);
+        if (lane == WARP_SIZE - 1) {
+            s_gt[warp] = gi;
+            s_eq[warp] = ei;
+        }
+        __syncthreads();
+        // warp totals -> what the warps before hold, and the group's totals
+        int gt0 = s_base[0];
+        int eq0 = s_base[1];
+        for (int w = 0; w < warp; ++w) {
+            gt0 += s_gt[w];
+            eq0 += s_eq[w];
+        }
+        int eq_before = eq0 + ei - n_eq;
+        int pos       = gt0 + gi - n_gt + min(eq_before, need);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            if (kk[e] > thr) {
+                out[pos++] = c + e;
+            } else if (kk[e] == thr && c + e < ncols) {
+                if (eq_before < need) {
+                    out[pos++] = c + e;
+                }
+                eq_before++;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int g = 0, e = 0;
+            for (int w = 0; w < nw; ++w) {
+                g += s_gt[w];
+                e += s_eq[w];
+            }
+            s_base[0] += g;
+            s_base[1] += e;
+        }
+        __syncthreads();
     }
 }
 
@@ -563,7 +636,7 @@ static bool top_k_select_cuda(const float * src, int * dst, const int ncols, con
     static const bool enabled = getenv("GGML_CUDA_TOP_K_SELECT") == nullptr || atoi(getenv("GGML_CUDA_TOP_K_SELECT")) != 0;
     const int max_threads = CUDA_TOP_K_SEL_WARPS*WARP_SIZE;
     // the keys of a thread stay in registers, a block of 1024 threads has 63 per thread; past 32 per thread (rows of
-    // more than 32K columns, a 128K context) the rest are read from the row at every step
+    // more than 32K columns, a 128K context) the rest are read from the row at every pass
     // k == ncols stays with the sort: its order is the order the consumer sums in, and nothing is saved there
     if (!enabled || k <= CUDA_TOP_K_MAX_K || k >= ncols || nrows < 1 || ncols > 64*max_threads) {
         return false;

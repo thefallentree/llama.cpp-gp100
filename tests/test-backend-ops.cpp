@@ -12250,6 +12250,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
         }
     }
+    // the pools of a qwen4exp decode window at a 64K and a 200K context (k = top_k/kpool)
+    for (auto cols : {16384, 65536}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 3, 1, 1}, 512));
+    }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));

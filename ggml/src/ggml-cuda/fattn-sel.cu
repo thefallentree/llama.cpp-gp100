@@ -12,8 +12,64 @@
 
 static __device__ __forceinline__ half2 fattn_sel_h2(const int v) { return *(const half2 *) &v; }
 
+// 32 values of a row as 8 float4 (as 4 uint4 of f16 pairs are read): f16, or one q8_0 block (34 bytes, 2-byte
+// aligned: the scale, then 16 pairs of quants)
+static __device__ __forceinline__ void fattn_sel_row32_f16(const char * row, const int w, float4 (&v)[8]) {
+    const uint4 * p = (const uint4 *) row + 4*w;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint4  u  = p[i];
+        const float2 k0 = __half22float2(fattn_sel_h2((int) u.x));
+        const float2 k1 = __half22float2(fattn_sel_h2((int) u.y));
+        const float2 k2 = __half22float2(fattn_sel_h2((int) u.z));
+        const float2 k3 = __half22float2(fattn_sel_h2((int) u.w));
+        v[2*i]     = make_float4(k0.x, k0.y, k1.x, k1.y);
+        v[2*i + 1] = make_float4(k2.x, k2.y, k3.x, k3.y);
+    }
+}
+
+static __device__ __forceinline__ void fattn_sel_row32_q8(const char * row, const int w, float4 (&v)[8]) {
+    const unsigned short * p = (const unsigned short *) (row + 34*w);
+    const float d = __half2float(__ushort_as_half(p[0]));
+    unsigned short q[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        q[i] = p[1 + i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int a = (int) (signed char) (q[2*i] & 0xFF);
+        const int b = (int) (signed char) (q[2*i] >> 8);
+        const int c = (int) (signed char) (q[2*i + 1] & 0xFF);
+        const int e = (int) (signed char) (q[2*i + 1] >> 8);
+        v[i] = make_float4(d*(float) a, d*(float) b, d*(float) c, d*(float) e);
+    }
+}
+
+// 8 values of a row at 8*lane (one uint4 of f16 pairs): f16, or a quarter of a q8_0 block
+static __device__ __forceinline__ void fattn_sel_row8_f16(const char * row, const int lane, float4 & v0, float4 & v1) {
+    const uint4  u  = *(const uint4 *) (row + 16*lane);
+    const float2 a0 = __half22float2(fattn_sel_h2((int) u.x));
+    const float2 a1 = __half22float2(fattn_sel_h2((int) u.y));
+    const float2 a2 = __half22float2(fattn_sel_h2((int) u.z));
+    const float2 a3 = __half22float2(fattn_sel_h2((int) u.w));
+    v0 = make_float4(a0.x, a0.y, a1.x, a1.y);
+    v1 = make_float4(a2.x, a2.y, a3.x, a3.y);
+}
+
+static __device__ __forceinline__ void fattn_sel_row8_q8(const char * row, const int lane, float4 & v0, float4 & v1) {
+    const unsigned short * p = (const unsigned short *) (row + 34*(lane/4));
+    const float d = __half2float(__ushort_as_half(p[0]));
+    const unsigned short * q = p + 1 + 4*(lane % 4);
+    const unsigned short q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+    v0 = make_float4(d*(float) (int) (signed char) (q0 & 0xFF), d*(float) (int) (signed char) (q0 >> 8),
+                     d*(float) (int) (signed char) (q1 & 0xFF), d*(float) (int) (signed char) (q1 >> 8));
+    v1 = make_float4(d*(float) (int) (signed char) (q2 & 0xFF), d*(float) (int) (signed char) (q2 >> 8),
+                     d*(float) (int) (signed char) (q3 & 0xFF), d*(float) (int) (signed char) (q3 >> 8));
+}
+
 // block (token, chunk block): heads h0 .. h0 + NH - 1 of one kv head over the chunks [cb*cpb, (cb + 1)*cpb)
-template <int NH>
+template <int NH, bool Q8>
 static __global__ void __launch_bounds__(FATTN_SEL_NW*WARP_SIZE, 2)
 fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
     constexpr int D  = FATTN_SEL_D;
@@ -34,8 +90,8 @@ fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
     const int lane  = threadIdx.x % WARP_SIZE;
     const int warp  = threadIdx.x / WARP_SIZE;
     const int32_t * sel = a.sel + (int64_t) t*a.s_sel;
-    const half *    K   = a.K + (int64_t) (h0/a.gqa)*a.skh;
-    const half *    V   = a.V + (int64_t) (h0/a.gqa)*a.svh;
+    const char *    K   = a.K + (int64_t) (h0/a.gqa)*a.skh;
+    const char *    V   = a.V + (int64_t) (h0/a.gqa)*a.svh;
 
     for (int e = threadIdx.x; e < NH*D/4; e += NW*WARP_SIZE) {
         const int h = e/(D/4);
@@ -70,11 +126,12 @@ fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
             const int c    = cg + lane;
             int       cell = c < n_c ? sel[c_lo + c] : -1;
             cell = cell >= 0 && cell < a.n_kv ? cell : -1;
-            const uint4 * kr = (const uint4 *) (K + (int64_t) (cell >= 0 ? cell : 0)*a.sk) + 4*warp;
-            uint4 u[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                u[i] = kr[i];
+            const char * kr = K + (int64_t) (cell >= 0 ? cell : 0)*a.sk;
+            float4 kv[8];
+            if (Q8) {
+                fattn_sel_row32_q8(kr, warp, kv);
+            } else {
+                fattn_sel_row32_f16(kr, warp, kv);
             }
             if (warp == 0 && c < C) {
                 s_cell[c] = cell >= 0 ? cell : 0; // a dead slot reads row 0 with the weight 0
@@ -86,16 +143,12 @@ fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
                 sc[h] = 0.0f;
             }
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 k0 = __half22float2(fattn_sel_h2((int) u[i].x));
-                const float2 k1 = __half22float2(fattn_sel_h2((int) u[i].y));
-                const float2 k2 = __half22float2(fattn_sel_h2((int) u[i].z));
-                const float2 k3 = __half22float2(fattn_sel_h2((int) u[i].w));
+            for (int i = 0; i < 8; ++i) {
+                const float4 k = kv[i];
 #pragma unroll
                 for (int h = 0; h < NH; ++h) {
-                    const float4 q0 = *(const float4 *) (s_q[h] + 32*warp + 8*i);
-                    const float4 q1 = *(const float4 *) (s_q[h] + 32*warp + 8*i + 4);
-                    sc[h] += k0.x*q0.x + k0.y*q0.y + k1.x*q0.z + k1.y*q0.w + k2.x*q1.x + k2.y*q1.y + k3.x*q1.z + k3.y*q1.w;
+                    const float4 q = *(const float4 *) (s_q[h] + 32*warp + 4*i);
+                    sc[h] += k.x*q.x + k.y*q.y + k.z*q.z + k.w*q.w;
                 }
             }
 #pragma unroll
@@ -169,25 +222,26 @@ fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
             }
         }
         for (int c0 = warp/2; c0 < n_c; c0 += 4*(NW/2)) {
-            uint4 u[4];
+            float4 v0[4], v1[4];
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
-                const int c = c0 + b*(NW/2);
-                u[b] = *(const uint4 *) (V + (int64_t) s_cell[c < n_c ? c : 0]*a.sv + 8*lane);
+                const int    c  = c0 + b*(NW/2);
+                const char * vr = V + (int64_t) s_cell[c < n_c ? c : 0]*a.sv;
+                if (Q8) {
+                    fattn_sel_row8_q8(vr, lane, v0[b], v1[b]);
+                } else {
+                    fattn_sel_row8_f16(vr, lane, v0[b], v1[b]);
+                }
             }
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
                 const int c = c0 + b*(NW/2);
                 if (c < n_c) {
-                    const float2 v0 = __half22float2(fattn_sel_h2((int) u[b].x));
-                    const float2 v1 = __half22float2(fattn_sel_h2((int) u[b].y));
-                    const float2 v2 = __half22float2(fattn_sel_h2((int) u[b].z));
-                    const float2 v3 = __half22float2(fattn_sel_h2((int) u[b].w));
 #pragma unroll
                     for (int h = 0; h < HW; ++h) {
                         const float p = s_s[hg*HW + h][c];
-                        acc[h][0] += p*v0.x; acc[h][1] += p*v0.y; acc[h][2] += p*v1.x; acc[h][3] += p*v1.y;
-                        acc[h][4] += p*v2.x; acc[h][5] += p*v2.y; acc[h][6] += p*v3.x; acc[h][7] += p*v3.y;
+                        acc[h][0] += p*v0[b].x; acc[h][1] += p*v0[b].y; acc[h][2] += p*v0[b].z; acc[h][3] += p*v0[b].w;
+                        acc[h][4] += p*v1[b].x; acc[h][5] += p*v1[b].y; acc[h][6] += p*v1[b].z; acc[h][7] += p*v1[b].w;
                     }
                 }
             }
@@ -263,27 +317,36 @@ void ggml_cuda_fattn_sel_plan(ggml_cuda_fattn_sel_args & a, const int nt) {
     a.n_cb = (n_chunk + a.cpb - 1)/a.cpb;
 }
 
-void ggml_cuda_fattn_sel_launch(const ggml_cuda_fattn_sel_args & a, const int nt, cudaStream_t stream) {
-    GGML_ASSERT(a.n_cb == 1 || a.part != nullptr);
+template <bool Q8>
+static void fattn_sel_launch_t(const ggml_cuda_fattn_sel_args & a, const int nt, cudaStream_t stream) {
     const dim3 grid((unsigned) nt, (unsigned) a.n_cb, 1);
     // the head groups of a block share one kv head
     for (int hk0 = 0; hk0 < a.n_head; hk0 += a.gqa) {
         for (int h0 = hk0; h0 < hk0 + a.gqa; ) {
             const int nh = hk0 + a.gqa - h0;
             if (nh >= 16) {
-                fattn_sel<16><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<16, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 16;
             } else if (nh >= 12) {
-                fattn_sel<12><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<12, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 12;
             } else if (nh >= 8) {
-                fattn_sel<8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<8, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 8;
             } else {
-                fattn_sel<4><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<4, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 4;
             }
         }
+    }
+}
+
+void ggml_cuda_fattn_sel_launch(const ggml_cuda_fattn_sel_args & a, const int nt, cudaStream_t stream) {
+    GGML_ASSERT(a.n_cb == 1 || a.part != nullptr);
+    if (a.q8) {
+        fattn_sel_launch_t<true>(a, nt, stream);
+    } else {
+        fattn_sel_launch_t<false>(a, nt, stream);
     }
     if (a.n_cb > 1) {
         fattn_sel_join<<<dim3((unsigned) a.n_head, (unsigned) nt, 1), FATTN_SEL_D, 0, stream>>>(a);
@@ -298,11 +361,15 @@ bool ggml_cuda_flash_attn_sel_supported(const ggml_tensor * op) {
     const int64_t n_head    = q->ne[1];
     const int64_t n_head_kv = k->ne[2];
     const int64_t gqa       = n_head/n_head_kv;
-    return q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && sel->type == GGML_TYPE_I32 &&
+    const bool    f16       = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    const bool    q8        = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
+    // f16 rows are read 16 bytes at a time, q8_0 rows 2 bytes at a time
+    const size_t  al        = f16 ? 16 : 2;
+    return q->type == GGML_TYPE_F32 && (f16 || q8) && sel->type == GGML_TYPE_I32 &&
            op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
            q->ne[0] == FATTN_SEL_D && q->nb[0] == sizeof(float) && q->nb[1] % 16 == 0 && q->nb[2] % 16 == 0 &&
-           k->nb[0] == sizeof(half) && k->nb[1] % 16 == 0 && k->nb[2] % 16 == 0 &&
-           v->nb[0] == sizeof(half) && v->nb[1] % 16 == 0 && v->nb[2] % 16 == 0 &&
+           k->nb[0] == ggml_type_size(k->type) && k->nb[1] % al == 0 && k->nb[2] % al == 0 &&
+           v->nb[0] == ggml_type_size(v->type) && v->nb[1] % al == 0 && v->nb[2] % al == 0 &&
            sel->nb[0] == sizeof(int32_t) && sel->ne[0] <= FATTN_SEL_MAX_SEL &&
            n_head % 4 == 0 && gqa % 4 == 0 && k->ne[1] < INT32_MAX;
 }
@@ -313,7 +380,9 @@ void ggml_cuda_flash_attn_sel(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * v   = dst->src[2];
     const ggml_tensor * sel = dst->src[3];
     GGML_ASSERT(ggml_cuda_flash_attn_sel_supported(dst));
-    GGML_ASSERT(((uintptr_t) q->data & 0xF) == 0 && ((uintptr_t) k->data & 0xF) == 0 && ((uintptr_t) v->data & 0xF) == 0 &&
+    const bool   q8 = k->type == GGML_TYPE_Q8_0;
+    const size_t al = q8 ? 2 : 16;
+    GGML_ASSERT(((uintptr_t) q->data & 0xF) == 0 && ((uintptr_t) k->data % al) == 0 && ((uintptr_t) v->data % al) == 0 &&
                 ((uintptr_t) dst->data & 0xF) == 0);
 
     const int nt = (int) q->ne[2];
@@ -321,17 +390,18 @@ void ggml_cuda_flash_attn_sel(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_fattn_sel_args a;
     a.sel    = (const int32_t *) sel->data;
     a.q      = (const float *) q->data;
-    a.K      = (const half *) k->data;
-    a.V      = (const half *) v->data;
+    a.K      = (const char *) k->data;
+    a.V      = (const char *) v->data;
     a.out    = (float *) dst->data;
     a.part   = nullptr;
+    a.q8     = q8;
     a.s_sel  = (int) (sel->nb[1]/sizeof(int32_t));
     a.sq_t   = (int) (q->nb[2]/sizeof(float));
     a.sq_h   = (int) (q->nb[1]/sizeof(float));
-    a.sk     = (int) (k->nb[1]/sizeof(half));
-    a.skh    = (int) (k->nb[2]/sizeof(half));
-    a.sv     = (int) (v->nb[1]/sizeof(half));
-    a.svh    = (int) (v->nb[2]/sizeof(half));
+    a.sk     = (int64_t) k->nb[1];
+    a.skh    = (int64_t) k->nb[2];
+    a.sv     = (int64_t) v->nb[1];
+    a.svh    = (int64_t) v->nb[2];
     a.so_t   = (int) (dst->nb[2]/sizeof(float));
     a.so_h   = (int) (dst->nb[1]/sizeof(float));
     a.n_sel  = (int) sel->ne[0];

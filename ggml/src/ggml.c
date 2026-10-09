@@ -6643,8 +6643,8 @@ struct ggml_tensor * ggml_flash_attn_sel(
         struct ggml_tensor  * sel,
         float                 scale) {
     GGML_ASSERT(  q->type == GGML_TYPE_F32);
-    GGML_ASSERT(  k->type == GGML_TYPE_F16);
-    GGML_ASSERT(  v->type == GGML_TYPE_F16);
+    GGML_ASSERT(  k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(  v->type == k->type);
     GGML_ASSERT(sel->type == GGML_TYPE_I32);
 
     const int64_t n_embd    = q->ne[0];

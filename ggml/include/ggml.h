@@ -2731,8 +2731,8 @@ extern "C" {
     // attention of every token over its own selection of cache rows (sparse attention)
     //
     // q:   [n_embd, n_head, n_tokens]   f32
-    // k:   [n_embd, n_kv,   n_head_kv]  f16, rows may be strided; head h reads kv head h/(n_head/n_head_kv)
-    // v:   [n_embd, n_kv,   n_head_kv]  f16
+    // k:   [n_embd, n_kv,   n_head_kv]  f16 or q8_0, rows may be strided; head h reads kv head h/(n_head/n_head_kv)
+    // v:   [n_embd, n_kv,   n_head_kv]  the type of k
     // sel: [n_sel,  n_tokens]           i32 rows of k and v per token; a row outside [0, n_kv) is skipped
     // res: [n_embd, n_head, n_tokens]   f32
     //

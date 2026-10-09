@@ -11663,9 +11663,12 @@ void ggml_compute_forward_flash_attn_sel(
     const ggml_tensor * v   = dst->src[2];
     const ggml_tensor * sel = dst->src[3];
 
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && sel->type == GGML_TYPE_I32);
-    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && v->type == k->type &&
+                sel->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type));
     GGML_ASSERT(sel->nb[0] == sizeof(int32_t));
+
+    const ggml_type_traits * traits = ggml_get_type_traits(k->type);
 
     const int64_t n_embd    = q->ne[0];
     const int64_t n_head    = q->ne[1];
@@ -11701,8 +11704,8 @@ void ggml_compute_forward_flash_attn_sel(
                 s[j] = -INFINITY;
                 continue;
             }
-            const ggml_fp16_t * kr = (const ggml_fp16_t *) ((const char *) k->data + c*k->nb[1] + hk*k->nb[2]);
-            ggml_cpu_fp16_to_fp32(kr, kf, n_embd);
+            const char * kr = (const char *) k->data + c*k->nb[1] + hk*k->nb[2];
+            traits->to_float(kr, kf, n_embd);
             float dot = 0.0f;
             for (int64_t i = 0; i < n_embd; ++i) {
                 dot += qr[i]*kf[i];
@@ -11725,8 +11728,8 @@ void ggml_compute_forward_flash_attn_sel(
             }
             const float p = expf(s[j] - m);
             l += p;
-            const ggml_fp16_t * vr = (const ggml_fp16_t *) ((const char *) v->data + c*v->nb[1] + hk*v->nb[2]);
-            ggml_cpu_fp16_to_fp32(vr, vf, n_embd);
+            const char * vr = (const char *) v->data + c*v->nb[1] + hk*v->nb[2];
+            traits->to_float(vr, vf, n_embd);
             for (int64_t i = 0; i < n_embd; ++i) {
                 out[i] += p*vf[i];
             }

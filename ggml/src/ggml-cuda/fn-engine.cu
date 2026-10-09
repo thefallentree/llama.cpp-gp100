@@ -3108,7 +3108,8 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         score->ne[1] != nt || top_k->type != GGML_TYPE_I32 || top_k->nb[0] != sizeof(int32_t) || top_k->ne[1] != nt ||
         n_sel != kpool*top_k->ne[0] + kpool - 1 || n[8]->src[0]->ne[0] != kpool - 1 || n[14]->ne[0] != n_sel || n[14]->ne[1] != nt ||
         q->ne[2] != nt || nt > FN_MAX_T || n_sel > FATTN_SEL_MAX_SEL || q->ne[1] > FN_QSA_ATTN_MAX_HEAD ||
-        !ggml_cuda_flash_attn_sel_supported(out) || !fn_hc_aligned(q) || !fn_hc_aligned(k) || !fn_hc_aligned(v) || !fn_hc_aligned(out)) {
+        !ggml_cuda_flash_attn_sel_supported(out) || !fn_hc_aligned(q) || !fn_hc_aligned(out) ||
+        (k->type == GGML_TYPE_F16 && (!fn_hc_aligned(k) || !fn_hc_aligned(v)))) {
         return fn_decline("qsa_attn: shapes", i);
     }
     // a block writes its output while other blocks still read: the output may share memory with the selection
@@ -3136,17 +3137,18 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     ggml_cuda_fattn_sel_args a;
     a.sel    = ctx.fn_qsa_cells;
     a.q      = (const float *) q->data;
-    a.K      = (const half *) k->data;
-    a.V      = (const half *) v->data;
+    a.K      = (const char *) k->data;
+    a.V      = (const char *) v->data;
     a.out    = (float *) out->data;
     a.part   = nullptr;
+    a.q8     = k->type == GGML_TYPE_Q8_0;
     a.s_sel  = (int) n_sel;
     a.sq_t   = (int) (q->nb[2]/sizeof(float));
     a.sq_h   = (int) (q->nb[1]/sizeof(float));
-    a.sk     = (int) (k->nb[1]/sizeof(half));
-    a.skh    = (int) (k->nb[2]/sizeof(half));
-    a.sv     = (int) (v->nb[1]/sizeof(half));
-    a.svh    = (int) (v->nb[2]/sizeof(half));
+    a.sk     = (int64_t) k->nb[1];
+    a.skh    = (int64_t) k->nb[2];
+    a.sv     = (int64_t) v->nb[1];
+    a.svh    = (int64_t) v->nb[2];
     a.so_t   = (int) (out->nb[2]/sizeof(float));
     a.so_h   = (int) (out->nb[1]/sizeof(float));
     a.n_sel  = (int) n_sel;

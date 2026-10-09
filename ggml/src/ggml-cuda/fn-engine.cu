@@ -589,6 +589,12 @@ static float fn_gain(const int64_t n) {
 
 #ifndef FN_STANDALONE
 
+// GGML_CUDA_FN_DEBUG: why a fused pattern was declined, and the conversions that no producer folded
+static bool fn_debug() {
+    static const bool on = getenv("GGML_CUDA_FN_DEBUG") != nullptr;
+    return on;
+}
+
 // The fp16 activations of the vectors that mat-vecs read, keyed by the tensor (ggml_backend_cuda_context::fn_act).
 // A slot is [FN_MAX_T*n halves][FN_MAX_T floats]. Slots are an optimization only: a mat-vec that finds none converts
 // its input with fn_act_h16.
@@ -648,6 +654,12 @@ static const fn_act_slot & fn_act_get(ggml_backend_cuda_context & ctx, const ggm
         return *f;
     }
     fn_act_slot & s = fn_act_put(ctx, src1, n, nt, true);
+    if (fn_debug()) {
+        static std::atomic<int> n_msg { 0 };
+        if (n_msg.fetch_add(1) < 2000) {
+            fprintf(stderr, "fn-debug: act_h16 for %s (%s) n %d nt %d\n", src1->name, ggml_op_name(src1->op), n, nt);
+        }
+    }
     fn_act_h16<<<nt, FN_ACT_TPB, 0, ctx.stream()>>>(x, stride_t, n, fn_gain(n), fn_act_X(s), fn_act_xs(s));
     CUDA_CHECK(cudaGetLastError());
     return s;
@@ -1006,22 +1018,48 @@ static void fn_dense(const int nt, const fn_dense_part * parts, const int n, con
 }
 
 // out[t][i] = epilogue(sum over the np parts of parts[p][t][i]), one block per token: as floats, and as fp16
-// activations with their scale if X is not null.
+// activations with their scale if X is not null. A thread's U values of all parts are loaded together: summed as
+// they arrive, a value is a chain of np memory latencies, and the kernel is a few such chains long (7.5 us for
+// 320 values of 4 parts).
+#define FN_SUM_U 4
 static __global__ void fn_sum_parts(const float * __restrict__ parts, const int np, const int n, const int epi, const float es,
                                     const float eb, float * __restrict__ dst, const int dst_stride, const float gain,
                                     half * __restrict__ X, float * __restrict__ xscale) {
+    constexpr int U = FN_SUM_U;
     __shared__ float s_red[FN_ACT_TPB/WARP_SIZE];
     const int t  = blockIdx.x;
     const int nt = gridDim.x;
     float m = 0.0f;
-    for (int i = threadIdx.x; i < n; i += FN_ACT_TPB) {
-        float v = 0.0f;
-        for (int q = 0; q < np; ++q) {
-            v += parts[((int64_t) q*nt + t)*n + i];
+    float keep[U]; // the values of the first U*FN_ACT_TPB, which are all of them for the activations of a read
+    for (int i0 = 0; i0 < n; i0 += U*FN_ACT_TPB) {
+        float v[U][FN_MAX_SEG];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+#pragma unroll
+            for (int q = 0; q < FN_MAX_SEG; ++q) {
+                const int i = i0 + threadIdx.x + u*FN_ACT_TPB;
+                v[u][q] = q < np && i < n ? parts[((int64_t) q*nt + t)*n + i] : 0.0f;
+            }
         }
-        v = fn_epilogue(v, epi, es, eb);
-        dst[t*dst_stride + i] = v;
-        m = fmaxf(m, fabsf(v));
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = i0 + threadIdx.x + u*FN_ACT_TPB;
+            float a = 0.0f;
+#pragma unroll
+            for (int q = 0; q < FN_MAX_SEG; ++q) {
+                if (q < np) {
+                    a += v[u][q];
+                }
+            }
+            a = fn_epilogue(a, epi, es, eb);
+            if (i0 == 0) {
+                keep[u] = a;
+            }
+            if (i < n) {
+                dst[t*dst_stride + i] = a;
+                m = fmaxf(m, fabsf(a));
+            }
+        }
     }
     if (X == nullptr) {
         return;
@@ -1040,8 +1078,18 @@ static __global__ void fn_sum_parts(const float * __restrict__ parts, const int 
         m = fmaxf(m, s_red[w]);
     }
     const float sc = m > 0.0f ? gain/m : 0.0f;
-    for (int i = threadIdx.x; i < n; i += FN_ACT_TPB) {
-        X[(int64_t) t*n + i] = __float2half_rn(dst[t*dst_stride + i]*sc);
+    if (n <= U*FN_ACT_TPB) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = threadIdx.x + u*FN_ACT_TPB;
+            if (i < n) {
+                X[(int64_t) t*n + i] = __float2half_rn(keep[u]*sc);
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < n; i += FN_ACT_TPB) {
+            X[(int64_t) t*n + i] = __float2half_rn(dst[t*dst_stride + i]*sc);
+        }
     }
     if (threadIdx.x == 0) {
         xscale[t] = m > 0.0f ? m/gain : 0.0f;
@@ -2227,11 +2275,6 @@ static bool fn_pattern_closed(const ggml_cgraph * cgraph, const int i, const ggm
     return ggml_cuda_fn_pattern_closed(cgraph, i, ops, n, 0);
 }
 
-// temporary: why a fused pattern was declined (GGML_CUDA_FN_DEBUG)
-static bool fn_debug() {
-    static const bool on = getenv("GGML_CUDA_FN_DEBUG") != nullptr;
-    return on;
-}
 
 static void fn_pattern_why(const char * name, const ggml_cgraph * cgraph, const int i, const ggml_op * ops, const int n) {
     static std::atomic<int> n_msg { 0 };

@@ -46,6 +46,15 @@ bool ggml_cuda_expert_cache_take(ggml_backend_cuda_context & ctx, const ggml_ten
 // after the context's stream was synchronized
 void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx);
 
+// The same on a thread of its own with GGML_CUDA_EXPERT_CACHE_THREAD=1 (the scan, the selection and the exchange's
+// enqueue take ~0.15 ms per device of the host's time before the drafts; what reads the hot slices next joins it,
+// ggml_cuda_expert_cache_wait); inline by default, the thread cost more than it saved where the host-tier threads
+// already fill the cores.
+void ggml_cuda_expert_cache_update_async(ggml_backend_cuda_context & ctx);
+
+// waits for an update on its thread, if one runs
+void ggml_cuda_expert_cache_join(ggml_backend_cuda_context & ctx);
+
 // before the context's next graph is put on its stream (outside a capture): the stream waits for the exchanges
 // that the last update started
 void ggml_cuda_expert_cache_wait(ggml_backend_cuda_context & ctx);

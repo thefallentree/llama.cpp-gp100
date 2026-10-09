@@ -3210,9 +3210,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     cuda_ctx->in_direct = false;
     FN_PROF_ADD("cuda.sync", t_sy0);
 
-    // the graphs are done: the experts they routed to may take the VRAM slots of idle ones
+    // the graphs are done: the experts they routed to may take the VRAM slots of idle ones (on a thread)
     FN_PROF_T(t_sy1);
-    ggml_cuda_expert_cache_update(*cuda_ctx);
+    ggml_cuda_expert_cache_update_async(*cuda_ctx);
     FN_PROF_ADD("cuda.sync.ec_update", t_sy1);
 
     GGML_UNUSED(backend);

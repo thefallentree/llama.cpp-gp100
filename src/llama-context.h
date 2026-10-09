@@ -449,6 +449,11 @@ private:
 
     bool has_evaluated_once = false;
 
+    // work put on the backends since the last synchronize(): the accessors synchronize at every call (a round of
+    // speculative decoding makes a dozen), which is a stream synchronization per device and a look at the expert
+    // cache each time; without pending work synchronize() returns at once
+    bool sync_pending = true;
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 

@@ -782,9 +782,10 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    if (!sched) {
+    if (!sched || !sync_pending) {
         return;
     }
+    sync_pending = false;
 
     FN_PROF_T(t_s0);
     ggml_backend_sched_synchronize(sched.get());
@@ -3063,6 +3064,7 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    sync_pending = true;
     auto status = ggml_backend_sched_graph_compute_async(sched_active(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);

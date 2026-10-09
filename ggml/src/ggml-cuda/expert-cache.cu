@@ -323,6 +323,7 @@ void ggml_cuda_expert_cache_prepare(ggml_backend_cuda_context & ctx, const ggml_
     if (!cold || status != cudaStreamCaptureStatusNone) {
         return;
     }
+    ggml_cuda_expert_cache_join(ctx);
     std::lock_guard<std::mutex> lock(d.mtx);
     if (ec_alloc(d, ctx.device)) {
         d.ready.store(true, std::memory_order_release);
@@ -567,7 +568,34 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     FN_PROF_ADD("ec.enqueue", t_ec2);
 }
 
+void ggml_cuda_expert_cache_join(ggml_backend_cuda_context & ctx) {
+    if (ctx.ec_future.valid()) {
+        ctx.ec_future.get();
+    }
+}
+
+void ggml_cuda_expert_cache_update_async(ggml_backend_cuda_context & ctx) {
+    // off by default: on the 14-core box the thread displaces a host-tier worker and the window pays more than
+    // the 0.15 ms per device it saves the host (1K round 32.3 -> 32.9 ms)
+    static const bool threaded = getenv("GGML_CUDA_EXPERT_CACHE_THREAD") != nullptr && atoi(getenv("GGML_CUDA_EXPERT_CACHE_THREAD")) != 0;
+    ggml_cuda_expert_cache_join(ctx);
+    if (!ctx.ec_pending) {
+        return;
+    }
+    // only the context that updates the layers has work for a thread
+    ec_device & d = g_ec[ctx.device];
+    if (!threaded || d.n_layers.load(std::memory_order_acquire) == 0 || d.owner != &ctx || d.frozen) {
+        ggml_cuda_expert_cache_update(ctx);
+        return;
+    }
+    ctx.ec_future = std::async(std::launch::async, [&ctx] {
+        ggml_cuda_set_device(ctx.device);
+        ggml_cuda_expert_cache_update(ctx);
+    });
+}
+
 void ggml_cuda_expert_cache_wait(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_expert_cache_join(ctx);
     if (!ctx.ec_wait) {
         return;
     }
@@ -577,6 +605,7 @@ void ggml_cuda_expert_cache_wait(ggml_backend_cuda_context & ctx) {
 }
 
 void ggml_cuda_expert_cache_context_free(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_expert_cache_join(ctx);
     ec_device & d = g_ec[ctx.device];
     std::lock_guard<std::mutex> lock(d.mtx);
     if (d.owner != &ctx) {

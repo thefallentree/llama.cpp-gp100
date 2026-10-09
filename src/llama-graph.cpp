@@ -69,14 +69,50 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+bool llm_graph_tok_embd_host(const ggml_tensor * tok_embd) {
+    static const bool enabled = getenv("LLAMA_EMBD_HOST_ROWS") == nullptr || atoi(getenv("LLAMA_EMBD_HOST_ROWS")) != 0;
+    return enabled && tok_embd != nullptr && tok_embd->data != nullptr && tok_embd->buffer != nullptr &&
+           ggml_backend_buffer_is_host(tok_embd->buffer) && ggml_is_contiguous(tok_embd) &&
+           (tok_embd->type == GGML_TYPE_F32 || ggml_get_type_traits(tok_embd->type)->to_float != nullptr);
+}
+
+void llm_graph_gather_tok_embd(const ggml_tensor * tok_embd, const int32_t * ids, const int64_t n, float * dst) {
+    const int64_t n_embd = tok_embd->ne[0];
+    const auto *  traits = ggml_get_type_traits(tok_embd->type);
+    for (int64_t k = 0; k < n; ++k) {
+        GGML_ASSERT(ids[k] >= 0 && ids[k] < tok_embd->ne[1]);
+        const char * row = (const char *) tok_embd->data + (size_t) ids[k]*tok_embd->nb[1];
+        if (tok_embd->type == GGML_TYPE_F32) {
+            memcpy(dst + k*n_embd, row, n_embd*sizeof(float));
+        } else {
+            traits->to_float(row, dst + k*n_embd, n_embd);
+        }
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (tok_embd_host != nullptr) {
+        // every row from the host: the token rows dequantized here, the embd rows as given
+        const int64_t n_tokens = ubatch->n_tokens;
+        GGML_ASSERT(embd && embd->ne[0] == n_embd && embd->ne[1] == n_tokens && tok_embd_host->ne[0] == n_embd);
+        rows_buf.resize((size_t) n_tokens*n_embd);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[i]);
+            if (is_embd) {
+                GGML_ASSERT(ubatch->embd);
+                memcpy(rows_buf.data() + i*n_embd, ubatch->embd + i*n_embd, n_embd*sizeof(float));
+            } else {
+                llm_graph_gather_tok_embd(tok_embd_host, ubatch->token + i, 1, rows_buf.data() + i*n_embd);
+            }
+        }
+        ggml_backend_tensor_set(embd, rows_buf.data(), 0, rows_buf.size()*sizeof(float));
+    } else if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
-    if (ubatch->embd && embd && !ubatch->is_mixed()) {
+    if (tok_embd_host == nullptr && ubatch->embd && embd && !ubatch->is_mixed()) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -84,7 +120,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 
-    if (ubatch->is_mixed() && embd) {
+    if (tok_embd_host == nullptr && ubatch->is_mixed() && embd) {
         GGML_ASSERT(mixed_tokens && mixed_slots && mixed_embd && "mixed token/embd ubatch is not supported here");
 
         std::vector<int32_t> ids;
@@ -130,6 +166,9 @@ static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
+    if (tok_embd_host != nullptr) {
+        return embd && embd->ne[1] == params.ubatch.n_tokens && (!scale_rows || scale_rows->ne[1] == params.ubatch.n_tokens);
+    }
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
     res &= (!mixed_tokens) || mixed_tokens->ne[0] == llm_graph_n_tok_rows(params.ubatch);
@@ -144,7 +183,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
-    if (ubatch->token) {
+    if (ubatch->token && tok_rows != nullptr) {
+        GGML_ASSERT(tok_embd_host && tok_rows->ne[0] == tok_embd_host->ne[0] && tok_rows->ne[1] == n_tokens);
+        rows_buf.resize((size_t) n_tokens*tok_rows->ne[0]);
+        llm_graph_gather_tok_embd(tok_embd_host, ubatch->token, n_tokens, rows_buf.data());
+        ggml_backend_tensor_set(tok_rows, rows_buf.data(), 0, rows_buf.size()*sizeof(float));
+    } else if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
@@ -168,6 +212,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+    res &= (!tok_rows) || tok_rows->ne[1] == params.ubatch.n_tokens;
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
@@ -2449,6 +2494,27 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
+
+    // the rows of a host table gathered by set_input: one input for every kind of batch, no CPU split
+    // (training feeds the graph through the token input, so it keeps the get_rows)
+    if (n_embd_inp == n_embd && loras->empty() && !cparams.training && llm_graph_tok_embd_host(tok_embd)) {
+        inp->tok_embd_host = tok_embd;
+        ggml_tensor * cur = inp->embd;
+        res->t_inp_embd = cur;
+        inp->scale_tok = tok_scale*(hparams.f_embedding_scale != 0.0f && hparams.n_deepstack_layers > 0 ? hparams.f_embedding_scale : 1.0f);
+        if (hparams.f_embedding_scale != 0.0f && hparams.n_deepstack_layers == 0) {
+            cur = ggml_scale(ctx0, cur, hparams.f_embedding_scale);
+        }
+        if (inp->scale_tok != 1.0f) {
+            inp->scale_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
+            cb(inp->scale_rows, "inp_scale_rows", -1);
+            ggml_set_input(inp->scale_rows);
+            cur = ggml_mul(ctx0, cur, inp->scale_rows);
+        }
+        cb(cur, "embd", -1);
+        res->add_input(std::move(inp));
+        return cur;
+    }
 
     // token embeddings with lora and padding
     auto build_tok = [&](ggml_tensor * ids) {

@@ -612,7 +612,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    ggml_tensor * tok_embd = nullptr;
+    if (llm_graph_tok_embd_host(model.tok_embd)) {
+        // the rows gathered on the host: no get_rows of the host table, the draft window is one split
+        inp->tok_embd_host = model.tok_embd;
+        inp->tok_rows      = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.tok_embd->ne[0], n_tokens);
+        ggml_set_input(inp->tok_rows);
+        tok_embd = inp->tok_rows;
+    } else {
+        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    }
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h = inp->h;

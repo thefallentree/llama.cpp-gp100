@@ -142,10 +142,22 @@ public:
     ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
 
+    // the token table in host memory whose rows set_input gathers into embd itself (llm_graph_tok_embd_host):
+    // the graph then has no get_rows on the CPU, so a decode window is one split of the device backend
+    const ggml_tensor * tok_embd_host = nullptr;
+    std::vector<float>  rows_buf;
+
     float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
+
+// Whether the rows of tok_embd can be gathered on the host (a table in host memory of a type with to_float):
+// gathering them in set_input saves the CPU split that a get_rows of a host table costs every graph.
+bool llm_graph_tok_embd_host(const ggml_tensor * tok_embd);
+
+// rows ids[0..n) of tok_embd (llm_graph_tok_embd_host) as floats at dst, n_embd = tok_embd->ne[0] apart
+void llm_graph_gather_tok_embd(const ggml_tensor * tok_embd, const int32_t * ids, int64_t n, float * dst);
 
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
@@ -160,6 +172,11 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+
+    // the token rows gathered on the host (llm_graph_tok_embd_host) instead of a get_rows of the host table
+    ggml_tensor *       tok_rows      = nullptr; // F32 [tok_embd->ne[0], n_batch]
+    const ggml_tensor * tok_embd_host = nullptr;
+    std::vector<float>  rows_buf;
 
     const int64_t n_embd = 0;
 };

@@ -3,6 +3,7 @@
 // Interface between the CUDA side of the host cold-expert path (moe-host.cu) and its host worker pool
 // (moe-host-cpu.cpp, plain C++ so it can use AVX-512 intrinsics). See moe-host.cuh for the design.
 
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 
@@ -90,5 +91,7 @@ bool mh_cpu_supported();
 // Starts the workers on first call; later calls only attach the context's mailbox (index: 0, 1, ... in the order of
 // the calls). n_devices: how many devices compute a layer together; each gets a pool of its own.
 void mh_pool_attach(int index, mh_mailbox * mb, int n_devices);
+// the CPUs the host threads were pinned to (GGML_CUDA_MOE_HOST_CPUS / _PIN): other threads that spin stay off them
+std::vector<int> mh_pinned_cpus();
 // Returns the slot id of the layer (registered once, looked up by its down tensor afterwards).
 int  mh_pool_register(const mh_slot_desc & d);

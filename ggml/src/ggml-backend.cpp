@@ -1898,7 +1898,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 if (!synced) {
                     FN_PROF_T(t_s0);
-                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    // a graph launched ahead waits for these inputs on the device: the backend cannot be synchronized
+                    // (its last graph is done, or the caller would not be here), and the copies go to it unsynchronized
+                    const bool gated = split_backend->iface.gate_pending != NULL && split_backend->iface.gate_pending(split_backend);
+                    if (gated) {
+                        // nothing to wait for
+                    } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                         ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                     } else {
                         ggml_backend_synchronize(split_backend);
@@ -1950,11 +1955,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         FN_PROF_ADD(fn_in_names[split_id < 3 ? split_id : 3], t_in0);
         FN_PROF_T(t_gc0);
         if (!sched->callback_eval) {
+            // the split's inputs are all staged: a gated window launched now passes its gate at once
+            if (split_backend->iface.fire != NULL) {
+                split_backend->iface.fire(split_backend);
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             FN_PROF_ADD(fn_gc_names[split_id < 3 ? split_id : 3], t_gc0);
             FN_PROF_ADD(ggml_backend_name(split_backend), t_gc0); // the same by backend
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            // a captured window waits for its inputs on the device: they are all staged now
+            if (split_backend->iface.fire != NULL) {
+                split_backend->iface.fire(split_backend);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend

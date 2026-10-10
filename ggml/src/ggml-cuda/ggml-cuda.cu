@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/moe-host.cuh"
+#include "ggml-cuda/moe-host-cpu.h"
 #include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/fn-engine.cuh"
 #include "ggml-cuda/fattn-sel.cuh"
@@ -472,6 +473,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
         if (prop.major == 12 && prop.minor == 1) {
             CUDA_CHECK(cudaSetDevice(physical_id));
             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+        }
+        // GGML_CUDA_SCHED_SPIN=0 to leave the driver's choice: with "auto" the driver sleeps in a synchronization when
+        // it sees fewer processors than CUDA contexts (a process pinned to two cores with two devices and two
+        // llama contexts), and on the P100 box a woken thread runs slowly for a while: the MTP window's decode took
+        // 5.8 ms instead of 1.3. Spinning is what the decode loop wants everywhere.
+        {
+            static const bool spin = getenv("GGML_CUDA_SCHED_SPIN") == nullptr || atoi(getenv("GGML_CUDA_SCHED_SPIN")) != 0;
+            if (spin && !(prop.major == 12 && prop.minor == 1)) {
+                CUDA_CHECK(cudaSetDevice(physical_id));
+                const cudaError_t err = cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError(); // a context already set up: its flags stay
+                }
+            }
         }
 
 #endif  // defined(GGML_USE_HIP)
@@ -932,6 +947,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         cudaFreeHost(in_host);
         cudaFree(in_dev);
     }
+    if (in_flag_dev != nullptr) {
+        cudaFree(in_flag_dev);
+        cudaFree(in_seen_dev);
+        cudaEventDestroy(in_copy_event);
+    }
     for (void * mem : retired_mem) {
         cudaFree(mem);
     }
@@ -1230,7 +1250,10 @@ struct ggml_backend_cuda_comm_context {
     bool                        window_capture = false;
 
     // Launching a captured window takes the host about a microsecond per node. A helper thread launches the second
-    // device's graph while the calling thread launches the first one, so that both devices start together.
+    // device's graph while the calling thread launches the first one, so that both devices start together. One
+    // launcher thread serves every comm context of the process (ggml_backend_cuda_window_launcher_get): the contexts
+    // of a process launch their windows from one thread, one after the other, and a spinning launcher per context
+    // would cost a core each.
     struct window_launcher {
         std::thread             thread;
         std::mutex              mutex;
@@ -1244,22 +1267,18 @@ struct ggml_backend_cuda_comm_context {
         // the hand-off and the wait, spinning (ggml_backend_cuda_window_spin)
         std::atomic<int>        spin_pending { 0 };
         std::atomic<int>        spin_done    { 0 };
+        int64_t                 launch_ns = 0; // the last launch's duration on the launcher thread (FN_PROF)
+        std::atomic<bool>       in_use { false }; // a window launch is in progress (two contexts must not overlap)
     };
-    std::unique_ptr<window_launcher> launcher;
+    std::shared_ptr<window_launcher> launcher;
+    bool window_gated = false; // the window being captured begins with the input gate
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
-        if (launcher) {
-            {
-                std::lock_guard<std::mutex> lock(launcher->mutex);
-                launcher->stop = true;
-            }
-            launcher->cv.notify_all();
-            launcher->thread.join();
-        }
+        launcher.reset(); // the last context stops the thread
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -3107,9 +3126,9 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 // ---------------------------------------------------------------------------
 // staged inputs (ggml_backend_cuda_context::in_host)
 // ---------------------------------------------------------------------------
-#define GGML_CUDA_IN_SMALL ((size_t) 256 << 10) // the hidden states of four tokens for the MTP block are 164 KB
-#define GGML_CUDA_IN_MAX   64
-#define GGML_CUDA_IN_DATA  ((size_t) 2 << 20)
+#define GGML_CUDA_IN_SMALL ((size_t) 4 << 20)   // everything a decode window takes is staged (the k-pool mask of a 200K context is 640 KB)
+#define GGML_CUDA_IN_MAX   128
+#define GGML_CUDA_IN_DATA  ((size_t) 8 << 20)
 
 struct ggml_cuda_in_entry {
     char *   dst;
@@ -3130,11 +3149,111 @@ static __global__ void k_in_scatter(const char * __restrict__ blob) {
     }
 }
 
-// The staged inputs go to the device, on the context's stream: before anything else is put on it that may read them.
-static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
-    if (ctx.in_n == 0) {
+// The gate of a captured window, its first node: waits until the host has fired (the flag, set on the input
+// stream after the blob's copy to in_dev, differs from what the device consumed last), then scatters the entries
+// of the table in in_dev, one block per entry. Everything it reads is device memory: a kernel reading the host's
+// memory over PCIe starves the GPU's fetch of the commands the host is still submitting (measured: the launch of
+// the same window took 2.3 ms instead of 1.2). A window launched before its inputs are staged waits here.
+// k_in_seen, the node after it, records the flag the window consumed.
+#define GGML_CUDA_IN_STREAM (GGML_CUDA_MAX_STREAMS - 2)
+
+static __global__ void k_in_gate(const volatile unsigned int * __restrict__ flag, const unsigned int * __restrict__ seen,
+                                 const char * __restrict__ blob) {
+    __shared__ char *   s_dst;
+    __shared__ uint32_t s_off, s_size;
+    if (threadIdx.x == 0) {
+        const unsigned int last = *seen;
+        while (*flag == last) {
+        }
+        __threadfence();
+        const volatile ggml_cuda_in_entry * tab = (const volatile ggml_cuda_in_entry *) blob;
+        s_dst  = (char *) tab[blockIdx.x].dst;
+        s_off  = tab[blockIdx.x].off;
+        s_size = tab[blockIdx.x].size;
+    }
+    __syncthreads();
+    char *         dst  = s_dst;
+    const uint32_t off  = s_off;
+    const uint32_t size = s_size;
+    if (size == 0) {
         return;
     }
+    const uint32_t n16 = ((uintptr_t) dst & 15) == 0 ? size/16 : 0;
+    for (uint32_t i = threadIdx.x; i < n16; i += blockDim.x) {
+        ((uint4 *) dst)[i] = __ldcg((const uint4 *) (blob + off) + i);
+    }
+    for (uint32_t i = 16*n16 + threadIdx.x; i < size; i += blockDim.x) {
+        dst[i] = __ldcg((const unsigned char *) blob + off + i);
+    }
+}
+
+static __global__ void k_in_seen(const volatile unsigned int * __restrict__ flag, unsigned int * __restrict__ seen) {
+    *seen = *flag;
+}
+
+static __global__ void k_in_flag(unsigned int * __restrict__ flag, const unsigned int value) {
+    __threadfence();
+    *((volatile unsigned int *) flag) = value;
+}
+
+static bool ggml_cuda_in_alloc(ggml_backend_cuda_context & ctx);
+
+// records the gate as the first nodes of the window being captured on the context's stream
+static void ggml_cuda_in_gate_record(ggml_backend_cuda_context & ctx) {
+    GGML_ASSERT(ggml_cuda_in_alloc(ctx));
+    ggml_cuda_set_device(ctx.device);
+    if (ctx.in_flag_dev == nullptr) {
+        CUDA_CHECK(cudaMalloc((void **) &ctx.in_flag_dev, 64));
+        CUDA_CHECK(cudaMemset(ctx.in_flag_dev, 0, 64));
+        CUDA_CHECK(cudaMalloc((void **) &ctx.in_seen_dev, 64));
+        CUDA_CHECK(cudaMemset(ctx.in_seen_dev, 0, 64));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.in_copy_event, cudaEventDisableTiming));
+        ctx.in_fired = 0;
+    }
+    k_in_gate<<<GGML_CUDA_IN_MAX, 256, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev, ctx.in_dev);
+    k_in_seen<<<1, 1, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// The table is complete: the blob goes to in_dev on the input stream and the flag follows it there, so the gate of
+// the next window to pass (or waiting) scatters it. The main stream is not touched: a window may be queued on it.
+static void ggml_cuda_in_fire_now(ggml_backend_cuda_context & ctx) {
+    GGML_ASSERT(ctx.in_flag_dev != nullptr);
+    ggml_cuda_set_device(ctx.device);
+    ggml_cuda_in_entry * e = (ggml_cuda_in_entry *) ctx.in_host;
+    for (int i = ctx.in_n; i < GGML_CUDA_IN_MAX; ++i) {
+        e[i] = { nullptr, 0, 0 };
+    }
+    cudaStream_t is = ctx.stream(ctx.device, GGML_CUDA_IN_STREAM);
+    CUDA_CHECK(cudaMemcpyAsync(ctx.in_dev, ctx.in_host, GGML_CUDA_IN_TABLE + ctx.in_used, cudaMemcpyHostToDevice, is));
+    CUDA_CHECK(cudaEventRecord(ctx.in_copy_event, is));
+    k_in_flag<<<1, 1, 0, is>>>(ctx.in_flag_dev, ++ctx.in_fired);
+    CUDA_CHECK(cudaGetLastError());
+    ctx.in_n    = 0;
+    ctx.in_used = 0;
+    ctx.in_busy = true;
+}
+
+// The staged inputs are complete. A window launched before them (waiting at its gate) may read them now; else the
+// next gated window fires itself as it is launched, so that the device passes the gate as soon as it reaches it
+// and keeps running the window while the host is still submitting the rest of it.
+static void ggml_cuda_in_fire(ggml_backend_cuda_context & ctx) {
+    if (ctx.in_gate_pending) {
+        ctx.in_gate_pending = false;
+        ggml_cuda_in_fire_now(ctx);
+        return;
+    }
+    ctx.in_fire_armed = true;
+}
+
+// The staged inputs go to the device, on the context's stream: before anything else is put on it that may read them.
+static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
+    if (ctx.in_n == 0 || ctx.in_gated_capture) {
+        // nothing staged, or the staged inputs are what the gate of the window being captured scatters when fired
+        return;
+    }
+    // a window waits for its inputs ahead of anything put on the stream now: the copy would never run
+    GGML_ASSERT(!ctx.in_gate_pending && "staged inputs flushed while a window waits for them (ggml_cuda_in_fire)");
     ggml_cuda_set_device(ctx.device);
     CUDA_CHECK(cudaMemcpyAsync(ctx.in_dev, ctx.in_host, GGML_CUDA_IN_TABLE + ctx.in_used, cudaMemcpyHostToDevice, ctx.stream()));
     k_in_scatter<<<ctx.in_n, 256, 0, ctx.stream()>>>(ctx.in_dev);
@@ -3144,25 +3263,39 @@ static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
     ctx.in_busy = true;
 }
 
+static bool ggml_cuda_in_alloc(ggml_backend_cuda_context & ctx) {
+    if (ctx.in_host != nullptr) {
+        return true;
+    }
+    ggml_cuda_set_device(ctx.device);
+    void * hp = nullptr;
+    if (cudaMallocHost(&hp, GGML_CUDA_IN_TABLE + GGML_CUDA_IN_DATA) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    ctx.in_host = (char *) hp;
+    memset(ctx.in_host, 0, GGML_CUDA_IN_TABLE);
+    CUDA_CHECK(cudaMalloc((void **) &ctx.in_dev, GGML_CUDA_IN_TABLE + GGML_CUDA_IN_DATA));
+    return true;
+}
+
 // false: the caller copies it itself
 static bool ggml_cuda_in_stage(ggml_backend_cuda_context & ctx, char * dst, const void * data, const size_t size) {
     static const bool enabled = getenv("GGML_CUDA_IN_STAGE") == nullptr || atoi(getenv("GGML_CUDA_IN_STAGE")) != 0;
     if (!enabled || size == 0 || size > GGML_CUDA_IN_SMALL || ggml_cuda_capturing) {
         return false;
     }
-    if (ctx.in_host == nullptr) {
-        ggml_cuda_set_device(ctx.device);
-        void * hp = nullptr;
-        if (cudaMallocHost(&hp, GGML_CUDA_IN_TABLE + GGML_CUDA_IN_DATA) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return false;
-        }
-        ctx.in_host = (char *) hp;
-        CUDA_CHECK(cudaMalloc((void **) &ctx.in_dev, GGML_CUDA_IN_TABLE + GGML_CUDA_IN_DATA));
+    if (!ggml_cuda_in_alloc(ctx)) {
+        return false;
     }
     if (ctx.in_n == 0 && ctx.in_busy) {
-        // the blob is written again: its last copy must be done (it is, where the scheduler synchronized after the inputs)
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        // the blob is written again: its last copy must be done (it is, where the scheduler synchronized after the
+        // inputs; a fire's copy on the input stream is waited for through its event)
+        if (ctx.in_copy_event != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(ctx.in_copy_event));
+        } else {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        }
         ctx.in_busy = false;
     }
     ggml_cuda_in_entry * e = (ggml_cuda_in_entry *) ctx.in_host;
@@ -3203,6 +3336,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     if (ggml_cuda_in_stage(*cuda_ctx, (char *) tensor->data + offset, data, size)) {
         return;
     }
+    GGML_ASSERT(!cuda_ctx->in_gate_pending && "an input too large to stage while a window waits for its inputs");
     ggml_cuda_in_flush(*cuda_ctx);
     cuda_ctx->in_direct = true;
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -3210,6 +3344,14 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static bool ggml_backend_cuda_inputs_staged(ggml_backend_t backend) {
     return !((const ggml_backend_cuda_context *) backend->context)->in_direct;
+}
+
+static void ggml_backend_cuda_fire(ggml_backend_t backend) {
+    ggml_cuda_in_fire(*(ggml_backend_cuda_context *) backend->context);
+}
+
+static bool ggml_backend_cuda_gate_pending(ggml_backend_t backend) {
+    return ((const ggml_backend_cuda_context *) backend->context)->in_gate_pending;
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3312,6 +3454,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     FN_PROF_T(t_sy0);
+    GGML_ASSERT(!cuda_ctx->in_gate_pending && "synchronize while a window waits for its inputs (fire first)");
     ggml_cuda_in_flush(*cuda_ctx);
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
     cuda_ctx->in_busy   = false;
@@ -6433,6 +6576,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
     /* .inputs_staged           = */ ggml_backend_cuda_inputs_staged,
+    /* .fire                    = */ ggml_backend_cuda_fire,
+    /* .gate_pending            = */ ggml_backend_cuda_gate_pending,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
@@ -7405,6 +7550,7 @@ struct ggml_backend_cuda_comm_window {
     std::vector<cudaGraph_t>     graphs;
     std::vector<cudaGraphExec_t> execs;
     bool                         needs_ec = false; // reads the hot expert slices: a launch waits for a pending exchange
+    bool                         gated    = false; // begins with the input gate: a launch waits for fire() on the device
 };
 
 static bool ggml_backend_cuda_comm_window_supported(void * comm_ctx_v, struct ggml_cgraph * cgraph, size_t max_bytes) {
@@ -7443,12 +7589,15 @@ static bool ggml_backend_cuda_comm_window_supported(void * comm_ctx_v, struct gg
 static void ggml_backend_cuda_comm_window_begin(void * comm_ctx_v, bool capture) {
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     GGML_ASSERT(!comm_ctx->window_active);
+    static const bool gate = getenv("GGML_CUDA_WINDOW_GATE") == nullptr || atoi(getenv("GGML_CUDA_WINDOW_GATE")) != 0;
     for (ggml_backend_t backend : comm_ctx->backends) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
         cuda_ctx->window_active   = true;
         cuda_ctx->window_needs_ec = false;
         cuda_ctx->fn_act_clear();
-        ggml_cuda_in_flush(*cuda_ctx);
+        if (!(capture && gate)) {
+            ggml_cuda_in_flush(*cuda_ctx);
+        }
 #ifdef USE_CUDA_GRAPH
         if (capture) {
             ggml_cuda_set_device(cuda_ctx->device);
@@ -7457,9 +7606,15 @@ static void ggml_backend_cuda_comm_window_begin(void * comm_ctx_v, bool capture)
                 ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
             }
             CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+            if (gate) {
+                // the window's inputs stay staged: its first node scatters them when the host fires
+                ggml_cuda_in_gate_record(*cuda_ctx);
+                cuda_ctx->in_gated_capture = true;
+            }
         }
 #endif // USE_CUDA_GRAPH
     }
+    comm_ctx->window_gated = capture && gate;
     ggml_cuda_capturing      = capture;
     comm_ctx->window_active  = true;
     comm_ctx->window_capture = capture;
@@ -7474,6 +7629,7 @@ static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
 #ifdef USE_CUDA_GRAPH
     if (comm_ctx->window_capture) {
         window = new ggml_backend_cuda_comm_window;
+        window->gated = comm_ctx->window_gated;
         for (ggml_backend_t backend : comm_ctx->backends) {
             ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
             ggml_cuda_set_device(cuda_ctx->device);
@@ -7484,6 +7640,7 @@ static void * ggml_backend_cuda_comm_window_end(void * comm_ctx_v) {
             }
             FN_PROF_T(t_ec);
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph));
+            cuda_ctx->in_gated_capture = false;
             FN_PROF_ADD("window.end_capture", t_ec);
             FN_PROF_T(t_in);
             ggml_cuda_mem_checkpoint(cuda_ctx->device, "window capture", "");
@@ -7533,7 +7690,9 @@ static void ggml_backend_cuda_comm_window_launcher_main(ggml_backend_cuda_comm_c
             }
             l->spin_pending.store(0, std::memory_order_relaxed);
             ggml_cuda_set_device(l->device);
+            const int64_t t_l0 = fn_prof_now();
             CUDA_CHECK(cudaGraphLaunch(l->exec, l->stream));
+            l->launch_ns = fn_prof_now() - t_l0;
             l->spin_done.store(1, std::memory_order_release);
         }
     }
@@ -7550,6 +7709,105 @@ static void ggml_backend_cuda_comm_window_launcher_main(ggml_backend_cuda_comm_c
         l->cv.notify_all();
     }
 }
+
+// the process's launcher thread, started by the first comm context that launches a window and stopped by the last
+// one that goes away
+static std::shared_ptr<ggml_backend_cuda_comm_context::window_launcher> ggml_backend_cuda_window_launcher_get() {
+    using window_launcher = ggml_backend_cuda_comm_context::window_launcher;
+    static std::mutex                  mutex;
+    static std::weak_ptr<window_launcher> weak;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::shared_ptr<window_launcher> l = weak.lock();
+    if (l) {
+        return l;
+    }
+    l = std::shared_ptr<window_launcher>(new window_launcher, [](window_launcher * l) {
+        {
+            std::lock_guard<std::mutex> lock(l->mutex);
+            l->stop = true;
+        }
+        l->cv.notify_all();
+        l->thread.join();
+        delete l;
+    });
+    l->thread = std::thread(ggml_backend_cuda_comm_window_launcher_main, l.get());
+#if defined(__linux__)
+    // GGML_CUDA_PIN_LAUNCH=0 to leave it: the thread that launches the windows (this one) and the launcher are each
+    // pinned to a CPU of the allowed set, on different cores, away from the cores the host tier's spinning threads
+    // own (mh_pinned_cpus), so that the two launches of a window never share a core with a spinning thread and the
+    // driver's own threads keep the other CPUs. Unpinned, the scheduler put the spinning launcher on the launching
+    // thread's sibling hyperthread (both launches 2.4 ms instead of 0.9); on a core of the host tier, 10 ms.
+    static const bool pin = getenv("GGML_CUDA_PIN_LAUNCH") == nullptr || atoi(getenv("GGML_CUDA_PIN_LAUNCH")) != 0;
+    if (pin) {
+        auto core_of = [](const int cpu) {
+            char path[128];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+            int id = -1;
+            if (FILE * f = fopen(path, "r")) {
+                if (fscanf(f, "%d", &id) != 1) {
+                    id = -1;
+                }
+                fclose(f);
+            }
+            return id;
+        };
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        const int here = sched_getcpu();
+        std::vector<int> free_cpus; // allowed, not a host thread's CPU nor a hyperthread of one
+        if (here >= 0 && sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+            const std::vector<int> busy = mh_pinned_cpus();
+            std::vector<int> busy_cores;
+            for (const int c : busy) {
+                busy_cores.push_back(core_of(c));
+            }
+            for (int c = 0; c < CPU_SETSIZE; ++c) {
+                if (!CPU_ISSET(c, &allowed) || std::find(busy.begin(), busy.end(), c) != busy.end()) {
+                    continue;
+                }
+                const int core = core_of(c);
+                if (core >= 0 && std::find(busy_cores.begin(), busy_cores.end(), core) != busy_cores.end()) {
+                    continue;
+                }
+                free_cpus.push_back(c);
+            }
+        }
+        if (free_cpus.size() >= 2) {
+            // the launching thread stays where it is when that CPU is free, the launcher takes the first free CPU
+            // of another core (or any other free CPU)
+            const int main_cpu = std::find(free_cpus.begin(), free_cpus.end(), here) != free_cpus.end() ? here : free_cpus[0];
+            const int core_main = core_of(main_cpu);
+            int other = -1;
+            for (const int c : free_cpus) {
+                if (c != main_cpu && (core_main < 0 || core_of(c) != core_main)) {
+                    other = c;
+                    break;
+                }
+            }
+            if (other < 0) {
+                for (const int c : free_cpus) {
+                    if (c != main_cpu) {
+                        other = c;
+                        break;
+                    }
+                }
+            }
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(main_cpu, &set);
+            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            CPU_ZERO(&set);
+            CPU_SET(other, &set);
+            pthread_setaffinity_np(l->thread.native_handle(), sizeof(set), &set);
+            GGML_LOG_INFO("%s: the window launches pinned: the launching thread on CPU %d, the launcher on CPU %d (%zu free CPUs)\n", __func__, main_cpu, other, free_cpus.size());
+        } else {
+            GGML_LOG_WARN("%s: the window launches are not pinned: %zu CPUs free of the host threads\n", __func__, free_cpus.size());
+        }
+    }
+#endif
+    weak = l;
+    return l;
+}
 #endif // USE_CUDA_GRAPH
 
 static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * window_v) {
@@ -7558,10 +7816,23 @@ static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * windo
     auto * window   = static_cast<ggml_backend_cuda_comm_window *>(window_v);
     static const bool threaded = getenv("GGML_CUDA_WINDOW_THREADS") == nullptr || atoi(getenv("GGML_CUDA_WINDOW_THREADS")) != 0;
     for (ggml_backend_t backend : comm_ctx->backends) {
-        ((ggml_backend_cuda_context *) backend->context)->ec_pending = true;
-        ggml_cuda_in_flush(*(ggml_backend_cuda_context *) backend->context);
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+        cuda_ctx->ec_pending = true;
+        if (window->gated) {
+            // the inputs stay in the blob for the window's gate: fired now if the caller said they are complete
+            // (ggml_cuda_in_fire before the launch), else when it fires after the launch
+            GGML_ASSERT(!cuda_ctx->in_gate_pending && "a window launched while another waits for its inputs");
+            if (cuda_ctx->in_fire_armed) {
+                cuda_ctx->in_fire_armed = false;
+                ggml_cuda_in_fire_now(*cuda_ctx);
+            } else {
+                cuda_ctx->in_gate_pending = true;
+            }
+        } else {
+            ggml_cuda_in_flush(*cuda_ctx);
+        }
         if (window->needs_ec) {
-            ggml_cuda_expert_cache_wait(*(ggml_backend_cuda_context *) backend->context);
+            ggml_cuda_expert_cache_wait(*cuda_ctx);
         }
     }
     bool probe = false;
@@ -7581,13 +7852,17 @@ static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * windo
     } probe_end_guard { probe };
     if (threaded && comm_ctx->backends.size() == 2) {
         if (!comm_ctx->launcher) {
-            comm_ctx->launcher = std::make_unique<ggml_backend_cuda_comm_context::window_launcher>();
-            comm_ctx->launcher->thread = std::thread(ggml_backend_cuda_comm_window_launcher_main, comm_ctx->launcher.get());
+            comm_ctx->launcher = ggml_backend_cuda_window_launcher_get();
         }
         auto * l = comm_ctx->launcher.get();
         ggml_backend_cuda_context * ctx0 = (ggml_backend_cuda_context *) comm_ctx->backends[0]->context;
         ggml_backend_cuda_context * ctx1 = (ggml_backend_cuda_context *) comm_ctx->backends[1]->context;
         cudaStream_t stream1 = ctx1->stream();
+        GGML_ASSERT(!l->in_use.exchange(true) && "two contexts launch windows at the same time");
+        struct in_use_guard {
+            std::atomic<bool> & flag;
+            ~in_use_guard() { flag.store(false); }
+        } in_use_guard_ { l->in_use };
         if (ggml_backend_cuda_window_spin()) {
             l->exec   = window->execs[1];
             l->stream = stream1;
@@ -7595,12 +7870,17 @@ static void ggml_backend_cuda_comm_window_launch(void * comm_ctx_v, void * windo
             l->spin_done.store(0, std::memory_order_relaxed);
             l->spin_pending.store(1, std::memory_order_release);
             ggml_cuda_set_device(ctx0->device);
+            FN_PROF_T(t_l0);
             CUDA_CHECK(cudaGraphLaunch(window->execs[0], ctx0->stream()));
+            FN_PROF_ADD("window.launch0", t_l0);
+            FN_PROF_T(t_j0);
             while (l->spin_done.load(std::memory_order_acquire) == 0) {
 #if defined(__x86_64__) || defined(_M_X64)
                 __builtin_ia32_pause();
 #endif
             }
+            FN_PROF_ADD("window.join1", t_j0);
+            if (g_fn_prof.on) { g_fn_prof.add("window.launch1", l->launch_ns); }
             return;
         }
         {

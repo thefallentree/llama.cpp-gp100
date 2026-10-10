@@ -158,6 +158,14 @@ extern "C" {
         // (optional) true if the backend has copies of all the data it was given with set_tensor_async since the last
         // synchronize: the caller may change that data without synchronizing first
         bool (*inputs_staged)(ggml_backend_t backend);
+
+        // (optional) the inputs given with set_tensor_async are complete: a graph launched before them (a captured
+        // window that waits for its inputs on the device) may read them now, and a window launched after this
+        // passes its gate at once. The scheduler calls it before and after a split's compute.
+        void (*fire)(ggml_backend_t backend);
+        // (optional) true if a graph launched on this backend waits for its inputs: the backend must not be
+        // synchronized before fire()
+        bool (*gate_pending)(ggml_backend_t backend);
     };
 
     struct ggml_backend {

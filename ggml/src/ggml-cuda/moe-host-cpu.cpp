@@ -284,6 +284,9 @@ struct slot_table {
 
 slot_table g_slots;
 
+std::mutex       g_pinned_mtx;
+std::vector<int> g_pinned_cpus; // mh_pinned_cpus
+
 // The CPUs this process may run on, one per physical core first (hyperthreads of cores already listed last).
 std::vector<int> cpu_list() {
     std::vector<int> first, rest;
@@ -729,10 +732,13 @@ struct pool {
             cpus = cpu_list();
         }
         for (int t = 0; t < n_threads && !cpus.empty(); ++t) {
+            const int cpu = cpus[(size_t) (pool_id*n_threads + t) % cpus.size()];
             cpu_set_t set;
             CPU_ZERO(&set);
-            CPU_SET(cpus[(size_t) (pool_id*n_threads + t) % cpus.size()], &set);
+            CPU_SET(cpu, &set);
             pthread_setaffinity_np(threads[t].native_handle(), sizeof(set), &set);
+            std::lock_guard<std::mutex> lock(g_pinned_mtx);
+            g_pinned_cpus.push_back(cpu);
         }
 #endif
         GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s)\n", __func__, pool_id, n_pools, n_threads, isa);
@@ -765,6 +771,11 @@ int        g_n_pools = 0;
 
 bool mh_cpu_supported() {
     return true;
+}
+
+std::vector<int> mh_pinned_cpus() {
+    std::lock_guard<std::mutex> lock(g_pinned_mtx);
+    return g_pinned_cpus;
 }
 
 void mh_pool_attach(int index, mh_mailbox * m, int n_devices) {

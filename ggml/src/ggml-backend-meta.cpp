@@ -3296,6 +3296,27 @@ static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, struct ggml
     }
 }
 
+static void ggml_backend_meta_fire(ggml_backend_t backend) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, i);
+        if (simple->iface.fire != nullptr) {
+            simple->iface.fire(simple);
+        }
+    }
+}
+
+static bool ggml_backend_meta_gate_pending(ggml_backend_t backend) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, i);
+        if (simple->iface.gate_pending != nullptr && simple->iface.gate_pending(simple)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_backend_meta_inputs_staged(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
@@ -3325,6 +3346,8 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
     /* .inputs_staged           = */ ggml_backend_meta_inputs_staged,
+    /* .fire                    = */ ggml_backend_meta_fire,
+    /* .gate_pending            = */ ggml_backend_meta_gate_pending,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

@@ -971,6 +971,8 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    bool deferred_inputs; // ggml_backend_sched_set_deferred_inputs: the splits are launched without firing their gate
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1955,8 +1957,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         FN_PROF_ADD(fn_in_names[split_id < 3 ? split_id : 3], t_in0);
         FN_PROF_T(t_gc0);
         if (!sched->callback_eval) {
-            // the split's inputs are all staged: a gated window launched now passes its gate at once
-            if (split_backend->iface.fire != NULL) {
+            // the split's inputs are all staged: a gated window launched now passes its gate at once (unless the
+            // caller sets some of them after the launch: ggml_backend_sched_set_deferred_inputs)
+            if (split_backend->iface.fire != NULL && !sched->deferred_inputs) {
                 split_backend->iface.fire(split_backend);
             }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -1965,8 +1968,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
-            // a captured window waits for its inputs on the device: they are all staged now
-            if (split_backend->iface.fire != NULL) {
+            // a captured window waits for its inputs on the device (the launch could not fire them): they are all
+            // staged now. Only then: a fire with nothing waiting would arm the next launch, which may be a deferred one.
+            if (split_backend->iface.fire != NULL && !sched->deferred_inputs &&
+                    split_backend->iface.gate_pending != NULL && split_backend->iface.gate_pending(split_backend)) {
                 split_backend->iface.fire(split_backend);
             }
         } else {
@@ -2219,6 +2224,44 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_deferred_inputs(ggml_backend_sched_t sched, bool deferred) {
+    sched->deferred_inputs = deferred;
+}
+
+bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, const struct ggml_tensor * input) {
+    GGML_ASSERT(input->flags & GGML_TENSOR_FLAG_INPUT);
+    if (input->buffer == NULL || input->data == NULL) {
+        return false; // not part of the computed graph
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input));
+    bool copied = false;
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            // the split's input is the tensor or a view of it (a reshape of the embeddings input)
+            struct ggml_tensor * split_input = split->inputs[input_id];
+            if (split_input != input && split_input->view_src != input) {
+                continue;
+            }
+            GGML_ASSERT(split_input->data != NULL && ggml_is_contiguous(split_input));
+            ggml_backend_t split_backend = sched->backends[split->backend_id];
+            struct ggml_tensor * input_cpy = tensor_copy(split_input, split->backend_id, sched->cur_copy);
+            GGML_ASSERT(split_backend->iface.set_tensor_async != NULL && ggml_nbytes(split_input) == ggml_nbytes(input_cpy));
+            split_backend->iface.set_tensor_async(split_backend, input_cpy, split_input->data, 0, ggml_nbytes(split_input));
+            copied = true;
+        }
+    }
+    return copied;
+}
+
+void ggml_backend_sched_fire(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_backends; i++) {
+        if (sched->backends[i]->iface.fire != NULL) {
+            sched->backends[i]->iface.fire(sched->backends[i]);
+        }
+    }
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

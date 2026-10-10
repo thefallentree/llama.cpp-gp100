@@ -119,6 +119,13 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // Launch-ahead (llama_decode_prepare/commit): the inputs whose data depends on the ubatch's token ids are set
+    // again when the ids are known, after the graph was launched. Such an input returns its tensors here (the
+    // ones set_input writes), nothing otherwise.
+    virtual void token_tensors(std::vector<ggml_tensor *> & out) const {
+        GGML_UNUSED(out);
+    }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -134,6 +141,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void token_tensors(std::vector<ggml_tensor *> & out) const override;
 
     ggml_tensor * tokens       = nullptr; // I32 [n_batch]
     ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
@@ -940,6 +949,9 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+
+    // launch-ahead: set the inputs that depend on the token ids again, and return their tensors (llm_graph_input_i::token_tensors)
+    void set_token_inputs(const llama_ubatch * ubatch, std::vector<ggml_tensor *> & tensors);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

@@ -1317,6 +1317,11 @@ public:
         return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
+    // the rows are hashed from the token ids (launch-ahead: set again when they are known)
+    void token_tensors(std::vector<ggml_tensor *> & out) const override {
+        out.push_back(emb != nullptr ? emb : rows);
+    }
+
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
     ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * ple_n_heads, n_tokens], gathered here when the table is in host memory
 

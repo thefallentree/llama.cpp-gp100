@@ -163,6 +163,26 @@ static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
     return n;
 }
 
+void llm_graph_input_embd::token_tensors(std::vector<ggml_tensor *> & out) const {
+    // the token ids, or the rows gathered from them (the host path); an embd batch (no ids) has nothing that
+    // depends on them
+    if (tok_embd_host != nullptr) {
+        if (embd != nullptr) {
+            out.push_back(embd);
+        }
+        return;
+    }
+    if (tokens != nullptr) {
+        out.push_back(tokens);
+    }
+    if (mixed_tokens != nullptr) {
+        out.push_back(mixed_tokens);
+    }
+    if (mixed_embd != nullptr) {
+        out.push_back(mixed_embd);
+    }
+}
+
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
@@ -1446,6 +1466,17 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::set_token_inputs(const llama_ubatch * ubatch, std::vector<ggml_tensor *> & tensors) {
+    tensors.clear();
+    for (auto & input : inputs) {
+        const size_t n0 = tensors.size();
+        input->token_tensors(tensors);
+        if (tensors.size() > n0) {
+            input->set_input(ubatch);
+        }
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
@@ -1509,7 +1540,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: can_reuse = %d (%s)\n", __func__, cur, typeid(*input).name());
         }
 
         res = res && cur;

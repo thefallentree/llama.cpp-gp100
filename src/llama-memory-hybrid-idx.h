@@ -214,6 +214,8 @@ public:
     bool next()  override;
     bool apply() override;
 
+    void reapply_tokens() override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //

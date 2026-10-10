@@ -1100,6 +1100,15 @@ extern "C" {
                              enum llama_process_type   type,
                               struct llama_batch_ext * batch);
 
+    // Launch-ahead decode: llama_decode_prepare decodes a batch whose token ids may be placeholders; where the
+    // backend supports it (the CUDA tensor-split windows) the graph starts on the device and waits for the inputs
+    // that depend on the ids. llama_decode_commit gives the ids of all the batch's tokens (n_tokens of them, in
+    // batch order), releases the graph and makes the outputs available as llama_process would have. Between the
+    // two calls nothing of this context may be read (the accessors synchronize it); other contexts may run.
+    // A prepared decode is one ubatch. Return values as llama_decode().
+    LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch_ext * batch);
+    LLAMA_API int32_t llama_decode_commit (struct llama_context * ctx, const llama_token * tokens, size_t n_tokens);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

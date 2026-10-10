@@ -211,6 +211,10 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // common_speculative_set_launch_hook: called once per draft() by the drafters that decode, after the first
+    // decode is launched and before its result is read
+    std::function<void()> launch_hook;
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1966,6 +1970,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
             }
+            if (i == 0 && launch_hook) {
+                // the first step computes: the caller's own launch goes here (its host side runs alongside)
+                launch_hook();
+            }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -3148,6 +3156,15 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     return result;
+}
+
+void common_speculative_set_launch_hook(common_speculative * spec, std::function<void()> hook) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->launch_hook = hook;
+    }
 }
 
 void common_speculative_draft(common_speculative * spec) {

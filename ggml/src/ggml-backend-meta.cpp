@@ -2126,6 +2126,20 @@ struct ggml_backend_meta_context {
     using backend_flush_t = void (*)(ggml_backend_t backend);
     backend_flush_t backend_flush = nullptr;
 
+    // The readback of a vocabulary-sharded ARGMAX (ggml_backend_meta_get_tensor_async): the shards' packed keys go
+    // asynchronously to pinned memory and are reduced to token ids when the backend is synchronized, so that the
+    // caller is not held until the graph is done (the draft of a speculative decode launches the next graph meanwhile).
+    struct argmax_readback {
+        int32_t *            ids;
+        size_t               n_rows;
+        size_t               off;   // of the keys in argmax_scratch, n_backends*n_rows of them
+        std::vector<int64_t> ne;    // the shards' widths (0 = no shard on that backend)
+    };
+    std::vector<argmax_readback> argmax_pending;
+    ggml_backend_buffer_t        argmax_scratch      = nullptr; // pinned
+    size_t                       argmax_scratch_size = 0;
+    size_t                       argmax_scratch_used = 0;
+
     struct window_entry {
         uint64_t uid       = 0;
         void *   window    = nullptr; // captured
@@ -2209,6 +2223,9 @@ struct ggml_backend_meta_context {
             if (w.window != nullptr) {
                 comm_window_free(comm_ctx, w.window);
             }
+        }
+        if (argmax_scratch != nullptr) {
+            ggml_backend_buffer_free(argmax_scratch);
         }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
@@ -2309,41 +2326,45 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 
             const size_t n_rows = ggml_nelements(tensor);
             GGML_ASSERT(size == n_rows*sizeof(int32_t));
-            std::vector<std::vector<uint64_t>> keys(n_backends, std::vector<uint64_t>(n_rows));
 
+            // the keys go to pinned memory asynchronously, the reduction waits for the synchronize
+            ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+            const size_t need = n_backends*n_rows*sizeof(uint64_t);
+            if (backend_ctx->argmax_scratch == nullptr || backend_ctx->argmax_scratch_used + need > backend_ctx->argmax_scratch_size) {
+                if (!backend_ctx->argmax_pending.empty()) {
+                    ggml_backend_meta_synchronize(backend); // frees the scratch
+                }
+                if (backend_ctx->argmax_scratch == nullptr || need > backend_ctx->argmax_scratch_size) {
+                    if (backend_ctx->argmax_scratch != nullptr) {
+                        ggml_backend_buffer_free(backend_ctx->argmax_scratch);
+                    }
+                    ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_meta_simple_backend(backend, 0));
+                    ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+                    if (buft == nullptr) {
+                        buft = ggml_backend_cpu_buffer_type();
+                    }
+                    backend_ctx->argmax_scratch_size = std::max<size_t>(need, 64*1024);
+                    backend_ctx->argmax_scratch      = ggml_backend_buft_alloc_buffer(buft, backend_ctx->argmax_scratch_size);
+                    GGML_ASSERT(backend_ctx->argmax_scratch != nullptr);
+                }
+                backend_ctx->argmax_scratch_used = 0;
+            }
+            ggml_backend_meta_context::argmax_readback rb;
+            rb.ids    = (int32_t *) data;
+            rb.n_rows = n_rows;
+            rb.off    = backend_ctx->argmax_scratch_used;
+            rb.ne.assign(src_ss.ne, src_ss.ne + n_backends);
+            backend_ctx->argmax_scratch_used += need;
+            uint64_t * keys = (uint64_t *) ((char *) ggml_backend_buffer_get_base(backend_ctx->argmax_scratch) + rb.off);
             for (size_t j = 0; j < n_backends; ++j) {
                 if (src_ss.ne[j] == 0) {
                     continue;
                 }
                 ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
                 const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                ggml_backend_synchronize(simple_backend);
-                ggml_backend_tensor_get(simple_tensor, keys[j].data(), 0, n_rows*sizeof(uint64_t));
+                ggml_backend_tensor_get_async(simple_backend, simple_tensor, keys + j*n_rows, 0, n_rows*sizeof(uint64_t));
             }
-
-            int32_t * ids = (int32_t *) data;
-            for (size_t row = 0; row < n_rows; ++row) {
-                uint32_t best_score = 0;
-                uint32_t best_id    = UINT32_MAX;
-                uint32_t col_offset = 0;
-                for (size_t j = 0; j < n_backends; ++j) {
-                    if (src_ss.ne[j] == 0) {
-                        continue;
-                    }
-                    const uint64_t key      = keys[j][row];
-                    const uint32_t score    = uint32_t(key >> 32);
-                    const uint32_t local_id = ~uint32_t(key);
-                    GGML_ASSERT(local_id < (uint32_t) src_ss.ne[j]);
-                    const uint32_t global_id = col_offset + local_id;
-                    if (score > best_score || (score == best_score && global_id < best_id)) {
-                        best_score = score;
-                        best_id    = global_id;
-                    }
-                    col_offset += src_ss.ne[j];
-                }
-                GGML_ASSERT(best_id != UINT32_MAX);
-                ids[row] = (int32_t) best_id;
-            }
+            backend_ctx->argmax_pending.push_back(std::move(rb));
             return;
         }
     }
@@ -2386,7 +2407,7 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     // the devices work on what they hold while the first one is waited for
     for (size_t i = 0; i < n_backends && backend_ctx->backend_flush != nullptr; i++) {
         backend_ctx->backend_flush(ggml_backend_meta_simple_backend(backend, i));
@@ -2394,6 +2415,34 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
+    // the sharded ARGMAX readbacks are in: reduce them
+    for (const auto & rb : backend_ctx->argmax_pending) {
+        const uint64_t * keys = (const uint64_t *) ((const char *) ggml_backend_buffer_get_base(backend_ctx->argmax_scratch) + rb.off);
+        for (size_t row = 0; row < rb.n_rows; ++row) {
+            uint32_t best_score = 0;
+            uint32_t best_id    = UINT32_MAX;
+            uint32_t col_offset = 0;
+            for (size_t j = 0; j < n_backends; ++j) {
+                if (rb.ne[j] == 0) {
+                    continue;
+                }
+                const uint64_t key      = keys[j*rb.n_rows + row];
+                const uint32_t score    = uint32_t(key >> 32);
+                const uint32_t local_id = ~uint32_t(key);
+                GGML_ASSERT(local_id < (uint32_t) rb.ne[j]);
+                const uint32_t global_id = col_offset + local_id;
+                if (score > best_score || (score == best_score && global_id < best_id)) {
+                    best_score = score;
+                    best_id    = global_id;
+                }
+                col_offset += rb.ne[j];
+            }
+            GGML_ASSERT(best_id != UINT32_MAX);
+            rb.ids[row] = (int32_t) best_id;
+        }
+    }
+    backend_ctx->argmax_pending.clear();
+    backend_ctx->argmax_scratch_used = 0;
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {

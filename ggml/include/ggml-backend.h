@@ -367,6 +367,14 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Launch-ahead: a graph computed with deferred inputs is launched on a backend that gates it (ggml_backend_i::fire)
+    // without firing the gate, so that it waits on the device for inputs the caller sets later. The caller then sets
+    // those inputs (their graph input tensors), copies them with ggml_backend_sched_copy_input and fires the gate
+    // with ggml_backend_sched_fire. The scheduler must not be synchronized in between.
+    GGML_API void                 ggml_backend_sched_set_deferred_inputs(ggml_backend_sched_t sched, bool deferred);
+    GGML_API bool                 ggml_backend_sched_copy_input(ggml_backend_sched_t sched, const struct ggml_tensor * input);
+    GGML_API void                 ggml_backend_sched_fire(ggml_backend_sched_t sched);
+
     //
     // Meta backend
     //

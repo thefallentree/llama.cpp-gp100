@@ -64,6 +64,10 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // launch-ahead (llama_decode_prepare/commit): the current ubatch's token ids were placeholders when apply() ran
+    // and are known now, in the ubatch: store them again where the memory keeps tokens (the cells' ext.tok)
+    virtual void reapply_tokens() {}
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

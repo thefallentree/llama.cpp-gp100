@@ -2019,9 +2019,57 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+static int64_t decode_t_last_end = 0; // FN_PROF: the end of the last decode, for the time between two
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    return decode_impl(batch_inp, false);
+}
+
+int llama_context::decode_prepare(const llama_batch_ext & batch_inp) {
+    GGML_ASSERT(!pending.active && "a prepared decode is waiting for its tokens (decode_commit)");
+    return decode_impl(batch_inp, true);
+}
+
+int llama_context::decode_commit(const llama_token * tokens, size_t n_tokens) {
+    GGML_ASSERT(pending.active && "no prepared decode (decode_prepare)");
+    ggml_fn_prof_tag = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1;
+    FN_PROF_T(t_c0);
+    pending.active = false;
+
+    const llama_ubatch & ubatch = pending.mctx->get_ubatch();
+    GGML_ASSERT(n_tokens == ubatch.n_tokens && ubatch.token != nullptr);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        ubatch.token[i] = tokens[i];
+    }
+    pending.mctx->reapply_tokens();
+
+    // the inputs hashed or gathered from the ids, to the device, and the graph released
+    std::vector<ggml_tensor *> tensors;
+    pending.res->set_token_inputs(&ubatch, tensors);
+    for (ggml_tensor * t : tensors) {
+        if (!ggml_backend_sched_copy_input(pending.sch, t)) {
+            LLAMA_LOG_WARN("%s: the token input %s is not an input of the computed graph\n", __func__, t->name);
+        }
+    }
+    ggml_backend_sched_fire(pending.sch);
+    FN_PROF_ADD("decode.commit", t_c0);
+
+    decode_extract(pending.res, ubatch, pending.n_outputs_all, pending.n_outputs_prev, pending.n_tokens_prev, pending.t_d0, t_c0);
+    // the ubatch is done (the memory's bookkeeping of a consumed ubatch, e.g. the indexer's re-pooled blocks)
+    const bool more = pending.mctx->next();
+    GGML_ASSERT(!more);
+    decode_finish(pending.n_outputs_all, pending.t_d0);
+    pending.mctx.reset();
+    pending.res = nullptr;
+    pending.sch = nullptr;
+
+    return 0;
+}
+
+int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+        GGML_ASSERT(!prepare);
         return encode(batch_inp);
     }
 
@@ -2043,9 +2091,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     FN_PROF_T(t_d0);
     fn_prof_t_window[ggml_fn_prof_tag] = t_d0;
     fn_prof_n_window[ggml_fn_prof_tag] = (int) batch_inp.tokens.size();
-    static int64_t t_last_end = 0;
-    if (t_last_end != 0) { FN_PROF_ADD("decode.between", t_last_end); }
-    const int64_t n_vocab = vocab.n_tokens();
+    if (decode_t_last_end != 0) { FN_PROF_ADD("decode.between", decode_t_last_end); }
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2217,9 +2263,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_status status;
 
         FN_PROF_T(t_d4);
+        if (prepare) {
+            ggml_backend_sched_set_deferred_inputs(sched.get(), true);
+            for (auto & slot : gf_slots) {
+                ggml_backend_sched_set_deferred_inputs(slot.sched.get(), true);
+            }
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (prepare) {
+            ggml_backend_sched_set_deferred_inputs(sched.get(), false);
+            for (auto & slot : gf_slots) {
+                ggml_backend_sched_set_deferred_inputs(slot.sched.get(), false);
+            }
+        }
         FN_PROF_ADD("decode.process_ubatch", t_d4);
-        FN_PROF_T(t_d5);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2252,6 +2309,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        if (prepare) {
+            // the graph waits for its tokens on the device: the outputs are extracted at the commit
+            pending.active         = true;
+            pending.res            = const_cast<llm_graph_result *>(res);
+            pending.sch            = sched_active();
+            pending.n_outputs_all  = n_outputs_all;
+            pending.n_outputs_prev = n_outputs_prev;
+            pending.n_tokens_prev  = n_tokens_prev;
+            pending.t_d0           = t_d0;
+            GGML_ASSERT(n_tokens_all == ubatch.n_tokens && "a prepared decode is one ubatch");
+            pending.mctx = std::move(mctx);
+            return 0;
+        }
+
+        decode_extract(res, ubatch, n_outputs_all, n_outputs_prev, n_tokens_prev, t_d0, t_d4);
+    } while (mctx->next());
+
+    decode_finish(n_outputs_all, t_d0);
+
+    return 0;
+}
+
+void llama_context::decode_extract(const llm_graph_result * res, const llama_ubatch & ubatch, uint32_t n_outputs_all, int64_t & n_outputs_prev, int64_t & n_tokens_prev, int64_t t_d0, int64_t t_d4) {
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+    const int64_t n_vocab = vocab.n_tokens();
+    const bool has_samplers = !sampling.samplers.empty();
+    FN_PROF_T(t_d5);
+    {
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
@@ -2413,7 +2499,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             g_fn_prof.add("probe.gpu_start..gpu_end",     ggml_fn_probe_ns[1] - ggml_fn_probe_ns[0]);
             g_fn_prof.add("probe.gpu_end..extract_end",   fn_prof_now() - ggml_fn_probe_ns[1]);
         }
-    } while (mctx->next());
+    }
+    GGML_UNUSED(hparams);
+}
+
+void llama_context::decode_finish(uint32_t n_outputs_all, int64_t t_d0) {
     FN_PROF_T(t_d6);
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2470,9 +2560,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
     FN_PROF_ADD("decode.tail", t_d6);
     FN_PROF_ADD("decode.total", t_d0);
-    t_last_end = g_fn_prof.on ? fn_prof_now() : 0;
-
-    return 0;
+    decode_t_last_end = g_fn_prof.on ? fn_prof_now() : 0;
 }
 
 //
@@ -4984,6 +5072,14 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
         case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
     }
     return -1;
+}
+
+int32_t llama_decode_prepare(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode_prepare(*batch);
+}
+
+int32_t llama_decode_commit(llama_context * ctx, const llama_token * tokens, size_t n_tokens) {
+    return ctx->decode_commit(tokens, n_tokens);
 }
 
 //

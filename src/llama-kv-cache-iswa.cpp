@@ -340,6 +340,11 @@ bool llama_kv_cache_iswa_context::apply() {
     return res;
 }
 
+void llama_kv_cache_iswa_context::reapply_tokens() {
+    ctx_base->reapply_tokens();
+    ctx_swa ->reapply_tokens();
+}
+
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {
     return status;
 }

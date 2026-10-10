@@ -1616,6 +1616,7 @@ struct ggml_backend_cuda_context {
     // main stream waits for it to differ from in_seen_dev (the value the last window consumed) and scatters from
     // in_dev. in_copy_event: the copy of the blob is done, the host may write it again.
     unsigned int * in_flag_dev  = nullptr;
+    unsigned int * in_flag_host = nullptr; // pinned ring of the values the flag is set to: the fire copies one (DMA)
     unsigned int * in_seen_dev  = nullptr;
     unsigned int   in_fired     = 0;
     cudaEvent_t    in_copy_event = nullptr;

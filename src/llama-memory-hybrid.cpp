@@ -273,6 +273,11 @@ bool llama_memory_hybrid_context::apply() {
     return res;
 }
 
+void llama_memory_hybrid_context::reapply_tokens() {
+    ctx_attn->reapply_tokens();
+    ctx_recr->reapply_tokens();
+}
+
 llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }

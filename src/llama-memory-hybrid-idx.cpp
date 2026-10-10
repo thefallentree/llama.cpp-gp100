@@ -668,6 +668,13 @@ bool llama_memory_hybrid_idx_context::next() {
     return llama_memory_hybrid_context::next();
 }
 
+void llama_memory_hybrid_idx_context::reapply_tokens() {
+    llama_memory_hybrid_context::reapply_tokens();
+    if (ctx_idx) {
+        ctx_idx->reapply_tokens();
+    }
+}
+
 bool llama_memory_hybrid_idx_context::apply() {
     FN_PROF_T(t_a0);
     bool res = llama_memory_hybrid_context::apply();

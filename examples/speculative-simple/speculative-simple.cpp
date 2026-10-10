@@ -165,6 +165,18 @@ int main(int argc, char ** argv) {
     std::vector<int64_t> trace_t0, trace_tgt;
     std::vector<int>     trace_acc;
 
+    // launch-ahead (LLAMA_SPEC_AHEAD=1): the target's decode is launched from inside the drafter, when its first
+    // step computes, with placeholder ids for the draft rows (llama_decode_prepare); the ids follow when the draft
+    // is done (llama_decode_commit). The draft is padded to the prepared rows: the padding rows are rejected like
+    // any draft token. Off by default: the launch already overlapped the window's start, so the round is the same
+    // (1K: 26.7 ms either way); it is the base for a draft computed in one window.
+    // LLAMA_SPEC_AHEAD=2 prepares after the draft, with the real ids (a test of the mechanism alone).
+    const int  spec_ahead_mode = getenv("LLAMA_SPEC_AHEAD") == nullptr ? 0 : atoi(getenv("LLAMA_SPEC_AHEAD"));
+    const bool spec_ahead = spec_ahead_mode != 0;
+    const bool spec_ahead_late = spec_ahead_mode == 2;
+    int  n_prepared = 0; // rows of the prepared decode, 0 = none
+    int64_t t_prepared = 0;
+
     while (true) {
         if (spec_trace) {
             trace_t0.push_back(ggml_time_us());
@@ -202,7 +214,32 @@ int main(int argc, char ** argv) {
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
             };
+            n_prepared = 0;
+            // n_draft_max 0 is no limit for the drafter (common_speculative_draft), not zero tokens
+            const int n_rows = 1 + (n_draft_max > 0 ? std::min(n_draft_max, params_spec.draft.n_max) : params_spec.draft.n_max);
+            auto prepare = [&, n_rows]() {
+                batch_tgt.clear();
+                for (int i = 0; i < n_rows; ++i) {
+                    // the ids of the draft rows come with the commit (the real ones in the late test mode)
+                    const llama_token id = spec_ahead_late && i > 0 && i - 1 < (int) draft.size() ? draft[i - 1] : id_last;
+                    batch_tgt.add(id, n_past + i, seq_id, true);
+                }
+                const int64_t t0 = ggml_time_us();
+                if (llama_decode_prepare(ctx_tgt, batch_tgt.get()) == 0) {
+                    n_prepared = n_rows;
+                    t_prepared = t0;
+                } else {
+                    LOG_ERR("%s", "llama_decode_prepare failed\n");
+                }
+            };
+            if (spec_ahead && !spec_ahead_late) {
+                common_speculative_set_launch_hook(spec, prepare);
+            }
             common_speculative_draft(spec);
+            common_speculative_set_launch_hook(spec, nullptr);
+            if (spec_ahead_late) {
+                prepare();
+            }
 
             // save a checkpoint of the target context before evaluating the draft
             // this allows us to restore the state if partial draft acceptance occurs
@@ -237,15 +274,38 @@ int main(int argc, char ** argv) {
                 batch_tgt.add(draft[i], n_past + i, seq_id, true);
             }
 
-
-            const int64_t t0 = ggml_time_us();
-            llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
-            if (getenv("LLAMA_SPEC_TIMING") != nullptr) {
-                llama_synchronize(ctx_tgt);
-            }
-            t_tgt_us += ggml_time_us() - t0;
-            if (spec_trace) {
-                trace_tgt.push_back(ggml_time_us() - t0);
+            if (n_prepared > 0) {
+                // the prepared decode has n_prepared rows: the draft padded to them (the padding is rejected)
+                GGML_ASSERT((int) draft.size() + 1 <= n_prepared);
+                std::vector<llama_token> ids;
+                ids.push_back(id_last);
+                ids.insert(ids.end(), draft.begin(), draft.end());
+                while ((int) ids.size() < n_prepared) {
+                    batch_tgt.add(id_last, n_past + (int) ids.size() - 1, seq_id, true);
+                    ids.push_back(id_last);
+                }
+                if (llama_decode_commit(ctx_tgt, ids.data(), ids.size()) != 0) {
+                    LOG_ERR("%s", "llama_decode_commit failed\n");
+                    break;
+                }
+                if (getenv("LLAMA_SPEC_TIMING") != nullptr) {
+                    llama_synchronize(ctx_tgt);
+                }
+                t_tgt_us += ggml_time_us() - t_prepared;
+                if (spec_trace) {
+                    trace_tgt.push_back(ggml_time_us() - t_prepared);
+                }
+                n_prepared = 0;
+            } else {
+                const int64_t t0 = ggml_time_us();
+                llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
+                if (getenv("LLAMA_SPEC_TIMING") != nullptr) {
+                    llama_synchronize(ctx_tgt);
+                }
+                t_tgt_us += ggml_time_us() - t0;
+                if (spec_trace) {
+                    trace_tgt.push_back(ggml_time_us() - t0);
+                }
             }
             n_tgt++;
             n_tgt_tok += batch_tgt.size();

@@ -950,6 +950,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (in_flag_dev != nullptr) {
         cudaFree(in_flag_dev);
         cudaFree(in_seen_dev);
+        cudaFreeHost(in_flag_host);
         cudaEventDestroy(in_copy_event);
     }
     for (void * mem : retired_mem) {
@@ -3157,15 +3158,26 @@ static __global__ void k_in_scatter(const char * __restrict__ blob) {
 // k_in_seen, the node after it, records the flag the window consumed.
 #define GGML_CUDA_IN_STREAM (GGML_CUDA_MAX_STREAMS - 2)
 
-static __global__ void k_in_gate(const volatile unsigned int * __restrict__ flag, const unsigned int * __restrict__ seen,
-                                 const char * __restrict__ blob) {
-    __shared__ char *   s_dst;
-    __shared__ uint32_t s_off, s_size;
+// one warp waits (one resident block: a gate of a block per entry, 128 of them spinning, slowed the kernels of
+// another context running meanwhile three times), the scatter is the node after it
+static __global__ void k_in_gate(const volatile unsigned int * __restrict__ flag, const unsigned int * __restrict__ seen) {
     if (threadIdx.x == 0) {
         const unsigned int last = *seen;
         while (*flag == last) {
+            // a pause between the polls: the flag comes from the copy engine, microseconds apart
+            const long long t0 = clock64();
+            while (clock64() - t0 < 500) {
+            }
         }
         __threadfence();
+    }
+}
+
+// the entries of the table in the device copy of the blob, one block per entry (after the gate)
+static __global__ void k_in_gate_scatter(const char * __restrict__ blob) {
+    __shared__ char *   s_dst;
+    __shared__ uint32_t s_off, s_size;
+    if (threadIdx.x == 0) {
         const volatile ggml_cuda_in_entry * tab = (const volatile ggml_cuda_in_entry *) blob;
         s_dst  = (char *) tab[blockIdx.x].dst;
         s_off  = tab[blockIdx.x].off;
@@ -3191,10 +3203,8 @@ static __global__ void k_in_seen(const volatile unsigned int * __restrict__ flag
     *seen = *flag;
 }
 
-static __global__ void k_in_flag(unsigned int * __restrict__ flag, const unsigned int value) {
-    __threadfence();
-    *((volatile unsigned int *) flag) = value;
-}
+// (the flag was set by a kernel on the input stream: it never ran while a window's gate was spinning on the main
+// stream, the two streams sharing a hardware queue; a copy on the copy engine does)
 
 static bool ggml_cuda_in_alloc(ggml_backend_cuda_context & ctx);
 
@@ -3207,10 +3217,13 @@ static void ggml_cuda_in_gate_record(ggml_backend_cuda_context & ctx) {
         CUDA_CHECK(cudaMemset(ctx.in_flag_dev, 0, 64));
         CUDA_CHECK(cudaMalloc((void **) &ctx.in_seen_dev, 64));
         CUDA_CHECK(cudaMemset(ctx.in_seen_dev, 0, 64));
+        CUDA_CHECK(cudaMallocHost((void **) &ctx.in_flag_host, 16*sizeof(unsigned int)));
+        memset(ctx.in_flag_host, 0, 16*sizeof(unsigned int));
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx.in_copy_event, cudaEventDisableTiming));
         ctx.in_fired = 0;
     }
-    k_in_gate<<<GGML_CUDA_IN_MAX, 256, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev, ctx.in_dev);
+    k_in_gate<<<1, 32, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev);
+    k_in_gate_scatter<<<GGML_CUDA_IN_MAX, 256, 0, ctx.stream()>>>(ctx.in_dev);
     k_in_seen<<<1, 1, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -3227,8 +3240,12 @@ static void ggml_cuda_in_fire_now(ggml_backend_cuda_context & ctx) {
     cudaStream_t is = ctx.stream(ctx.device, GGML_CUDA_IN_STREAM);
     CUDA_CHECK(cudaMemcpyAsync(ctx.in_dev, ctx.in_host, GGML_CUDA_IN_TABLE + ctx.in_used, cudaMemcpyHostToDevice, is));
     CUDA_CHECK(cudaEventRecord(ctx.in_copy_event, is));
-    k_in_flag<<<1, 1, 0, is>>>(ctx.in_flag_dev, ++ctx.in_fired);
-    CUDA_CHECK(cudaGetLastError());
+    // the flag follows the blob on the copy engine (a kernel would wait behind a spinning gate: the streams share
+    // hardware queues); the value comes from a pinned ring, one word per fire in flight
+    ++ctx.in_fired;
+    unsigned int * flag_src = ctx.in_flag_host + (ctx.in_fired % 16);
+    *flag_src = ctx.in_fired;
+    CUDA_CHECK(cudaMemcpyAsync(ctx.in_flag_dev, flag_src, sizeof(unsigned int), cudaMemcpyHostToDevice, is));
     ctx.in_n    = 0;
     ctx.in_used = 0;
     ctx.in_busy = true;
@@ -3248,6 +3265,8 @@ static void ggml_cuda_in_fire(ggml_backend_cuda_context & ctx) {
 
 // The staged inputs go to the device, on the context's stream: before anything else is put on it that may read them.
 static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
+    // the inputs go to the stream now: a fire armed for a window launch has nothing left to fire
+    ctx.in_fire_armed = false;
     if (ctx.in_n == 0 || ctx.in_gated_capture) {
         // nothing staged, or the staged inputs are what the gate of the window being captured scatters when fired
         return;
@@ -3371,6 +3390,18 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    // while a window waits for its inputs, a small strided input (the rows of a tensor split along its first axis) is
+    // staged row by row for the gate, like the others; otherwise the copy goes to the stream as before
+    if (cuda_ctx->in_gate_pending && n_copies <= 16 && size*n_copies <= GGML_CUDA_IN_SMALL) {
+        bool staged = true;
+        for (size_t i = 0; i < n_copies && staged; ++i) {
+            staged = ggml_cuda_in_stage(*cuda_ctx, (char *) tensor->data + offset + i*stride_tensor, (const char *) data + i*stride_data, size);
+        }
+        if (staged) {
+            return;
+        }
+    }
+    GGML_ASSERT(!cuda_ctx->in_gate_pending && "an input too large to stage while a window waits for its inputs");
     ggml_cuda_in_flush(*cuda_ctx);
     cuda_ctx->in_direct = true;
     CUDA_CHECK(cudaMemcpy2DAsync(

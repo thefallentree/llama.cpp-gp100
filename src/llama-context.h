@@ -146,6 +146,13 @@ struct llama_context {
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
 
+    // Launch-ahead: decode_prepare runs a decode whose token ids (some of them) are placeholders: the graph is
+    // launched and waits on the device for its token-dependent inputs. decode_commit gives the ids, sets those
+    // inputs and releases the graph, then extracts the outputs as decode does. Between the two the context is not
+    // synchronized (no accessor is called), other contexts may run. One ubatch per prepared decode.
+    int decode_prepare(const llama_batch_ext & batch_inp);
+    int decode_commit(const llama_token * tokens, size_t n_tokens);
+
     // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -453,6 +460,24 @@ private:
     // speculative decoding makes a dozen), which is a stream synchronization per device and a look at the expert
     // cache each time; without pending work synchronize() returns at once
     bool sync_pending = true;
+
+    // a decode launched by decode_prepare, waiting for its tokens (decode_commit)
+    struct decode_pending {
+        bool                     active = false;
+        llama_memory_context_ptr mctx;
+        llm_graph_result *       res = nullptr;
+        ggml_backend_sched_t     sch = nullptr;
+        uint32_t                 n_outputs_all = 0;
+        int64_t                  n_outputs_prev = 0;
+        int64_t                  n_tokens_prev  = 0;
+        int64_t                  t_d0 = 0;
+    } pending;
+
+    int  decode_impl(const llama_batch_ext & batch_inp, bool prepare);
+    // the outputs of a computed ubatch (the copies to the host, asynchronous)
+    void decode_extract(const llm_graph_result * res, const llama_ubatch & ubatch, uint32_t n_outputs_all, int64_t & n_outputs_prev, int64_t & n_tokens_prev, int64_t t_d0, int64_t t_d4);
+    // the end of a decode: the output mappings
+    void decode_finish(uint32_t n_outputs_all, int64_t t_d0);
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

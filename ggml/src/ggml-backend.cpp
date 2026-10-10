@@ -2185,11 +2185,15 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    FN_PROF_T(t_sp);
     ggml_backend_sched_split_graph(sched, graph);
+    FN_PROF_ADD("sched.alloc.split", t_sp);
 
+    FN_PROF_T(t_al);
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
+    FN_PROF_ADD("sched.alloc.splits", t_al);
 
     sched->is_alloc = true;
 

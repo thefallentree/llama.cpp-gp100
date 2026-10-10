@@ -1629,7 +1629,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
-    return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+    FN_PROF_T(t_it);
+    const ggml_status status = ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+    FN_PROF_ADD("meta.init_tensor", t_it);
+    return status;
 }
 
 static void ggml_backend_meta_buffer_memset_tensor(
@@ -2635,6 +2638,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
+        FN_PROF_T(t_rb0);
         // A view of a tensor of another buffer (a cache) is registered in that buffer's compute containers. They are
         // never cleared and the current one changes with every graph that is allocated on the buffer, so a graph that is
         // computed again can find the registration of an earlier graph that had the view's address: same source, old shape.
@@ -2674,6 +2678,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        FN_PROF_ADD("meta.rb.views", t_rb0);
+        FN_PROF_T(t_rb1);
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
 
@@ -2718,6 +2724,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        FN_PROF_ADD("meta.rb.nodes", t_rb1);
+        FN_PROF_T(t_rb2);
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed_branch = [&](const int i) -> int {
@@ -3062,6 +3070,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        FN_PROF_ADD("meta.rb.plan", t_rb2);
         backend_ctx->uid             = cgraph->uid;
         backend_ctx->n_subgraphs     = n_subgraphs;
         backend_ctx->max_partial_cur = max_tmp_size;

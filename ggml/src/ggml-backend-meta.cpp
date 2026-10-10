@@ -20,6 +20,7 @@ FN_PROF_DECL("meta");
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -550,8 +551,17 @@ struct ggml_backend_meta_buffer_context {
             return std::hash<const ggml_tensor *>()(key.first) ^ (size_t) key.second;
         }
     };
-    // hashed: a graph asks ten thousand times, and the nodes of a tree this large are a cache miss per level
-    std::unordered_map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>, split_state_key_hash> split_state_cache;
+    // hashed: a graph asks ten thousand times, and the nodes of a tree this large are a cache miss per level.
+    // An entry holds the generation it was computed in: a tensor found changed at its address (a graph rebuilt
+    // into the same arena) starts a new generation, which retires every entry at once (the states of the tensors
+    // above the changed one were computed from it), without the recursion of a cleared cache
+    struct split_state_entry {
+        ggml_backend_meta_split_state state;
+        uint32_t                      gen;
+        char                          bytes[nbtc];
+    };
+    uint32_t split_state_gen = 0;
+    std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash> split_state_cache;
 
     int debug;
 
@@ -647,6 +657,72 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+
+// does the cache of the tensor's buffer hold the state of this very tensor (the same bytes at this address)?
+static bool ggml_backend_meta_split_state_cached(const struct ggml_tensor * tensor, bool assume_sync) {
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return true; // not split: nothing to compute
+    }
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const auto it = buf_ctx->split_state_cache.find(std::make_pair(tensor, assume_sync));
+    return it != buf_ctx->split_state_cache.end() && it->second.gen == buf_ctx->split_state_gen &&
+           memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) == 0;
+}
+
+// The state of a tensor is computed from the states of its sources, recursively through
+// ggml_backend_meta_get_split_state. With the cache cold below a deep tensor (a graph rebuilt into the same
+// arena whose tensors differ from the last graph's only near its end: another sampler after a request) that
+// recursion went ~1400 levels down and overflowed the stack. So before a tensor's state is computed, the
+// uncached tensors below it are found with an explicit stack and computed bottom-up: every recursion is then one
+// level deep.
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+
+static void ggml_backend_meta_split_state_prepare(const struct ggml_tensor * root) {
+    struct item {
+        const ggml_tensor * t;
+        bool                expanded;
+    };
+    std::vector<item> stack;
+    std::vector<const ggml_tensor *> order;
+    std::unordered_set<const ggml_tensor *> seen;
+    stack.push_back({ root, false });
+    seen.insert(root);
+    while (!stack.empty()) {
+        item & top = stack.back();
+        if (top.expanded) {
+            order.push_back(top.t);
+            stack.pop_back();
+            continue;
+        }
+        top.expanded = true;
+        const ggml_tensor * t = top.t;
+        const ggml_tensor * deps[GGML_MAX_SRC + 1];
+        size_t n_deps = 0;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (t->src[i] != nullptr && t->src[i] != t) {
+                deps[n_deps++] = t->src[i];
+            }
+        }
+        if (t->view_src != nullptr && t->view_src != t) {
+            deps[n_deps++] = t->view_src;
+        }
+        for (size_t i = 0; i < n_deps; i++) {
+            const ggml_tensor * d = deps[i];
+            if (d->buffer == nullptr || !ggml_backend_buffer_is_meta(d->buffer) || seen.count(d) != 0) {
+                continue;
+            }
+            if (ggml_backend_meta_split_state_cached(d, true)) {
+                continue; // its own sources were cached when it was
+            }
+            seen.insert(d);
+            stack.push_back({ d, false });
+        }
+    }
+    // the root is last in the post-order: its caller computes it
+    for (size_t i = 0; i + 1 < order.size(); i++) {
+        ggml_backend_meta_get_split_state(order[i], /*assume_sync =*/ true);
+    }
+}
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
@@ -1391,16 +1467,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
-    if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
+    if (it != buf_ctx->split_state_cache.end() && it->second.gen != buf_ctx->split_state_gen) {
+        // retired with its generation: as good as absent
         it = buf_ctx->split_state_cache.end();
+    } else if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) != 0) {
+        // another tensor at this address (a graph rebuilt into the same arena): every entry of the cache may
+        // describe a tensor that is gone or that was computed from one (the states above this address), so all
+        // of them retire (once: the retired ones are not stale again). The states below this tensor are then
+        // computed again bottom-up with an explicit stack (ggml_backend_meta_split_state_prepare): before, a
+        // cleared cache made that a recursion through every tensor below, and a graph that differs from the last
+        // one only at its end (another sampler after a request) overflowed the stack ~1400 levels down
+        buf_ctx->split_state_gen++;
+        it = buf_ctx->split_state_cache.end();
+    }
+    if (it == buf_ctx->split_state_cache.end()) {
+        ggml_backend_meta_split_state_prepare(tensor);
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
         const ggml_backend_meta_split_state calculated = calculate_split_state();
         auto & entry = buf_ctx->split_state_cache[key];
-        entry.first = calculated;
-        memcpy(entry.second, tensor, sizeof(entry.second));
+        entry.state = calculated;
+        entry.gen   = buf_ctx->split_state_gen;
+        memcpy(entry.bytes, tensor, sizeof(entry.bytes));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1428,18 +1517,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (!ne_info.empty()) {
                     ne_info += ", ";
                 }
-                const ggml_backend_meta_split_state & ss = buf_ctx->split_state_cache[key].first;
+                const ggml_backend_meta_split_state & ss = buf_ctx->split_state_cache[key].state;
                 ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
             }
             GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
-                ggml_backend_meta_split_axis_name(buf_ctx->split_state_cache[key].first.axis), ne_info.c_str());
+                ggml_backend_meta_split_axis_name(buf_ctx->split_state_cache[key].state.axis), ne_info.c_str());
         }
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
         it = buf_ctx->split_state_cache.find(key);
     }
-    ggml_backend_meta_split_state ret = it->second.first;
+    ggml_backend_meta_split_state ret = it->second.state;
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
@@ -2626,6 +2715,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
+            // the split-state cache's bound: the retired entries (older generations) go
+            if (buf_ctx->split_state_cache.size() > 256*1024) {
+                for (auto it = buf_ctx->split_state_cache.begin(); it != buf_ctx->split_state_cache.end(); ) {
+                    it = it->second.gen != buf_ctx->split_state_gen ? buf_ctx->split_state_cache.erase(it) : std::next(it);
+                }
+            }
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
             // A meta buffer can be shared by more than one scheduler. This is
             // the case for an MTP context that consumes a target context's KV

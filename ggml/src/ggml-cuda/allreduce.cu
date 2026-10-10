@@ -1213,6 +1213,32 @@ void ggml_cuda_ar_window_next(ggml_cuda_ar_pipeline * p, ggml_cuda_ar_window_io 
     }
 }
 
+// The plain reduction of a window with the flag-in-data exchange (allreduce.cuh): F32 data in units of four values.
+// Every thread publishes all of its units before it polls any, so that no thread waits for a unit the peer's thread
+// still has to publish. The result is formed of the two 24-bit values like the exchange of fn_ar_hc.
+static __global__ void ggml_cuda_ar_fid_kernel(
+        float * __restrict__ data, uint4 * __restrict__ wire_mine, const uint4 * __restrict__ wire_other,
+        const int n4, const unsigned int * epoch, const int site) {
+    const int token  = ggml_cuda_ar_window_token(epoch, site);
+    const int stride = gridDim.x * blockDim.x;
+    const int i0     = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = i0; i < n4; i += stride) {
+        const float4 v = *(const float4 *) (data + 4*i);
+        wire_mine[i] = ggml_cuda_ar_pack(ggml_cuda_ar_f24(v.x), ggml_cuda_ar_f24(v.y), ggml_cuda_ar_f24(v.z), ggml_cuda_ar_f24(v.w), token);
+    }
+    for (int i = i0; i < n4; i += stride) {
+        // volatile: __ldcv() and inline PTX loads are loop-invariant for the compiler, which then drops the loop
+        const volatile unsigned int * q = (const volatile unsigned int *) (wire_other + i);
+        while ((int) q[3] != token) {
+        }
+        const float4 o = ggml_cuda_ar_unpack(make_uint4(q[0], q[1], q[2], 0));
+        const float4 v = *(const float4 *) (data + 4*i);
+        *(float4 *) (data + 4*i) = make_float4(
+            __fadd_rn(ggml_cuda_ar_f24_value(ggml_cuda_ar_f24(v.x)), o.x), __fadd_rn(ggml_cuda_ar_f24_value(ggml_cuda_ar_f24(v.y)), o.y),
+            __fadd_rn(ggml_cuda_ar_f24_value(ggml_cuda_ar_f24(v.z)), o.z), __fadd_rn(ggml_cuda_ar_f24_value(ggml_cuda_ar_f24(v.w)), o.w));
+    }
+}
+
 bool ggml_cuda_ar_window_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -1231,6 +1257,9 @@ bool ggml_cuda_ar_window_allreduce(
 
     // the wire type of ggml_cuda_ar_allreduce
     const bool use_bf16 = input_type == GGML_TYPE_F32 && p->bf16_threshold > 0 && input_nbytes >= p->bf16_threshold;
+    // F32 in units of four: the flag-in-data exchange, no fences (GGML_CUDA_AR_FID=0 for the token ring)
+    static const bool fid_on = getenv("GGML_CUDA_AR_FID") == nullptr || atoi(getenv("GGML_CUDA_AR_FID")) != 0;
+    const bool use_fid = fid_on && input_type == GGML_TYPE_F32 && ne % 4 == 0 && n == 2;
 
     ggml_cuda_ar_window_io io[GGML_CUDA_MAX_DEVICES];
     ggml_cuda_ar_window_next(p, io);
@@ -1266,7 +1295,12 @@ bool ggml_cuda_ar_window_allreduce(
             site, \
             p->win_epoch[i])
 
-        if (use_bf16) {
+        if (use_fid) {
+            const int n4 = (int) (ne/4);
+            ggml_cuda_ar_fid_kernel<<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>(
+                reinterpret_cast<float *>(data), reinterpret_cast<uint4 *>(wire_mine), reinterpret_cast<const uint4 *>(wire_other),
+                n4, p->win_epoch[i], site);
+        } else if (use_bf16) {
             LAUNCH_AR_KERNEL(float, nv_bfloat16);
         } else {
             switch (input_type) {

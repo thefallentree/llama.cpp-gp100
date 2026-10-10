@@ -1845,24 +1845,11 @@ fn_hc_up(const uint4 * __restrict__ W, const half * __restrict__ D, const float 
 // __threadfence_system() between the data and a separate signal (that fence takes microseconds on GP100, three of
 // them were most of this kernel). Both devices add the same two rounded values, so their results are identical.
 
-// a float as its upper 24 bits, rounded to nearest
-static __device__ __forceinline__ unsigned int fn_f24(const float x) {
-    return (__float_as_uint(x) + 0x80u) >> 8;
-}
-
-static __device__ __forceinline__ float fn_f24_value(const unsigned int t) {
-    return __uint_as_float(t << 8);
-}
-
-static __device__ __forceinline__ uint4 fn_ar_pack(const unsigned int t0, const unsigned int t1, const unsigned int t2,
-                                                   const unsigned int t3, const int token) {
-    return make_uint4(t0 | (t1 << 24), (t1 >> 8) | (t2 << 16), (t2 >> 16) | (t3 << 8), (unsigned int) token);
-}
-
-static __device__ __forceinline__ float4 fn_ar_unpack(const uint4 u) {
-    return make_float4(fn_f24_value(u.x & 0xffffffu), fn_f24_value((u.x >> 24) | ((u.y & 0xffffu) << 8)),
-                       fn_f24_value((u.y >> 16) | ((u.z & 0xffu) << 16)), fn_f24_value(u.z >> 8));
-}
+// the helpers of the exchange (allreduce.cuh), which the plain window AllReduce shares
+#define fn_f24       ggml_cuda_ar_f24
+#define fn_f24_value ggml_cuda_ar_f24_value
+#define fn_ar_pack   ggml_cuda_ar_pack
+#define fn_ar_unpack ggml_cuda_ar_unpack
 
 // four consecutive weights with one load
 static __device__ __forceinline__ float4 fn_load4(const float * p) {

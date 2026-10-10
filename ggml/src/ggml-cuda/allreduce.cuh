@@ -70,6 +70,29 @@ static __device__ __forceinline__ int ggml_cuda_ar_window_signal_get(const int *
     return *(const volatile int *) p;
 }
 
+// The flag-in-data exchange: four values travel as one 16-byte unit, 24 bits each plus the token of the reduction,
+// and the peer polls that unit until it carries the token. A 16-byte store arrives whole, so a unit with the token
+// is complete: no token ring and no __threadfence_system() between the data and a separate signal (microseconds
+// each on GP100). Both devices add the same two rounded values, so their results are identical.
+// a float as its upper 24 bits, rounded to nearest
+static __device__ __forceinline__ unsigned int ggml_cuda_ar_f24(const float x) {
+    return (__float_as_uint(x) + 0x80u) >> 8;
+}
+
+static __device__ __forceinline__ float ggml_cuda_ar_f24_value(const unsigned int t) {
+    return __uint_as_float(t << 8);
+}
+
+static __device__ __forceinline__ uint4 ggml_cuda_ar_pack(const unsigned int t0, const unsigned int t1, const unsigned int t2,
+                                                          const unsigned int t3, const int token) {
+    return make_uint4(t0 | (t1 << 24), (t1 >> 8) | (t2 << 16), (t2 >> 16) | (t3 << 8), (unsigned int) token);
+}
+
+static __device__ __forceinline__ float4 ggml_cuda_ar_unpack(const uint4 u) {
+    return make_float4(ggml_cuda_ar_f24_value(u.x & 0xffffffu), ggml_cuda_ar_f24_value((u.x >> 24) | ((u.y & 0xffffu) << 8)),
+                       ggml_cuda_ar_f24_value((u.y >> 16) | ((u.z & 0xffu) << 16)), ggml_cuda_ar_f24_value(u.z >> 8));
+}
+
 // io: one per device, in rank order
 void ggml_cuda_ar_window_next(ggml_cuda_ar_pipeline * pipeline, ggml_cuda_ar_window_io * io);
 

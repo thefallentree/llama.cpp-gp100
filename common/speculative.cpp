@@ -1587,8 +1587,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 on_backend = on_backend && chain != nullptr;
             }
             // greedy drafting on the backend without a probability cutoff: the rows need nothing from the host
+            // (one chain row for now: a chain ubatch that both reads and writes the chain tensors, as the middle
+            // ones of a longer chain do, crashed with an illegal memory access on the Meta backend; n_max 3 lost
+            // anyway on the 1K bench: 31.6 ms per round for +0.04 tokens)
             chain_ok = on_backend && !this->params.probabilistic && this->params.p_min <= 0.0f && !eval &&
-                       !is_mem_shared && n_mtp_layers == 1 && this->params.n_max >= 2 &&
+                       !is_mem_shared && n_mtp_layers == 1 && this->params.n_max == 2 &&
                        llama_draft_chain_supported(ctx_dft) &&
                        (getenv("LLAMA_SPEC_CHAIN") == nullptr || atoi(getenv("LLAMA_SPEC_CHAIN")) != 0);
             SPC_TRC("- draft chain: %s\n", chain_ok ? "on" : "off");

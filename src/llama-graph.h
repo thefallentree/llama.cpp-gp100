@@ -846,6 +846,16 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // the draft chain (llama_set_draft_chain): a ubatch whose token and h come from these tensors (in), one that
+    // writes them for the next ubatch (out)
+    struct {
+        bool          in       = false;
+        bool          out      = false;
+        ggml_tensor * tok      = nullptr; // I32 [1]
+        ggml_tensor * h        = nullptr; // F32 [n_embd_out]
+        ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft], null: the model's own table
+    } chain;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -882,6 +892,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (chain.in != other.chain.in || chain.out != other.chain.out) {
             return false;
         }
 
@@ -968,6 +982,9 @@ public:
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
     void set_params(const llm_graph_params & params);
+
+    // would a graph built with these params have the topology of this one (its inputs aside)?
+    bool allow_reuse(const llm_graph_params & params) const { return this->params.allow_reuse(params); }
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;

@@ -2080,7 +2080,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        // the events: with several copies of the inputs the pipeline's, and otherwise still the one that tells
+        // when this scheduler's last graph is done with its inputs, so that another scheduler's work on the same
+        // backend (another graph kept for reuse) is not waited for before the inputs are written
+        bool events = sched->n_copies > 1;
+        if (!events && backends[b]->device != NULL) {
+            static const bool sched_events = getenv("GGML_SCHED_EVENTS") == NULL || atoi(getenv("GGML_SCHED_EVENTS")) != 0;
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(backends[b]->device, &props);
+            events = sched_events && props.caps.events;
+        }
+        if (events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
@@ -2262,6 +2272,15 @@ void ggml_backend_sched_fire(ggml_backend_sched_t sched) {
             sched->backends[i]->iface.fire(sched->backends[i]);
         }
     }
+}
+
+bool ggml_backend_sched_gate_pending(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_backends; i++) {
+        if (sched->backends[i]->iface.gate_pending != NULL && sched->backends[i]->iface.gate_pending(sched->backends[i])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

@@ -7,6 +7,8 @@
 extern "C" {
     GGML_API bool   ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
+    // the split axis of a tensor allocated in a meta buffer (a weight), MIRRORED for any other
+    GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
 }
 FN_PROF_DECL("graph");
 
@@ -4060,10 +4062,23 @@ void llm_graph_context::build_sampling() const {
 
     static const std::vector<uint32_t> dummy_row = { 0 };
 
+    // a Meta device shards the vocabulary when the rows of the head are split over its devices (the output head);
+    // a mirrored head (a draft head, see llama_meta_device_get_split_state) leaves every device the whole row
     bool vocab_sharded = false;
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
         vocab_sharded |= dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+    }
+    if (vocab_sharded) {
+        const ggml_tensor * t = res->t_logits;
+        while (t != nullptr && t->op != GGML_OP_MUL_MAT && t->src[0] != nullptr &&
+                (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_CONT || t->op == GGML_OP_ADD ||
+                 t->op == GGML_OP_MUL || t->op == GGML_OP_SCALE || t->op == GGML_OP_GET_ROWS || t->op == GGML_OP_PAD)) {
+            t = t->src[0];
+        }
+        if (t != nullptr && t->op == GGML_OP_MUL_MAT && t->src[0] != nullptr && t->src[0]->buffer != nullptr) {
+            vocab_sharded = ggml_backend_meta_tensor_split_axis(t->src[0]) == GGML_BACKEND_SPLIT_AXIS_1;
+        }
     }
 
     for (const auto & [seq_id, sampler] : samplers) {
@@ -4092,7 +4107,7 @@ void llm_graph_context::build_sampling() const {
                 // the candidates: the k_pre largest logits of every shard of the row (one shard without a Meta
                 // device), the chain samples from them on the CPU (llama_sampler_chain_set_preselect_k)
                 int n_shards = 1;
-                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched) && vocab_sharded; ++b) {
                     ggml_backend_t backend = ggml_backend_sched_get_backend(sched, b);
                     if (ggml_backend_is_meta(backend)) {
                         n_shards = (int) ggml_backend_meta_n_backends(backend);

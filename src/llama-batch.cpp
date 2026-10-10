@@ -566,7 +566,22 @@ void llama_batch_allocr::split_reset() {
     used.resize(get_n_tokens(), false);
 }
 
+void llama_batch_allocr::set_n_chain(uint32_t n_chain) {
+    this->n_chain = n_chain;
+}
+
+uint32_t llama_batch_allocr::ubatch_cap(uint32_t n_ubatch) const {
+    const uint32_t n_tokens = get_n_tokens();
+    if (n_chain == 0 || n_chain >= n_tokens) {
+        return n_ubatch;
+    }
+    const uint32_t n_first = n_tokens - n_chain;
+    return n_used < n_first ? std::min(n_ubatch, n_first - n_used) : 1;
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    n_ubatch = ubatch_cap(n_ubatch);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -601,6 +616,11 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+    n_ubatch = ubatch_cap(n_ubatch);
+    if (n_chain > 0 && n_ubatch <= n_keep_tail) {
+        n_keep_tail = 0;
+    }
+
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -772,6 +792,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+    n_ubatch = ubatch_cap(n_ubatch);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {

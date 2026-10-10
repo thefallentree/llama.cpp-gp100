@@ -413,8 +413,9 @@ private:
     struct graph_slot {
         llm_graph_result_ptr   res;
         ggml_backend_sched_ptr sched;
-        bool                   valid    = false;
-        uint64_t               last_use = 0;
+        bool                   valid     = false;
+        uint64_t               last_use  = 0;
+        uint32_t               n_compute = 0; // computes of the graph since it was built
     };
 
     std::vector<graph_slot> gf_slots;
@@ -472,6 +473,26 @@ private:
         int64_t                  n_tokens_prev  = 0;
         int64_t                  t_d0 = 0;
     } pending;
+
+    // the draft chain (llama_set_draft_chain): persistent tensors a ubatch's graph writes for the next one
+    struct draft_chain_t {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * tok      = nullptr; // I32 [1]: the argmax of the draft logits of the output row
+        ggml_tensor * h        = nullptr; // F32 [n_embd_out]: its h_nextn row
+        ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft]: the token embeddings of the draft vocabulary (null: model.tok_embd)
+        int32_t       n        = 0;       // the chain rows of the next decode
+        bool          cur_in   = false;   // the ubatch being built reads the chain tensors
+        bool          cur_out  = false;   // ... writes them
+    } draft_chain;
+
+    void draft_chain_init();
+
+public:
+    bool draft_chain_available() const { return draft_chain.tok != nullptr; }
+    void set_draft_chain(int32_t n_chain) { draft_chain.n = draft_chain.tok != nullptr ? std::max(0, n_chain) : 0; }
+
+private:
 
     int  decode_impl(const llama_batch_ext & batch_inp, bool prepare);
     // the outputs of a computed ubatch (the copies to the host, asynchronous)

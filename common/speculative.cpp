@@ -1434,6 +1434,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     const int64_t * d2t     = nullptr;
     int32_t         n_vocab_draft = 0;
 
+    // the draft chain (llama_set_draft_chain): the draft steps after the first run as chain rows of the first
+    // step's decode, their tokens and hidden states stay on the device; one call per draft instead of n_max
+    bool chain_ok = false;
+
     // LLAMA_SPEC_MTP_EVAL=1: the teacher-forced accuracy of the draft head over the prompt batches (its argmax at
     // row k against the token of row k + 1), printed when the drafter is freed
     const bool eval    = getenv("LLAMA_SPEC_MTP_EVAL") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_EVAL")) != 0;
@@ -1576,6 +1580,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        {
+            bool on_backend = true;
+            for (auto * chain : backend_chains) {
+                on_backend = on_backend && chain != nullptr;
+            }
+            // greedy drafting on the backend without a probability cutoff: the rows need nothing from the host
+            chain_ok = on_backend && !this->params.probabilistic && this->params.p_min <= 0.0f && !eval &&
+                       !is_mem_shared && n_mtp_layers == 1 && this->params.n_max >= 2 &&
+                       llama_draft_chain_supported(ctx_dft) &&
+                       (getenv("LLAMA_SPEC_CHAIN") == nullptr || atoi(getenv("LLAMA_SPEC_CHAIN")) != 0);
+            SPC_TRC("- draft chain: %s\n", chain_ok ? "on" : "off");
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1943,6 +1960,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // the draft chain: with one sequence drafting, the rows of the steps after the first follow the row of
+        // id_last, their ids and h placeholders the device fills in (llama_set_draft_chain)
+        const int n_chain = chain_ok && n_drafting == 1 ? params.n_max - 1 : 0;
+        if (n_chain > 0) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id]) {
+                    continue;
+                }
+                const auto & dp = dparams[seq_id];
+                for (int k = 0; k < n_chain; ++k) {
+                    const int32_t idx = batch.add(dp.id_last, dp.pos0 + 1 + k, seq_id, true);
+                    batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+                }
+            }
+            llama_set_draft_chain(ctx_dft, n_chain);
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1965,7 +1999,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int64_t t_d0 = timing ? ggml_time_us() : 0;
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (timing) { t_phase_us[4] += ggml_time_us() - t_d0; }
-            n_draft_step++;
+            n_draft_step += 1 + n_chain;
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -1987,10 +2021,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+              // the rows of this step: one, or with the draft chain the row of id_last and its chain rows after it
+              for (int k = 0; k <= n_chain && drafting[seq_id]; ++k) {
+                const int32_t i_row = i_last[seq_id] + k;
+
                 const int64_t t_s0 = timing ? ggml_time_us() : 0;
-                llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_row, true);
                 const int64_t t_s1 = timing ? ggml_time_us() : 0;
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                const float * h_row = n_chain > 0 ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_row);
                 if (timing) {
                     t_phase_us[5] += t_s1 - t_s0;
                     t_phase_us[6] += ggml_time_us() - t_s1;
@@ -2000,19 +2038,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 if (d2t != nullptr) {
                     // the backend sampled in the draft vocabulary: the ids become target token ids
+                    if (!(id_sampled >= 0 && id_sampled < n_vocab_draft)) {
+                        SPC_ERR("draft step %d: sampled id %d outside the draft vocabulary of %d (row %d)\n", i + k, (int) id_sampled, (int) n_vocab_draft, (int) i_row);
+                    }
                     GGML_ASSERT(id_sampled >= 0 && id_sampled < n_vocab_draft);
                     id_sampled = (llama_token) d2t[id_sampled];
-                    for (size_t k = 0; k < cur_p->size; ++k) {
-                        if (cur_p->data[k].id >= 0 && cur_p->data[k].id < n_vocab_draft) {
-                            cur_p->data[k].id = (llama_token) d2t[cur_p->data[k].id];
+                    for (size_t c = 0; c < cur_p->size; ++c) {
+                        if (cur_p->data[c].id >= 0 && cur_p->data[c].id < n_vocab_draft) {
+                            cur_p->data[c].id = (llama_token) d2t[cur_p->data[c].id];
                         }
                     }
                 }
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                for (int c = 0; c < std::min(3, (int) cur_p->size); ++c) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                            seq_id, c, i + k, cur_p->data[c].id, cur_p->data[c].p,
+                            common_token_to_piece(ctx_dft, cur_p->data[c].id).c_str());
                 }
 
                 // add drafted token for each sequence
@@ -2037,9 +2078,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() || (n_chain > 0 && k == n_chain)) {
                     drafting[seq_id] = false;
                     n_drafting--;
+                    continue;
+                }
+
+                if (n_chain > 0) {
+                    // the next rows of the chain are computed
                     continue;
                 }
 
@@ -2065,6 +2111,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 }
+              }
             }
 
             if (batch.size() == 0) {
@@ -2865,6 +2912,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }
+    }
+
+    // the MTP drafter's draft chain decodes every draft step of a call in one go and samples each on the backend
+    // (llama_set_draft_chain)
+    const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (has_mtp && params_spec.backend_sampling) {
+        const int32_t per_seq = std::max(1, params_spec.n_max);
+        result.n_outputs_max         = std::max(result.n_outputs_max, params.n_parallel * per_seq);
+        result.n_outputs_max_per_seq = std::max(result.n_outputs_max_per_seq, per_seq);
     }
 
     return result;

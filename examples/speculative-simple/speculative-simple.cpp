@@ -225,11 +225,14 @@ int main(int argc, char ** argv) {
                     batch_tgt.add(id, n_past + i, seq_id, true);
                 }
                 const int64_t t0 = ggml_time_us();
-                if (llama_decode_prepare(ctx_tgt, batch_tgt.get()) == 0) {
+                const int32_t rc = llama_decode_prepare(ctx_tgt, batch_tgt.get());
+                if (rc == 0) {
                     n_prepared = n_rows;
                     t_prepared = t0;
+                } else if (rc == 3) {
+                    LOG_DBG("%s", "no gated window for this decode yet, decoding it after the draft\n");
                 } else {
-                    LOG_ERR("%s", "llama_decode_prepare failed\n");
+                    LOG_ERR("llama_decode_prepare failed, rc = %d\n", rc);
                 }
             };
             if (spec_ahead && !spec_ahead_late) {

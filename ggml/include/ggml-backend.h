@@ -374,6 +374,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_deferred_inputs(ggml_backend_sched_t sched, bool deferred);
     GGML_API bool                 ggml_backend_sched_copy_input(ggml_backend_sched_t sched, const struct ggml_tensor * input);
     GGML_API void                 ggml_backend_sched_fire(ggml_backend_sched_t sched);
+    // is a launched graph waiting on its gate for the inputs (a backend of the scheduler holds one)?
+    GGML_API bool                 ggml_backend_sched_gate_pending(ggml_backend_sched_t sched);
 
     //
     // Meta backend

@@ -660,33 +660,44 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
-
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
-
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->embd);
-
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
-
     ggml_tensor * tok_embd = nullptr;
-    if (llm_graph_tok_embd_host(model.tok_embd)) {
-        // the rows gathered on the host: no get_rows of the host table, the draft window is one split
-        inp->tok_embd_host = model.tok_embd;
-        inp->tok_rows      = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.tok_embd->ne[0], n_tokens);
-        ggml_set_input(inp->tok_rows);
-        tok_embd = inp->tok_rows;
+    ggml_tensor * h        = nullptr;
+
+    if (params.chain.in) {
+        // a chain row (llama_set_draft_chain): its token is the argmax the ubatch before left on the device, its
+        // embedding a row of the draft vocabulary's table there, its h the output row the ubatch before left
+        GGML_ASSERT(n_tokens == 1 && params.chain.tok != nullptr && params.chain.h != nullptr);
+        ggml_tensor * table = params.chain.tok_embd != nullptr ? params.chain.tok_embd : model.tok_embd;
+        tok_embd = ggml_get_rows(ctx0, table, params.chain.tok);
+        h        = ggml_reshape_2d(ctx0, params.chain.h, hparams.n_embd_out(), 1);
     } else {
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->embd);
+
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+
+        if (llm_graph_tok_embd_host(model.tok_embd)) {
+            // the rows gathered on the host: no get_rows of the host table, the draft window is one split
+            inp->tok_embd_host = model.tok_embd;
+            inp->tok_rows      = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.tok_embd->ne[0], n_tokens);
+            ggml_set_input(inp->tok_rows);
+            tok_embd = inp->tok_rows;
+        } else {
+            tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        }
+
+        h = inp->h;
+
+        res->add_input(std::move(inp));
     }
     cb(tok_embd, "mtp_tok_embd", il);
-
-    ggml_tensor * h = inp->h;
-
-    res->add_input(std::move(inp));
 
     auto * inp_hyb = build_inp_mem_hybrid();
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
@@ -738,6 +749,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     if (layer.nextn.shared_head_head) {
         cur = build_lora_mm(layer.nextn.shared_head_head, cur);
+        if (params.chain.out) {
+            // the next ubatch is a chain row: leave it the argmax of these logits (an id of the draft vocabulary, as
+            // its table is) and the output row's h
+            GGML_ASSERT(params.chain.tok != nullptr && params.chain.h != nullptr);
+            GGML_ASSERT(cur->ne[1] == 1 && flat_out->ne[1] == 1 && "the ubatch before a chain row has one output");
+            ggml_tensor * chain_tok = ggml_argmax(ctx0, cur);
+            cb(chain_tok, "draft_chain_tok", il);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, chain_tok, params.chain.tok));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_1d(ctx0, flat_out, flat_out->ne[0]), params.chain.h));
+        }
         // a reduced draft vocabulary (d2t): on a tensor-split model the logits stay in the draft vocabulary (they are
         // sharded, a scatter cannot be expressed; the backend sampler's argmax is a draft id that the drafter maps);
         // on one device they are scattered to their target token ids, the rest -inf, so that any sampler works

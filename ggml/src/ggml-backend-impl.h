@@ -103,6 +103,8 @@ extern "C" {
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
+    // the split axis of a tensor allocated in a meta buffer (a weight), MIRRORED for any other
+    GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
     //

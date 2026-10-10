@@ -168,6 +168,10 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
+    // the draft chain (llama_set_draft_chain): the last n_chain tokens of the batch each form a ubatch of their own,
+    // after the rest; 0 = off
+    void set_n_chain(uint32_t n_chain);
+
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 
@@ -241,6 +245,11 @@ private:
     std::vector<int32_t> out_ids;
 
     uint32_t n_used;
+
+    uint32_t n_chain = 0;
+
+    // the ubatch size the split functions get: capped by the draft chain
+    uint32_t ubatch_cap(uint32_t n_ubatch) const;
 
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;

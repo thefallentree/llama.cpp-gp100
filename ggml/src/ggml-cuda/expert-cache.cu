@@ -17,12 +17,16 @@ FN_PROF_DECL("ec");
 #define EC_SCAN_TPB    512
 #define EC_RES_CAND    7     // exchanges of a layer that come back with its counts: a decode window has fewer
 
-// one slice exchange: n16 16-byte words
+// one slice exchange: n16 16-byte words. The incoming slice goes from host[h] to the spare VRAM slot dev_to, the
+// evicted one from dev to the spare host slot host_to (spare slots: nothing reads them meanwhile, so the copies
+// need no wait from the graphs); without spares (dev_to == dev) the two are swapped in place.
 struct ec_job {
     uint4 *  dev;
     uint4 *  host;
+    uint4 *  dev_to;
+    uint4 *  host_to;
     uint32_t n16;
-    uint32_t pad;
+    uint32_t pad[3];
 };
 
 // the new positions of the two experts of an exchange (indexes into the table of all layers)
@@ -59,16 +63,21 @@ struct ec_layer {
     char * hot[3]  = {};          // up, gate, down: the slices of the experts in VRAM
     char * cold[3] = {};          // their slices in pinned host memory
     size_t nb2[3]  = {};          // bytes per expert
-    int    n_hot   = 0;
-    int    n_cold  = 0;
+    int    n_hot   = 0;           // VRAM slots (the experts there plus the spares)
+    int    n_cold  = 0;           // host slots
+    int    n_expert = 0;          // the experts: n_hot + n_cold - 2*n_spare
     bool   dead    = false;       // its buffer was freed
+    bool   perm_dirty = false;    // the row on the device is not this perm (registered during a capture)
     std::vector<int32_t> perm;    // expert -> position: a VRAM slot below n_hot, else n_hot + host slot
+    // spare slots (LLAMA_EXPERT_SPARE): free now, and freed by the last exchange (free once it is done)
+    std::vector<int32_t> free_v, free_h, pend_v, pend_h;
 };
 
 struct ec_device {
     std::mutex            mtx;
     std::vector<ec_layer> layers;
     std::atomic<int>      n_layers { 0 };
+    std::atomic<bool>     perm_dirty { false }; // a layer's perm registered during a capture is not on the device yet
     std::atomic<bool>     ready { false }; // the tables exist
     int32_t *    perm_dev    = nullptr;  // [EC_MAX_LAYERS][EC_MAX_EXPERTS]
     uint32_t *   counts_dev  = nullptr;  // likewise: how often each expert was routed to
@@ -122,8 +131,8 @@ static __global__ void ec_swap(const ec_job * __restrict__ jobs, const int n_job
         for (uint32_t i = threadIdx.x; i < job.n16; i += blockDim.x) {
             const uint4 h = job.host[i];
             const uint4 d = job.dev[i];
-            job.dev[i]  = h;
-            job.host[i] = d;
+            job.dev_to[i]  = h;
+            job.host_to[i] = d;
         }
     }
     if (threadIdx.x == 0) {
@@ -284,6 +293,16 @@ static bool ec_alloc(ec_device & d, const int device) {
     return true;
 }
 
+// do the layers have spare slots? (then the exchanges never hold a graph)
+static bool n_spare_any(const ec_device & d) {
+    for (const ec_layer & l : d.layers) {
+        if (!l.free_v.empty() || !l.pend_v.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // the sizes of the layers that registered since the last update and their first use counts; no layer where one died
 static void ec_rows_sync(ec_device & d) {
     const size_t n_rows = d.layers.size();
@@ -294,7 +313,7 @@ static void ec_rows_sync(ec_device & d) {
     std::vector<float>  prior(EC_MAX_EXPERTS);
     for (size_t row = 0; row < n_rows; ++row) {
         const ec_layer & l = d.layers[row];
-        const int n_all = l.n_hot + l.n_cold;
+        const int n_all = l.n_expert;
         rows[row] = { l.n_hot, l.dead ? 0 : n_all };
         if (row >= d.n_rows_dev) {
             // the file's order is by use in a calibration text: a weak prior
@@ -362,7 +381,10 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
     const ggml_tensor * w[3]    = { up->src[0], gate->src[0], down->src[0] };
     const char *        cold[3] = { c_up, c_gate, c_down };
     const int n_hot = (int) down->src[0]->ne[2];
-    bool ok = n_hot + n_cold <= EC_MAX_EXPERTS && n_cold > 0 && d.layers.size() < EC_MAX_LAYERS;
+    // the spare slots at the end of both tensors (llama-model: LLAMA_EXPERT_SPARE pads them past the file's data)
+    static const int n_spare_env = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
+    const int n_spare = std::min(n_spare_env, std::min(n_hot, n_cold) - 1);
+    bool ok = n_hot + n_cold <= EC_MAX_EXPERTS && n_cold > 0 && d.layers.size() < EC_MAX_LAYERS && n_spare >= 0;
     for (int k = 0; k < 3 && ok; ++k) {
         ok = w[k]->ne[2] == n_hot && w[k]->nb[2] % 16 == 0 && ((uintptr_t) w[k]->data & 0xF) == 0 &&
              ((uintptr_t) cold[k] & 0xF) == 0 && cold[k] != nullptr;
@@ -379,13 +401,30 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
         l.cold[k] = (char *) cold[k];
         l.nb2[k]  = w[k]->nb[2];
     }
-    l.n_hot  = n_hot;
-    l.n_cold = n_cold;
-    l.perm.resize(n_hot + n_cold);
-    for (int e = 0; e < n_hot + n_cold; ++e) {
-        l.perm[e] = e;
+    l.n_hot    = n_hot;
+    l.n_cold   = n_cold;
+    l.n_expert = n_hot + n_cold - 2*n_spare;
+    l.perm.resize(l.n_expert);
+    const int n_hot_map = n_hot - n_spare; // the file's experts in VRAM: the first ones, then the host slots
+    for (int e = 0; e < l.n_expert; ++e) {
+        l.perm[e] = e < n_hot_map ? e : n_hot + (e - n_hot_map);
     }
-    // the row of the layer on the device is the identity already (ec_alloc), the update before its first use sends the rest
+    for (int i = 0; i < n_spare; ++i) {
+        l.free_v.push_back(n_hot_map + i);
+        l.free_h.push_back(n_cold - n_spare + i);
+    }
+    // the row of the layer on the device is the identity (ec_alloc): with spares the perm differs from it and goes
+    // to the device now, or before the next graph when a capture is in progress (ggml_cuda_expert_cache_wait)
+    if (n_spare > 0) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+        if (cap == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaMemcpy(d.perm_dev + d.layers.size()*EC_MAX_EXPERTS, l.perm.data(), l.perm.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+        } else {
+            l.perm_dirty = true;
+            d.perm_dirty = true;
+        }
+    }
     d.layers.push_back(std::move(l));
     d.n_layers.store((int) d.layers.size(), std::memory_order_release);
     if (d.owner == nullptr) {
@@ -537,34 +576,72 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     }
     FN_PROF_T(t_ec2);
     const int  n_swaps = (int) swaps.size();
-    const int  n_jobs  = 3*n_swaps;
-    ec_patch * patches = (ec_patch *) (d.jobs_host + n_jobs);
+    ec_patch * patches = (ec_patch *) (d.jobs_host + 3*n_swaps);
+    // the slots the last exchange freed are free once it is done: it had the round (the join is usually immediate)
+    if (ctx.ec_event != nullptr && ctx.ec_pend) {
+        CUDA_CHECK(cudaEventSynchronize(ctx.ec_event));
+        ctx.ec_pend = false;
+        for (ec_layer & l : d.layers) {
+            l.free_v.insert(l.free_v.end(), l.pend_v.begin(), l.pend_v.end());
+            l.free_h.insert(l.free_h.end(), l.pend_h.begin(), l.pend_h.end());
+            l.pend_v.clear();
+            l.pend_h.clear();
+        }
+    }
+    int n_taken = 0;
     for (int i = 0; i < n_swaps; ++i) {
         const swap & s = swaps[i];
         ec_layer &   l = d.layers[s.row];
+        if (l.perm[s.e_out] >= l.n_hot || l.perm[s.e_in] < l.n_hot) {
+            continue; // the scan saw the table before the last patch: not an exchange any more
+        }
         const int v = l.perm[s.e_out];           // VRAM slot
         const int h = l.perm[s.e_in] - l.n_hot;  // host slot
-        for (int k = 0; k < 3; ++k) {
-            d.jobs_host[3*i + k] = { (uint4 *) (l.hot[k] + (size_t) v*l.nb2[k]), (uint4 *) (l.cold[k] + (size_t) h*l.nb2[k]),
-                                     (uint32_t) (l.nb2[k]/16), 0 };
+        int v_to = v, h_to = h;
+        if (!l.free_v.empty() && !l.free_h.empty()) {
+            // into spare slots: the graphs keep reading v and h until the patch, nothing reads the spares
+            v_to = l.free_v.back(); l.free_v.pop_back();
+            h_to = l.free_h.back(); l.free_h.pop_back();
+            l.pend_v.push_back(v);
+            l.pend_h.push_back(h);
+        } else if (!l.free_v.empty() || !l.free_h.empty() || n_spare_any(d)) {
+            continue; // this layer's spares are taken this round: the exchange waits for the next update
         }
-        l.perm[s.e_in]  = v;
-        l.perm[s.e_out] = l.n_hot + h;
-        patches[i] = { s.row*EC_MAX_EXPERTS + s.e_in, v, s.row*EC_MAX_EXPERTS + s.e_out, l.n_hot + h };
+        for (int k = 0; k < 3; ++k) {
+            d.jobs_host[3*n_taken + k] = { (uint4 *) (l.hot[k] + (size_t) v*l.nb2[k]), (uint4 *) (l.cold[k] + (size_t) h*l.nb2[k]),
+                                           (uint4 *) (l.hot[k] + (size_t) v_to*l.nb2[k]), (uint4 *) (l.cold[k] + (size_t) h_to*l.nb2[k]),
+                                           (uint32_t) (l.nb2[k]/16), { 0, 0, 0 } };
+        }
+        l.perm[s.e_in]  = v_to;
+        l.perm[s.e_out] = l.n_hot + h_to;
+        patches[n_taken] = { s.row*EC_MAX_EXPERTS + s.e_in, v_to, s.row*EC_MAX_EXPERTS + s.e_out, l.n_hot + h_to };
+        n_taken++;
     }
-    d.n_swaps += swaps.size();
+    if (n_taken == 0) {
+        return;
+    }
+    d.n_swaps += n_taken;
     // The slices and the positions, on a stream of their own: what the caller copies from the device next (the
     // results of the window) does not wait for megabytes over PCIe. The next graph does (ggml_cuda_expert_cache_wait).
     cudaStream_t xs = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
-    CUDA_CHECK(cudaMemcpyAsync(d.jobs_dev, d.jobs_host, n_jobs*sizeof(ec_job) + n_swaps*sizeof(ec_patch), cudaMemcpyHostToDevice, xs));
-    ec_swap<<<std::min(n_jobs, EC_SWAP_GRID), EC_SWAP_TPB, 0, xs>>>(d.jobs_dev, n_jobs, (const ec_patch *) (d.jobs_dev + n_jobs), n_swaps,
+    const int n_jobs = 3*n_taken;
+    // the patches follow the jobs of the swaps taken; the table was laid out for every candidate, pack it
+    if (n_taken < n_swaps) {
+        memmove(d.jobs_host + n_jobs, patches, n_taken*sizeof(ec_patch));
+        patches = (ec_patch *) (d.jobs_host + n_jobs);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d.jobs_dev, d.jobs_host, n_jobs*sizeof(ec_job) + n_taken*sizeof(ec_patch), cudaMemcpyHostToDevice, xs));
+    ec_swap<<<std::min(n_jobs, EC_SWAP_GRID), EC_SWAP_TPB, 0, xs>>>(d.jobs_dev, n_jobs, (const ec_patch *) (d.jobs_dev + n_jobs), n_taken,
         d.perm_dev);
     CUDA_CHECK(cudaGetLastError());
     if (ctx.ec_event == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx.ec_event, cudaEventDisableTiming));
     }
     CUDA_CHECK(cudaEventRecord(ctx.ec_event, xs));
-    ctx.ec_wait = true;
+    // with spares the graphs need not wait for the exchange (the slots they read are untouched, the patch is
+    // consistent at any point); without, the next graph waits for it
+    ctx.ec_wait = !n_spare_any(d);
+    ctx.ec_pend = true;
     FN_PROF_ADD("ec.enqueue", t_ec2);
 }
 
@@ -596,6 +673,20 @@ void ggml_cuda_expert_cache_update_async(ggml_backend_cuda_context & ctx) {
 
 void ggml_cuda_expert_cache_wait(ggml_backend_cuda_context & ctx) {
     ggml_cuda_expert_cache_join(ctx);
+    ec_device & d = g_ec[ctx.device];
+    if (d.perm_dirty.load(std::memory_order_acquire)) {
+        // a layer registered during a capture: its perm goes to the device before the graph that reads it
+        std::lock_guard<std::mutex> lock(d.mtx);
+        ggml_cuda_set_device(ctx.device);
+        for (size_t row = 0; row < d.layers.size(); ++row) {
+            ec_layer & l = d.layers[row];
+            if (l.perm_dirty) {
+                CUDA_CHECK(cudaMemcpy(d.perm_dev + row*EC_MAX_EXPERTS, l.perm.data(), l.perm.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+                l.perm_dirty = false;
+            }
+        }
+        d.perm_dirty.store(false, std::memory_order_release);
+    }
     if (!ctx.ec_wait) {
         return;
     }

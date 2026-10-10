@@ -6030,6 +6030,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
+        // a hot/cold layer registered during the capture: its table goes to the device before the launch
+        ggml_cuda_expert_cache_wait(*cuda_ctx);
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else

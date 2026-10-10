@@ -231,6 +231,14 @@ struct llama_model_loader {
     // tensors are created. False, and nothing changed, if the two are not stored one after the other.
     bool resplit(const std::string & first, const std::string & second, int64_t n_first, int axis);
 
+    // Makes a tensor n_extra slices longer along `axis` than the file holds (spare slots of an expert cache): the
+    // created tensor and its buffer are the larger size, the file's bytes go to its first slices, the rest is left
+    // as allocated. Call it before the tensor is created. False if the tensor is not in the file.
+    bool pad_dim(const std::string & name, int axis, int64_t n_extra);
+
+    // the bytes the file holds for a tensor padded with pad_dim (ggml_nbytes otherwise)
+    std::map<std::string, size_t> n_bytes_file;
+
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 
     const struct ggml_tensor * check_tensor_dims(

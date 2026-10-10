@@ -237,6 +237,30 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
         LLAMA_LOG_INFO("%s: %.1f hot experts per layer on average (the file's split: %u)\n", __func__, (double) total/n_layer, hparams.n_expert_hot);
     }
+    // Spare expert slots (LLAMA_EXPERT_SPARE=N, default 4) on both sides of every hot/cold layer: an exchange of the
+    // expert cache copies into spares and remaps, so that a running graph never waits for the copies (the slots it
+    // reads stay what they are). The tensors are N slices longer than the file holds (ggml-cuda/expert-cache.cu).
+    int64_t n_spare = 0;
+    if (hparams.n_expert_hot > 0 && !mtp_only) {
+        n_spare = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
+        static const llm_tensor exps[3][2] = {
+            { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
+            { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
+            { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
+        };
+        int n_padded = 0;
+        for (int il = 0; il < n_layer && n_spare > 0; ++il) {
+            for (const auto & pair : exps) {
+                n_padded += ml.pad_dim(tn(pair[0], "weight", il).str(), 2, n_spare) ? 1 : 0;
+                n_padded += ml.pad_dim(tn(pair[1], "weight", il).str(), 2, n_spare) ? 1 : 0;
+            }
+        }
+        if (n_padded > 0) {
+            LLAMA_LOG_INFO("%s: %" PRId64 " spare expert slots per layer on each side (%d tensors padded)\n", __func__, n_spare, n_padded);
+        } else {
+            n_spare = 0;
+        }
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -336,13 +360,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // with nextn.expert_count the MTP block has its own expert count (an expert-pruned trunk, the vendor's draft block)
         const int64_t n_expert_l = il >= n_layer && hparams.n_expert_nextn > 0 ? (int64_t) hparams.n_expert_nextn : n_expert;
         const int64_t n_hot = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) && il < n_layer ? n_hot_layer[il] : n_expert_l;
+        // the trunk's hot and cold tensors carry n_spare slots past their experts (padded above)
+        const int64_t n_sp  = hparams.n_expert_hot > 0 && !(flags & TENSOR_SKIP) && il < n_layer && n_hot < n_expert_l ? n_spare : 0;
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert_l }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_hot }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_hot, flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_hot + n_sp }, flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_hot + n_sp, flags);
         if (n_hot < n_expert_l) {
-            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", il), { n_ff_exp, n_embd, n_expert_l - n_hot }, flags);
-            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", il), { n_embd, n_ff_exp, n_expert_l - n_hot }, flags);
-            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", il), { n_embd, n_ff_exp, n_expert_l - n_hot }, flags);
+            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", il), { n_ff_exp, n_embd, n_expert_l - n_hot + n_sp }, flags);
+            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", il), { n_embd, n_ff_exp, n_expert_l - n_hot + n_sp }, flags);
+            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", il), { n_embd, n_ff_exp, n_expert_l - n_hot + n_sp }, flags);
             GGML_ASSERT(layer.ffn_gate_exps && layer.ffn_up_exps && "cold experts need separate gate and up tensors");
             exps_cold[layer.ffn_down_exps] = layer.ffn_down_exps_cold;
             exps_cold[layer.ffn_gate_exps] = layer.ffn_gate_exps_cold;

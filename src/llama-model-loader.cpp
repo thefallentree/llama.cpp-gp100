@@ -894,6 +894,22 @@ bool llama_model_loader::resplit(const std::string & first, const std::string & 
     return true;
 }
 
+bool llama_model_loader::pad_dim(const std::string & name, const int axis, const int64_t n_extra) {
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end() || axis < 0 || axis >= GGML_MAX_DIMS || n_extra < 0) {
+        return false;
+    }
+    ggml_tensor * t = it->second.tensor;
+    if (n_bytes_file.find(name) == n_bytes_file.end()) {
+        n_bytes_file[name] = ggml_nbytes(t);
+    }
+    t->ne[axis] += n_extra;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        t->nb[d] = t->nb[d - 1]*t->ne[d - 1];
+    }
+    return true;
+}
+
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
     const auto * weight = get_weight(name);
     if (!weight) {
@@ -1675,6 +1691,13 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+        {
+            // a tensor padded past the file's data (pad_dim) reads what the file holds
+            const auto it_pad = n_bytes_file.find(ggml_get_name(cur));
+            if (it_pad != n_bytes_file.end()) {
+                n_size = std::min(n_size, it_pad->second);
+            }
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1787,6 +1810,9 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+        if (n_size < ggml_nbytes(cur)) {
+            size_done += ggml_nbytes(cur) - n_size; // the padding counts as done (size_data holds the padded size)
+        }
     }
 
     // free temporary resources used for async uploads

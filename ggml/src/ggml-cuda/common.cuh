@@ -1583,6 +1583,7 @@ struct ggml_backend_cuda_context {
     bool                ec_pending  = false;
     cudaEvent_t         ec_event    = nullptr; // the end of the last exchange, on its own stream
     bool                ec_wait     = false;   // the next graph has to wait for it
+    bool                ec_pend     = false;   // an exchange was started since the slots it frees were taken back
     std::future<void>   ec_future;             // an update running on a thread (ggml_cuda_expert_cache_update_async)
 
     // temporary (GGML_CUDA_FN_WAITS=1): device counters of the waits inside kernels, in clock64() ticks:

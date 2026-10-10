@@ -327,6 +327,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    int32_t n_bias = 0; // the tokens a bias may lower (the candidate pre-selection below counts them)
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
 
@@ -338,6 +339,7 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+            n_bias = (int32_t) merged.size();
         }
     }
 
@@ -429,6 +431,56 @@ struct common_sampler * common_sampler_init(
 
     for (auto * smpl : samplers) {
         llama_sampler_chain_add(chain, smpl);
+    }
+
+    // On a backend that cannot run the chain (a vocabulary sharded over devices) the chain samples on the CPU from
+    // the candidates the backend pre-selects, when that is exact: the first truncation is a top-k, and before it
+    // only samplers that lower logits (penalties of the usual sign, non-positive biases) or none: a lowered token
+    // can leave the top-k but no token outside the top-(k + lowered) can enter it. Otherwise the CPU runs on every
+    // logit of the row as before (248K of them: ~1 ms per token).
+    static const bool preselect_on = getenv("LLAMA_SAMPLER_PRESELECT") == nullptr || atoi(getenv("LLAMA_SAMPLER_PRESELECT")) != 0;
+    if (preselect_on && params.backend_sampling && params.mirostat == 0 && !grmr && !rbudget) {
+        int32_t k_pre = 0;
+        bool    ok    = true;
+        for (const auto & b : params.logit_bias) {
+            ok = ok && b.bias <= 0.0f;
+        }
+        int32_t n_lowered = n_bias;
+        if (greedy_only) {
+            // [logit biases, greedy]: the argmax among the candidates not lowered; a bare greedy runs on the backend
+            if (n_bias > 0) {
+                k_pre = 1 + n_bias;
+            }
+        } else for (const auto & cnstr : params.samplers) {
+            if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
+                if (params.top_k > 0 && params.top_k <= 1024) {
+                    k_pre = params.top_k + n_lowered;
+                }
+                break;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_PENALTIES) {
+                const bool active = params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f);
+                if (active) {
+                    ok = ok && params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f && params.penalty_last_n > 0;
+                    n_lowered += params.penalty_last_n;
+                }
+                continue;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_DRY && params.dry_multiplier == 0.0f) {
+                continue;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_TOP_N_SIGMA && params.top_n_sigma < 0.0f) {
+                continue;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp > 0.0f) {
+                continue; // a positive scale keeps the order
+            }
+            ok = false; // another truncation or an unbounded change of the logits before the top-k
+            break;
+        }
+        if (ok && k_pre > 0) {
+            llama_sampler_chain_set_preselect_k(chain, k_pre);
+        }
     }
 
     if (grmr && params.backend_sampling) {
@@ -677,7 +729,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // common_sampler_init) and no caller interested in probabilities: scan the logits row for its maximum instead
     // of materializing and filtering an n_vocab-sized candidate array (~1.3 ms per token on a 248k vocabulary).
     // Logit biases (e.g. --ignore-eos) and suppressed tokens are applied to the few tokens they name.
-    if (!grmr && !rbudget && common_sampler_is_greedy(gsmpl->params)) {
+    // with the backend's candidates (llama_sampler_chain_set_preselect_k) the chain runs on them below
+    if (!grmr && !rbudget && common_sampler_is_greedy(gsmpl->params) && llama_get_sampled_candidates_count_ith(ctx, idx) == 0) {
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const int     n_vocab = llama_vocab_n_tokens(vocab);

@@ -743,6 +743,15 @@ static bool llama_sampler_chain_backend_init(
     bool res = true;
     bool backend_prefix = true;
 
+    if (chain->preselect_k > 0) {
+        // the backend selects the candidates, every sampler runs on the CPU on them
+        for (auto & smpl : chain->samplers) {
+            smpl.is_backend = false;
+        }
+        chain->n_nodes = 8;
+        return true;
+    }
+
     for (auto & smpl : chain->samplers) {
         bool cur_prefix = backend_prefix;
 
@@ -874,12 +883,25 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
             /* .params               = */ params,
             /* .is_init              = */ false,
             /* .n_nodes              = */ 0,
+            /* .preselect_k          = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
             /* .t_sample_us          = */ 0,
             /* .n_sample             = */ 0,
         }
     );
+}
+
+void llama_sampler_chain_set_preselect_k(struct llama_sampler * chain, int32_t k) {
+    GGML_ASSERT(chain != nullptr && chain->iface == &llama_sampler_chain_i);
+    ((llama_sampler_chain *) chain->ctx)->preselect_k = k;
+}
+
+int32_t llama_sampler_chain_get_preselect_k(const struct llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return 0;
+    }
+    return ((const llama_sampler_chain *) chain->ctx)->preselect_k;
 }
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {

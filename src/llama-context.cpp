@@ -1353,7 +1353,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     for (const auto & dev : model.devices) {
         on_meta |= dev.is_meta;
     }
-    if (sampler && on_meta && !sampler_is_bare_greedy(sampler)) {
+    if (sampler && on_meta && !sampler_is_bare_greedy(sampler) && llama_sampler_chain_get_preselect_k(sampler) > 0) {
+        static bool announced = false;
+        if (!announced) {
+            LLAMA_LOG_INFO("%s: tensor-split model: the chain samples on the CPU from the top-%d candidates of every shard\n",
+                    __func__, llama_sampler_chain_get_preselect_k(sampler));
+            announced = true;
+        }
+    } else if (sampler && on_meta && !sampler_is_bare_greedy(sampler)) {
         static bool warned = false;
         if (!warned) {
             std::string chain_desc;
@@ -1374,7 +1381,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampling.samplers.erase(seq_id);
         return false;
     }
-    if (sampler && on_meta) {
+    if (sampler && on_meta && llama_sampler_chain_get_preselect_k(sampler) == 0) {
         static bool announced = false;
         if (!announced) {
             LLAMA_LOG_INFO("%s: tensor-split model: greedy chain runs on the backend\n", __func__);

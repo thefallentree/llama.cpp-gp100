@@ -680,6 +680,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
 
+        // A TOP_K over a vocab-sharded row: every shard keeps its own top-k (its share of the k requested, the
+        // shards being equal) and the result is their lists one after the other, split on axis 0; the indices
+        // are local to the shard until the readback adds the shards' offsets (ggml_backend_meta_get_tensor_async).
+        // The candidates a sampler chain on the CPU samples from (llama_sampler_chain_set_preselect_k).
+        if (tensor->op == GGML_OP_TOP_K && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].n_segments == 1) {
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            size_t n_shards = 0;
+            for (size_t j = 0; j < n_bufs; j++) {
+                n_shards += src_ss[0].ne[j] > 0 ? 1 : 0;
+            }
+            if (n_shards > 1) {
+                GGML_ASSERT(tensor->ne[0] % (int64_t) n_shards == 0 && "the top-k over a sharded row: k must be a multiple of the shard count");
+                for (size_t j = 0; j < n_bufs; j++) {
+                    GGML_ASSERT((src_ss[0].ne[j] == 0 || src_ss[0].ne[j] == tensor->src[0]->ne[0] / (int64_t) n_shards) &&
+                                "the top-k over a sharded row: the shards must be equal");
+                }
+                return src_ss[0]; // the ratio of the shards is what the per-shard sizes take over below
+            }
+        }
+
         // A per-row op is still well defined under a nominal axis-0 split when
         // the whole row lives on backend 0 and every other shard is empty, as
         // with an output head that a split model keeps unsharded.  The op runs
@@ -919,6 +939,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_get_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
+        }
+        // the rows sharded (a sharded vocabulary row reshaped to one row per logit) gathered with the indices every
+        // shard produced for its own rows (the per-shard TOP_K above): each shard gathers its own, the result is
+        // split like the indices, on the rows' axis of the output
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                tensor->src[1]->op == GGML_OP_TOP_K && tensor->ne[0] == tensor->src[0]->ne[0]) {
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
         }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
@@ -2140,6 +2167,15 @@ struct ggml_backend_meta_context {
     size_t                       argmax_scratch_size = 0;
     size_t                       argmax_scratch_used = 0;
 
+    // the readback of a per-shard TOP_K over a sharded row: the shards' indices are local, the shard's column
+    // offset is added once the data is in (at the synchronize)
+    struct topk_readback {
+        int32_t *            ids;
+        std::vector<int64_t> n;      // per shard: entries
+        std::vector<int64_t> offset; // per shard: the first column of the shard in the row
+    };
+    std::vector<topk_readback> topk_pending;
+
     struct window_entry {
         uint64_t uid       = 0;
         void *   window    = nullptr; // captured
@@ -2369,6 +2405,28 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
         }
     }
 
+    // a per-shard TOP_K (handle_per_row): the indices of every shard are local to it, fixed up once they are in
+    if (tensor->op == GGML_OP_TOP_K && tensor->type == GGML_TYPE_I32 && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+            tensor->src[0] != nullptr && ggml_backend_buffer_is_meta(tensor->src[0]->buffer) && ggml_nelements(tensor) == tensor->ne[0]) {
+        const ggml_backend_meta_split_state src_ss = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ false);
+        size_t n_shards = 0;
+        for (size_t j = 0; j < n_backends; ++j) {
+            n_shards += src_ss.ne[j] > 0 ? 1 : 0;
+        }
+        if (src_ss.axis == GGML_BACKEND_SPLIT_AXIS_0 && n_shards > 1) {
+            ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+            ggml_backend_meta_context::topk_readback rb;
+            rb.ids = (int32_t *) data;
+            int64_t col = 0;
+            for (size_t j = 0; j < n_backends; ++j) {
+                rb.n.push_back(split_state.ne[j]);
+                rb.offset.push_back(col);
+                col += src_ss.ne[j];
+            }
+            backend_ctx->topk_pending.push_back(std::move(rb));
+        }
+    }
+
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
@@ -2443,6 +2501,17 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
     backend_ctx->argmax_pending.clear();
     backend_ctx->argmax_scratch_used = 0;
+    // the per-shard top-k lists are in: their indices become columns of the row
+    for (const auto & rb : backend_ctx->topk_pending) {
+        int64_t pos = 0;
+        for (size_t j = 0; j < rb.n.size(); ++j) {
+            for (int64_t i = 0; i < rb.n[j]; ++i) {
+                rb.ids[pos + i] += (int32_t) rb.offset[j];
+            }
+            pos += rb.n[j];
+        }
+    }
+    backend_ctx->topk_pending.clear();
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {

@@ -17,6 +17,11 @@ struct llama_sampler_chain {
 
     uint32_t n_nodes = 0;
 
+    // llama_sampler_chain_set_preselect_k: on a backend that cannot run the chain (a sharded vocabulary), the
+    // backend keeps the top preselect_k logits of every shard as the candidates the whole chain then samples from
+    // on the CPU; 0 = the chain runs on the backend as far as it can
+    int32_t preselect_k = 0;
+
     struct info {
         bool is_backend;
 

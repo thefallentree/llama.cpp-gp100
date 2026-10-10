@@ -1,6 +1,13 @@
 #include "llama-graph.h"
 #include "fn-prof.h"
 #include <typeinfo>
+
+// the Meta (tensor-split) backend's shard count, for the candidate pre-selection (ggml-backend-impl.h is not on
+// llama's include path)
+extern "C" {
+    GGML_API bool   ggml_backend_is_meta       (ggml_backend_t backend);
+    GGML_API size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
+}
 FN_PROF_DECL("graph");
 
 #include "llama-impl.h"
@@ -4080,7 +4087,28 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             ggml_tensor * logits_in = data.logits;
-            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            const int32_t k_pre = llama_sampler_chain_get_preselect_k(sampler);
+            if (k_pre > 0) {
+                // the candidates: the k_pre largest logits of every shard of the row (one shard without a Meta
+                // device), the chain samples from them on the CPU (llama_sampler_chain_set_preselect_k)
+                int n_shards = 1;
+                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+                    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, b);
+                    if (ggml_backend_is_meta(backend)) {
+                        n_shards = (int) ggml_backend_meta_n_backends(backend);
+                    }
+                }
+                ggml_tensor * logits_row = ggml_reshape_1d(ctx0, data.logits, ggml_nelements(data.logits));
+                const int64_t k_all = std::min<int64_t>((int64_t) k_pre*n_shards, logits_row->ne[0]);
+                ggml_tensor * top = ggml_top_k(ctx0, logits_row, (int) k_all);
+                ggml_format_name(top, "preselect_ids_%d_%u", seq_id, i);
+                ggml_tensor * logits_rows = ggml_reshape_2d(ctx0, logits_row, 1, logits_row->ne[0]);
+                data.candidates = top;
+                data.logits     = ggml_get_rows(ctx0, logits_rows, top);
+                ggml_format_name(data.logits, "preselect_logits_%d_%u", seq_id, i);
+            } else {
+                sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            }
             if (vocab_sharded && data.sampled != nullptr && data.sampled->op == GGML_OP_ARGMAX &&
                     data.sampled->type == GGML_TYPE_I32 && data.sampled->src[0] != nullptr &&
                     ggml_nelements(data.sampled) == 1) {

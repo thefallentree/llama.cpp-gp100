@@ -105,6 +105,9 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     // the split axis of a tensor allocated in a meta buffer (a weight), MIRRORED for any other
     GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
+    // the size of every device's slice of a tensor split along an axis: returns the number of devices (at most n_max
+    // sizes are written), 0 for a tensor that is not in a meta buffer or not split along an axis
+    GGML_API size_t ggml_backend_meta_tensor_shards(const struct ggml_tensor * tensor, int64_t * ne, size_t n_max);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
     //

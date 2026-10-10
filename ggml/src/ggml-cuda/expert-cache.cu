@@ -498,7 +498,12 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     if (d.owner != &ctx || d.frozen) {
         return;
     }
-    static const int   n_swaps_max = getenv("GGML_CUDA_EXPERT_CACHE_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_SWAPS")) : 48;
+    // the cap per update and the gain an exchange needs (below): measured on the 1K server bench (2026-10-10), a
+    // cap of 48 with gain 0.25 exchanged ~45 experts every round at a steady 4-6% cold share (the marginal experts
+    // going in and out: 130 MB of PCIe traffic and an ec_swap kernel beside every window) and took ~8 rounds to
+    // follow a shift of the routing (a 15-25% cold share, windows of 35-45 ms on the host tier); 96 / 2.0 exchange
+    // 10-20 per round in the steady state and follow a shift twice as fast: the mean round 29.3 -> 28.3 ms
+    static const int   n_swaps_max = getenv("GGML_CUDA_EXPERT_CACHE_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_SWAPS")) : 96;
     static const float decay       = getenv("GGML_CUDA_EXPERT_CACHE_DECAY") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_DECAY")) : 0.98f;
 
     ggml_cuda_set_device(ctx.device);
@@ -506,7 +511,7 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     const size_t n_rows = d.layers.size();
     FN_PROF_T(t_ec0);
     ec_rows_sync(d);
-    static const float min_gain = getenv("GGML_CUDA_EXPERT_CACHE_GAIN") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_GAIN")) : 0.25f;
+    static const float min_gain = getenv("GGML_CUDA_EXPERT_CACHE_GAIN") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_GAIN")) : 2.0f;
     // the update after a prompt ubatch: its counts in the units of a decode window (3 tokens)
     static const bool rescale_on = getenv("GGML_CUDA_EXPERT_CACHE_RESCALE") == nullptr || atoi(getenv("GGML_CUDA_EXPERT_CACHE_RESCALE")) != 0;
     const float rescale = rescale_on && d.last_prompt_tokens > 3 ? 3.0f/(float) d.last_prompt_tokens : 1.0f;

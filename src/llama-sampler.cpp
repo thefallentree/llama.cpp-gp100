@@ -904,6 +904,7 @@ int32_t llama_sampler_chain_get_preselect_k(const struct llama_sampler * chain) 
     return ((const llama_sampler_chain *) chain->ctx)->preselect_k;
 }
 
+
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     GGML_ASSERT(sampler != nullptr);
     GGML_ASSERT(sampler->iface == &llama_sampler_chain_i);
@@ -1131,6 +1132,26 @@ static struct llama_sampler_i llama_sampler_greedy_i = {
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_greedy>,
 };
+
+std::string llama_sampler_graph_key(const struct llama_sampler * smpl) {
+    // a chain whose backend graph is the pre-selection of candidates (the chain itself runs on the CPU)
+    const int32_t k_pre = llama_sampler_chain_get_preselect_k(smpl);
+    if (k_pre > 0) {
+        return "preselect:" + std::to_string(k_pre);
+    }
+    // a bare greedy: a chain of one (or a chain wrapping such a chain) around the greedy sampler
+    const llama_sampler * s = smpl;
+    while (s != nullptr && s->iface == &llama_sampler_chain_i) {
+        if (llama_sampler_chain_n(s) != 1) {
+            return "";
+        }
+        s = llama_sampler_chain_get(const_cast<llama_sampler *>(s), 0);
+    }
+    if (s != nullptr && s->iface == &llama_sampler_greedy_i) {
+        return "greedy";
+    }
+    return "";
+}
 
 struct llama_sampler * llama_sampler_init_greedy() {
     return llama_sampler_init(

@@ -754,8 +754,28 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             // its table is) and the output row's h
             GGML_ASSERT(params.chain.tok != nullptr && params.chain.h != nullptr);
             GGML_ASSERT(cur->ne[1] == 1 && flat_out->ne[1] == 1 && "the ubatch before a chain row has one output");
-            ggml_tensor * chain_tok = ggml_argmax(ctx0, cur);
+            ggml_tensor * chain_tok = nullptr;
+            if (params.chain.eye != nullptr) {
+                // the head is sharded over the vocabulary: every device finds the best of its rows (value, global
+                // index), the pairs meet on every device through an AllReduce of their one-hot placement (the
+                // identity split by rows: device j's row puts its pair at column j), the best of them is the token
+                const int64_t n_dev = params.chain.eye->ne[0];
+                ggml_tensor * row  = ggml_reshape_1d(ctx0, cur, cur->ne[0]);
+                ggml_tensor * top  = ggml_top_k(ctx0, row, (int) n_dev); // I32 [n_dev]: one per shard, local
+                ggml_set_name(top, "preselect_ids_chain");
+                ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, row, 1, row->ne[0]), top); // F32 [1, n_dev]
+                ggml_tensor * idx  = ggml_add(ctx0, ggml_cast(ctx0, top, GGML_TYPE_F32), params.chain.off); // F32 [n_dev]: global
+                ggml_tensor * pair = ggml_concat(ctx0, ggml_reshape_2d(ctx0, vals, n_dev, 1), ggml_reshape_2d(ctx0, idx, n_dev, 1), 1); // [n_dev, 2]
+                ggml_tensor * all  = ggml_mul_mat(ctx0, params.chain.eye, pair); // [n_dev, 2]: every shard's pair
+                cb(all, "draft_chain_pairs", il);
+                ggml_tensor * best = ggml_argmax(ctx0, ggml_view_2d(ctx0, all, n_dev, 1, all->nb[1], 0)); // I32 [1]
+                ggml_tensor * tokf = ggml_get_rows(ctx0, ggml_view_2d(ctx0, all, 1, n_dev, all->nb[0], all->nb[1]), best); // F32 [1, 1]
+                chain_tok = ggml_cast(ctx0, ggml_reshape_1d(ctx0, tokf, 1), GGML_TYPE_I32);
+            } else {
+                chain_tok = ggml_argmax(ctx0, cur);
+            }
             cb(chain_tok, "draft_chain_tok", il);
+            res->t_draft_tok = chain_tok;
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, chain_tok, params.chain.tok));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_1d(ctx0, flat_out, flat_out->ne[0]), params.chain.h));
         }

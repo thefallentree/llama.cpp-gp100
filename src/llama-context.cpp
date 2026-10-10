@@ -631,6 +631,12 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 
 // the draft chain (llama_set_draft_chain): the tensors a ubatch's graph leaves for the next one, and the token
 // embeddings of the draft vocabulary on the device, the rows of a host-resident table gathered here once
+extern "C" {
+    // ggml-backend-impl.h: the layout of a tensor in a meta buffer
+    GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
+    GGML_API size_t ggml_backend_meta_tensor_shards(const struct ggml_tensor * tensor, int64_t * ne, size_t n_max);
+}
+
 void llama_context::draft_chain_init() {
     const auto & hparams = model.hparams;
     if (hparams.n_layer_nextn != 1 || model.layers.size() <= hparams.n_layer() || !model.draft_chain_supported()) {
@@ -671,8 +677,13 @@ void llama_context::draft_chain_init() {
             type_table = GGML_TYPE_Q8_0;
     }
 
+    // a head sharded over the vocabulary: the shards' first rows, for the merge of their best rows on the device
+    int64_t shard_ne[16];
+    const size_t n_shards = ggml_backend_meta_tensor_split_axis(layer.nextn.shared_head_head) == GGML_BACKEND_SPLIT_AXIS_1 ?
+            ggml_backend_meta_tensor_shards(layer.nextn.shared_head_head, shard_ne, 16) : 0;
+
     ggml_init_params ip = {
-        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+        /*.mem_size   =*/ 6*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -685,14 +696,34 @@ void llama_context::draft_chain_init() {
         draft_chain.tok_embd = ggml_new_tensor_2d(draft_chain.ctx.get(), type_table, n_embd, n_vocab_dr);
         ggml_set_name(draft_chain.tok_embd, "draft_chain_tok_embd");
     }
+    if (n_shards > 1) {
+        draft_chain.eye = ggml_new_tensor_2d(draft_chain.ctx.get(), GGML_TYPE_F32, n_shards, n_shards);
+        ggml_set_name(draft_chain.eye, "draft_chain_eye");
+        draft_chain.off = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_F32, n_shards);
+        ggml_set_name(draft_chain.off, "draft_chain_off");
+    }
     draft_chain.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_chain.ctx.get(), buft));
     if (draft_chain.buf == nullptr) {
         LLAMA_LOG_WARN("%s: draft chain unavailable: could not allocate its buffer\n", __func__);
-        draft_chain.tok = draft_chain.h = draft_chain.tok_embd = nullptr;
+        draft_chain.tok = draft_chain.h = draft_chain.tok_embd = draft_chain.eye = draft_chain.off = nullptr;
         draft_chain.ctx.reset();
         return;
     }
     ggml_backend_buffer_clear(draft_chain.buf.get(), 0);
+
+    if (n_shards > 1) {
+        std::vector<float> eye((size_t) n_shards*n_shards, 0.0f);
+        std::vector<float> off(n_shards, 0.0f);
+        int64_t row = 0;
+        for (size_t j = 0; j < n_shards; ++j) {
+            eye[j*n_shards + j] = 1.0f;
+            off[j] = (float) row;
+            row += shard_ne[j];
+        }
+        ggml_backend_tensor_set(draft_chain.eye, eye.data(), 0, eye.size()*sizeof(float));
+        ggml_backend_tensor_set(draft_chain.off, off.data(), 0, off.size()*sizeof(float));
+        LLAMA_LOG_INFO("%s: draft chain: the draft head is sharded over %zu devices, the shards' best rows merge on the device\n", __func__, n_shards);
+    }
 
     if (host_table) {
         const int64_t t0 = ggml_time_us();
@@ -1485,6 +1516,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             sched_need_reserve = true;
         }
         sampling.samplers.erase(seq_id);
+        sampling.sampler_keys.erase(seq_id);
         return false;
     }
     if (sampler && on_meta && llama_sampler_chain_get_preselect_k(sampler) == 0) {
@@ -1506,7 +1538,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
-        sampling.samplers[seq_id] = sampler;
+        sampling.samplers[seq_id]     = sampler;
+        sampling.sampler_keys[seq_id] = llama_sampler_graph_key(sampler);
 
         sched_need_reserve = true;
 
@@ -1521,11 +1554,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         }
 
         sampling.samplers.erase(seq_id);
+        sampling.sampler_keys.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
+    sampling.sampler_keys.erase(seq_id);
 
     sched_need_reserve = true;
 
@@ -3301,6 +3336,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
+        /*.sampler_keys=*/ sampling.sampler_keys,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(sched),
         /*.res         =*/ res,
@@ -3310,6 +3346,8 @@ llm_graph_params llama_context::graph_params(
     params.chain.tok      = draft_chain.tok;
     params.chain.h        = draft_chain.h;
     params.chain.tok_embd = draft_chain.tok_embd;
+    params.chain.eye      = draft_chain.eye;
+    params.chain.off      = draft_chain.off;
     return params;
 }
 

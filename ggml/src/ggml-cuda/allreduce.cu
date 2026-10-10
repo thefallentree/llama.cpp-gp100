@@ -583,7 +583,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
-    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // the smallest tensors stay F32 on the wire: an exchange of values that must arrive exact (the draft chain's
+    // (value, index) pairs, 16 bytes); every tensor of a model's graph is larger
+    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 64);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }

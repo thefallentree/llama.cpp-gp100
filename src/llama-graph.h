@@ -778,14 +778,15 @@ public:
 
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
-    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
-        samplers(std::move(samplers)) { }
+    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers, std::map<llama_seq_id, std::string> keys) :
+        samplers(std::move(samplers)), keys(std::move(keys)) { }
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::string>     keys; // llama_sampler_graph_key of each (llm_graph_params::sampler_keys)
 };
 
 //
@@ -824,16 +825,27 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    // llama_sampler_graph_key of each: samplers with the same non-empty key run the same graph (the server's
+    // requests one after the other), recorded at the build since the sampler of a kept graph may be gone
+    std::map<llama_seq_id, std::string> sampler_keys;
 
     static bool samplers_equal(
-          const std::map<llama_seq_id, llama_sampler *> & lhs,
-          const std::map<llama_seq_id, llama_sampler *> & rhs) {
+          const std::map<llama_seq_id, llama_sampler *> & lhs, const std::map<llama_seq_id, std::string> & lhs_keys,
+          const std::map<llama_seq_id, llama_sampler *> & rhs, const std::map<llama_seq_id, std::string> & rhs_keys) {
         if (lhs.size() != rhs.size()) {
             return false;
         }
         for (const auto & [seq_id, sampler] : lhs) {
             auto it = rhs.find(seq_id);
-            if (it == rhs.end() || it->second != sampler) {
+            if (it == rhs.end()) {
+                return false;
+            }
+            if (it->second == sampler) {
+                continue;
+            }
+            auto kl = lhs_keys.find(seq_id);
+            auto kr = rhs_keys.find(seq_id);
+            if (kl == lhs_keys.end() || kr == rhs_keys.end() || kl->second.empty() || kl->second != kr->second) {
                 return false;
             }
         }
@@ -854,6 +866,8 @@ struct llm_graph_params {
         ggml_tensor * tok      = nullptr; // I32 [1]
         ggml_tensor * h        = nullptr; // F32 [n_embd_out]
         ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft], null: the model's own table
+        ggml_tensor * eye      = nullptr; // F32 [n_dev, n_dev], a head sharded over the vocabulary: the shards' best rows meet through it
+        ggml_tensor * off      = nullptr; // F32 [n_dev]: the first row of every shard
     } chain;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
@@ -899,7 +913,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (!samplers_equal(samplers, other.samplers)) {
+        if (!samplers_equal(samplers, sampler_keys, other.samplers, other.sampler_keys)) {
             return false;
         }
 
@@ -993,6 +1007,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_draft_tok   = nullptr; // I32 [1]: the draft chain's token of the single output row, the greedy sampler takes it
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1096,6 +1111,7 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::string>     sampler_keys;
 
     const llm_graph_cb & cb_func;
 

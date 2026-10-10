@@ -3560,6 +3560,24 @@ enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const stru
     return ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true).axis;
 }
 
+size_t ggml_backend_meta_tensor_shards(const struct ggml_tensor * tensor, int64_t * ne, size_t n_max) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return 0;
+    }
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
+    if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+        return 0;
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    for (size_t j = 0; j < n_bufs && j < n_max; j++) {
+        ne[j] = 0;
+        for (size_t s = 0; s < ss.n_segments; s++) {
+            ne[j] += ss.ne[s*n_bufs + j] * ss.nr[s];
+        }
+    }
+    return n_bufs;
+}
+
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;

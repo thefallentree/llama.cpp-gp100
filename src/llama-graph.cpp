@@ -1405,15 +1405,13 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
-    if (samplers.size() != params.samplers.size()) {
+    if (!llm_graph_params::samplers_equal(samplers, keys, params.samplers, params.sampler_keys)) {
         return false;
     }
 
-    for (const auto & [seq_id, sampler] : params.samplers) {
-        if (samplers[seq_id] != sampler) {
-            return false;
-        }
-    }
+    // other samplers of the same keys: the graph is theirs now (set_input calls them)
+    samplers = params.samplers;
+    keys     = params.sampler_keys;
 
     return true;
 }
@@ -1440,6 +1438,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_draft_tok   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1618,6 +1617,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
+    sampler_keys     (params.sampler_keys),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -4031,7 +4031,7 @@ void llm_graph_context::build_sampling() const {
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
 
-    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers, sampler_keys);
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
@@ -4123,6 +4123,12 @@ void llm_graph_context::build_sampling() const {
                 ggml_format_name(data.logits, "preselect_logits_%d_%u", seq_id, i);
             } else {
                 sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            }
+            if (res->t_draft_tok != nullptr && n_rows == 1 && rows.size() == 1 && data.sampled != nullptr &&
+                    data.sampled->op == GGML_OP_ARGMAX && ggml_nelements(data.sampled) == 1) {
+                // the draft chain computed the token of the output row (the shards' best rows merged on the
+                // device): the greedy sampler's own argmax is the same, read back as it is
+                data.sampled = res->t_draft_tok;
             }
             if (vocab_sharded && data.sampled != nullptr && data.sampled->op == GGML_OP_ARGMAX &&
                     data.sampled->type == GGML_TYPE_I32 && data.sampled->src[0] != nullptr &&

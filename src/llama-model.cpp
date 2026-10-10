@@ -437,11 +437,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // the output head, sharded over the vocabulary
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
-    // the head of an MTP block that has its own: mirrored (LLAMA_DRAFT_HEAD_SPLIT=1 shards it over the vocabulary
-    // like the output head), so that the draft's logits are whole on every device and its argmax is a plain one,
-    // usable on the device (the draft chain), not a sharded argmax merged on the host. Costs the head's matvec over
-    // the whole draft vocabulary on each device (~0.17 ms per draft step for 97.6K rows of Q4_0) and its slice twice.
+    // the head of an MTP block that has its own: sharded over the vocabulary like the output head (every device
+    // the matvec over its rows; the draft chain merges the shards' best rows on the device, see
+    // llama_model_qwen4exp::graph_mtp). LLAMA_DRAFT_HEAD_SPLIT=0 mirrors it instead: the logits whole on every
+    // device at the cost of the whole matvec on each (+0.27 ms per draft step on a P100 for 97.6K rows of Q4_0).
     static const std::regex pattern_draft_head_weight("blk\\.\\d*\\.nextn\\.shared_head_head\\.weight");
+    // the draft chain's constants (llama_context::draft_chain_init): a row of each per device
+    static const std::regex pattern_draft_chain_dev("draft_chain_(eye|off)");
 
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
@@ -617,11 +619,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_draft_head_weight)) {
-            static const bool by_vocab = getenv("LLAMA_DRAFT_HEAD_SPLIT") != nullptr && atoi(getenv("LLAMA_DRAFT_HEAD_SPLIT")) == 1;
+            static const bool by_vocab = getenv("LLAMA_DRAFT_HEAD_SPLIT") == nullptr || atoi(getenv("LLAMA_DRAFT_HEAD_SPLIT")) != 0;
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(by_vocab ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (std::regex_match(tensor_name, pattern_draft_chain_dev)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");

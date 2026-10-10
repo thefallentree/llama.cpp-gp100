@@ -328,6 +328,7 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        std::map<llama_seq_id, std::string>     sampler_keys; // llama_sampler_graph_key of each
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
@@ -481,6 +482,11 @@ private:
         ggml_tensor * tok      = nullptr; // I32 [1]: the argmax of the draft logits of the output row
         ggml_tensor * h        = nullptr; // F32 [n_embd_out]: its h_nextn row
         ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft]: the token embeddings of the draft vocabulary (null: model.tok_embd)
+        // a draft head sharded over the vocabulary: the shards' best rows meet through an AllReduce of a one-hot
+        // placement (see llama_model_qwen4exp::graph_mtp); eye [n_dev, n_dev] is the identity split by rows, off
+        // [n_dev] the first row of every shard, each device holding its own row of them
+        ggml_tensor * eye      = nullptr;
+        ggml_tensor * off      = nullptr;
         int32_t       n        = 0;       // the chain rows of the next decode
         bool          cur_in   = false;   // the ubatch being built reads the chain tensors
         bool          cur_out  = false;   // ... writes them

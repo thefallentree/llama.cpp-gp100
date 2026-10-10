@@ -3275,6 +3275,12 @@ static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
     GGML_ASSERT(!ctx.in_gate_pending && "staged inputs flushed while a window waits for them (ggml_cuda_in_fire)");
     ggml_cuda_set_device(ctx.device);
     CUDA_CHECK(cudaMemcpyAsync(ctx.in_dev, ctx.in_host, GGML_CUDA_IN_TABLE + ctx.in_used, cudaMemcpyHostToDevice, ctx.stream()));
+    // the blob's copy is waited for through this event before the blob is written again (ggml_cuda_in_stage), the
+    // same as a fire's copy on the input stream: a prompt's flush after a gated window left the event on the
+    // fire's copy and the host overwrote the blob under the main stream's copy (an illegal memory access at 16K)
+    if (ctx.in_copy_event != nullptr) {
+        CUDA_CHECK(cudaEventRecord(ctx.in_copy_event, ctx.stream()));
+    }
     k_in_scatter<<<ctx.in_n, 256, 0, ctx.stream()>>>(ctx.in_dev);
     CUDA_CHECK(cudaGetLastError());
     ctx.in_n    = 0;

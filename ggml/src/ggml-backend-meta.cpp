@@ -684,7 +684,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // shards being equal) and the result is their lists one after the other, split on axis 0; the indices
         // are local to the shard until the readback adds the shards' offsets (ggml_backend_meta_get_tensor_async).
         // The candidates a sampler chain on the CPU samples from (llama_sampler_chain_set_preselect_k).
-        if (tensor->op == GGML_OP_TOP_K && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].n_segments == 1) {
+        if (tensor->op == GGML_OP_TOP_K && strncmp(tensor->name, "preselect_ids", 13) == 0 &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].n_segments == 1) {
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
             size_t n_shards = 0;
             for (size_t j = 0; j < n_bufs; j++) {
@@ -944,7 +945,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // shard produced for its own rows (the per-shard TOP_K above): each shard gathers its own, the result is
         // split like the indices, on the rows' axis of the output
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
-                tensor->src[1]->op == GGML_OP_TOP_K && tensor->ne[0] == tensor->src[0]->ne[0]) {
+                tensor->src[1]->op == GGML_OP_TOP_K && strncmp(tensor->src[1]->name, "preselect_ids", 13) == 0 &&
+                tensor->ne[0] == tensor->src[0]->ne[0]) {
             return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
         }
         return handle_generic(src_ss, /*scalar_only =*/ true);
@@ -2406,7 +2408,8 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 
     // a per-shard TOP_K (handle_per_row): the indices of every shard are local to it, fixed up once they are in
-    if (tensor->op == GGML_OP_TOP_K && tensor->type == GGML_TYPE_I32 && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+    if (tensor->op == GGML_OP_TOP_K && tensor->type == GGML_TYPE_I32 && strncmp(tensor->name, "preselect_ids", 13) == 0 &&
+            split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
             tensor->src[0] != nullptr && ggml_backend_buffer_is_meta(tensor->src[0]->buffer) && ggml_nelements(tensor) == tensor->ne[0]) {
         const ggml_backend_meta_split_state src_ss = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ false);
         size_t n_shards = 0;

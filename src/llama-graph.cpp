@@ -1,4 +1,16 @@
 #include "llama-graph.h"
+#include "fn-prof.h"
+#include <typeinfo>
+
+// the Meta (tensor-split) backend's shard count, for the candidate pre-selection (ggml-backend-impl.h is not on
+// llama's include path)
+extern "C" {
+    GGML_API bool   ggml_backend_is_meta       (ggml_backend_t backend);
+    GGML_API size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
+    // the split axis of a tensor allocated in a meta buffer (a weight), MIRRORED for any other
+    GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
+}
+FN_PROF_DECL("graph");
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -67,14 +79,50 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+bool llm_graph_tok_embd_host(const ggml_tensor * tok_embd) {
+    static const bool enabled = getenv("LLAMA_EMBD_HOST_ROWS") == nullptr || atoi(getenv("LLAMA_EMBD_HOST_ROWS")) != 0;
+    return enabled && tok_embd != nullptr && tok_embd->data != nullptr && tok_embd->buffer != nullptr &&
+           ggml_backend_buffer_is_host(tok_embd->buffer) && ggml_is_contiguous(tok_embd) &&
+           (tok_embd->type == GGML_TYPE_F32 || ggml_get_type_traits(tok_embd->type)->to_float != nullptr);
+}
+
+void llm_graph_gather_tok_embd(const ggml_tensor * tok_embd, const int32_t * ids, const int64_t n, float * dst) {
+    const int64_t n_embd = tok_embd->ne[0];
+    const auto *  traits = ggml_get_type_traits(tok_embd->type);
+    for (int64_t k = 0; k < n; ++k) {
+        GGML_ASSERT(ids[k] >= 0 && ids[k] < tok_embd->ne[1]);
+        const char * row = (const char *) tok_embd->data + (size_t) ids[k]*tok_embd->nb[1];
+        if (tok_embd->type == GGML_TYPE_F32) {
+            memcpy(dst + k*n_embd, row, n_embd*sizeof(float));
+        } else {
+            traits->to_float(row, dst + k*n_embd, n_embd);
+        }
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (tok_embd_host != nullptr) {
+        // every row from the host: the token rows dequantized here, the embd rows as given
+        const int64_t n_tokens = ubatch->n_tokens;
+        GGML_ASSERT(embd && embd->ne[0] == n_embd && embd->ne[1] == n_tokens && tok_embd_host->ne[0] == n_embd);
+        rows_buf.resize((size_t) n_tokens*n_embd);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[i]);
+            if (is_embd) {
+                GGML_ASSERT(ubatch->embd);
+                memcpy(rows_buf.data() + i*n_embd, ubatch->embd + i*n_embd, n_embd*sizeof(float));
+            } else {
+                llm_graph_gather_tok_embd(tok_embd_host, ubatch->token + i, 1, rows_buf.data() + i*n_embd);
+            }
+        }
+        ggml_backend_tensor_set(embd, rows_buf.data(), 0, rows_buf.size()*sizeof(float));
+    } else if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
-    if (ubatch->embd && embd && !ubatch->is_mixed()) {
+    if (tok_embd_host == nullptr && ubatch->embd && embd && !ubatch->is_mixed()) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -82,7 +130,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 
-    if (ubatch->is_mixed() && embd) {
+    if (tok_embd_host == nullptr && ubatch->is_mixed() && embd) {
         GGML_ASSERT(mixed_tokens && mixed_slots && mixed_embd && "mixed token/embd ubatch is not supported here");
 
         std::vector<int32_t> ids;
@@ -125,9 +173,32 @@ static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
     return n;
 }
 
+void llm_graph_input_embd::token_tensors(std::vector<ggml_tensor *> & out) const {
+    // the token ids, or the rows gathered from them (the host path); an embd batch (no ids) has nothing that
+    // depends on them
+    if (tok_embd_host != nullptr) {
+        if (embd != nullptr) {
+            out.push_back(embd);
+        }
+        return;
+    }
+    if (tokens != nullptr) {
+        out.push_back(tokens);
+    }
+    if (mixed_tokens != nullptr) {
+        out.push_back(mixed_tokens);
+    }
+    if (mixed_embd != nullptr) {
+        out.push_back(mixed_embd);
+    }
+}
+
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
+    if (tok_embd_host != nullptr) {
+        return embd && embd->ne[1] == params.ubatch.n_tokens && (!scale_rows || scale_rows->ne[1] == params.ubatch.n_tokens);
+    }
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
     res &= (!mixed_tokens) || mixed_tokens->ne[0] == llm_graph_n_tok_rows(params.ubatch);
@@ -142,7 +213,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
-    if (ubatch->token) {
+    if (ubatch->token && tok_rows != nullptr) {
+        GGML_ASSERT(tok_embd_host && tok_rows->ne[0] == tok_embd_host->ne[0] && tok_rows->ne[1] == n_tokens);
+        rows_buf.resize((size_t) n_tokens*tok_rows->ne[0]);
+        llm_graph_gather_tok_embd(tok_embd_host, ubatch->token, n_tokens, rows_buf.data());
+        ggml_backend_tensor_set(tok_rows, rows_buf.data(), 0, rows_buf.size()*sizeof(float));
+    } else if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
@@ -162,6 +238,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+    res &= (!tok_rows) || tok_rows->ne[1] == params.ubatch.n_tokens;
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
@@ -1150,7 +1227,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when every attention layer selects its cells (qwen4exp QSA)
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1348,15 +1428,13 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
-    if (samplers.size() != params.samplers.size()) {
+    if (!llm_graph_params::samplers_equal(samplers, keys, params.samplers, params.sampler_keys)) {
         return false;
     }
 
-    for (const auto & [seq_id, sampler] : params.samplers) {
-        if (samplers[seq_id] != sampler) {
-            return false;
-        }
-    }
+    // other samplers of the same keys: the graph is theirs now (set_input calls them)
+    samplers = params.samplers;
+    keys     = params.sampler_keys;
 
     return true;
 }
@@ -1383,6 +1461,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_draft_tok   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1413,7 +1492,20 @@ void llm_graph_result::reset() {
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
+        FN_PROF_T(t0);
         input->set_input(ubatch);
+        FN_PROF_ADD(typeid(*input).name(), t0);
+    }
+}
+
+void llm_graph_result::set_token_inputs(const llama_ubatch * ubatch, std::vector<ggml_tensor *> & tensors) {
+    tensors.clear();
+    for (auto & input : inputs) {
+        const size_t n0 = tensors.size();
+        input->token_tensors(tensors);
+        if (tensors.size() > n0) {
+            input->set_input(ubatch);
+        }
     }
 }
 
@@ -1480,7 +1572,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: can_reuse = %d (%s)\n", __func__, cur, typeid(*input).name());
         }
 
         res = res && cur;
@@ -1560,6 +1652,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
+    sampler_keys     (params.sampler_keys),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1663,6 +1756,21 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+
+    if (exps_cold) {
+        const auto it = exps_cold->find(w);
+        if (it != exps_cold->end()) {
+            // ids >= w->ne[2] select experts of the cold tensor; a backend that does not read this tag must not run the op
+            ggml_tensor * cold = it->second;
+            const int32_t tag[2] = { (int32_t) LLAMA_EXPS_COLD_MAGIC, (int32_t) cold->ne[2] };
+            memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM, tag, sizeof(tag));
+            memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM + 2, &cold->data, sizeof(void *));
+            // on a tensor-split device the cold tensor is a source of the node, so that each device gets its own slice
+            if (cold->buffer != nullptr && ggml_backend_buffer_is_meta(cold->buffer)) {
+                res->src[LLAMA_EXPS_COLD_SRC] = cold;
+            }
+        }
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2545,6 +2653,32 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
 
     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
+
+    // the rows of a host table gathered by set_input: one input for every kind of batch, no CPU split
+    // (training feeds the graph through the token input, so it keeps the get_rows)
+    if (n_embd_inp == n_embd && loras->empty() && !cparams.training && llm_graph_tok_embd_host(tok_embd)) {
+        inp->tok_embd_host = tok_embd;
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+        cb(inp->embd, "inp_embd", -1);
+        ggml_set_input(inp->embd);
+
+        ggml_tensor * cur = inp->embd;
+        res->t_inp_embd = cur;
+        inp->scale_tok = tok_scale*(hparams.f_embedding_scale != 0.0f && hparams.n_deepstack_layers > 0 ? hparams.f_embedding_scale : 1.0f);
+        if (hparams.f_embedding_scale != 0.0f && hparams.n_deepstack_layers == 0) {
+            cur = ggml_scale(ctx0, cur, hparams.f_embedding_scale);
+        }
+        if (inp->scale_tok != 1.0f) {
+            inp->scale_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
+            cb(inp->scale_rows, "inp_scale_rows", -1);
+            ggml_set_input(inp->scale_rows);
+            cur = ggml_mul(ctx0, cur, inp->scale_rows);
+        }
+        cb(cur, "embd", -1);
+        res->add_input(std::move(inp));
+        return cur;
+    }
 
     // we have 3 standard paths to produce the input embeddings for the first layer:
     // - embd0: extract from the token embeddings weight (`tok_embd`) using the input token ids
@@ -4087,7 +4221,7 @@ void llm_graph_context::build_sampling() const {
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
 
-    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers, sampler_keys);
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
@@ -4117,6 +4251,25 @@ void llm_graph_context::build_sampling() const {
 
     static const std::vector<uint32_t> no_rows;
 
+    // a Meta device shards the vocabulary when the rows of the head are split over its devices (the output head);
+    // a mirrored head (a draft head, see llama_meta_device_get_split_state) leaves every device the whole row
+    bool vocab_sharded = false;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+        vocab_sharded |= dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+    }
+    if (vocab_sharded) {
+        const ggml_tensor * t = res->t_logits;
+        while (t != nullptr && t->op != GGML_OP_MUL_MAT && t->src[0] != nullptr &&
+                (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_CONT || t->op == GGML_OP_ADD ||
+                 t->op == GGML_OP_MUL || t->op == GGML_OP_SCALE || t->op == GGML_OP_GET_ROWS || t->op == GGML_OP_PAD)) {
+            t = t->src[0];
+        }
+        if (t != nullptr && t->op == GGML_OP_MUL_MAT && t->src[0] != nullptr && t->src[0]->buffer != nullptr) {
+            vocab_sharded = ggml_backend_meta_tensor_split_axis(t->src[0]) == GGML_BACKEND_SPLIT_AXIS_1;
+        }
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, like the reserve, so the graph keeps its topology
     // whatever rows the ubatch outputs: a chain without a row works on the first row and is not selected
     for (const auto & [seq_id, sampler] : samplers) {
@@ -4139,7 +4292,53 @@ void llm_graph_context::build_sampling() const {
             };
 
             assert(sampler->iface->backend_apply);
-            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            ggml_tensor * logits_in = data.logits;
+            const int32_t k_pre = llama_sampler_chain_get_preselect_k(sampler);
+            if (k_pre > 0) {
+                // the candidates: the k_pre largest logits of every shard of the row (one shard without a Meta
+                // device), the chain samples from them on the CPU (llama_sampler_chain_set_preselect_k)
+                int n_shards = 1;
+                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched) && vocab_sharded; ++b) {
+                    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, b);
+                    if (ggml_backend_is_meta(backend)) {
+                        n_shards = (int) ggml_backend_meta_n_backends(backend);
+                    }
+                }
+                ggml_tensor * logits_row = ggml_reshape_1d(ctx0, data.logits, ggml_nelements(data.logits));
+                const int64_t k_all = std::min<int64_t>((int64_t) k_pre*n_shards, logits_row->ne[0]);
+                ggml_tensor * top = ggml_top_k(ctx0, logits_row, (int) k_all);
+                ggml_format_name(top, "preselect_ids_%d_%u", seq_id, i);
+                ggml_tensor * logits_rows = ggml_reshape_2d(ctx0, logits_row, 1, logits_row->ne[0]);
+                data.candidates = top;
+                data.logits     = ggml_get_rows(ctx0, logits_rows, top);
+                ggml_format_name(data.logits, "preselect_logits_%d_%u", seq_id, i);
+            } else {
+                sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            }
+            if (res->t_draft_tok != nullptr && n_rows == 1 && rows.size() == 1 && data.sampled != nullptr &&
+                    data.sampled->op == GGML_OP_ARGMAX && ggml_nelements(data.sampled) == 1) {
+                // the draft chain computed the token of the output row (the shards' best rows merged on the
+                // device): the greedy sampler's own argmax is the same, read back as it is
+                data.sampled = res->t_draft_tok;
+            }
+            if (vocab_sharded && data.sampled != nullptr && data.sampled->op == GGML_OP_ARGMAX &&
+                    data.sampled->type == GGML_TYPE_I32 && data.sampled->src[0] != nullptr &&
+                    ggml_nelements(data.sampled) == 1) {
+                // A Meta device shards the vocabulary across backends, so no backend
+                // can reduce the row alone.  Typing a terminal argmax as I64 selects
+                // the packed max/location kernel; each shard yields one candidate and
+                // the Meta readback merges them into a global token id.
+                static bool announced = false;
+                if (!announced) {
+                    LLAMA_LOG_INFO("%s: sharded vocabulary: greedy argmax runs as a packed max/location reduction\n", __func__);
+                    announced = true;
+                }
+                data.sampled->type  = GGML_TYPE_I64;
+                data.sampled->nb[0] = ggml_type_size(GGML_TYPE_I64);
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                    data.sampled->nb[d] = data.sampled->nb[d - 1]*data.sampled->ne[d - 1];
+                }
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {
@@ -4157,7 +4356,10 @@ void llm_graph_context::build_sampling() const {
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
-            if (data.logits != nullptr) {
+            // A chain that never touched its logits (a bare greedy sampler) has
+            // nothing to export: copying the untouched full-vocabulary row back
+            // to the host per output is the cost backend sampling removes.
+            if (data.logits != nullptr && data.logits != logits_in) {
                 if (active) {
                     res->t_sampled_logits[row] = data.logits;
                 }

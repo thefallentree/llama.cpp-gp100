@@ -71,6 +71,24 @@ static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const in
     v.y = (v.y * dm.x) + dm.y;
 }
 
+static __device__ __forceinline__ void dequantize_q4_1_g64(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q4_1_g64 * x = (const block_q4_1_g64 *) vx;
+
+    const float2 dm = __half22float2(x[ib].dm);
+
+    // Two Q4_1-layout 16-byte halves behind one (d, m): logical position iqs sits in
+    // half 0 at byte (iqs & 15), low or high nibble by (iqs >> 4); position iqs + 32
+    // sits at the same offset of half 1.
+    const int j     = iqs & 15;
+    const int shift = (iqs >> 4) * 4;
+
+    v.x = (x[ib].qs[j     ] >> shift) & 0xF;
+    v.y = (x[ib].qs[j + 16] >> shift) & 0xF;
+
+    v.x = (v.x * dm.x) + dm.y;
+    v.y = (v.y * dm.x) + dm.y;
+}
+
 static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q5_0 * x = (const block_q5_0 *) vx;
 

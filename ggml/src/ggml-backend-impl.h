@@ -103,6 +103,11 @@ extern "C" {
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
+    // the split axis of a tensor allocated in a meta buffer (a weight), MIRRORED for any other
+    GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
+    // the size of every device's slice of a tensor split along an axis: returns the number of devices (at most n_max
+    // sizes are written), 0 for a tensor that is not in a meta buffer or not split along an axis
+    GGML_API size_t ggml_backend_meta_tensor_shards(const struct ggml_tensor * tensor, int64_t * ne, size_t n_max);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
     //
@@ -154,6 +159,18 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) true if the backend has copies of all the data it was given with set_tensor_async since the last
+        // synchronize: the caller may change that data without synchronizing first
+        bool (*inputs_staged)(ggml_backend_t backend);
+
+        // (optional) the inputs given with set_tensor_async are complete: a graph launched before them (a captured
+        // window that waits for its inputs on the device) may read them now, and a window launched after this
+        // passes its gate at once. The scheduler calls it before and after a split's compute.
+        void (*fire)(ggml_backend_t backend);
+        // (optional) true if a graph launched on this backend waits for its inputs: the backend must not be
+        // synchronized before fire()
+        bool (*gate_pending)(ggml_backend_t backend);
     };
 
     struct ggml_backend {

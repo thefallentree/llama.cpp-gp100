@@ -422,6 +422,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        // nothing of this sequence lies in [p0, p1): skip the scan over all cells.  Speculative
+        // decoding calls this once per round with p0 just past the accepted tokens, usually
+        // removing nothing, and the scan costs ~0.3 ms per 128k cells.
+        if (p0 > cells.seq_pos_max(seq_id)) {
+            return true;
+        }
+
         uint32_t new_head = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -1114,6 +1121,33 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+void llama_kv_cache::apply_ubatch_tokens(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    if (other || !ubatch.token) {
+        return;
+    }
+
+    assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t i = s*sinfo.size() + ii;
+
+            auto & cells = v_cells[sinfo.strm[s]];
+
+            const auto idx = sinfo.idxs[s][ii];
+
+            const bool is_embd = ubatch.is_mixed() && ubatch.type[i];
+            if (is_embd || cells.is_empty(idx)) {
+                continue;
+            }
+
+            llama_kv_cell_ext ext = cells.ext_get(idx);
+            ext.tok = ubatch.token[i];
+            cells.ext_set(idx, ext);
+        }
+    }
+}
+
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -1286,10 +1320,23 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
+    // temporary switch (LLAMA_KV_PAD_GEOM=N): sizes that double from N times the pad, so that a long generation rebuilds its graph a few times, not every 256 tokens
+    static const uint32_t geom = getenv("LLAMA_KV_PAD_GEOM") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_PAD_GEOM"))) : 0;
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        // with one cell to spare the size changes in the same decode as the pool count of the indexer
+        // (llama-memory-hybrid-idx.cpp, kpool_pad): one new graph instead of two
+        uint32_t n = std::max(n_pad_cur, GGML_PAD(cells.used_max_p1() + (geom ? 1 : 0), n_pad_cur));
+        if (geom) {
+            uint32_t g = n_pad_cur*geom;
+            while (g < n) {
+                g *= 2;
+            }
+            n = g;
+        }
+        result = std::max(std::min(cells.size(), n), result);
     }
 
     return result;
@@ -2869,6 +2916,12 @@ bool llama_kv_cache_context::apply() {
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
     return true;
+}
+
+void llama_kv_cache_context::reapply_tokens() {
+    if (!ubatches.empty()) {
+        kv->apply_ubatch_tokens(sinfos[i_cur], ubatches[i_cur]);
+    }
 }
 
 llama_memory_status llama_kv_cache_context::get_status() const {

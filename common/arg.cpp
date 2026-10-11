@@ -259,6 +259,11 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // pinned host memory: CPU-resident weights that are offloaded for large batches copy faster from it
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -4167,6 +4172,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--graph-slots"}, "N",
+        string_format("graphs kept for reuse per context (default: %d, 0 = auto: 8 with speculative decoding, 1 otherwise)", params.n_graph_slots),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_graph_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_GRAPH_SLOTS"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
@@ -4174,7 +4189,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
-        {"--spec-draft-n-ubatch"}, "N",
+        {"--spec-draft-n-ubatch", "--spec-draft-ubatch-size", "-ubd"}, "N",
         string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: %d - same as --n-ubatch)", params.speculative.draft.n_ubatch),
         [](common_params & params, int value) {
             if (value < 0) {

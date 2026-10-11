@@ -252,6 +252,40 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         return (d * qs.astype(np.float32))
 
 
+# 16 weights d*(code - 8), the codes in the planar engine's order: byte b of word w holds weight 8w + b (low nibble)
+# and 8w + b + 4 (high). Q4_16.pack_codes() packs integer codes [n_blocks, 16] in that order; the scales are the
+# caller's where a tensor is re-encoded exactly (scripts/fn_inplace.py).
+class Q4_16(__Quant, qtype=GGMLQuantizationType.Q4_16):
+    @classmethod
+    def pack_codes(cls, q: np.ndarray) -> np.ndarray:
+        n_blocks = q.shape[0]
+        q = q.astype(np.uint8).reshape((n_blocks, 2, 2, 4))  # word, half (low | high nibbles), byte
+        return (q[:, :, 0, :] | (q[:, :, 1, :] << np.uint8(4))).reshape((n_blocks, 8))
+
+    @classmethod
+    def unpack_codes(cls, qs: np.ndarray) -> np.ndarray:
+        n_blocks = qs.shape[0]
+        qs = qs.reshape((n_blocks, 2, 1, 4)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        return (qs & np.uint8(0x0F)).reshape((n_blocks, 16))
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        imax = abs(blocks).argmax(axis=-1, keepdims=True)
+        max = np.take_along_axis(blocks, imax, axis=-1)
+        d = max / -8
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        q = np.trunc((blocks * id) + np.float32(8.5), dtype=np.float32).astype(np.uint8).clip(0, 15)
+        return np.concatenate([d.astype(np.float16).view(np.uint8), cls.pack_codes(q)], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        d, qs = np.hsplit(blocks, [2])
+        d = d.view(np.float16).astype(np.float32)
+        q = cls.unpack_codes(qs).astype(np.int8) - np.int8(8)
+        return d * q.astype(np.float32)
+
+
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
     @classmethod
     def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:

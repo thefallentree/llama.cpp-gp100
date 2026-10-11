@@ -26,6 +26,11 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <cerrno>
+#include <cstring>
+#endif
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -398,7 +403,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
-    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
+    static const std::regex pattern_idx_cache       ("cache_idx_(pool_|cells_)?(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
@@ -419,20 +424,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
-    static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
+    static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?(_cold)?.weight");
     static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
-    static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?.weight");
+    static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?(_cold)?.weight");
     static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
     static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
-    static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?(_cold)?.weight");
     static const std::regex pattern_ffn_down_bias         ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias    ("blk\\.\\d*\\.ffn_down_exps.bias");
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
+    // the output head, sharded over the vocabulary
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
+    // the head of an MTP block that has its own: sharded over the vocabulary like the output head (every device
+    // the matvec over its rows; the draft chain merges the shards' best rows on the device, see
+    // llama_model_qwen4exp::graph_mtp). LLAMA_DRAFT_HEAD_SPLIT=0 mirrors it instead: the logits whole on every
+    // device at the cost of the whole matvec on each (+0.27 ms per draft step on a P100 for 97.6K rows of Q4_0).
+    static const std::regex pattern_draft_head_weight("blk\\.\\d*\\.nextn\\.shared_head_head\\.weight");
+    // the draft chain's constants (llama_context::draft_chain_init): a row of each per device
+    static const std::regex pattern_draft_chain_dev("draft_chain_(eye|off)");
 
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
@@ -606,6 +619,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+        }
+        if (std::regex_match(tensor_name, pattern_draft_head_weight)) {
+            static const bool by_vocab = getenv("LLAMA_DRAFT_HEAD_SPLIT") == nullptr || atoi(getenv("LLAMA_DRAFT_HEAD_SPLIT")) != 0;
+            if (is_dsv4) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            return get_tensor_config_impl(by_vocab ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (std::regex_match(tensor_name, pattern_draft_chain_dev)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
@@ -830,9 +853,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
-            return {blck_size_perf};
+            // slices of 128 columns for the mat-vec kernels where that divides the rows evenly, else the quant
+            // block (64 for the 640-wide experts of Qwen3.8-Flash-Next on two devices: 320 + 320 instead of
+            // 256 + 384, whose larger half every layer waits for)
+            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            const int64_t blck_size_min  = std::lcm(blck_size, 64);
+            return {segments[0].first % (blck_size_perf*(int64_t) ud->n_devices) == 0 ? blck_size_perf : blck_size_min};
         }
 
         // everything else
@@ -2020,6 +2047,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+#if defined(__linux__)
+    // LLAMA_PLE_MLOCK=0 to leave it: the PLE n-gram table (28.8 GB for Qwen3.8-Flash-Next) stays a mapping in host memory
+    // that every decode window reads a few dozen random rows of; with 5% of it out of the page cache, those reads
+    // cost 0.6 ms per window at a 64K context (77 us at 1K, where the n-grams repeat). Locked, nothing is ever read
+    // from the disk again. The load touches what was not resident (seconds).
+    if (per_layer_tok_embd != nullptr && per_layer_tok_embd->data != nullptr && per_layer_tok_embd->buffer != nullptr &&
+            ggml_backend_buffer_is_host(per_layer_tok_embd->buffer) &&
+            (getenv("LLAMA_PLE_MLOCK") == nullptr || atoi(getenv("LLAMA_PLE_MLOCK")) != 0)) {
+        const size_t size = ggml_nbytes(per_layer_tok_embd);
+        const int64_t t0  = ggml_time_us();
+        if (mlock(per_layer_tok_embd->data, size) == 0) {
+            LLAMA_LOG_INFO("%s: the PLE table (%.1f GB) locked in memory in %.1f s\n", __func__, size/1e9, (ggml_time_us() - t0)/1e6);
+            // nothing to page in any more: the madvise per row of a prompt ubatch (2.5 us each, ~60 ms per 1024 tokens) is spared
+            can_prefetch.erase(per_layer_tok_embd);
+        } else {
+            LLAMA_LOG_WARN("%s: mlock of the PLE table (%.1f GB) failed: %s\n", __func__, size/1e9, strerror(errno));
+        }
+    }
+#endif
 
     return true;
 }
@@ -3385,6 +3432,30 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+bool llama_model::draft_chain_supported() const {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
+int32_t llama_model_n_vocab_draft(const llama_model * model) {
+    return model->d2t ? (int32_t) model->d2t->ne[0] : (int32_t) model->vocab.n_tokens();
+}
+
+bool llama_model_draft_logits_reduced(const llama_model * model) {
+    return model->d2t != nullptr && model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+}
+
+const int64_t * llama_model_d2t(const llama_model * model) {
+    if (model->d2t == nullptr) {
+        return nullptr;
+    }
+    if (model->d2t_host.empty()) {
+        GGML_ASSERT(model->d2t->type == GGML_TYPE_I64 && model->d2t->buffer != nullptr);
+        model->d2t_host.resize(model->d2t->ne[0]);
+        ggml_backend_tensor_get(model->d2t, model->d2t_host.data(), 0, ggml_nbytes(model->d2t));
+    }
+    return model->d2t_host.data();
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {

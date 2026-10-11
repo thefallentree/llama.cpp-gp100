@@ -94,6 +94,8 @@ static int fn_dense_tile_rows(const int64_t cols) {
 
 #ifndef FN_STANDALONE
 
+static bool fn_debug();
+
 // ---------------------------------------------------------------------------------------------------------------
 // planar weights: the registry
 
@@ -158,7 +160,7 @@ bool ggml_cuda_fn_enabled() {
 }
 
 bool ggml_cuda_fn_planar(const ggml_tensor * t, ggml_cuda_fn_plane * plane) {
-    if (g_fn_n_planes.load(std::memory_order_relaxed) == 0 || (t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0) || t->data == nullptr) {
+    if (g_fn_n_planes.load(std::memory_order_relaxed) == 0 || (t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q4_16) || t->data == nullptr) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_fn_mutex);
@@ -189,6 +191,7 @@ static bool fn_plane_of(const ggml_tensor * t, const char ** w, ggml_cuda_fn_pla
     *w              = it->second.w;
     plane->rowscale = it->second.rowscale;
     plane->q4       = false;
+    plane->s16      = false;
     return true;
 }
 
@@ -205,6 +208,7 @@ static bool fn_plane_rest(const ggml_tensor * t, const char ** w, ggml_cuda_fn_p
     *w              = it->second.w2;
     plane->rowscale = it->second.rowscale2;
     plane->q4       = false;
+    plane->s16      = false;
     return true;
 }
 
@@ -318,6 +322,18 @@ static __global__ void fn_p4_repack(const char * __restrict__ src, const int64_t
         out[w] = (uint32_t) (c[0] | (c[4] << 4)) | ((uint32_t) (c[1] | (c[5] << 4)) << 8) |
                  ((uint32_t) (c[2] | (c[6] << 4)) << 16) | ((uint32_t) (c[3] | (c[7] << 4)) << 24);
     }
+}
+
+// one thread per Q4_16 block of `src` (a copy of n blocks): its 8 code bytes are in the planar order already
+static __global__ void fn_p4s16_repack(const char * __restrict__ src, const int64_t n, char * __restrict__ dst) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const uint16_t * s = (const uint16_t *) (src + i*(QK4_16/2 + 2) + 2); // the blocks are 2-byte aligned
+    uint32_t *       o = (uint32_t *) (dst + i*(QK4_16/2));
+    o[0] = (uint32_t) s[0] | ((uint32_t) s[1] << 16);
+    o[1] = (uint32_t) s[2] | ((uint32_t) s[3] << 16);
 }
 
 // the scale plane: the block scales relative to their row's
@@ -459,10 +475,10 @@ static bool fn_planar_eligible(const ggml_backend_cuda_context & ctx, const ggml
         return false;
     }
     const ggml_tensor * w = node->src[0];
-    // Q4_0 weights as P4 (GGML_CUDA_FN_P4=0: they stay with the generic mat-vec)
+    // Q4_0 and Q4_16 weights as P4 (GGML_CUDA_FN_P4=0: they stay with the generic mat-vec, Q4_16 with cuBLAS)
     static const bool p4 = getenv("GGML_CUDA_FN_P4") == nullptr || atoi(getenv("GGML_CUDA_FN_P4")) != 0;
     // only weights in this device's own memory (not host memory, not the tensors of a tensor-split meta device)
-    if ((w->type != GGML_TYPE_Q8_0 && !(p4 && w->type == GGML_TYPE_Q4_0)) || w->data == nullptr || w->buffer == nullptr || w->view_src != nullptr ||
+    if ((w->type != GGML_TYPE_Q8_0 && !(p4 && (w->type == GGML_TYPE_Q4_0 || w->type == GGML_TYPE_Q4_16))) || w->data == nullptr || w->buffer == nullptr || w->view_src != nullptr ||
         ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
         ggml_backend_buffer_get_type(w->buffer) != ggml_backend_cuda_buffer_type(ctx.device) ||
         !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1) {
@@ -506,16 +522,19 @@ void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph *
             synced = true;
         }
         const int64_t rows   = w->ne[1];
-        const int     nb     = (int) (w->ne[0]/FN_QK);
+        const bool    q4     = w->type == GGML_TYPE_Q4_0 || w->type == GGML_TYPE_Q4_16;
+        const bool    s16    = w->type == GGML_TYPE_Q4_16;
+        const int     qk     = s16 ? QK4_16 : FN_QK;  // weights per block
+        const int     nb     = (int) (w->ne[0]/qk);
         const size_t  nbytes = ggml_nbytes(w);
-        const bool    q4     = w->type == GGML_TYPE_Q4_0;
-        const int     cb     = q4 ? FN_QK/2 : FN_QK; // code bytes per block
-        const int     bs     = cb + 2;               // bytes per block
+        const int     cb     = q4 ? qk/2 : qk;        // code bytes per block
+        const int     bs     = cb + 2;                // bytes per block
         GGML_ASSERT(nbytes == (size_t) rows*nb*bs);
 
         fn_plane_entry e;
-        e.device   = ctx.device;
-        e.plane.q4 = q4;
+        e.device    = ctx.device;
+        e.plane.q4  = q4;
+        e.plane.s16 = s16;
         const int64_t nblk  = rows*nb;
         const int64_t chunk = std::min<int64_t>(nblk, 1 << 19); // blocks per pass
         char * tmp  = nullptr;
@@ -529,7 +548,9 @@ void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph *
         for (int64_t b0 = 0; b0 < nblk; b0 += chunk) {
             const int64_t n = std::min(chunk, nblk - b0);
             CUDA_CHECK(cudaMemcpyAsync(tmp, (const char *) w->data + b0*bs, n*bs, cudaMemcpyDeviceToDevice, stream));
-            if (q4) {
+            if (s16) {
+                fn_p4s16_repack<<<(unsigned) ((n + 255)/256), 256, 0, stream>>>(tmp, n, (char *) w->data + b0*cb);
+            } else if (q4) {
                 fn_p4_repack<<<(unsigned) ((n + 255)/256), 256, 0, stream>>>(tmp, n, (char *) w->data + b0*cb);
             } else {
                 fn_p8_repack<<<(unsigned) ((n + 255)/256), 256, 0, stream>>>(tmp, n, (char *) w->data + b0*cb);
@@ -542,6 +563,10 @@ void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph *
         CUDA_CHECK(cudaFree(tmp));
         CUDA_CHECK(cudaFree(dtmp));
 
+        if (fn_debug()) {
+            fprintf(stderr, "fn-debug: planar %s %s [%lld x %lld] on device %d%s\n", ggml_type_name(w->type), w->name,
+                    (long long) w->ne[0], (long long) w->ne[1], ctx.device, s16 ? " (scale per 16)" : "");
+        }
         std::lock_guard<std::mutex> lock(g_fn_mutex);
         g_fn_planes[w->data] = e;
         g_fn_n_planes.store((int) g_fn_planes.size(), std::memory_order_relaxed);
@@ -572,8 +597,8 @@ static __global__ void fn_p8_dequantize(const uint4 * __restrict__ W, const half
     }
 }
 
-// the P4 layout: a word's low nibbles are its columns 0-3, its high nibbles 4-7
-template <typename dst_t>
+// the P4 layout: a word's low nibbles are its columns 0-3, its high nibbles 4-7; SB: the columns a scale covers
+template <typename dst_t, int SB>
 static __global__ void fn_p4_dequantize(const uint2 * __restrict__ W, const half * __restrict__ D,
                                         const float * __restrict__ rowscale, const int tpr, const int64_t n16,
                                         dst_t * __restrict__ y) {
@@ -584,7 +609,7 @@ static __global__ void fn_p4_dequantize(const uint2 * __restrict__ W, const half
     const int64_t r = i / tpr;
     const int     k = (int) (i - r*tpr);
     const uint2   v = W[i];
-    const float   s = __half2float(D[r*(tpr/2) + (k >> 1)])*rowscale[r];
+    const float   s = __half2float(D[r*(tpr*16/SB) + k*16/SB])*rowscale[r];
     const uint32_t w[2] = { v.x, v.y };
     dst_t * yo = y + i*16;
 #pragma unroll
@@ -606,19 +631,21 @@ void ggml_cuda_fn_dequantize(const ggml_tensor * src0, void * dst, const ggml_ty
     const unsigned grid = (unsigned) ((n16 + 255)/256);
     if (plane.q4) {
         const uint2 * W = (const uint2 *) src0->data;
+#define FN_P4_DEQ(T, SB) fn_p4_dequantize<T, SB><<<grid, 256, 0, stream>>>(W, D, plane.rowscale, tpr, n16, (T *) dst)
         switch (dst_type) {
             case GGML_TYPE_F16:
-                fn_p4_dequantize<half><<<grid, 256, 0, stream>>>(W, D, plane.rowscale, tpr, n16, (half *) dst);
+                if (plane.s16) { FN_P4_DEQ(half, 16); } else { FN_P4_DEQ(half, 32); }
                 break;
             case GGML_TYPE_BF16:
-                fn_p4_dequantize<nv_bfloat16><<<grid, 256, 0, stream>>>(W, D, plane.rowscale, tpr, n16, (nv_bfloat16 *) dst);
+                if (plane.s16) { FN_P4_DEQ(nv_bfloat16, 16); } else { FN_P4_DEQ(nv_bfloat16, 32); }
                 break;
             case GGML_TYPE_F32:
-                fn_p4_dequantize<float><<<grid, 256, 0, stream>>>(W, D, plane.rowscale, tpr, n16, (float *) dst);
+                if (plane.s16) { FN_P4_DEQ(float, 16); } else { FN_P4_DEQ(float, 32); }
                 break;
             default:
                 GGML_ABORT("fatal error");
         }
+#undef FN_P4_DEQ
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -802,19 +829,36 @@ static __device__ __forceinline__ void fn_p4_decode(const uint2 v, const half2 m
     w[7] = __hsub2(fn_h2(__byte_perm(hi1, 0x64646464, 0x4342)), magic);
 }
 
-// a thread's 16 columns of a row by the code width: 16 bytes of P8, 8 of P4
+// a thread's 16 columns of a row by the code width Q: 16 bytes of P8, 8 of P4; sblk: the columns a block scale
+// covers (Q = 5: P4 with a scale per 16 columns, a Q4_16 tensor)
 template <int Q> struct fn_wq;
 template <> struct fn_wq<8> {
     typedef uint4 vec;
     static constexpr int   bytes = 16;
+    static constexpr int   sblk  = 32;
     static constexpr float magic = 1152.0f; // 1024 + 128
     static __device__ __forceinline__ void decode(const vec v, const half2 m, half2 * w) { fn_p8_decode(v, m, w); }
 };
 template <> struct fn_wq<4> {
     typedef uint2 vec;
     static constexpr int   bytes = 8;
+    static constexpr int   sblk  = 32;
     static constexpr float magic = 1032.0f; // 1024 + 8
     static __device__ __forceinline__ void decode(const vec v, const half2 m, half2 * w) { fn_p4_decode(v, m, w); }
+};
+template <> struct fn_wq<5> {
+    typedef uint2 vec;
+    static constexpr int   bytes = 8;
+    static constexpr int   sblk  = 16;
+    static constexpr float magic = 1032.0f;
+    static __device__ __forceinline__ void decode(const vec v, const half2 m, half2 * w) { fn_p4_decode(v, m, w); }
+};
+template <> struct fn_wq<9> { // mixed: never decoded as such (the kernel takes the segment's width)
+    typedef uint2 vec;
+    static constexpr int   bytes = 8;
+    static constexpr int   sblk  = 32;
+    static constexpr float magic = 0.0f;
+    static __device__ __forceinline__ void decode(const vec, const half2, half2 *) {}
 };
 
 // The 16 columns of one thread for T tokens, as 8 half2 each; the tokens are xstride half2 apart. They are loaded
@@ -904,6 +948,7 @@ struct fn_dense_seg {
     int           dst_stride;
     int           ntiles;
     int           block_end;  // the segment's blocks: from the block_end of the segment before to this one
+    int           q;          // the code width of the segment (8, 4, 5), read by the mixed kernel only
 };
 
 struct fn_dense_job {
@@ -925,14 +970,15 @@ static __device__ __forceinline__ void fn_dense_tiles(const fn_dense_job & job, 
     for (int tile = blockIdx.x - b0; tile < ntiles; tile += nb) {
         const fn_dense_seg & sg = job.seg[si_mem];
         // row (r, g) of the tile is tile*G*R + r*G + g: consecutive rows for consecutive g
+        constexpr int SBK = fn_wq<Q>::sblk/16; // threads per block scale
         const vec *  wr = (const vec *) sg.W + (size_t) tile*(R*NT*S) + g*(TPR*S) + k;
-        const half * dr = sg.D + (size_t) tile*(R*NT*S/2) + g*(TPR*S/2) + (k >> 1);
+        const half * dr = sg.D + (size_t) tile*(R*NT*S/SBK) + g*(TPR*S/SBK) + k/SBK;
         vec  v[R];
         half d[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             v[r] = __ldg(wr + r*(NT*S));
-            d[r] = dr[r*(NT*S/2)];
+            d[r] = dr[r*(NT*S/SBK)];
         }
         // the row scales are loaded with the weights: a load issued by the gathering threads after the barrier
         // would make the whole block wait for it
@@ -996,9 +1042,10 @@ static __device__ __forceinline__ void fn_dense_tiles(const fn_dense_job & job, 
 // A thread's R*T partial sums go to shared memory two per word; thread (g, p) then sums pair p over row g's threads.
 // The geometry is compile-time: with it as kernel arguments the index arithmetic (XMAD chains for every load and
 // store) doubled the instruction count and the kernel ran at half the speed.
-// Q: the code width of the launch's segments, 8 (P8) or 4 (P4). One kernel for both widths, taking a block's width
-// from its segment, cost 2 registers (a spill of 8 bytes in 12 of the 56 instantiations): the launcher groups the
-// segments by width instead.
+// Q: the code width of the launch's segments, 8 (P8), 4 (P4), 5 (P4 with a scale per 16) - or 9: mixed, the width
+// read from the segment (a launch of mat-vecs that read one vector but differ in width, e.g. a Q4_16 attn_qkv with
+// the Q8_0 alpha/beta; one more launch per layer otherwise). The mixed kernel holds all three tile loops and costs
+// registers (a spill of 8 bytes in some instantiations), so launches of one width take the specialized kernels.
 // P4 (measured on a P100 with runs/fn-m2/k/eng3.cu, the P8 table): qkv/2 [5120 x 2560] T1 27.2 -> 16.8 us, T3 29.6 ->
 // 21.7, T5 31.7 -> 27.8; attn_q/2 [6144 x 2560] T1 32.0 -> 19.3, T3 34.4 -> 24.6; ssm_out/2 T3 18.6 -> 14.7. P8 streams
 // at 470-520 GB/s; P4 reads half the bytes but its decode (11 instructions per word: two masks, a shift, four PRMT, four
@@ -1053,7 +1100,18 @@ fn_dense_p8(const fn_dense_job job) {
         xs1 = job.seg[si].xscale[vt1];
     }
 
-    fn_dense_tiles<T, R, TPR, G, S, Q, NPG, NSP, WRED>(job, si_mem, b0, nb, ntiles, g, k, a, gather, p, gg, vr0, vr1, vt0, vt1, xs0, xs1, s_part);
+    if (Q == 9) {
+        const int q = job.seg[si].q;
+        if (q == 8) {
+            fn_dense_tiles<T, R, TPR, G, S, 8, NPG, NSP, WRED>(job, si_mem, b0, nb, ntiles, g, k, a, gather, p, gg, vr0, vr1, vt0, vt1, xs0, xs1, s_part);
+        } else if (q == 4) {
+            fn_dense_tiles<T, R, TPR, G, S, 4, NPG, NSP, WRED>(job, si_mem, b0, nb, ntiles, g, k, a, gather, p, gg, vr0, vr1, vt0, vt1, xs0, xs1, s_part);
+        } else {
+            fn_dense_tiles<T, R, TPR, G, S, 5, NPG, NSP, WRED>(job, si_mem, b0, nb, ntiles, g, k, a, gather, p, gg, vr0, vr1, vt0, vt1, xs0, xs1, s_part);
+        }
+    } else {
+        fn_dense_tiles<T, R, TPR, G, S, Q, NPG, NSP, WRED>(job, si_mem, b0, nb, ntiles, g, k, a, gather, p, gg, vr0, vr1, vt0, vt1, xs0, xs1, s_part);
+    }
 #else
     GGML_UNUSED_VARS(job);
     NO_DEVICE_CODE;
@@ -1118,8 +1176,70 @@ static void fn_dense_launch_p4(const int nt, const fn_dense_geom & gm, const fn_
     CUDA_CHECK(cudaGetLastError());
 }
 
-static void fn_dense_launch(const int nt, const fn_dense_geom & gm, const fn_dense_job & job, const int grid, const bool q4, cudaStream_t stream) {
-    if (q4) {
+static void fn_dense_launch_p4s16(const int nt, const fn_dense_geom & gm, const fn_dense_job & job, const int grid, cudaStream_t stream) {
+    GGML_ASSERT(gm.s == 1 || gm.tpr == 160);
+    switch (nt) {
+#define FN_ROW(N, R20, B20, R40, B40, R160, B160, R192, B192, R384, B384)                                                  \
+        case N:                                                                                                       \
+            switch (gm.tpr) {                                                                                         \
+                case  20: fn_dense_p8<N, R20,   20, 8, B20,  1, 5><<<grid, 8*20, 0, stream>>>(job); break;            \
+                case  40: fn_dense_p8<N, R40,   40, 4, B40,  1, 5><<<grid, 4*40, 0, stream>>>(job); break;            \
+                case 160:                                                                                             \
+                    if (gm.s == 1) {                                                                                  \
+                        fn_dense_p8<N, R160, 160, 1, B160, 1, 5><<<grid, 160, 0, stream>>>(job);                      \
+                    } else if (gm.s == 2) {                                                                           \
+                        fn_dense_p8<N, R160, 160, 1, B160, 2, 5><<<grid, 160, 0, stream>>>(job);                      \
+                    } else {                                                                                          \
+                        fn_dense_p8<N, R160, 160, 1, B160, 4, 5><<<grid, 160, 0, stream>>>(job);                      \
+                    }                                                                                                 \
+                    break;                                                                                            \
+                case 192: fn_dense_p8<N, R192, 192, 1, B192, 1, 5><<<grid, 192, 0, stream>>>(job); break;             \
+                default:  fn_dense_p8<N, R384, 384, 1, B384, 1, 5><<<grid, 384, 0, stream>>>(job); break;             \
+            }                                                                                                         \
+            break;
+        FN_DENSE_TABLE_P4(FN_ROW)
+#undef FN_ROW
+        default:
+            GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void fn_dense_launch_mixed(const int nt, const fn_dense_geom & gm, const fn_dense_job & job, const int grid, cudaStream_t stream) {
+    GGML_ASSERT(gm.s == 1 || gm.tpr == 160);
+    switch (nt) {
+#define FN_ROW(N, R20, B20, R40, B40, R160, B160, R192, B192, R384, B384)                                                  \
+        case N:                                                                                                       \
+            switch (gm.tpr) {                                                                                         \
+                case  20: fn_dense_p8<N, R20,   20, 8, B20,  1, 9><<<grid, 8*20, 0, stream>>>(job); break;            \
+                case  40: fn_dense_p8<N, R40,   40, 4, B40,  1, 9><<<grid, 4*40, 0, stream>>>(job); break;            \
+                case 160:                                                                                             \
+                    if (gm.s == 1) {                                                                                  \
+                        fn_dense_p8<N, R160, 160, 1, B160, 1, 9><<<grid, 160, 0, stream>>>(job);                      \
+                    } else if (gm.s == 2) {                                                                           \
+                        fn_dense_p8<N, R160, 160, 1, B160, 2, 9><<<grid, 160, 0, stream>>>(job);                      \
+                    } else {                                                                                          \
+                        fn_dense_p8<N, R160, 160, 1, B160, 4, 9><<<grid, 160, 0, stream>>>(job);                      \
+                    }                                                                                                 \
+                    break;                                                                                            \
+                case 192: fn_dense_p8<N, R192, 192, 1, B192, 1, 9><<<grid, 192, 0, stream>>>(job); break;             \
+                default:  fn_dense_p8<N, R384, 384, 1, B384, 1, 9><<<grid, 384, 0, stream>>>(job); break;             \
+            }                                                                                                         \
+            break;
+        FN_DENSE_TABLE_P4(FN_ROW)
+#undef FN_ROW
+        default:
+            GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void fn_dense_launch(const int nt, const fn_dense_geom & gm, const fn_dense_job & job, const int grid, const int q, cudaStream_t stream) {
+    if (q == 9) {
+        fn_dense_launch_mixed(nt, gm, job, grid, stream);
+    } else if (q == 5) {
+        fn_dense_launch_p4s16(nt, gm, job, grid, stream);
+    } else if (q == 4) {
         fn_dense_launch_p4(nt, gm, job, grid, stream);
     } else {
         fn_dense_launch_p8(nt, gm, job, grid, stream);
@@ -1131,7 +1251,7 @@ struct fn_dense_part {
     const char *  w;          // planar weights [rows x cols]
     int64_t       rows, cols;
     const float * rowscale;
-    bool          q4 = false; // P4 codes (8 bytes per 16 columns), else P8
+    int           q = 8;      // the code width: 8 (P8), 4 (P4), 5 (P4 with a scale per 16 columns)
     int           part;       // which of the row's parts (S > 1)
     const half *  X;          // activations: [T][xstride halves]
     int           xstride;
@@ -1143,11 +1263,14 @@ struct fn_dense_part {
 // n mat-vecs of the same row width and code width in one launch
 static void fn_dense_q(const int nt, const fn_dense_part * parts, const int n, const int nsm, cudaStream_t stream) {
     GGML_ASSERT(n >= 1 && n <= FN_MAX_SEG);
+    int q = parts[0].q;
     for (int i = 1; i < n; ++i) {
-        GGML_ASSERT(parts[i].q4 == parts[0].q4);
+        if (parts[i].q != parts[0].q) {
+            q = 9; // mixed widths: the kernel that reads the width per segment
+        }
     }
     fn_dense_geom gm;
-    GGML_ASSERT(fn_dense_geometry(parts[0].cols, &gm, nt, parts[0].q4));
+    GGML_ASSERT(fn_dense_geometry(parts[0].cols, &gm, nt, q != 8));
     const int tile_rows = gm.g*gm.r;
     int ntiles[FN_MAX_SEG];
     int total = 0;
@@ -1195,11 +1318,13 @@ static void fn_dense_q(const int nt, const fn_dense_part * parts, const int n, c
             sg.block_end = grid;
             continue;
         }
-        const fn_dense_part & pt = parts[i];
-        const int             wb = pt.q4 ? fn_wq<4>::bytes : fn_wq<8>::bytes; // per 16 columns
+        const fn_dense_part & pt  = parts[i];
+        const int             wb  = pt.q == 8 ? fn_wq<8>::bytes : fn_wq<4>::bytes; // per 16 columns
+        const int             sbk = pt.q == 5 ? 1 : 2;                              // threads per block scale
         end += nb[i];
         sg.W          = pt.w + (size_t) pt.part*gm.tpr*wb;
-        sg.D          = (const half *) (pt.w + pt.rows*pt.cols*wb/16) + (size_t) pt.part*(gm.tpr/2);
+        sg.D          = (const half *) (pt.w + pt.rows*pt.cols*wb/16) + (size_t) pt.part*(gm.tpr/sbk);
+        sg.q          = pt.q;
         sg.rowscale   = pt.rowscale;
         sg.X          = (const half2 *) pt.X;
         sg.xscale     = pt.xscale;
@@ -1209,18 +1334,24 @@ static void fn_dense_q(const int nt, const fn_dense_part * parts, const int n, c
         sg.ntiles     = ntiles[i];
         sg.block_end  = end;
     }
-    fn_dense_launch(nt, gm, job, grid, parts[0].q4, stream);
+    fn_dense_launch(nt, gm, job, grid, q, stream);
 }
 
-// n mat-vecs of the same row width: one launch per code width among them (one launch when the model's types keep
-// the mat-vecs of a vector at one width, which the re-encoding does)
+// n mat-vecs of the same row width in one launch, of one code width (the specialized kernels) or of several (the
+// mixed kernel; GGML_CUDA_FN_MIXED=0 launches once per width instead)
 static void fn_dense(const int nt, const fn_dense_part * parts, const int n, const int nsm, cudaStream_t stream) {
     GGML_ASSERT(n >= 1 && n <= FN_MAX_SEG);
+    static const bool mixed = getenv("GGML_CUDA_FN_MIXED") == nullptr || atoi(getenv("GGML_CUDA_FN_MIXED")) != 0;
+    if (mixed) {
+        fn_dense_q(nt, parts, n, nsm, stream);
+        return;
+    }
     fn_dense_part group[FN_MAX_SEG];
-    for (int pass = 0; pass < 2; ++pass) {
+    static const int widths[3] = { 8, 4, 5 };
+    for (int pass = 0; pass < 3; ++pass) {
         int m = 0;
         for (int i = 0; i < n; ++i) {
-            if (parts[i].q4 == (pass == 1)) {
+            if (parts[i].q == widths[pass]) {
                 group[m++] = parts[i];
             }
         }
@@ -1326,7 +1457,7 @@ static fn_dense_part fn_dense_part_of(const ggml_tensor * w, const ggml_cuda_fn_
     pt.rows       = w->ne[1];
     pt.cols       = w->ne[0];
     pt.rowscale   = plane.rowscale;
-    pt.q4         = plane.q4;
+    pt.q          = plane.q4 ? (plane.s16 ? 5 : 4) : 8;
     pt.part       = part;
     pt.X          = fn_act_X(x);
     pt.xstride    = x.n;
@@ -1501,7 +1632,7 @@ void ggml_cuda_fn_reorder(ggml_cgraph * cgraph) {
     auto candidate = [](const ggml_tensor * node) {
         const ggml_tensor * w = node->src[0];
         const ggml_tensor * x = node->src[1];
-        return node->op == GGML_OP_MUL_MAT && (w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q4_0) && w->ne[2] == 1 && w->ne[3] == 1 &&
+        return node->op == GGML_OP_MUL_MAT && (w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q4_0 || w->type == GGML_TYPE_Q4_16) && w->ne[2] == 1 && w->ne[3] == 1 &&
                x->type == GGML_TYPE_F32 && x->ne[1] <= FN_MAX_T && x->ne[2] == 1 && x->ne[3] == 1 &&
                fn_dense_geometry(w->ne[0]) && w->ne[0]/16 != 640;
     };

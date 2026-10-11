@@ -33,9 +33,11 @@
 // columns, byte b (of a word) holds column b in its low nibble and column b + 4 in its high one, so that the mat-vec
 // decodes a word's low and high nibbles as two words of bytes the way it decodes P8. Half the bytes of P8 for the
 // same mat-vec (which streams the weights: ~2x on the P100), at the precision of Q4_0.
+// P4 with a scale per 16 columns (s16, a Q4_16 tensor): the scale plane has twice the entries, the codes are the same.
 struct ggml_cuda_fn_plane {
     float * rowscale = nullptr;
     bool    q4       = false;
+    bool    s16      = false;
 };
 
 bool ggml_cuda_fn_enabled();
@@ -43,7 +45,7 @@ bool ggml_cuda_fn_enabled();
 // Is the tensor's data in the planar layout? (looked up by its data pointer)
 bool ggml_cuda_fn_planar(const ggml_tensor * t, ggml_cuda_fn_plane * plane = nullptr);
 
-// graph_optimize: repacks the Q8_0 and Q4_0 weights that the graph's MUL_MAT nodes read on this device. It runs
+// graph_optimize: repacks the Q8_0, Q4_0 and Q4_16 weights that the graph's MUL_MAT nodes read on this device. It runs
 // before the first use of a graph, so no captured or in-flight launch still expects the old layout.
 void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph);
 

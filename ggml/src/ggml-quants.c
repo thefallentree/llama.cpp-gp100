@@ -494,6 +494,54 @@ void dequantize_row_q4_1_g64(const block_q4_1_g64 * GGML_RESTRICT x, float * GGM
     }
 }
 
+// the code of weight j of a block: word j/8 % ... see block_q4_16
+static inline int q4_16_byte(const int j) { return 4*(j / 8) + (j % 8) % 4; }
+static inline int q4_16_shift(const int j) { return (j % 8) < 4 ? 0 : 4; }
+
+void dequantize_row_q4_16(const block_q4_16 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_16;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = d*(float) (((x[i].qs[q4_16_byte(j)] >> q4_16_shift(j)) & 0x0F) - 8);
+        }
+    }
+}
+
+// the plain rounding (the exact re-encodings of Q3_K/Q2_0 tensors are made by scripts/fn_inplace.py)
+void quantize_row_q4_16_ref(const float * GGML_RESTRICT x, block_q4_16 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_16;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f, max = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+                max  = v;
+            }
+        }
+        const float d  = max / -8;
+        const float id = d ? 1.0f/d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < qk; ++j) {
+            const float v  = x[i*qk + j]*id;
+            const uint8_t q = MIN(15, (int8_t) (v + 8.5f));
+            y[i].qs[q4_16_byte(j)] |= q << q4_16_shift(j);
+        }
+    }
+}
+
+size_t quantize_q4_16(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q4_16_ref(src, dst, (int64_t) nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q4_16, n_per_row);
+}
+
 void quantize_row_q4_1_g64_ref(const float * GGML_RESTRICT x, block_q4_1_g64 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_1_G64;
     assert(k % qk == 0);
@@ -5616,6 +5664,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_1_G64:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_1_g64, data, nb, d, m);
+            } break;
+        case GGML_TYPE_Q4_16:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_16, data, nb);
             } break;
         case GGML_TYPE_Q5_0:
             {

@@ -431,7 +431,9 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_Q4_1_G64 = 43, // Q4_1 nibbles with one (d,m) per 64 weights (4.5 bpw)
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_Q4_16   = 44, // 4-bit codes (value = d*(code - 8)) with one fp16 d per 16 weights (5 bpw): a
+                                // Q3_K or Q2_0 tensor re-encoded exactly; the nibbles in the planar engine's order
+        GGML_TYPE_COUNT   = 45,
     };
 
     // [TAG_GGML_PREC]

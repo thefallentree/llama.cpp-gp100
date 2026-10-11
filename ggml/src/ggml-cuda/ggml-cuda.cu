@@ -2467,7 +2467,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         // Q4_1_G64 has no generic MMVQ kernel: only shapes the sm_60 HFMA2 hook accepts may
         // route here; everything else must fall through to dequant + cuBLAS below.
-        if (src0->type != GGML_TYPE_Q4_1_G64 ||
+        if (src0->type == GGML_TYPE_Q4_16) {
+            // no generic mat-vec: the planar engine took it above where it could, else dequantize + cuBLAS
+        } else if (src0->type != GGML_TYPE_Q4_1_G64 ||
                 ggml_cuda_mmvq_f16_sm60_supported(src0, src1, nullptr, dst)) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
             return;
@@ -2483,7 +2485,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_DP4A &&
         ggml_cuda_should_use_mmvq(src0->type, cc, MMVQ_MAX_BATCH_SIZE) &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-        src0->type != GGML_TYPE_Q4_1_G64) {
+        src0->type != GGML_TYPE_Q4_1_G64 && src0->type != GGML_TYPE_Q4_16) {
         for (int64_t c0 = 0; c0 < ne11; c0 += MMVQ_MAX_BATCH_SIZE) {
             const int64_t n = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ne11 - c0);
             ggml_tensor src1_c = *src1;
@@ -2736,7 +2738,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     // planar weights (fn-engine.cuh) keep their ggml type but only MUL_MAT can read them, as src0
     for (int j = 0; j < GGML_MAX_SRC; ++j) {
         const ggml_tensor * src = dst->src[j];
-        if (src != nullptr && (src->type == GGML_TYPE_Q8_0 || src->type == GGML_TYPE_Q4_0) && !(dst->op == GGML_OP_MUL_MAT && j == 0) && ggml_cuda_fn_planar(src)) {
+        if (src != nullptr && (src->type == GGML_TYPE_Q8_0 || src->type == GGML_TYPE_Q4_0 || src->type == GGML_TYPE_Q4_16) && !(dst->op == GGML_OP_MUL_MAT && j == 0) && ggml_cuda_fn_planar(src)) {
             GGML_ABORT("%s: %s reads the planar weight %s\n", __func__, ggml_op_name(dst->op), src->name);
         }
     }
@@ -7039,6 +7041,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_1_G64:
+                    case GGML_TYPE_Q4_16:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:

@@ -1621,6 +1621,15 @@ struct ggml_backend_cuda_context {
     unsigned int * in_seen_dev  = nullptr;
     unsigned int   in_fired     = 0;
     cudaEvent_t    in_copy_event = nullptr;
+    // in_dev holds one blob: a copy into it (a fire, a flush) must wait until the scatter of the blob before it has
+    // run on the device, or the earlier window scatters the later window's inputs (a torn table: an illegal address;
+    // a whole one: stale inputs, and the later gate waits for a flag it has seen). The gate's k_in_seen writes the
+    // flag it consumed to in_seen_host (pinned, mapped) for the host to see; a flush's scatter is followed by
+    // in_scatter_event.
+    unsigned int * in_seen_host     = nullptr; // pinned, mapped: the flag the last gate consumed
+    unsigned int * in_seen_host_dev = nullptr; // its device pointer
+    cudaEvent_t    in_scatter_event = nullptr;
+    bool           in_last_fire     = false;   // the blob in in_dev came from a fire (else from a flush)
     bool           in_gate_pending = false; // a launched window waits for fire()
     bool           in_fire_armed   = false; // fire() came before the launch: the launch fires itself
     bool           in_gated_capture = false; // a gated window is being captured: the staged inputs are the gate's, nothing flushes them

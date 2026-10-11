@@ -3199,8 +3199,11 @@ static __global__ void k_in_gate_scatter(const char * __restrict__ blob) {
     }
 }
 
-static __global__ void k_in_seen(const volatile unsigned int * __restrict__ flag, unsigned int * __restrict__ seen) {
-    *seen = *flag;
+static __global__ void k_in_seen(const volatile unsigned int * __restrict__ flag, unsigned int * __restrict__ seen,
+                                 volatile unsigned int * __restrict__ seen_host) {
+    const unsigned int f = *flag;
+    *seen      = f;
+    *seen_host = f; // for the host: the scatter before this node has run, in_dev may be written again
 }
 
 // (the flag was set by a kernel on the input stream: it never ran while a window's gate was spinning on the main
@@ -3222,10 +3225,37 @@ static void ggml_cuda_in_gate_record(ggml_backend_cuda_context & ctx) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx.in_copy_event, cudaEventDisableTiming));
         ctx.in_fired = 0;
     }
+    if (ctx.in_seen_host == nullptr) {
+        CUDA_CHECK(cudaHostAlloc((void **) &ctx.in_seen_host, 64, cudaHostAllocMapped));
+        memset(ctx.in_seen_host, 0, 64);
+        CUDA_CHECK(cudaHostGetDevicePointer((void **) &ctx.in_seen_host_dev, ctx.in_seen_host, 0));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.in_scatter_event, cudaEventDisableTiming));
+    }
     k_in_gate<<<1, 32, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev);
     k_in_gate_scatter<<<GGML_CUDA_IN_MAX, 256, 0, ctx.stream()>>>(ctx.in_dev);
-    k_in_seen<<<1, 1, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev);
+    k_in_seen<<<1, 1, 0, ctx.stream()>>>(ctx.in_flag_dev, ctx.in_seen_dev, ctx.in_seen_host_dev);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// before a copy into in_dev: the scatter of the blob that is there has run (see in_seen_host)
+static void ggml_cuda_in_dev_free(ggml_backend_cuda_context & ctx) {
+    if (ctx.in_last_fire) {
+        if (ctx.in_seen_host != nullptr && ctx.in_fired != 0) {
+            FN_PROF_T(tw);
+            const int64_t t0 = ggml_time_us();
+            while (*(volatile unsigned int *) ctx.in_seen_host != ctx.in_fired) {
+                if (ggml_time_us() - t0 > 5000000) {
+                    GGML_ABORT("%s: the gate of the last fired window (%u) did not pass in 5 s (seen %u)\n", __func__,
+                               ctx.in_fired, *(volatile unsigned int *) ctx.in_seen_host);
+                }
+            }
+            FN_PROF_ADD("in.fire_wait", tw);
+        }
+    } else if (ctx.in_scatter_event != nullptr) {
+        FN_PROF_T(tw);
+        CUDA_CHECK(cudaEventSynchronize(ctx.in_scatter_event));
+        FN_PROF_ADD("in.flush_wait", tw);
+    }
 }
 
 // The table is complete: the blob goes to in_dev on the input stream and the flag follows it there, so the gate of
@@ -3237,6 +3267,8 @@ static void ggml_cuda_in_fire_now(ggml_backend_cuda_context & ctx) {
     for (int i = ctx.in_n; i < GGML_CUDA_IN_MAX; ++i) {
         e[i] = { nullptr, 0, 0 };
     }
+    ggml_cuda_in_dev_free(ctx);
+    ctx.in_last_fire = true;
     cudaStream_t is = ctx.stream(ctx.device, GGML_CUDA_IN_STREAM);
     CUDA_CHECK(cudaMemcpyAsync(ctx.in_dev, ctx.in_host, GGML_CUDA_IN_TABLE + ctx.in_used, cudaMemcpyHostToDevice, is));
     CUDA_CHECK(cudaEventRecord(ctx.in_copy_event, is));
@@ -3274,6 +3306,8 @@ static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
     // a window waits for its inputs ahead of anything put on the stream now: the copy would never run
     GGML_ASSERT(!ctx.in_gate_pending && "staged inputs flushed while a window waits for them (ggml_cuda_in_fire)");
     ggml_cuda_set_device(ctx.device);
+    ggml_cuda_in_dev_free(ctx);
+    ctx.in_last_fire = false;
     CUDA_CHECK(cudaMemcpyAsync(ctx.in_dev, ctx.in_host, GGML_CUDA_IN_TABLE + ctx.in_used, cudaMemcpyHostToDevice, ctx.stream()));
     // the blob's copy is waited for through this event before the blob is written again (ggml_cuda_in_stage), the
     // same as a fire's copy on the input stream: a prompt's flush after a gated window left the event on the
@@ -3283,6 +3317,9 @@ static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
     }
     k_in_scatter<<<ctx.in_n, 256, 0, ctx.stream()>>>(ctx.in_dev);
     CUDA_CHECK(cudaGetLastError());
+    if (ctx.in_scatter_event != nullptr) {
+        CUDA_CHECK(cudaEventRecord(ctx.in_scatter_event, ctx.stream()));
+    }
     ctx.in_n    = 0;
     ctx.in_used = 0;
     ctx.in_busy = true;
@@ -3313,15 +3350,20 @@ static bool ggml_cuda_in_stage(ggml_backend_cuda_context & ctx, char * dst, cons
     if (!ggml_cuda_in_alloc(ctx)) {
         return false;
     }
-    if (ctx.in_n == 0 && ctx.in_busy) {
-        // the blob is written again: its last copy must be done (it is, where the scheduler synchronized after the
-        // inputs; a fire's copy on the input stream is waited for through its event)
-        if (ctx.in_copy_event != nullptr) {
-            CUDA_CHECK(cudaEventSynchronize(ctx.in_copy_event));
-        } else {
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    // the blob is written again: its last copy must be done (it is, where the scheduler synchronized after the
+    // inputs; a fire's copy on the input stream is waited for through its event)
+    const auto blob_wait = [&ctx]() {
+        if (ctx.in_busy) {
+            if (ctx.in_copy_event != nullptr) {
+                CUDA_CHECK(cudaEventSynchronize(ctx.in_copy_event));
+            } else {
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            }
+            ctx.in_busy = false;
         }
-        ctx.in_busy = false;
+    };
+    if (ctx.in_n == 0) {
+        blob_wait();
     }
     ggml_cuda_in_entry * e = (ggml_cuda_in_entry *) ctx.in_host;
     for (int i = 0; i < ctx.in_n; ++i) {
@@ -3332,12 +3374,19 @@ static bool ggml_cuda_in_stage(ggml_backend_cuda_context & ctx, char * dst, cons
         }
         if (dst < e[i].dst + e[i].size && e[i].dst < dst + size) {
             // overlaps a staged one: in the order they were set
+            FN_PROF_COUNT("in.flush_overlap");
             ggml_cuda_in_flush(ctx);
             break;
         }
     }
     if (ctx.in_n == GGML_CUDA_IN_MAX || ctx.in_used + size > GGML_CUDA_IN_DATA) {
+        FN_PROF_COUNT("in.flush_full");
         ggml_cuda_in_flush(ctx);
+    }
+    // a flush here put the blob's copy on the stream behind whatever runs there: the blob is written again only
+    // when that copy is done (the wait above is for the blob as it was on entry)
+    if (ctx.in_n == 0) {
+        blob_wait();
     }
     e[ctx.in_n] = { dst, (uint32_t) (GGML_CUDA_IN_TABLE + ctx.in_used), (uint32_t) size };
     memcpy(ctx.in_host + e[ctx.in_n].off, data, size);

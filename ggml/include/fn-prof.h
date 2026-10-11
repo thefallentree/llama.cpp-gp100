@@ -91,3 +91,5 @@ static inline int64_t fn_prof_now() {
 #define FN_PROF_DECL(tu) static fn_prof_t g_fn_prof(tu)
 #define FN_PROF_T(var) const int64_t var = g_fn_prof.on ? fn_prof_now() : 0
 #define FN_PROF_ADD(name, t0) do { if (g_fn_prof.on) { g_fn_prof.add(name, fn_prof_now() - (t0)); } } while (0)
+// an event counted (its n), no duration
+#define FN_PROF_COUNT(name) do { if (g_fn_prof.on) { g_fn_prof.add(name, 0); } } while (0)

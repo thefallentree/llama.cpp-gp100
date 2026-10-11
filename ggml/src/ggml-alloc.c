@@ -1050,7 +1050,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+    // temporary (GGML_ALLOC_TIMING=1): the phases of an allocation that takes long
+    static int timing = -1;
+    if (timing < 0) {
+        timing = getenv("GGML_ALLOC_TIMING") != NULL ? 1 : 0;
+    }
+    const int64_t t0 = timing ? ggml_time_us() : 0;
+    const bool realloc = ggml_gallocr_needs_realloc(galloc, graph);
+    const int64_t t1 = timing ? ggml_time_us() : 0;
+    if (realloc) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
@@ -1065,6 +1073,7 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             return false;
         }
     }
+    const int64_t t2 = timing ? ggml_time_us() : 0;
 
     // reset buffers
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -1092,6 +1101,13 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j]);
         }
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
+    }
+    if (timing) {
+        const int64_t t3 = ggml_time_us();
+        if (t3 - t0 > 5000) {
+            GGML_LOG_WARN("gallocr: %d nodes %d leafs: needs_realloc %.1f ms, reserve %.1f ms (%s), init %.1f ms\n",
+                graph->n_nodes, graph->n_leafs, (t1 - t0)/1000.0, (t2 - t1)/1000.0, realloc ? "yes" : "no", (t3 - t2)/1000.0);
+        }
     }
 
     return true;

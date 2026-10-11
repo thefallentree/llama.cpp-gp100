@@ -337,6 +337,28 @@ typedef struct {
 } block_q4_K;
 static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2, "wrong q4_K block size/padding");
 
+#define QK4_1_G64 64
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d;
+            ggml_half m;
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t qs[QK4_1_G64 / 2]; // two Q4_1-layout 16-byte halves
+} block_q4_1_g64;
+static_assert(sizeof(block_q4_1_g64) == 2*sizeof(ggml_half) + QK4_1_G64/2, "wrong q4_1_g64 block size/padding");
+
+// 16 weights d*(code - 8), one fp16 scale: byte b of word w (bytes 4w..4w+3) holds the code of weight 8w + b in its
+// low nibble and of weight 8w + b + 4 in its high one (the order the sm_60 planar mat-vec decodes a word in)
+#define QK4_16 16
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK4_16 / 2];
+} block_q4_16;
+static_assert(sizeof(block_q4_16) == sizeof(ggml_half) + QK4_16/2, "wrong q4_16 block size/padding");
+
 // 5-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b

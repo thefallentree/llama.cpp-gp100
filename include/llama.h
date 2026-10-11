@@ -158,6 +158,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q4_1_G64      = 42, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -371,6 +372,9 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t n_graph_slots;         // graphs kept for reuse (0 or 1 = only the previous graph). more than 1 avoids
+                                        // rebuilding the graph when small ubatches alternate between shapes (e.g. a
+                                        // speculative drafter that alternates embedding injection and token drafting)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
@@ -602,6 +606,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    // the draft (MTP) head's reduced vocabulary: its size and its map to the target token ids (NULL: the full vocabulary)
+    LLAMA_API int32_t         llama_model_n_vocab_draft(const struct llama_model * model);
+    LLAMA_API const int64_t * llama_model_d2t          (const struct llama_model * model);
+    // true when the draft logits of this model stay in the draft vocabulary (a tensor-split model: the backend
+    // sampler's argmax is a draft id to map through d2t); false when they are scattered to the full vocabulary
+    LLAMA_API bool            llama_model_draft_logits_reduced(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
@@ -1094,6 +1104,26 @@ extern "C" {
                              enum llama_process_type   type,
                               struct llama_batch_ext * batch);
 
+    // Launch-ahead decode: llama_decode_prepare decodes a batch whose token ids may be placeholders; where the
+    // backend supports it (the CUDA tensor-split windows) the graph starts on the device and waits for the inputs
+    // that depend on the ids. llama_decode_commit gives the ids of all the batch's tokens (n_tokens of them, in
+    // batch order), releases the graph and makes the outputs available as llama_process would have. Between the
+    // two calls nothing of this context may be read (the accessors synchronize it); other contexts may run.
+    // A prepared decode is one ubatch. Return values as llama_decode(), and 3 when the backend could not hold the
+    // decode (it ran with the placeholders and was undone): the caller runs it with llama_process instead.
+    LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch_ext * batch);
+    LLAMA_API int32_t llama_decode_commit (struct llama_context * ctx, const llama_token * tokens, size_t n_tokens);
+
+    // The draft chain of an MTP context: the last n_chain rows of the next decode's batch are chain rows. Each runs
+    // as a ubatch of its own after the rest of the batch, and takes its token and its hidden state from the device:
+    // the argmax of the draft logits and the h_nextn row of the single output row of the ubatch before it. Their
+    // token ids and embeddings in the batch are placeholders (their positions and sequence are used). The outputs
+    // are those of a decode of the real rows, so n_chain draft steps run in one call without a round trip to the
+    // host between them. Applies to the next decode only. Returns false if the context cannot (no MTP head, or
+    // the embeddings of the draft vocabulary are not on the device).
+    LLAMA_API bool llama_draft_chain_supported(const struct llama_context * ctx);
+    LLAMA_API void llama_set_draft_chain      (      struct llama_context * ctx, int32_t n_chain);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1464,6 +1494,14 @@ extern "C" {
 
     // the total number of samplers in the chain
     LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
+
+    // Candidate pre-selection for a backend that cannot run the chain itself (a vocabulary sharded over several
+    // devices): the backend keeps the k largest logits of every shard and the whole chain samples from those
+    // candidates on the CPU. Exact when the chain's first truncation is a top-k of at most k minus the tokens its
+    // penalties may lower (common_sampler_init sets it). 0 (the default) = the chain runs on the backend as far as
+    // it can, or on the CPU with every logit.
+    LLAMA_API void    llama_sampler_chain_set_preselect_k(      struct llama_sampler * chain, int32_t k);
+    LLAMA_API int32_t llama_sampler_chain_get_preselect_k(const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);

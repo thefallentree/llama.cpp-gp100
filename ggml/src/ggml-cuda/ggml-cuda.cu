@@ -2736,7 +2736,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     // planar weights (fn-engine.cuh) keep their ggml type but only MUL_MAT can read them, as src0
     for (int j = 0; j < GGML_MAX_SRC; ++j) {
         const ggml_tensor * src = dst->src[j];
-        if (src != nullptr && src->type == GGML_TYPE_Q8_0 && !(dst->op == GGML_OP_MUL_MAT && j == 0) && ggml_cuda_fn_planar(src)) {
+        if (src != nullptr && (src->type == GGML_TYPE_Q8_0 || src->type == GGML_TYPE_Q4_0) && !(dst->op == GGML_OP_MUL_MAT && j == 0) && ggml_cuda_fn_planar(src)) {
             GGML_ABORT("%s: %s reads the planar weight %s\n", __func__, ggml_op_name(dst->op), src->name);
         }
     }

@@ -29,8 +29,13 @@
 //   [rows*cols/32 halves: each block's scale relative to the largest scale of its row]
 // plus a float scale per row in a side buffer. Same size as the Q8_0 blocks, same values (the relative scale is
 // rounded to fp16). The tensor keeps its ggml type: only the kernels here may read it, see ggml_cuda_fn_planar().
+// Planar Q4_0 ("P4", q4): the same with the quants as nibbles, [rows*cols/2 bytes]: of the 8 bytes of a thread's 16
+// columns, byte b (of a word) holds column b in its low nibble and column b + 4 in its high one, so that the mat-vec
+// decodes a word's low and high nibbles as two words of bytes the way it decodes P8. Half the bytes of P8 for the
+// same mat-vec (which streams the weights: ~2x on the P100), at the precision of Q4_0.
 struct ggml_cuda_fn_plane {
     float * rowscale = nullptr;
+    bool    q4       = false;
 };
 
 bool ggml_cuda_fn_enabled();
@@ -38,8 +43,8 @@ bool ggml_cuda_fn_enabled();
 // Is the tensor's data in the planar layout? (looked up by its data pointer)
 bool ggml_cuda_fn_planar(const ggml_tensor * t, ggml_cuda_fn_plane * plane = nullptr);
 
-// graph_optimize: repacks the Q8_0 weights that the graph's MUL_MAT nodes read on this device. It runs before the
-// first use of a graph, so no captured or in-flight launch still expects the old layout.
+// graph_optimize: repacks the Q8_0 and Q4_0 weights that the graph's MUL_MAT nodes read on this device. It runs
+// before the first use of a graph, so no captured or in-flight launch still expects the old layout.
 void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph);
 
 // a device buffer is freed: forget the planar tensors in it

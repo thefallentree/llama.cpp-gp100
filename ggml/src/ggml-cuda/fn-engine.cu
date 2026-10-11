@@ -1131,7 +1131,7 @@ struct fn_dense_part {
     const char *  w;          // planar weights [rows x cols]
     int64_t       rows, cols;
     const float * rowscale;
-    bool          q4;         // P4 codes (8 bytes per 16 columns), else P8
+    bool          q4 = false; // P4 codes (8 bytes per 16 columns), else P8
     int           part;       // which of the row's parts (S > 1)
     const half *  X;          // activations: [T][xstride halves]
     int           xstride;

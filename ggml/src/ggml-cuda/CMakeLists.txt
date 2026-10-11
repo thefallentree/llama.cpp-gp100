@@ -127,6 +127,9 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    # host worker pool of the cold-expert path (plain C++: its kernels use x86 intrinsics with target attributes)
+    list(APPEND GGML_SOURCES_CUDA moe-host-cpu.cpp)
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}

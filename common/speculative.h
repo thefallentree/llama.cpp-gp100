@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <functional>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -91,6 +93,11 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+// (optional) a hook the drafter calls from inside common_speculative_draft once the first decode of a draft is
+// launched and before it waits for it: the caller launches the target's next decode there (llama_decode_prepare),
+// so that its host side runs while the draft computes. Drafters that do not decode never call it.
+void common_speculative_set_launch_hook(common_speculative * spec, std::function<void()> hook);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

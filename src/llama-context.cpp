@@ -1,4 +1,8 @@
 #include "llama-context.h"
+#include "fn-prof.h"
+FN_PROF_DECL("llama");
+static int64_t fn_prof_t_window[2] = { 0, 0 };
+static int     fn_prof_n_window[2] = { 0, 0 };
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -360,6 +364,8 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    cparams.n_graph_slots = std::max(1u, params.n_graph_slots);
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -514,12 +520,17 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // tensor overrides usually move weights to the CPU, where it does not pay off; LLAMA_PIPELINE_PARALLEL=1
+        // enables it anyway (e.g. for overrides that keep weights in host memory the GPUs read themselves), except
+        // for an MTP context: its single block runs on one device
+        const char * pp_env = getenv("LLAMA_PIPELINE_PARALLEL");
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides() &&
+            (!model.has_tensor_overrides() ||
+             (pp_env != nullptr && atoi(pp_env) != 0 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP)) &&
             cparams.moe_cache_size == 0; // not supported by the MoE cache
 
         // pipeline parallelism requires support for async compute and events in all devices
@@ -553,6 +564,10 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            draft_chain_init();
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -712,12 +727,154 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+// the draft chain (llama_set_draft_chain): the tensors a ubatch's graph leaves for the next one, and the token
+// embeddings of the draft vocabulary on the device, the rows of a host-resident table gathered here once
+extern "C" {
+    // ggml-backend-impl.h: the layout of a tensor in a meta buffer
+    GGML_API enum ggml_backend_meta_split_axis ggml_backend_meta_tensor_split_axis(const struct ggml_tensor * tensor);
+    GGML_API size_t ggml_backend_meta_tensor_shards(const struct ggml_tensor * tensor, int64_t * ne, size_t n_max);
+}
+
+void llama_context::draft_chain_init() {
+    const auto & hparams = model.hparams;
+    if (hparams.n_layer_nextn != 1 || model.layers.size() <= hparams.n_layer() || !model.draft_chain_supported()) {
+        return;
+    }
+    const auto & layer = model.layers[hparams.n_layer()];
+    if (layer.nextn.shared_head_head == nullptr || model.tok_embd == nullptr) {
+        return;
+    }
+    static const bool enabled = getenv("LLAMA_DRAFT_CHAIN") == nullptr || atoi(getenv("LLAMA_DRAFT_CHAIN")) != 0;
+    if (!enabled) {
+        return;
+    }
+
+    ggml_backend_dev_t dev = model.dev_output();
+    ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_buffer_type(dev) : nullptr;
+    if (buft == nullptr) {
+        return;
+    }
+
+    const int64_t n_embd     = model.tok_embd->ne[0];
+    const int64_t n_vocab_dr = llama_model_n_vocab_draft(&model);
+    const bool    host_table = llm_graph_tok_embd_host(model.tok_embd);
+    const int64_t * d2t      = llama_model_d2t(&model);
+    if (!host_table && d2t != nullptr) {
+        LLAMA_LOG_WARN("%s: draft chain unavailable: the token embeddings are on the device and the draft vocabulary is reduced\n", __func__);
+        return;
+    }
+
+    // a table of the draft vocabulary's rows in a type the device gathers from: the model's own when it is one of
+    // them, Q8_0 for the others (a K-quant)
+    ggml_type type_table = model.tok_embd->type;
+    switch (type_table) {
+        case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
+            break;
+        default:
+            type_table = GGML_TYPE_Q8_0;
+    }
+
+    // a head sharded over the vocabulary: the shards' first rows, for the merge of their best rows on the device
+    int64_t shard_ne[16];
+    const size_t n_shards = ggml_backend_meta_tensor_split_axis(layer.nextn.shared_head_head) == GGML_BACKEND_SPLIT_AXIS_1 ?
+            ggml_backend_meta_tensor_shards(layer.nextn.shared_head_head, shard_ne, 16) : 0;
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 6*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    draft_chain.ctx.reset(ggml_init(ip));
+    draft_chain.tok = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_name(draft_chain.tok, "draft_chain_tok");
+    draft_chain.h   = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
+    ggml_set_name(draft_chain.h, "draft_chain_h");
+    if (host_table) {
+        draft_chain.tok_embd = ggml_new_tensor_2d(draft_chain.ctx.get(), type_table, n_embd, n_vocab_dr);
+        ggml_set_name(draft_chain.tok_embd, "draft_chain_tok_embd");
+    }
+    if (n_shards > 1) {
+        draft_chain.eye = ggml_new_tensor_2d(draft_chain.ctx.get(), GGML_TYPE_F32, n_shards, n_shards);
+        ggml_set_name(draft_chain.eye, "draft_chain_eye");
+        draft_chain.off = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_F32, n_shards);
+        ggml_set_name(draft_chain.off, "draft_chain_off");
+    }
+    draft_chain.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_chain.ctx.get(), buft));
+    if (draft_chain.buf == nullptr) {
+        LLAMA_LOG_WARN("%s: draft chain unavailable: could not allocate its buffer\n", __func__);
+        draft_chain.tok = draft_chain.h = draft_chain.tok_embd = draft_chain.eye = draft_chain.off = nullptr;
+        draft_chain.ctx.reset();
+        return;
+    }
+    ggml_backend_buffer_clear(draft_chain.buf.get(), 0);
+
+    if (n_shards > 1) {
+        std::vector<float> eye((size_t) n_shards*n_shards, 0.0f);
+        std::vector<float> off(n_shards, 0.0f);
+        int64_t row = 0;
+        for (size_t j = 0; j < n_shards; ++j) {
+            eye[j*n_shards + j] = 1.0f;
+            off[j] = (float) row;
+            row += shard_ne[j];
+        }
+        ggml_backend_tensor_set(draft_chain.eye, eye.data(), 0, eye.size()*sizeof(float));
+        ggml_backend_tensor_set(draft_chain.off, off.data(), 0, off.size()*sizeof(float));
+        LLAMA_LOG_INFO("%s: draft chain: the draft head is sharded over %zu devices, the shards' best rows merge on the device\n", __func__, n_shards);
+    }
+
+    if (host_table) {
+        const int64_t t0 = ggml_time_us();
+        const ggml_tensor * src = model.tok_embd;
+        const size_t row_src = src->nb[1];
+        const size_t row_dst = ggml_row_size(type_table, n_embd);
+        const int64_t n_chunk = 4096;
+        std::vector<uint8_t> rows((size_t) n_chunk*row_dst);
+        std::vector<float>   tmp;
+        const auto * traits = ggml_get_type_traits(src->type);
+        for (int64_t r0 = 0; r0 < n_vocab_dr; r0 += n_chunk) {
+            const int64_t n = std::min(n_chunk, n_vocab_dr - r0);
+            for (int64_t r = 0; r < n; ++r) {
+                const int64_t id = d2t != nullptr ? d2t[r0 + r] : r0 + r;
+                GGML_ASSERT(id >= 0 && id < src->ne[1]);
+                const uint8_t * s = (const uint8_t *) src->data + (size_t) id*row_src;
+                uint8_t * d = rows.data() + (size_t) r*row_dst;
+                if (type_table == src->type) {
+                    memcpy(d, s, row_dst);
+                } else {
+                    tmp.resize(n_embd);
+                    if (src->type == GGML_TYPE_F32) {
+                        memcpy(tmp.data(), s, n_embd*sizeof(float));
+                    } else {
+                        traits->to_float(s, tmp.data(), n_embd);
+                    }
+                    ggml_quantize_chunk(type_table, tmp.data(), d, 0, 1, n_embd, nullptr);
+                }
+            }
+            ggml_backend_tensor_set(draft_chain.tok_embd, rows.data(), (size_t) r0*row_dst, (size_t) n*row_dst);
+        }
+        LLAMA_LOG_INFO("%s: draft chain: %lld token embeddings of the draft vocabulary on the device as %s (%.1f MiB, %.2f s)\n", __func__,
+                (long long) n_vocab_dr, ggml_type_name(type_table), ggml_nbytes(draft_chain.tok_embd)/1024.0/1024.0, (ggml_time_us() - t0)/1e6);
+    } else {
+        LLAMA_LOG_INFO("%s: draft chain: the token embeddings are gathered on the device\n", __func__);
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
 
     sched_need_reserve = false;
+
+    // what this reservation covers: small (keyed) or no samplers
+    sampling.reserved_small = true;
+    for (const auto & [seq_id, key] : sampling.sampler_keys) {
+        sampling.reserved_small = sampling.reserved_small && !key.empty();
+    }
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        sampling.reserved_small = sampling.reserved_small && sampling.sampler_keys.count(seq_id) > 0;
+    }
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -867,11 +1024,31 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    if (!sched) {
+    if (!sched || !sync_pending) {
         return;
     }
+    sync_pending = false;
 
+    FN_PROF_T(t_s0);
     ggml_backend_sched_synchronize(sched.get());
+
+    for (auto & slot : gf_slots) {
+        ggml_backend_sched_synchronize(slot.sched.get());
+    }
+    FN_PROF_ADD("ctx.synchronize", t_s0);
+    {
+        // a decode and the wait for its results
+        const int tag = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1;
+        if (g_fn_prof.on && fn_prof_t_window[tag] != 0) {
+            const int n = fn_prof_n_window[tag];
+            ggml_fn_prof_tag = tag;
+            FN_PROF_ADD(n == 1 ? "window(T=1)" : n == 2 ? "window(T=2)" : n == 3 ? "window(T=3)" :
+                        n == 4 ? "window(T=4)" : n <= 8 ? "window(T=5..8)" : "window(T>8)", fn_prof_t_window[tag]);
+            FN_PROF_ADD(n == 1 ? "window.wait(T=1)" : n == 2 ? "window.wait(T=2)" : n == 3 ? "window.wait(T=3)" :
+                        n == 4 ? "window.wait(T=4)" : n <= 8 ? "window.wait(T=5..8)" : "window.wait(T>8)", t_s0);
+            fn_prof_t_window[tag] = 0;
+        }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -977,6 +1154,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        gf_slots_invalidate();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1384,6 +1562,28 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// A tensor-split model shards the vocabulary across devices.  The one backend
+// sampler that can run on a sharded row is a terminal argmax, which the meta
+// backend reduces across shards; any other chain stays on the CPU.
+static bool sampler_is_bare_greedy(llama_sampler * sampler) {
+    // Callers may hand over a chain, or a chain wrapping a chain; descend
+    // while there is exactly one element.
+    llama_sampler * s = sampler;
+    while (llama_sampler_chain_get(s, 0) != nullptr) {
+        if (llama_sampler_chain_n(s) != 1) {
+            return false;
+        }
+        s = llama_sampler_chain_get(s, 0);
+    }
+    // A backend sampler decorates its name with its probe result once
+    // initialized ("+greedy" / "-greedy"); compare past that.
+    const char * name = llama_sampler_name(s);
+    while (*name == '+' || *name == '-') {
+        ++name;
+    }
+    return strcmp(name, "greedy") == 0;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1391,17 +1591,45 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    bool on_meta = false;
+    for (const auto & dev : model.devices) {
+        on_meta |= dev.is_meta;
+    }
+    if (sampler && on_meta && !sampler_is_bare_greedy(sampler) && llama_sampler_chain_get_preselect_k(sampler) > 0) {
+        static bool announced = false;
+        if (!announced) {
+            LLAMA_LOG_INFO("%s: tensor-split model: the chain samples on the CPU from the top-%d candidates of every shard\n",
+                    __func__, llama_sampler_chain_get_preselect_k(sampler));
+            announced = true;
+        }
+    } else if (sampler && on_meta && !sampler_is_bare_greedy(sampler)) {
         static bool warned = false;
         if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
+            std::string chain_desc;
+            if (llama_sampler_chain_get(sampler, 0) != nullptr) {
+                for (int i = 0; i < llama_sampler_chain_n(sampler); ++i) {
+                    chain_desc += std::string(i ? " -> " : "") + llama_sampler_name(llama_sampler_chain_get(sampler, i));
+                }
+            } else {
+                chain_desc = llama_sampler_name(sampler);
+            }
+            LLAMA_LOG_WARN("%s: a tensor-split model runs only a bare greedy chain on the backend, got '%s'; using CPU\n",
+                    __func__, chain_desc.c_str());
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
             sched_need_reserve = true;
         }
         sampling.samplers.erase(seq_id);
+        sampling.sampler_keys.erase(seq_id);
         return false;
+    }
+    if (sampler && on_meta && llama_sampler_chain_get_preselect_k(sampler) == 0) {
+        static bool announced = false;
+        if (!announced) {
+            LLAMA_LOG_INFO("%s: tensor-split model: greedy chain runs on the backend\n", __func__);
+            announced = true;
+        }
     }
 
     const bool can_offload =
@@ -1415,9 +1643,15 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
-        sampling.samplers[seq_id] = sampler;
+        sampling.samplers[seq_id]     = sampler;
+        sampling.sampler_keys[seq_id] = llama_sampler_graph_key(sampler);
 
-        sched_need_reserve = true;
+        // a small sampler after a reservation made with small or no samplers: the compute buffers hold its graph
+        // (LLAMA_SAMPLER_RESERVE=1: reserve at every change of sampler, as before)
+        static const bool reserve_always = getenv("LLAMA_SAMPLER_RESERVE") != nullptr && atoi(getenv("LLAMA_SAMPLER_RESERVE")) != 0;
+        if (reserve_always || !(sampling.reserved_small && !sampling.sampler_keys[seq_id].empty())) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -1430,13 +1664,18 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         }
 
         sampling.samplers.erase(seq_id);
+        sampling.sampler_keys.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
+    sampling.sampler_keys.erase(seq_id);
 
-    sched_need_reserve = true;
+    // no sampler at all is less than the reservation holds
+    if (!sampling.reserved_small) {
+        sched_need_reserve = true;
+    }
 
     return true;
 }
@@ -1501,40 +1740,168 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
+    FN_PROF_T(t_pu0);
+    if (g_fn_prof.on && ggml_fn_prof_tag == 0) {
+        // the period of the ubatches of one decode: a window with everything around it
+        static int64_t t_last = 0;
+        static int     n_last = 0;
+        const int n = (int) ubatch.n_tokens;
+        if (t_last != 0 && n == n_last && n <= 8 && t_pu0 - t_last < 2000000000) {
+            FN_PROF_ADD(n == 1 ? "ubatch.period(T=1)" : n == 2 ? "ubatch.period(T=2)" : n == 3 ? "ubatch.period(T=3)" :
+                        n == 4 ? "ubatch.period(T=4)" : "ubatch.period(T=5..8)", t_last);
+        }
+        t_last = t_pu0;
+        n_last = n;
+    }
+    const bool mctx_ok = !mctx || mctx->apply();
+    FN_PROF_ADD("pu.mctx_apply", t_pu0);
+    FN_PROF_T(t_pu1);
+    if (!mctx_ok) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
-    auto * gf  = res->get_gf();
+    // small ubatches can use one of the extra graph slots, so that alternating shapes do not evict each other
+    if (cparams.n_graph_slots > 1 && gf_slots.empty()) {
+        const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+
+        gf_slots.resize(cparams.n_graph_slots);
+
+        for (auto & slot : gf_slots) {
+            slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+            ggml_backend_sched_set_copy_callback(slot.sched.get(), sched_copy_experts, this);
+            slot.res.reset(new llm_graph_result(max_nodes));
+        }
+
+        LLAMA_LOG_DEBUG("%s: graph slots = %zu (n_tokens <= %d)\n", __func__, gf_slots.size(), LLAMA_GRAPH_SLOT_N_TOKENS_MAX);
+    }
+
+    const bool use_slot = !gf_slots.empty() && (int) ubatch.n_tokens <= LLAMA_GRAPH_SLOT_N_TOKENS_MAX;
+
+    // large ubatches (prefill) use the main scheduler. leftover decode-slot
+    // compute buffers from the previous turn would otherwise stay resident and
+    // can OOM the next long context (measured: 505 MiB CUDA1 alloc after 64k
+    // spec-decode then 128k prefill+decode).
+    // small slot graphs stay: a turn of the same shapes then builds nothing, and the main scheduler keeps its buffers too.
+    // if the large graph does not fit next to them, the allocation below drops them and tries again
+    if (!use_slot) {
+        // temporary switch: the limit in MiB, 0 = always release
+        static const size_t keep_max = (getenv("LLAMA_GRAPH_SLOTS_KEEP_MIB") != nullptr ? (size_t) std::max(0, atoi(getenv("LLAMA_GRAPH_SLOTS_KEEP_MIB"))) : 256)*1024*1024;
+        if (!main_sched_held_large) {
+            FN_PROF_T(t_rel);
+            const size_t held = gf_slots_compute_size();
+            gf_slots_kept = held > 0 && held <= keep_max;
+            if (!gf_slots_kept) {
+                gf_slots_release_compute(false);
+            }
+            if (getenv("LLAMA_GRAPH_SLOTS_DEBUG") != nullptr) {
+                LLAMA_LOG_WARN("%s: graph slots hold %.1f MiB of compute buffers, %s\n", __func__, held/1024.0/1024.0, gf_slots_kept ? "kept" : "released");
+            }
+            FN_PROF_ADD(gf_slots_kept ? "pu.slots_kept" : "pu.slots_release", t_rel);
+        }
+        main_sched_held_large = true;
+    } else if (main_sched_held_large) {
+        if (!gf_slots_kept) {
+            FN_PROF_T(t_rec);
+            gf_main_sched_recreate();
+            FN_PROF_ADD("pu.main_recreate", t_rec);
+        }
+        main_sched_held_large = false;
+    }
+
+    llm_graph_result *   res  = nullptr;
+    ggml_backend_sched_t sch  = nullptr;
+    int                  slot = -1;
+    bool                 hit  = false;
+
+    if (use_slot) {
+        if (!graph_reuse_disable) {
+            for (int i = 0; i < (int) gf_slots.size(); ++i) {
+                if (!gf_slots[i].valid) {
+                    continue;
+                }
+
+                if (gf_slots[i].res->can_reuse(graph_params(gf_slots[i].res.get(), ubatch, mctx, gtype, gf_slots[i].sched.get()))) {
+                    slot = i;
+                    hit  = true;
+                    break;
+                }
+            }
+        }
+
+        if (slot < 0) {
+            // take a free slot, otherwise the least recently used one
+            slot = 0;
+            for (int i = 0; i < (int) gf_slots.size(); ++i) {
+                if (!gf_slots[i].valid) {
+                    slot = i;
+                    break;
+                }
+                if (gf_slots[i].last_use < gf_slots[slot].last_use) {
+                    slot = i;
+                }
+            }
+        }
+
+        gf_slots[slot].last_use = ++gf_slot_clock;
+
+        res = gf_slots[slot].res.get();
+        sch = gf_slots[slot].sched.get();
+    } else {
+        res = get_gf_res_prev();
+        sch = sched.get();
+    }
+
+    gf_slot_cur = use_slot ? slot : -1;
+
+    auto * gf = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, sch);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!use_slot) {
+        hit = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+    }
+
+    FN_PROF_ADD(hit ? "pu.lookup(hit)" : "pu.lookup(miss)", t_pu1);
+    if (getenv("LLAMA_GRAPH_SLOTS_DEBUG") != nullptr && (!hit || ubatch.n_tokens != 3)) {
+        LLAMA_LOG_WARN("%s: ctx %d %s slot %d, n_tokens %u, n_outputs %d, n_nodes %d, chain %d/%d, n_kv %u\n", __func__,
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1, hit ? "hit" : "miss", use_slot ? slot : -1, ubatch.n_tokens, (int) n_outputs,
+                hit ? ggml_graph_n_nodes(gf) : 0, (int) gparams.chain.in, (int) gparams.chain.out, memory ? (unsigned) memory->seq_pos_max(0) + 1 : 0);
+    }
+    FN_PROF_T(t_pu2);
+    if (hit) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_synchronize(sch);
         }
 
         n_reused++;
     } else {
-        gf_res_prev_active = nullptr;
+        if (!use_slot) {
+            gf_res_prev_active = nullptr;
+        }
         res->reset();
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (use_slot) {
+            gf_slots[slot].valid     = false;
+            gf_slots[slot].n_compute = 0;
+        }
+
+        ggml_backend_sched_reset(sch);
+        ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
+        FN_PROF_T(t_bg);
         gf = model.build_graph(gparams);
+        FN_PROF_ADD("pu.build_graph", t_bg);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1544,15 +1911,111 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        FN_PROF_T(t_al);
+        bool allocated = ggml_backend_sched_alloc_graph(sch, gf);
+        FN_PROF_ADD(allocated ? "pu.alloc(ok)" : "pu.alloc(fail)", t_al);
+
+        if (!allocated && use_slot) {
+            // the slot's compute buffers are not large enough for this graph yet (first use or a larger shape):
+            // reserve them for this graph and try again
+            ggml_backend_sched_reset(sch);
+
+            FN_PROF_T(t_rs);
+            const bool reserved = ggml_backend_sched_reserve(sch, gf);
+            FN_PROF_ADD("pu.reserve", t_rs);
+            if (reserved) {
+                ggml_backend_sched_reset(sch);
+                ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+
+                FN_PROF_T(t_al2);
+                allocated = ggml_backend_sched_alloc_graph(sch, gf);
+                FN_PROF_ADD("pu.alloc(2)", t_al2);
+            }
+
+            if (!allocated) {
+                // sibling slots may still hold the previous turn's decode graphs.
+                // free those first, then retry reserve on this slot.
+                bool freed_sibling = false;
+                for (int i = 0; i < (int) gf_slots.size(); ++i) {
+                    if (i == slot || !gf_slots[i].valid) {
+                        continue;
+                    }
+                    gf_slots_recreate_one(gf_slots[i]);
+                    freed_sibling = true;
+                }
+                if (freed_sibling) {
+                    LLAMA_LOG_INFO("%s: released sibling graph slots after alloc failure, retrying slot %d\n", __func__, slot);
+                    ggml_backend_sched_reset(sch);
+                    if (ggml_backend_sched_reserve(sch, gf)) {
+                        ggml_backend_sched_reset(sch);
+                        ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+                        allocated = ggml_backend_sched_alloc_graph(sch, gf);
+                    }
+                }
+            }
+
+            if (!allocated) {
+                // fall back to the main scheduler. reserving there can move the tensors of the previous graph, so it
+                // cannot be reused afterwards
+                LLAMA_LOG_DEBUG("%s: graph slot %d cannot hold this graph, using the main scheduler\n", __func__, slot);
+
+                sch = sched.get();
+                gf_slot_cur = -1;
+
+                for (auto & r : gf_res_prev) {
+                    if (r) {
+                        r->reset();
+                    }
+                }
+                gf_res_prev_active = nullptr;
+
+                ggml_backend_sched_reset(sch);
+                ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+
+                allocated = ggml_backend_sched_alloc_graph(sch, gf);
+            }
+        }
+
+        if (!allocated) {
+            // last resort: drop every cached graph with its compute buffers
+            // this graph goes with them (its slot, or the previous results), so build it again on the main scheduler
+            gf_slots_release_compute(true);
+            gf_main_sched_recreate();
+            main_sched_held_large = !use_slot;
+            gf_slots_kept         = false;
+            sch = sched.get();
+            gf_slot_cur = -1;
+            res = get_gf_res_prev();
+            res->reset();
+            ggml_backend_sched_reset(sch);
+            ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+            gf = model.build_graph(graph_params(res, ubatch, mctx, gtype, sch));
+            allocated = gf != nullptr && ggml_backend_sched_alloc_graph(sch, gf);
+            if (gf != nullptr && !allocated && ggml_backend_sched_reserve(sch, gf)) {
+                ggml_backend_sched_reset(sch);
+                ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
+                allocated = ggml_backend_sched_alloc_graph(sch, gf);
+            }
+            if (allocated) {
+                LLAMA_LOG_WARN("%s: allocated the graph after dropping every cached graph\n", __func__);
+            }
+        }
+
+        if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        if (use_slot && gf_slot_cur >= 0) {
+            gf_slots[slot].valid = true;
+        } else if (!use_slot) {
+            gf_res_prev_active = res;
+        }
     }
 
+    FN_PROF_ADD(hit ? "pu.sync(hit)" : "pu.build+alloc", t_pu2);
+    FN_PROF_T(t_pu3);
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1562,12 +2025,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    FN_PROF_ADD("pu.set_inputs", t_pu3);
+    FN_PROF_T(t_pu4);
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    FN_PROF_ADD("pu.graph_compute", t_pu4);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    if (use_slot && gf_slot_cur >= 0) {
+        gf_slots[gf_slot_cur].n_compute++;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1661,7 +2130,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // extract logits
     if (logits.data && t_logits) {
-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
@@ -1670,7 +2139,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // extract embeddings
     if (embd.data && t_embd) {
-        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_active(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
         switch (cparams.pooling_type) {
@@ -1725,7 +2194,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // extract nextn embeddings (hidden state before the final output norm)
     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
         const uint32_t n_embd = hparams.n_embd_out();
@@ -1788,7 +2257,9 @@ static void copy_tensor_async_rows(
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         T * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
+        // Copy element-wise in the destination type rather than ggml_nbytes: a
+        // packed I64 argmax on a sharded vocabulary reads back as I32 token ids.
+        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, n_elements*sizeof(T));
 
         if (counts) {
             GGML_ASSERT(row < counts->size());
@@ -1814,9 +2285,57 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+static int64_t decode_t_last_end = 0; // FN_PROF: the end of the last decode, for the time between two
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    return decode_impl(batch_inp, false);
+}
+
+int llama_context::decode_prepare(const llama_batch_ext & batch_inp) {
+    GGML_ASSERT(!pending.active && "a prepared decode is waiting for its tokens (decode_commit)");
+    return decode_impl(batch_inp, true);
+}
+
+int llama_context::decode_commit(const llama_token * tokens, size_t n_tokens) {
+    GGML_ASSERT(pending.active && "no prepared decode (decode_prepare)");
+    ggml_fn_prof_tag = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1;
+    FN_PROF_T(t_c0);
+    pending.active = false;
+
+    const llama_ubatch & ubatch = pending.mctx->get_ubatch();
+    GGML_ASSERT(n_tokens == ubatch.n_tokens && ubatch.token != nullptr);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        ubatch.token[i] = tokens[i];
+    }
+    pending.mctx->reapply_tokens();
+
+    // the inputs hashed or gathered from the ids, to the device, and the graph released
+    std::vector<ggml_tensor *> tensors;
+    pending.res->set_token_inputs(&ubatch, tensors);
+    for (ggml_tensor * t : tensors) {
+        if (!ggml_backend_sched_copy_input(pending.sch, t)) {
+            LLAMA_LOG_WARN("%s: the token input %s is not an input of the computed graph\n", __func__, t->name);
+        }
+    }
+    ggml_backend_sched_fire(pending.sch);
+    FN_PROF_ADD("decode.commit", t_c0);
+
+    decode_extract(pending.res, ubatch, pending.n_outputs_all, pending.n_outputs_prev, pending.n_tokens_prev, pending.t_d0, t_c0);
+    // the ubatch is done (the memory's bookkeeping of a consumed ubatch, e.g. the indexer's re-pooled blocks)
+    const bool more = pending.mctx->next();
+    GGML_ASSERT(!more);
+    decode_finish(pending.n_outputs_all, pending.t_d0);
+    pending.mctx.reset();
+    pending.res = nullptr;
+    pending.sch = nullptr;
+
+    return 0;
+}
+
+int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+        GGML_ASSERT(!prepare);
         return encode(batch_inp);
     }
 
@@ -1834,7 +2353,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
-    const int64_t n_vocab = vocab.n_tokens();
+    ggml_fn_prof_tag = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1;
+    FN_PROF_T(t_d0);
+    fn_prof_t_window[ggml_fn_prof_tag] = t_d0;
+    fn_prof_n_window[ggml_fn_prof_tag] = (int) batch_inp.tokens.size();
+    if (decode_t_last_end != 0) { FN_PROF_ADD("decode.between", decode_t_last_end); }
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -1906,17 +2429,33 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    FN_PROF_ADD("decode.balloc", t_d0);
+    FN_PROF_T(t_d1);
     sched_reserve();
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
+    FN_PROF_ADD("decode.reserve+memupd", t_d1);
+    FN_PROF_T(t_d2);
 
     llama_memory_context_ptr mctx;
 
+    // temporary switch: a short prompt in ubatches of a decode window's size, LLAMA_UBATCH_SMALL=<n> (0 = off), for prompts
+    // of up to LLAMA_UBATCH_SMALL_MAX tokens. A prompt of 19 tokens took 1.1-1.6 s as one ubatch: a graph of its own,
+    // every cold expert it routes to streamed to the devices, the batched kernels; the windows take ~40 ms each
+    static const uint32_t ub_small     = getenv("LLAMA_UBATCH_SMALL") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_UBATCH_SMALL"))) : 8;
+    static const uint32_t ub_small_max = getenv("LLAMA_UBATCH_SMALL_MAX") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_UBATCH_SMALL_MAX"))) : 256;
+    const uint32_t n_ubatch_eff = ub_small > 0 && n_tokens_all > ub_small && n_tokens_all <= ub_small_max ? ub_small : cparams.n_ubatch;
+
+    // the draft chain: the last n_chain rows each in a ubatch of their own (llama_set_draft_chain, this decode only)
+    const uint32_t n_chain = draft_chain.tok != nullptr && !prepare && draft_chain.n > 0 && (uint32_t) draft_chain.n < n_tokens_all ? draft_chain.n : 0;
+    draft_chain.n = 0;
+    balloc->set_n_chain(n_chain);
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
         if (!mctx) {
             return -2;
         }
@@ -1958,6 +2497,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    FN_PROF_ADD("decode.init_batch", t_d2);
+
+    if (prepare) {
+        // a prepared decode must be held by a gate on the device: a window the backend captures. The backend
+        // captures the second compute of a graph (the first one runs as submitted), so the graph of this batch has
+        // to be one of the kept graphs (the slots) computed at least twice: then its launch is gated, or the graph
+        // is rebuilt into a shape the backend knows and captures at once. Otherwise the caller decodes the batch
+        // with llama_process, which is what makes the shape known
+        const auto & ubatch = mctx->get_ubatch();
+        uint32_t n_outputs_ub = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+            n_outputs_ub += (uint32_t) (ubatch.output[i] != 0 || n_outputs_all == n_tokens_all);
+        }
+        n_outputs = n_outputs_ub;
+        bool gated = false;
+        if (!graph_reuse_disable && !gf_slots.empty() && (int) ubatch.n_tokens <= LLAMA_GRAPH_SLOT_N_TOKENS_MAX) {
+            for (const auto & slot : gf_slots) {
+                if (slot.valid && slot.n_compute >= 2 &&
+                        slot.res->allow_reuse(graph_params(slot.res.get(), ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), slot.sched.get()))) {
+                    gated = true;
+                    break;
+                }
+            }
+        }
+        if (!gated) {
+            LLAMA_LOG_DEBUG("%s: no gated window for a decode of %u tokens yet: decode it with llama_process\n", __func__, ubatch.n_tokens);
+            return 3;
+        }
+    }
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -1993,7 +2562,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // a chain ubatch reads the chain tensors, the ubatch before one writes them
+        draft_chain.cur_in  = n_chain > 0 && n_tokens_prev >= (int64_t) (n_tokens_all - n_chain);
+        draft_chain.cur_out = n_chain > 0 && n_tokens_prev + ubatch.n_tokens >= n_tokens_all - n_chain && n_tokens_prev + ubatch.n_tokens < n_tokens_all;
+        if (draft_chain.cur_in) {
+            GGML_ASSERT(ubatch.n_tokens == 1 && "a chain row is a ubatch of its own");
+        }
+        if (draft_chain.cur_out && n_outputs != 1) {
+            LLAMA_LOG_ERROR("%s: the ubatch before a chain row must have one output, it has %d\n", __func__, (int) n_outputs);
+            draft_chain.cur_in = draft_chain.cur_out = false;
+            return -1;
+        }
+
+        FN_PROF_T(t_d4);
+        if (prepare) {
+            ggml_backend_sched_set_deferred_inputs(sched.get(), true);
+            for (auto & slot : gf_slots) {
+                ggml_backend_sched_set_deferred_inputs(slot.sched.get(), true);
+            }
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        draft_chain.cur_in  = false;
+        draft_chain.cur_out = false;
+        if (prepare) {
+            ggml_backend_sched_set_deferred_inputs(sched.get(), false);
+            for (auto & slot : gf_slots) {
+                ggml_backend_sched_set_deferred_inputs(slot.sched.get(), false);
+            }
+        }
+        FN_PROF_ADD("decode.process_ubatch", t_d4);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2026,6 +2623,46 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        if (prepare) {
+            if (!ggml_backend_sched_gate_pending(sched_active())) {
+                // no gate held the graph: it computed with the placeholders (the check above should not let this
+                // happen). Its rows are taken out of the memory as far as it can
+                LLAMA_LOG_ERROR("%s: the backend did not hold the prepared decode (no gated window)\n", __func__);
+                ggml_backend_sched_synchronize(sched_active());
+                if (!memory->seq_rm(ubatch.seq_id[0][0], ubatch.pos[0], -1)) {
+                    LLAMA_LOG_ERROR("%s: the rows of the decode could not be removed from the memory\n", __func__);
+                    return -3;
+                }
+                return 3;
+            }
+            // the graph waits for its tokens on the device: the outputs are extracted at the commit
+            pending.active         = true;
+            pending.res            = const_cast<llm_graph_result *>(res);
+            pending.sch            = sched_active();
+            pending.n_outputs_all  = n_outputs_all;
+            pending.n_outputs_prev = n_outputs_prev;
+            pending.n_tokens_prev  = n_tokens_prev;
+            pending.t_d0           = t_d0;
+            GGML_ASSERT(n_tokens_all == ubatch.n_tokens && "a prepared decode is one ubatch");
+            pending.mctx = std::move(mctx);
+            return 0;
+        }
+
+        decode_extract(res, ubatch, n_outputs_all, n_outputs_prev, n_tokens_prev, t_d0, t_d4);
+    } while (mctx->next());
+
+    decode_finish(n_outputs_all, t_d0);
+
+    return 0;
+}
+
+void llama_context::decode_extract(const llm_graph_result * res, const llama_ubatch & ubatch, uint32_t n_outputs_all, int64_t & n_outputs_prev, int64_t & n_tokens_prev, int64_t t_d0, int64_t t_d4) {
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+    const int64_t n_vocab = vocab.n_tokens();
+    const bool has_samplers = !sampling.samplers.empty();
+    FN_PROF_T(t_d5);
+    {
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
@@ -2034,6 +2671,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+        FN_PROF_T(t_x0);
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -2041,7 +2679,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
@@ -2050,13 +2688,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                const int64_t n_vocab_t = t_logits->ne[0];
+                if (n_vocab_t == n_vocab) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                } else {
+                    // a draft head of a reduced vocabulary (see llama_model_draft_logits_reduced): its rows at the
+                    // stride of the full vocabulary, the columns past it -inf
+                    GGML_ASSERT(n_vocab_t < n_vocab && ggml_is_contiguous(t_logits));
+                    for (int64_t i = 0; i < n_outputs; ++i) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + i*n_vocab, i*n_vocab_t*sizeof(float), n_vocab_t*sizeof(float));
+                        std::fill(logits_out + i*n_vocab + n_vocab_t, logits_out + (i + 1)*n_vocab, -INFINITY);
+                    }
+                }
             }
         }
 
+        FN_PROF_ADD("extract.logits", t_x0);
+        FN_PROF_T(t_x1);
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_active(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
             switch (cparams.pooling_type) {
@@ -2114,8 +2765,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        FN_PROF_ADD("extract.embd", t_x1);
+        FN_PROF_T(t_x2);
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
         bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        FN_PROF_ADD("extract.layer_inputs", t_x2);
+        FN_PROF_T(t_x3);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2125,7 +2780,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd  = hparams.n_embd_out();
@@ -2144,19 +2799,37 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
         }
 
+        FN_PROF_ADD("extract.h_nextn", t_x3);
+        FN_PROF_T(t_x4);
         if (has_samplers) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched_active());
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched_active(), &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched_active(), &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched_active(), &sampling.candidates_count);
         }
 
+        FN_PROF_ADD("extract.sampled", t_x4);
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+        FN_PROF_ADD("decode.extract", t_d5);
+        if (g_fn_prof.on && ggml_fn_prof_tag == 0 && ubatch.n_tokens == 3 && ggml_fn_probe_ns[2] > t_d4 && ggml_fn_probe_ns[0] > ggml_fn_probe_ns[2] &&
+            ggml_fn_probe_ns[1] > ggml_fn_probe_ns[0]) {
+            // temporary (GGML_CUDA_FN_PROBE=1): where a decode window's wall time goes around the device's own
+            g_fn_prof.add("probe.decode_start..launch",   ggml_fn_probe_ns[2] - t_d0);
+            g_fn_prof.add("probe.launch..gpu_start",      ggml_fn_probe_ns[0] - ggml_fn_probe_ns[2]);
+            g_fn_prof.add("probe.launch_call",            ggml_fn_probe_ns[3] - ggml_fn_probe_ns[2]);
+            g_fn_prof.add("probe.gpu_start..gpu_end",     ggml_fn_probe_ns[1] - ggml_fn_probe_ns[0]);
+            g_fn_prof.add("probe.gpu_end..extract_end",   fn_prof_now() - ggml_fn_probe_ns[1]);
+        }
+    }
+    GGML_UNUSED(hparams);
+}
+
+void llama_context::decode_finish(uint32_t n_outputs_all, int64_t t_d0) {
+    FN_PROF_T(t_d6);
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2210,8 +2883,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
-
-    return 0;
+    FN_PROF_ADD("decode.tail", t_d6);
+    FN_PROF_ADD("decode.total", t_d0);
+    decode_t_last_end = g_fn_prof.on ? fn_prof_now() : 0;
 }
 
 //
@@ -2404,7 +3078,7 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched_active(), t);
         GGML_ASSERT(backend != nullptr);
         // Tensor-split backends require a zero source offset.
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
@@ -2631,6 +3305,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    gf_slots_invalidate();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -2645,7 +3320,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), sched.get());
 
     res->reset();
 
@@ -2676,18 +3351,90 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+ggml_backend_sched_t llama_context::sched_active() const {
+    return gf_slot_cur < 0 ? sched.get() : gf_slots[gf_slot_cur].sched.get();
+}
+
+void llama_context::gf_slots_invalidate() {
+    for (auto & slot : gf_slots) {
+        slot.res->reset();
+        slot.valid = false;
+    }
+
+    gf_slot_cur = -1;
+}
+
+void llama_context::gf_slots_recreate_one(graph_slot & slot) {
+    const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+    slot.valid    = false;
+    slot.last_use = 0;
+    slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    slot.res.reset(new llm_graph_result(max_nodes));
+}
+
+size_t llama_context::gf_slots_compute_size() const {
+    size_t res = 0;
+    for (const auto & slot : gf_slots) {
+        if (!slot.valid) {
+            continue;
+        }
+        for (const auto & backend : backend_ptrs) {
+            res += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+        }
+    }
+
+    return res;
+}
+
+void llama_context::gf_main_sched_recreate() {
+    synchronize();
+    const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+    for (auto & r : gf_res_prev) {
+        r.reset();
+    }
+    gf_res_prev_active = nullptr;
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    gf_slot_cur = -1;
+    LLAMA_LOG_INFO("%s: recreated main scheduler to free prefill compute buffers\n", __func__);
+}
+
+void llama_context::gf_slots_release_compute(bool force) {
+    if (gf_slots.empty()) {
+        return;
+    }
+
+    size_t n_held = 0;
+    for (const auto & slot : gf_slots) {
+        if (slot.valid) {
+            ++n_held;
+        }
+    }
+    if (!force && n_held == 0) {
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: releasing %zu graph-slot scheduler(s) (%zu cached%s)\n",
+            __func__, gf_slots.size(), n_held, force ? ", force" : "");
+
+    for (auto & slot : gf_slots) {
+        gf_slots_recreate_one(slot);
+    }
+    gf_slot_cur = -1;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
-    return {
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched) const {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
+        /*.sched       =*/ sched,
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
@@ -2697,10 +3444,19 @@ llm_graph_params llama_context::graph_params(
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
+        /*.sampler_keys=*/ sampling.sampler_keys,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ graph_get_cb(sched),
         /*.res         =*/ res,
     };
+    params.chain.in       = draft_chain.cur_in;
+    params.chain.out      = draft_chain.cur_out;
+    params.chain.tok      = draft_chain.tok;
+    params.chain.h        = draft_chain.h;
+    params.chain.tok_embd = draft_chain.tok_embd;
+    params.chain.eye      = draft_chain.eye;
+    params.chain.off      = draft_chain.off;
+    return params;
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
@@ -2743,7 +3499,8 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    sync_pending = true;
+    auto status = ggml_backend_sched_graph_compute_async(sched_active(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -2837,8 +3594,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     return true;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched) const {
+    return [this, sched](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -2855,7 +3612,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched, cur, backend.get());
                         }
                     }
                 }
@@ -3869,7 +4626,7 @@ void llama_context::opt_epoch_iter(
 
             auto * res = get_gf_res_prev();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), sched.get());
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
@@ -3976,6 +4733,7 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
+        /*.n_graph_slots               =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -4698,6 +5456,22 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
         case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
     }
     return -1;
+}
+
+int32_t llama_decode_prepare(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode_prepare(*batch);
+}
+
+int32_t llama_decode_commit(llama_context * ctx, const llama_token * tokens, size_t n_tokens) {
+    return ctx->decode_commit(tokens, n_tokens);
+}
+
+bool llama_draft_chain_supported(const llama_context * ctx) {
+    return ctx->draft_chain_available();
+}
+
+void llama_set_draft_chain(llama_context * ctx, int32_t n_chain) {
+    ctx->set_draft_chain(n_chain);
 }
 
 //

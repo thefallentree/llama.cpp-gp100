@@ -1551,7 +1551,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampling.sampler_keys[seq_id] = llama_sampler_graph_key(sampler);
 
         // a small sampler after a reservation made with small or no samplers: the compute buffers hold its graph
-        if (!(sampling.reserved_small && !sampling.sampler_keys[seq_id].empty())) {
+        // (LLAMA_SAMPLER_RESERVE=1: reserve at every change of sampler, as before)
+        static const bool reserve_always = getenv("LLAMA_SAMPLER_RESERVE") != nullptr && atoi(getenv("LLAMA_SAMPLER_RESERVE")) != 0;
+        if (reserve_always || !(sampling.reserved_small && !sampling.sampler_keys[seq_id].empty())) {
             sched_need_reserve = true;
         }
 
@@ -1769,8 +1771,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     FN_PROF_ADD(hit ? "pu.lookup(hit)" : "pu.lookup(miss)", t_pu1);
     if (getenv("LLAMA_GRAPH_SLOTS_DEBUG") != nullptr && (!hit || ubatch.n_tokens != 3)) {
-        LLAMA_LOG_WARN("%s: %s slot %d, n_tokens %u, n_outputs %d, n_nodes %d\n", __func__, hit ? "hit" : "miss", use_slot ? slot : -1, ubatch.n_tokens, (int) n_outputs,
-                hit ? ggml_graph_n_nodes(gf) : 0);
+        LLAMA_LOG_WARN("%s: ctx %d %s slot %d, n_tokens %u, n_outputs %d, n_nodes %d, chain %d/%d, n_kv %u\n", __func__,
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? 0 : 1, hit ? "hit" : "miss", use_slot ? slot : -1, ubatch.n_tokens, (int) n_outputs,
+                hit ? ggml_graph_n_nodes(gf) : 0, (int) gparams.chain.in, (int) gparams.chain.out, memory ? (unsigned) memory->seq_pos_max(0) + 1 : 0);
     }
     FN_PROF_T(t_pu2);
     if (hit) {

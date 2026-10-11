@@ -327,6 +327,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    int32_t n_bias = 0; // the tokens a bias may lower (the candidate pre-selection below counts them)
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
 
@@ -338,10 +339,23 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+            n_bias = (int32_t) merged.size();
         }
     }
 
-    if (params.mirostat == 0) {
+    // Temperature 0 is an argmax however the chain is spelled.  Spelled as one
+    // greedy sampler it is a single terminal op, which lets a backend -- a
+    // tensor-split one included -- reduce it without the truncation samplers in
+    // between, none of which can move the argmax.  Anything that can move it
+    // (penalties, DRY, XTC, adaptive-p) keeps the ordinary chain.
+    const bool greedy_only = params.backend_sampling && params.temp <= 0.0f && params.mirostat == 0 &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
+        params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f &&
+        std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == params.samplers.end();
+
+    if (greedy_only) {
+        samplers.push_back(llama_sampler_init_greedy());
+    } else if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
 
@@ -417,6 +431,56 @@ struct common_sampler * common_sampler_init(
 
     for (auto * smpl : samplers) {
         llama_sampler_chain_add(chain, smpl);
+    }
+
+    // On a backend that cannot run the chain (a vocabulary sharded over devices) the chain samples on the CPU from
+    // the candidates the backend pre-selects, when that is exact: the first truncation is a top-k, and before it
+    // only samplers that lower logits (penalties of the usual sign, non-positive biases) or none: a lowered token
+    // can leave the top-k but no token outside the top-(k + lowered) can enter it. Otherwise the CPU runs on every
+    // logit of the row as before (248K of them: ~1 ms per token).
+    static const bool preselect_on = getenv("LLAMA_SAMPLER_PRESELECT") == nullptr || atoi(getenv("LLAMA_SAMPLER_PRESELECT")) != 0;
+    if (preselect_on && params.backend_sampling && params.mirostat == 0 && !grmr && !rbudget) {
+        int32_t k_pre = 0;
+        bool    ok    = true;
+        for (const auto & b : params.logit_bias) {
+            ok = ok && b.bias <= 0.0f;
+        }
+        int32_t n_lowered = n_bias;
+        if (greedy_only) {
+            // [logit biases, greedy]: the argmax among the candidates not lowered; a bare greedy runs on the backend
+            if (n_bias > 0) {
+                k_pre = 1 + n_bias;
+            }
+        } else for (const auto & cnstr : params.samplers) {
+            if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
+                if (params.top_k > 0 && params.top_k <= 1024) {
+                    k_pre = params.top_k + n_lowered;
+                }
+                break;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_PENALTIES) {
+                const bool active = params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f);
+                if (active) {
+                    ok = ok && params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f && params.penalty_last_n > 0;
+                    n_lowered += params.penalty_last_n;
+                }
+                continue;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_DRY && params.dry_multiplier == 0.0f) {
+                continue;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_TOP_N_SIGMA && params.top_n_sigma < 0.0f) {
+                continue;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp > 0.0f) {
+                continue; // a positive scale keeps the order
+            }
+            ok = false; // another truncation or an unbounded change of the logits before the top-k
+            break;
+        }
+        if (ok && k_pre > 0) {
+            llama_sampler_chain_set_preselect_k(chain, k_pre);
+        }
     }
 
     if (grmr && params.backend_sampling) {
@@ -603,6 +667,13 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+static bool common_sampler_is_greedy(const common_params_sampling & params) {
+    return params.temp <= 0.0f && params.mirostat == 0 && params.n_probs == 0 && params.typ_p >= 1.0f &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
+        params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f &&
+        std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == params.samplers.end();
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -616,10 +687,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
-    // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
+    // A backend sampler may already have produced the token.  Check before
+    // set_logits(): without backend candidates that call materializes and scans
+    // a full-vocabulary array on the CPU, which is the cost the backend sampler
+    // exists to remove -- for greedy speculative verification it is paid once
+    // per draft row.
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
@@ -629,16 +701,117 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
+            // candidates are only needed by callers that inspect probabilities,
+            // which disable backend sampling; keep cur_p consistent when present.
+            // llama_get_sampled_candidates_ith() falls back to the full vocabulary when the backend
+            // produced no candidate list, so check the count: set_logits() would otherwise
+            // materialize an n_vocab-sized array for every token (~0.7 ms on a 248k vocabulary)
+            if (llama_get_sampled_candidates_count_ith(ctx, idx) > 0) {
+                gsmpl->set_logits(ctx, idx);
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    if (cur_p.data[i].id == id) {
+                        cur_p.selected = i;
+                        break;
+                    }
                 }
+            } else {
+                // leave a valid one-token candidate array behind for callers
+                // that inspect it after sampling
+                gsmpl->cur.resize(1);
+                gsmpl->cur[0] = llama_token_data{ id, 0.0f, 1.0f };
+                cur_p = { gsmpl->cur.data(), 1, 0, true };
             }
 
             return id;
         }
     }
+
+    // Temperature 0 with nothing in the chain that can move the argmax (the greedy_only condition of
+    // common_sampler_init) and no caller interested in probabilities: scan the logits row for its maximum instead
+    // of materializing and filtering an n_vocab-sized candidate array (~1.3 ms per token on a 248k vocabulary).
+    // Logit biases (e.g. --ignore-eos) and suppressed tokens are applied to the few tokens they name.
+    // with the backend's candidates (llama_sampler_chain_set_preselect_k) the chain runs on them below
+    if (!grmr && !rbudget && common_sampler_is_greedy(gsmpl->params) && llama_get_sampled_candidates_count_ith(ctx, idx) == 0) {
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int     n_vocab = llama_vocab_n_tokens(vocab);
+        const float * logits  = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        int32_t             n_suppress = 0;
+        const llama_token * suppress   = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        const auto & bias = gsmpl->params.logit_bias;
+        auto special = [&](llama_token t) {
+            if (std::find(suppress, suppress + n_suppress, t) != suppress + n_suppress) {
+                return true;
+            }
+            for (const auto & b : bias) {
+                if (b.token == t) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // the max first, with independent partial maxima (a single running max is a dependency chain the
+        // compiler may not vectorize without -ffast-math: ~0.8 ms on a 248k vocabulary), then its first index
+        float vm[8] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+        int t0 = 0;
+        for (; t0 + 8 <= n_vocab; t0 += 8) {
+            for (int j = 0; j < 8; ++j) {
+                vm[j] = logits[t0 + j] > vm[j] ? logits[t0 + j] : vm[j];
+            }
+        }
+        float vmax = -INFINITY;
+        for (int j = 0; j < 8; ++j) {
+            vmax = std::max(vmax, vm[j]);
+        }
+        for (int t = t0; t < n_vocab; ++t) {
+            vmax = std::max(vmax, logits[t]);
+        }
+        llama_token best = LLAMA_TOKEN_NULL;
+        for (int t = 0; t < n_vocab; ++t) {
+            if (logits[t] == vmax) {
+                best = t;
+                break;
+            }
+        }
+        if (best != LLAMA_TOKEN_NULL && special(best)) {
+            // the plain winner is biased or suppressed: take the best of the others ...
+            best = LLAMA_TOKEN_NULL;
+            vmax = -INFINITY;
+            for (llama_token t = 0; t < n_vocab; ++t) {
+                if (logits[t] > vmax && !special(t)) {
+                    vmax = logits[t];
+                    best = t;
+                }
+            }
+        }
+        // ... and let the biased tokens compete with their bias applied
+        for (const auto & b : bias) {
+            if (b.token < 0 || b.token >= n_vocab || std::find(suppress, suppress + n_suppress, b.token) != suppress + n_suppress) {
+                continue;
+            }
+            float v = logits[b.token];
+            for (const auto & b2 : bias) {
+                if (b2.token == b.token) {
+                    v += b2.bias;
+                }
+            }
+            if (v > vmax) {
+                vmax = v;
+                best = b.token;
+            }
+        }
+        if (best != LLAMA_TOKEN_NULL) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ best, vmax, 1.0f };
+            cur_p = { gsmpl->cur.data(), 1, 0, true };
+            return best;
+        }
+    }
+
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);

@@ -78,6 +78,8 @@ struct llama_hparams {
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;
     uint32_t n_expert = 0;
+    uint32_t n_expert_hot = 0; // > 0: experts [n_expert_hot, n_expert) are stored in the *_exps_cold tensors
+    uint32_t n_expert_nextn = 0; // > 0: the nextn (MTP) blocks keep this many routed experts, e.g. an expert-pruned trunk with the vendor's draft block
     uint32_t n_rel_attn_bkts = 0;
     uint32_t n_value_expert      = 0; // MoVA value experts (K2 Horizon)
     uint32_t n_value_expert_used = 0;
@@ -273,6 +275,7 @@ struct llama_hparams {
     uint32_t lilicorr_layers         = 0;
     float    lilicorr_vector_eps     = 0.0f;
     float    lilicorr_logit_scale    = 0.0f;
+    float    dflash_selector_edge_scale = 1.0f;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

@@ -331,3 +331,17 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
             gate_in, gate_out);
 }
+
+static __global__ void scale_silu_f32(const float * __restrict__ x, float * __restrict__ dst, const float s, const float b, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = x[i]*s + b;
+        dst[i] = v/(1.0f + expf(-v));
+    }
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale, ggml_tensor * silu) {
+    const float * p = (const float *) scale->op_params;
+    const int64_t n = ggml_nelements(silu);
+    scale_silu_f32<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) scale->src[0]->data, (float *) silu->data, p[0], p[1], n);
+}

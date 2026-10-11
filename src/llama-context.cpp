@@ -769,6 +769,15 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+    // what this reservation covers: small (keyed) or no samplers
+    sampling.reserved_small = true;
+    for (const auto & [seq_id, key] : sampling.sampler_keys) {
+        sampling.reserved_small = sampling.reserved_small && !key.empty();
+    }
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        sampling.reserved_small = sampling.reserved_small && sampling.sampler_keys.count(seq_id) > 0;
+    }
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -1541,7 +1550,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampling.samplers[seq_id]     = sampler;
         sampling.sampler_keys[seq_id] = llama_sampler_graph_key(sampler);
 
-        sched_need_reserve = true;
+        // a small sampler after a reservation made with small or no samplers: the compute buffers hold its graph
+        if (!(sampling.reserved_small && !sampling.sampler_keys[seq_id].empty())) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -1562,7 +1574,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     sampling.samplers.erase(seq_id);
     sampling.sampler_keys.erase(seq_id);
 
-    sched_need_reserve = true;
+    // no sampler at all is less than the reservation holds
+    if (!sampling.reserved_small) {
+        sched_need_reserve = true;
+    }
 
     return true;
 }

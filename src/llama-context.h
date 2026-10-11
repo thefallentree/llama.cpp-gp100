@@ -329,6 +329,10 @@ private:
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
         std::map<llama_seq_id, std::string>     sampler_keys; // llama_sampler_graph_key of each
+        // the schedulers were reserved with every sequence's sampler small (a graph key: a bare greedy, the
+        // pre-selection) or absent: another such sampler needs no new reservation (a server's request after
+        // request: ~175 ms each, with the kept graphs rebuilt)
+        bool reserved_small = false;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

@@ -1078,6 +1078,18 @@ private:
 
     common_speculative_ptr spec;
 
+    // launch-ahead of the verification window (llama_decode_prepare): with one slot generating, the drafter's hook
+    // prepares the target's decode of the sampled token and n_draft_max placeholders while the draft still runs;
+    // decode() commits it with the draft (LLAMA_SPEC_AHEAD=0 disables it)
+    struct {
+        bool          enabled = true;
+        bool          active  = false;   // a window waits on the device for this update's commit
+        server_slot * slot    = nullptr;
+        int32_t       n_rows  = 0;       // the rows prepared: 1 + n_draft_max
+        llama_pos     pos0    = 0;
+        common_batch  batch;
+    } spec_ahead;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1576,6 +1588,8 @@ private:
             params_base.cache_ram_mib    = 0;
             params_base.cache_idle_slots = false;
         }
+        spec_ahead.batch   = common_batch(ctx_tgt);
+        spec_ahead.enabled = getenv("LLAMA_SPEC_AHEAD") == nullptr || atoi(getenv("LLAMA_SPEC_AHEAD")) != 0;
 
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
@@ -2694,13 +2708,35 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // Hybrid/recurrent (GDN) restore requires a checkpoint with
+            // pos_min < pos_min_thold or pos_min == 0. Evicting front()
+            // threw away that only usable restore point; later checkpoints
+            // have high pos_min and force a full prefill. Keep the lowest
+            // pos_min checkpoint and drop the oldest of the rest.
+            auto keep = slot.prompt.checkpoints.begin();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min < keep->pos_min) {
+                    keep = it;
+                }
+            }
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            auto victim = slot.prompt.checkpoints.end();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it == keep) {
+                    continue;
+                }
+                if (victim == slot.prompt.checkpoints.end() || it->n_tokens < victim->n_tokens) {
+                    victim = it;
+                }
+            }
+            if (victim == slot.prompt.checkpoints.end()) {
+                victim = keep;
+            }
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, keeping pos_min = %d)\n",
+                    victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024, keep->pos_min);
+
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -3539,7 +3575,20 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            if (spec_ahead.active && off == 0) {
+                // the prepared window takes the rows of its slot, at the head of the batch
+                int32_t n_slot = 0;
+                while (n_slot < batch.size() && batch.tokens[n_slot].id_slot == spec_ahead.slot->id &&
+                        batch.tokens[n_slot].i_embd < 0 && batch.tokens[n_slot].pos[0] == spec_ahead.pos0 + n_slot && n_slot < spec_ahead.n_rows) {
+                    n_slot++;
+                }
+                if (n_slot == 0) {
+                    spec_ahead_discard();
+                } else {
+                    n_tokens = n_slot;
+                }
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -3804,9 +3853,51 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            spec_ahead.active = false;
+            bool others = false;
+            iterate(slots, [&](server_slot & slot) {
+                others |= slot.is_processing() && &slot != drafting[0];
+            });
+            // (a target checkpoint after the draft would read the context while its window waits: not with those)
+            if (spec_ahead.enabled && drafting.size() == 1 && generating.size() == 1 && !others && drafting[0]->inp_embd.empty() &&
+                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                server_slot * slot   = drafting[0];
+                const int32_t n_rows = 1 + std::min(slot->get_n_draft_max(), common_speculative_n_max(spec.get()));
+                common_speculative_set_launch_hook(spec.get(), [this, slot, n_rows]() {
+                    auto & b = spec_ahead.batch;
+                    b.clear();
+                    const llama_pos pos0 = slot->prompt.tokens.pos_next();
+                    for (int32_t i = 0; i < n_rows; ++i) {
+                        b.add(slot->sampled, pos0 + i, slot->id, true);
+                    }
+                    const int32_t rc = llama_decode_prepare(ctx_tgt, b.get());
+                    if (rc == 0) {
+                        spec_ahead.active = true;
+                        spec_ahead.slot   = slot;
+                        spec_ahead.n_rows = n_rows;
+                        spec_ahead.pos0   = pos0;
+                    } else if (rc == 3) {
+                        // no gated window for this shape yet: the batch is decoded after the draft as usual
+                        SRV_DBG("%s", "no gated window for the verification decode yet\n");
+                    } else {
+                        SRV_WRN("launch-ahead of the verification window is off: llama_decode_prepare returned %d\n", rc);
+                        spec_ahead.enabled = false;
+                    }
+                });
+            } else {
+                common_speculative_set_launch_hook(spec.get(), nullptr);
+            }
+
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+
+            common_speculative_set_launch_hook(spec.get(), nullptr);
+
+            if (spec_ahead.active && spec_ahead.slot->state != SLOT_STATE_GENERATING) {
+                // the slot went away during the draft
+                spec_ahead_discard();
+            }
         }
 
         // make checkpoints if needed
@@ -4546,6 +4637,21 @@ private:
         return true;
     }
 
+    // a prepared window (spec_ahead) that nothing commits: released with its placeholders, its rows leave the memory
+    void spec_ahead_discard() {
+        if (!spec_ahead.active) {
+            return;
+        }
+        std::vector<llama_token> toks(spec_ahead.n_rows, spec_ahead.slot->sampled);
+        const int32_t ret = llama_decode_commit(ctx_tgt, toks.data(), toks.size());
+        if (ret != 0) {
+            SRV_ERR("llama_decode_commit failed, ret = %d\n", ret);
+        }
+        llama_synchronize(ctx_tgt);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), spec_ahead.slot->id, spec_ahead.pos0, -1);
+        spec_ahead.active = false;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
@@ -4582,12 +4688,38 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
+        if (spec_ahead.active && off == 0) {
+            // the window prepared during the draft: its rows are the slot's, the ones past the draft are padding
+            // (the last token again) and leave the memory right away
+            const int32_t n_view = batch.view.size();
+            GGML_ASSERT(n_view >= 1 && n_view <= spec_ahead.n_rows);
+            GGML_ASSERT(batch.tokens[0].id_slot == spec_ahead.slot->id && batch.tokens[0].pos[0] == spec_ahead.pos0);
+            std::vector<llama_token> toks(spec_ahead.n_rows);
+            for (int32_t i = 0; i < spec_ahead.n_rows; ++i) {
+                toks[i] = i < n_view ? batch.tokens[i].token : toks[i - 1];
             }
-        });
+            spec_ahead.active = false;
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_decode_commit(ctx_tgt, toks.data(), toks.size());
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+            if (ret == 0 && n_view < spec_ahead.n_rows) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), spec_ahead.slot->id, spec_ahead.pos0 + n_view, -1);
+            }
+            if (ret != 0) {
+                SRV_ERR("llama_decode_commit failed, ret = %d\n", ret);
+                throw std::runtime_error("the prepared decode failed");
+            }
+        } else {
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
 
         if (ret != 0) {
             {

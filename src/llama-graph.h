@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <set>
@@ -124,6 +125,13 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // Launch-ahead (llama_decode_prepare/commit): the inputs whose data depends on the ubatch's token ids are set
+    // again when the ids are known, after the graph was launched. Such an input returns its tensors here (the
+    // ones set_input writes), nothing otherwise.
+    virtual void token_tensors(std::vector<ggml_tensor *> & out) const {
+        GGML_UNUSED(out);
+    }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -140,6 +148,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    void token_tensors(std::vector<ggml_tensor *> & out) const override;
+
     ggml_tensor * tokens       = nullptr; // I32 [n_batch]
     ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
@@ -147,10 +157,22 @@ public:
     ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
 
+    // the token table in host memory whose rows set_input gathers into embd itself (llm_graph_tok_embd_host):
+    // the graph then has no get_rows on the CPU, so a decode window is one split of the device backend
+    const ggml_tensor * tok_embd_host = nullptr;
+    std::vector<float>  rows_buf;
+
     float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
+
+// Whether the rows of tok_embd can be gathered on the host (a table in host memory of a type with to_float):
+// gathering them in set_input saves the CPU split that a get_rows of a host table costs every graph.
+bool llm_graph_tok_embd_host(const ggml_tensor * tok_embd);
+
+// rows ids[0..n) of tok_embd (llm_graph_tok_embd_host) as floats at dst, n_embd = tok_embd->ne[0] apart
+void llm_graph_gather_tok_embd(const ggml_tensor * tok_embd, const int32_t * ids, int64_t n, float * dst);
 
 // similar to llm_graph_input_embd but with an additional hidden state input, fed from ubatch.embd_state
 class llm_graph_input_embd_h : public llm_graph_input_i {
@@ -165,6 +187,11 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
+
+    // the token rows gathered on the host (llm_graph_tok_embd_host) instead of a get_rows of the host table
+    ggml_tensor *       tok_rows      = nullptr; // F32 [tok_embd->ne[0], n_batch]
+    const ggml_tensor * tok_embd_host = nullptr;
+    std::vector<float>  rows_buf;
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
@@ -763,14 +790,15 @@ public:
 
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
-    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
-        samplers(std::move(samplers)) { }
+    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers, std::map<llama_seq_id, std::string> keys) :
+        samplers(std::move(samplers)), keys(std::move(keys)) { }
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::string>     keys; // llama_sampler_graph_key of each (llm_graph_params::sampler_keys)
 };
 
 //
@@ -812,16 +840,27 @@ struct llm_graph_params {
     const llama_hadamard * hdmd = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    // llama_sampler_graph_key of each: samplers with the same non-empty key run the same graph (the server's
+    // requests one after the other), recorded at the build since the sampler of a kept graph may be gone
+    std::map<llama_seq_id, std::string> sampler_keys;
 
     static bool samplers_equal(
-          const std::map<llama_seq_id, llama_sampler *> & lhs,
-          const std::map<llama_seq_id, llama_sampler *> & rhs) {
+          const std::map<llama_seq_id, llama_sampler *> & lhs, const std::map<llama_seq_id, std::string> & lhs_keys,
+          const std::map<llama_seq_id, llama_sampler *> & rhs, const std::map<llama_seq_id, std::string> & rhs_keys) {
         if (lhs.size() != rhs.size()) {
             return false;
         }
         for (const auto & [seq_id, sampler] : lhs) {
             auto it = rhs.find(seq_id);
-            if (it == rhs.end() || it->second != sampler) {
+            if (it == rhs.end()) {
+                return false;
+            }
+            if (it->second == sampler) {
+                continue;
+            }
+            auto kl = lhs_keys.find(seq_id);
+            auto kr = rhs_keys.find(seq_id);
+            if (kl == lhs_keys.end() || kr == rhs_keys.end() || kl->second.empty() || kl->second != kr->second) {
                 return false;
             }
         }
@@ -833,6 +872,18 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // the draft chain (llama_set_draft_chain): a ubatch whose token and h come from these tensors (in), one that
+    // writes them for the next ubatch (out)
+    struct {
+        bool          in       = false;
+        bool          out      = false;
+        ggml_tensor * tok      = nullptr; // I32 [1]
+        ggml_tensor * h        = nullptr; // F32 [n_embd_out]
+        ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft], null: the model's own table
+        ggml_tensor * eye      = nullptr; // F32 [n_dev, n_dev], a head sharded over the vocabulary: the shards' best rows meet through it
+        ggml_tensor * off      = nullptr; // F32 [n_dev]: the first row of every shard
+    } chain;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -874,7 +925,11 @@ struct llm_graph_params {
             return false;
         }
 
-        if (!samplers_equal(samplers, other.samplers)) {
+        if (chain.in != other.chain.in || chain.out != other.chain.out) {
+            return false;
+        }
+
+        if (!samplers_equal(samplers, sampler_keys, other.samplers, other.sampler_keys)) {
             return false;
         }
 
@@ -938,6 +993,9 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+
+    // launch-ahead: set the inputs that depend on the token ids again, and return their tensors (llm_graph_input_i::token_tensors)
+    void set_token_inputs(const llama_ubatch * ubatch, std::vector<ggml_tensor *> & tensors);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -959,6 +1017,9 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // would a graph built with these params have the topology of this one (its inputs aside)?
+    bool allow_reuse(const llm_graph_params & params) const { return this->params.allow_reuse(params); }
+
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
@@ -966,6 +1027,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_draft_tok   = nullptr; // I32 [1]: the draft chain's token of the single output row, the greedy sampler takes it
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1018,7 +1080,16 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// op_params[12..15] of a MUL_MAT_ID whose experts continue in a cold tensor: { magic, n_cold, data pointer (2 ints) }
+// (the low op_params of MUL_MAT_ID hold precision settings); on a tensor-split device the cold tensor is src[3] instead
+#define LLAMA_EXPS_COLD_MAGIC 0x434f4c44
+#define LLAMA_EXPS_COLD_PARAM 12
+#define LLAMA_EXPS_COLD_SRC   3
+
 struct llm_graph_context {
+    // hot expert tensor -> cold expert tensor (pinned host memory); set by models that split their experts
+    const std::unordered_map<const ggml_tensor *, ggml_tensor *> * exps_cold = nullptr;
+
     const llm_arch arch;
 
     const llama_hparams & hparams;
@@ -1070,6 +1141,7 @@ struct llm_graph_context {
     const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::string>     sampler_keys;
 
     const llm_graph_cb & cb_func;
 

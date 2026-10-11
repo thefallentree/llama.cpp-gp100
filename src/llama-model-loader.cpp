@@ -42,6 +42,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_1_G64:  name = LLAMA_FTYPE_PREFIX "Q4_1_G64"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1:      name = LLAMA_FTYPE_PREFIX "Q5_1"; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
@@ -758,6 +759,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;
             case GGML_TYPE_Q4_0:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;    break;
             case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
+            case GGML_TYPE_Q4_1_G64: ftype = LLAMA_FTYPE_MOSTLY_Q4_1_G64; break;
             case GGML_TYPE_Q5_0:    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;    break;
             case GGML_TYPE_Q5_1:    ftype = LLAMA_FTYPE_MOSTLY_Q5_1;    break;
             case GGML_TYPE_Q8_0:    ftype = LLAMA_FTYPE_MOSTLY_Q8_0;    break;
@@ -860,6 +862,53 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
     }
     return *weight;
+}
+
+bool llama_model_loader::resplit(const std::string & first, const std::string & second, const int64_t n_first, const int axis) {
+    const auto it_a = weights_map.find(first);
+    const auto it_b = weights_map.find(second);
+    if (it_a == weights_map.end() || it_b == weights_map.end() || axis < 1 || axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    llama_tensor_weight & a = it_a->second;
+    llama_tensor_weight & b = it_b->second;
+    ggml_tensor * ta = a.tensor;
+    ggml_tensor * tb = b.tensor;
+    const int64_t n_a   = ta->ne[axis];
+    const int64_t n_b   = tb->ne[axis];
+    const size_t  slice = ta->nb[axis];
+    bool ok = a.idx == b.idx && ta->type == tb->type && tb->nb[axis] == slice && n_first >= 1 && n_first < n_a + n_b &&
+              b.offs == a.offs + (size_t) n_a*slice;
+    for (int d = 0; d < GGML_MAX_DIMS && ok; ++d) {
+        ok = d == axis ? true : d < axis ? ta->ne[d] == tb->ne[d] : ta->ne[d] == 1 && tb->ne[d] == 1;
+    }
+    if (!ok) {
+        return false;
+    }
+    ta->ne[axis] = n_first;
+    tb->ne[axis] = n_a + n_b - n_first;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        ta->nb[d] = ta->nb[d - 1]*ta->ne[d - 1];
+        tb->nb[d] = tb->nb[d - 1]*tb->ne[d - 1];
+    }
+    b.offs = a.offs + (size_t) n_first*slice;
+    return true;
+}
+
+bool llama_model_loader::pad_dim(const std::string & name, const int axis, const int64_t n_extra) {
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end() || axis < 0 || axis >= GGML_MAX_DIMS || n_extra < 0) {
+        return false;
+    }
+    ggml_tensor * t = it->second.tensor;
+    if (n_bytes_file.find(name) == n_bytes_file.end()) {
+        n_bytes_file[name] = ggml_nbytes(t);
+    }
+    t->ne[axis] += n_extra;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        t->nb[d] = t->nb[d - 1]*t->ne[d - 1];
+    }
+    return true;
 }
 
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
@@ -1256,6 +1305,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+
+                        // host memory of a tensor-split device: one slice per device, like the tensors in its VRAM
+                        ggml_backend_buffer_type_t buft_split =
+                            ggml_backend_meta_device_host_split_buffer_type(buft_list->front().first, buft);
+                        if (buft_split != nullptr) {
+                            buft = buft_split;
+                        }
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1702,6 +1758,13 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+        {
+            // a tensor padded past the file's data (pad_dim) reads what the file holds
+            const auto it_pad = n_bytes_file.find(ggml_get_name(cur));
+            if (it_pad != n_bytes_file.end()) {
+                n_size = std::min(n_size, it_pad->second);
+            }
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1820,6 +1883,9 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+        if (n_size < ggml_nbytes(cur)) {
+            size_done += ggml_nbytes(cur) - n_size; // the padding counts as done (size_data holds the padded size)
+        }
     }
 
     // free temporary resources used for async uploads

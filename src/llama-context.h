@@ -148,6 +148,13 @@ struct llama_context {
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
 
+    // Launch-ahead: decode_prepare runs a decode whose token ids (some of them) are placeholders: the graph is
+    // launched and waits on the device for its token-dependent inputs. decode_commit gives the ids, sets those
+    // inputs and releases the graph, then extracts the outputs as decode does. Between the two the context is not
+    // synchronized (no accessor is called), other contexts may run. One ubatch per prepared decode.
+    int decode_prepare(const llama_batch_ext & batch_inp);
+    int decode_commit(const llama_token * tokens, size_t n_tokens);
+
     // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -269,9 +276,10 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -323,6 +331,11 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        std::map<llama_seq_id, std::string>     sampler_keys; // llama_sampler_graph_key of each
+        // the schedulers were reserved with every sequence's sampler small (a graph key: a bare greedy, the
+        // pre-selection) or absent: another such sampler needs no new reservation (a server's request after
+        // request: ~175 ms each, with the kept graphs rebuilt)
+        bool reserved_small = false;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
@@ -402,6 +415,48 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // extra graphs kept for reuse (cparams.n_graph_slots > 1), each with its own scheduler so that its
+    // allocation survives while other graphs are built. used for ubatches of up to
+    // LLAMA_GRAPH_SLOT_N_TOKENS_MAX tokens; anything larger goes through the main scheduler.
+    struct graph_slot {
+        llm_graph_result_ptr   res;
+        ggml_backend_sched_ptr sched;
+        bool                   valid     = false;
+        uint64_t               last_use  = 0;
+        uint32_t               n_compute = 0; // computes of the graph since it was built
+    };
+
+    std::vector<graph_slot> gf_slots;
+
+    static constexpr int LLAMA_GRAPH_SLOT_N_TOKENS_MAX = 16;
+
+    int      gf_slot_cur   = -1; // slot holding the most recently computed graph (-1 = main scheduler)
+    uint64_t gf_slot_clock = 0;
+
+    ggml_backend_sched_t sched_active() const;
+
+    void gf_slots_invalidate();
+
+    // drop cached decode graphs and recreate their schedulers so leftover compute
+    // buffers (e.g. a previous 64k spec-decode) do not sit on the GPU through a
+    // later long prefill. force=true also recreates empty slots (OOM retry).
+    void gf_slots_release_compute(bool force = false);
+
+    // compute buffer bytes of the valid graph slots, all backends
+    size_t gf_slots_compute_size() const;
+
+    void gf_slots_recreate_one(graph_slot & slot);
+
+    // recreate the main scheduler so a prior large (prefill) compute buffer
+    // does not stay resident into decode. Q4_1 110k regrow still OOMd a
+    // 435 MiB CUDA1 alloc while that buffer was held.
+    void gf_main_sched_recreate();
+
+    bool main_sched_held_large = false;
+
+    // the graph slots stayed while the main scheduler ran a large ubatch
+    bool gf_slots_kept = false;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -409,6 +464,54 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    // work put on the backends since the last synchronize(): the accessors synchronize at every call (a round of
+    // speculative decoding makes a dozen), which is a stream synchronization per device and a look at the expert
+    // cache each time; without pending work synchronize() returns at once
+    bool sync_pending = true;
+
+    // a decode launched by decode_prepare, waiting for its tokens (decode_commit)
+    struct decode_pending {
+        bool                     active = false;
+        llama_memory_context_ptr mctx;
+        llm_graph_result *       res = nullptr;
+        ggml_backend_sched_t     sch = nullptr;
+        uint32_t                 n_outputs_all = 0;
+        int64_t                  n_outputs_prev = 0;
+        int64_t                  n_tokens_prev  = 0;
+        int64_t                  t_d0 = 0;
+    } pending;
+
+    // the draft chain (llama_set_draft_chain): persistent tensors a ubatch's graph writes for the next one
+    struct draft_chain_t {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * tok      = nullptr; // I32 [1]: the argmax of the draft logits of the output row
+        ggml_tensor * h        = nullptr; // F32 [n_embd_out]: its h_nextn row
+        ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft]: the token embeddings of the draft vocabulary (null: model.tok_embd)
+        // a draft head sharded over the vocabulary: the shards' best rows meet through an AllReduce of a one-hot
+        // placement (see llama_model_qwen4exp::graph_mtp); eye [n_dev, n_dev] is the identity split by rows, off
+        // [n_dev] the first row of every shard, each device holding its own row of them
+        ggml_tensor * eye      = nullptr;
+        ggml_tensor * off      = nullptr;
+        int32_t       n        = 0;       // the chain rows of the next decode
+        bool          cur_in   = false;   // the ubatch being built reads the chain tensors
+        bool          cur_out  = false;   // ... writes them
+    } draft_chain;
+
+    void draft_chain_init();
+
+public:
+    bool draft_chain_available() const { return draft_chain.tok != nullptr; }
+    void set_draft_chain(int32_t n_chain) { draft_chain.n = draft_chain.tok != nullptr ? std::max(0, n_chain) : 0; }
+
+private:
+
+    int  decode_impl(const llama_batch_ext & batch_inp, bool prepare);
+    // the outputs of a computed ubatch (the copies to the host, asynchronous)
+    void decode_extract(const llm_graph_result * res, const llama_ubatch & ubatch, uint32_t n_outputs_all, int64_t & n_outputs_prev, int64_t & n_tokens_prev, int64_t t_d0, int64_t t_d4);
+    // the end of a decode: the output mappings
+    void decode_finish(uint32_t n_outputs_all, int64_t t_d0);
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

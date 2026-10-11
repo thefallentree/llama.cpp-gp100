@@ -367,11 +367,25 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Launch-ahead: a graph computed with deferred inputs is launched on a backend that gates it (ggml_backend_i::fire)
+    // without firing the gate, so that it waits on the device for inputs the caller sets later. The caller then sets
+    // those inputs (their graph input tensors), copies them with ggml_backend_sched_copy_input and fires the gate
+    // with ggml_backend_sched_fire. The scheduler must not be synchronized in between.
+    GGML_API void                 ggml_backend_sched_set_deferred_inputs(ggml_backend_sched_t sched, bool deferred);
+    GGML_API bool                 ggml_backend_sched_copy_input(ggml_backend_sched_t sched, const struct ggml_tensor * input);
+    GGML_API void                 ggml_backend_sched_fire(ggml_backend_sched_t sched);
+    // is a launched graph waiting on its gate for the inputs (a backend of the scheduler holds one)?
+    GGML_API bool                 ggml_backend_sched_gate_pending(ggml_backend_sched_t sched);
+
     //
     // Meta backend
     //
 
-#define GGML_BACKEND_META_MAX_DEVICES 16
+// 16 upstream. ggml_backend_meta_split_state is copied several times per tensor when a graph is allocated: with 16 a
+// new decode graph took 40-60 ms longer.
+#ifndef GGML_BACKEND_META_MAX_DEVICES
+#define GGML_BACKEND_META_MAX_DEVICES 4
+#endif
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:
@@ -418,6 +432,14 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // A buffer type of the meta device made of the host buffer type of its simple devices: a tensor allocated in it is
+    // split like any tensor of the meta device, but every slice stays in host memory next to its device.
+    // Returns NULL if dev is not a meta device or host_buft is not the host buffer type of all its simple devices.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_device_host_split_buffer_type(ggml_backend_dev_t dev, ggml_backend_buffer_type_t host_buft);
+
+    // is the buffer one of a meta device (its tensors have a slice per simple device)?
+    GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
 
     //
     // Utils

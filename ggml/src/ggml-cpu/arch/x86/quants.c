@@ -698,6 +698,60 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+#if defined(__AVX2__)
+    // dword i of a lane holds 4 code bytes shifted right by 2*i: byte 4*i+b is the code of element 4*b+i
+    const __m256i shift  = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    const __m256i sel_lo = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+    const __m256i sel_hi = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
+    const __m256i perm   = _mm256_setr_epi8(
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m256i m3   = _mm256_set1_epi8(3);
+    const __m256i ones = _mm256_set1_epi8(1);
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT y0 = &y[2*ib + 0];
+        const block_q8_0 * GGML_RESTRICT y1 = &y[2*ib + 1];
+
+        const __m256i qs = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) x[ib].qs));
+
+        const __m256i q0 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srlv_epi32(_mm256_permutevar8x32_epi32(qs, sel_lo), shift), m3), ones);
+        const __m256i q1 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srlv_epi32(_mm256_permutevar8x32_epi32(qs, sel_hi), shift), m3), ones);
+
+        const __m256i qy0 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) y0->qs), perm);
+        const __m256i qy1 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) y1->qs), perm);
+
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0*GGML_CPU_FP16_TO_FP32(y0->d)), mul_sum_i8_pairs_float(q0, qy0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d0*GGML_CPU_FP16_TO_FP32(y1->d)), mul_sum_i8_pairs_float(q1, qy1), acc1);
+    }
+
+    *s = hsum_float_8(_mm256_add_ps(acc0, acc1));
+#else
+    UNUSED(nb);
+    UNUSED(x);
+    UNUSED(y);
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

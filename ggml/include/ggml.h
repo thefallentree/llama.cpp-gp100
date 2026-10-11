@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q4_1_G64 = 43, // Q4_1 nibbles with one (d,m) per 64 weights (4.5 bpw)
+        GGML_TYPE_Q4_16   = 44, // 4-bit codes (value = d*(code - 8)) with one fp16 d per 16 weights (5 bpw): a
+                                // Q3_K or Q2_0 tensor re-encoded exactly; the nibbles in the planar engine's order
+        GGML_TYPE_COUNT   = 45,
     };
 
     // [TAG_GGML_PREC]
@@ -585,6 +588,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_FLASH_ATTN_SEL,
 
         GGML_OP_UNARY,
 
@@ -2725,6 +2729,25 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // attention of every token over its own selection of cache rows (sparse attention)
+    //
+    // q:   [n_embd, n_head, n_tokens]   f32
+    // k:   [n_embd, n_kv,   n_head_kv]  f16 or q8_0, rows may be strided; head h reads kv head h/(n_head/n_head_kv)
+    // v:   [n_embd, n_kv,   n_head_kv]  the type of k
+    // sel: [n_sel,  n_tokens]           i32 rows of k and v per token; a row outside [0, n_kv) is skipped
+    // res: [n_embd, n_head, n_tokens]   f32
+    //
+    //   res[:, h, t] = sum_s softmax_s(scale*q[:, h, t] . k[:, sel[s, t], hk]) v[:, sel[s, t], hk]
+    //
+    // a token without a row in range gets zeros
+    GGML_API struct ggml_tensor * ggml_flash_attn_sel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * sel,
+            float                 scale);
 
     // custom operators
 

@@ -31,6 +31,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <future>
+#include <unordered_set>
+#include <set>
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -739,6 +742,17 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+    // Pascal has no DP4A.  PTX vmad (scalar MAC with byte selectors) avoids the byte
+    // extraction (BFE/SHR) of the generic fallback, cutting the dot product from ~15 to
+    // ~6.75 SASS instructions.  Integer arithmetic, so the result is bit-identical.
+    int r = c;
+    asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;"
+        : "+r"(r) : "r"(a), "r"(b));
+    return r;
 #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     const int8_t * a8 = (const int8_t *) &a;
     const int8_t * b8 = (const int8_t *) &b;
@@ -1443,10 +1457,255 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct mh_mailbox;
+
+// the gate/up/down MUL_MAT_IDs of a hot/cold MoE layer whose cold experts the host computes (moe-host.cuh)
+struct ggml_cuda_moe_host_triple {
+    const ggml_tensor * ids  = nullptr;
+    const ggml_tensor * up   = nullptr;
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * down = nullptr;
+};
+
+// prompt batches of a hot/cold MoE: the cold experts of the next MUL_MAT_ID are copied to VRAM on a second stream
+// while the current one computes (mmid-f16-sm60.cu)
+struct ggml_cuda_cold_prefetch {
+    cudaStream_t copy     = nullptr;
+    char *       buf[2]   = { nullptr, nullptr };
+    size_t       cap      = 0;
+    cudaEvent_t  ready[2] = { nullptr, nullptr };
+    cudaEvent_t  freed[2] = { nullptr, nullptr };
+    cudaEvent_t  fork     = nullptr;      // orders the copy stream after the graph start (and into a CUDA graph capture)
+    cudaEvent_t  join     = nullptr;      // joins the copy stream back at the graph end
+    std::vector<const ggml_tensor *> ops; // the graph's prompt-sized cold MUL_MAT_IDs, in order
+    int          next     = 0;            // the next of them to compute
+    bool         active   = false;        // buffers ready for this graph's ops
+    bool         started  = false;        // the first copies are issued
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_cold_prefetch cold_pf;
+    std::set<int64_t> prompt_graph_ntok; // ubatch sizes of the prompt graphs run so far, see ggml_backend_cuda_graph_compute
+
+    // cold experts on the host: the open triple, the mapped mailbox and the request state on the device
+    ggml_cuda_moe_host_triple moe_host;
+    mh_mailbox *              moe_host_mb     = nullptr;
+    uint32_t *                moe_host_dstate = nullptr;
+
+    // Single-slot cache of the sm_60 mat-vec's quantized activations.  Gate and up
+    // projections consume the same activation tensor back to back, so the second
+    // mat-vec can reuse the exact half2 values and scales produced for the first,
+    // skipping one quantize launch per pair.  The key holds a tensor pointer that a
+    // later graph may reuse, so it is cleared at the top of every graph compute; the
+    // buffer is a plain device allocation (NOT pool -- the pool is a stack allocator
+    // and holding one across calls breaks its free-order assert) kept across rounds
+    // and never shrunk, so after warmup there are no allocations.
+    char *              a16_cache_mem      = nullptr;
+    size_t              a16_cache_cap      = 0;
+    const ggml_tensor * a16_cache_src1     = nullptr;
+    const void *        a16_cache_data     = nullptr;
+    cudaStream_t        a16_cache_stream   = nullptr;
+    size_t              a16_cache_aq_size  = 0;
+    size_t              a16_cache_ads_size = 0;
+    int64_t             a16_cache_s[3]     = { 0, 0, 0 };
+
+    // converted activations of the sm_60 Q2_0 MUL_MAT_ID mat-vec: gate and up read the same src1 back to back
+    char *              mmid16_cache_mem  = nullptr;
+    size_t              mmid16_cache_cap  = 0;
+    const ggml_tensor * mmid16_cache_src1 = nullptr;
+    const void *        mmid16_cache_data = nullptr;
+    int64_t             mmid16_cache_key  = -1;
+
+    // sm_60 fused engine (fn-engine.cuh): the fp16 activations of the vectors that mat-vecs read, by tensor. The keys
+    // are tensor pointers, so they are cleared at the top of every graph compute (of every window when the graph is
+    // computed in parts, see window_active); the buffers are kept.
+    struct fn_act_slot {
+        const ggml_tensor * key      = nullptr;
+        int                 n        = 0;
+        int                 nt       = 0;
+        bool                full     = false; // the activations are (or will be, in stream order) written, not only the scales
+        uint64_t            last_use = 0;
+        char *              mem      = nullptr;
+        size_t              cap      = 0;
+    };
+    fn_act_slot fn_act[4];
+    uint64_t    fn_act_clock = 0;
+
+    void fn_act_clear() {
+        for (auto & s : fn_act) {
+            s.key = nullptr;
+        }
+    }
+    void fn_act_free() {
+        for (auto & s : fn_act) {
+            if (s.mem != nullptr) {
+                cudaFree(s.mem);
+                s.mem = nullptr;
+            }
+            s.cap = 0;
+        }
+        fn_act_clear();
+    }
+
+    // part of a tensor-split window: graph_compute runs the nodes on the stream without a CUDA graph of its own
+    bool window_active = false;
+    // a part of the window being captured reads the hot expert slices: its launches wait for a pending exchange
+    bool window_needs_ec = false;
+
+    // fn-engine MoE experts: the pairs, the SwiGLU outputs and their activations between the up and the down kernels
+    char *  fn_moe_mem = nullptr;
+    size_t  fn_moe_cap = 0;
+    int     fn_moe_n_ff = 0;
+    int     fn_moe_n_pairs = 0;
+    // ... and what the down projection of the open layer writes: the weighted sum and the nodes it replaces
+    // the SSM_CONV of a recurrent layer whose input side the fused engine computes there, and the kernel's arguments
+    const ggml_tensor * fn_gdn_pre_conv = nullptr;
+    char                fn_gdn_pre_args[192];
+    float *             fn_gdn_pre_mem = nullptr; // the staged inputs of fn_gdn_pre (fn_gdn_pre_stage)
+    size_t              fn_gdn_pre_cap = 0;       // floats
+    int32_t *           fn_qsa_cells = nullptr; // staged cells of fn_qsa_attn
+    float *             fn_qsa_part  = nullptr; // partial softmax states of its chunks
+    float *             fn_router_mem  = nullptr; // the output of a router's second copy: [FN_MAX_T][fn_router_rows]
+    int64_t             fn_router_rows = 0;
+    const ggml_tensor * fn_router_node = nullptr; // the MUL_MAT node it belongs to
+
+    const ggml_tensor * fn_moe_down = nullptr;
+    ggml_tensor *       fn_moe_dst  = nullptr;
+    int                 fn_moe_skip = 0;
+
+    // expert cache (expert-cache.cuh): the ids tensor whose ids were last made positions in this graph, and whether
+    // graphs ran since the last update
+    const ggml_tensor * ec_last_ids = nullptr;
+    bool                ec_pending  = false;
+    cudaEvent_t         ec_event    = nullptr; // the end of the last exchange, on its own stream
+    bool                ec_wait     = false;   // the next graph has to wait for it
+    bool                ec_pend     = false;   // an exchange was started since the slots it frees were taken back
+    std::future<void>   ec_future;             // an update running on a thread (ggml_cuda_expert_cache_update_async)
+
+    // temporary (GGML_CUDA_FN_WAITS=1): device counters of the waits inside kernels, in clock64() ticks:
+    // [0] host-tier collect wait, [1] collects, [2] AllReduce wait, [3] AllReduces
+    unsigned long long * fn_dbg = nullptr;
+    unsigned int *       fn_probe = nullptr; // mapped host memory that a window's first and last kernel write (temporary)
+    unsigned long long * fn_dbg_get();
+    void                 fn_dbg_report();
+
+    // uids of the graphs whose weights were looked at for the planar repack; true the first time a uid is seen
+    std::unordered_set<uint64_t> fn_planes_uids;
+    bool fn_planes_seen(const uint64_t uid) {
+        if (fn_planes_uids.size() > 4096) {
+            fn_planes_uids.clear();
+        }
+        return fn_planes_uids.insert(uid).second;
+    }
+
+    // Small inputs of a graph (set_tensor_async of up to GGML_CUDA_IN_SMALL bytes) wait here for one copy to the
+    // device and one kernel that distributes them: a copy of its own cost 5-6 us of host time per input and device,
+    // and a decode graph has 13 inputs. The blob is a table of GGML_CUDA_IN_MAX entries, then the data.
+    char * in_host = nullptr; // pinned
+    char * in_dev  = nullptr;
+    int    in_n    = 0;
+    size_t in_used = 0;       // bytes of data
+    bool   in_busy = false;   // a copy of the blob may still be on the stream
+    bool   in_direct = false; // since the last synchronize an input was copied from the caller's memory, not staged
+    // The gate of a captured window (ggml_cuda_in_gate_record): its first node waits until the host has staged the
+    // window's inputs and scatters them from in_dev itself, so the window can be launched before its inputs are
+    // known. in_flag_dev is set on the input stream (GGML_CUDA_IN_STREAM) after the blob's copy to in_dev; the gate on the
+    // main stream waits for it to differ from in_seen_dev (the value the last window consumed) and scatters from
+    // in_dev. in_copy_event: the copy of the blob is done, the host may write it again.
+    unsigned int * in_flag_dev  = nullptr;
+    unsigned int * in_flag_host = nullptr; // pinned ring of the values the flag is set to: the fire copies one (DMA)
+    unsigned int * in_seen_dev  = nullptr;
+    unsigned int   in_fired     = 0;
+    cudaEvent_t    in_copy_event = nullptr;
+    // in_dev holds one blob: a copy into it (a fire, a flush) must wait until the scatter of the blob before it has
+    // run on the device, or the earlier window scatters the later window's inputs (a torn table: an illegal address;
+    // a whole one: stale inputs, and the later gate waits for a flag it has seen). The gate's k_in_seen writes the
+    // flag it consumed to in_seen_host (pinned, mapped) for the host to see; a flush's scatter is followed by
+    // in_scatter_event.
+    unsigned int * in_seen_host     = nullptr; // pinned, mapped: the flag the last gate consumed
+    unsigned int * in_seen_host_dev = nullptr; // its device pointer
+    cudaEvent_t    in_scatter_event = nullptr;
+    bool           in_last_fire     = false;   // the blob in in_dev came from a fire (else from a flush)
+    bool           in_gate_pending = false; // a launched window waits for fire()
+    bool           in_fire_armed   = false; // fire() came before the launch: the launch fires itself
+    bool           in_gated_capture = false; // a gated window is being captured: the staged inputs are the gate's, nothing flushes them
+
+    // cache buffers replaced by larger ones: a captured CUDA graph may still use them (its kernels write and read
+    // them consistently), and freeing them during a capture is not permitted, so they are freed with the context
+    std::vector<void *> retired_mem;
+
+    void retire_mem(char *& mem, size_t & cap) {
+        if (mem != nullptr) {
+            retired_mem.push_back(mem);
+            mem = nullptr;
+        }
+        cap = 0;
+    }
+
+    void mmid16_cache_clear() {
+        mmid16_cache_src1 = nullptr;
+        mmid16_cache_data = nullptr;
+        mmid16_cache_key  = -1;
+    }
+    void mmid16_cache_free() {
+        if (mmid16_cache_mem != nullptr) {
+            cudaFree(mmid16_cache_mem);
+            mmid16_cache_mem = nullptr;
+        }
+        mmid16_cache_cap = 0;
+        mmid16_cache_clear();
+    }
+
+    void a16_cache_clear() {
+        a16_cache_src1   = nullptr;
+        a16_cache_data   = nullptr;
+        a16_cache_stream = nullptr;
+    }
+    void a16_cache_free() {
+        if (a16_cache_mem != nullptr) {
+            cudaFree(a16_cache_mem);
+            a16_cache_mem = nullptr;
+        }
+
+        a16_cache_cap = 0;
+        a16_cache_clear();
+    }
+
+    // A GET_ROWS whose execution was deferred so it can be folded into its consumer
+    // (GATED_DELTA_NET or CONCAT).  Cleared at the top of every graph computation
+    // because it holds tensor pointers.
+    const ggml_tensor * gdn_gather_node  = nullptr;  // the deferred GET_ROWS node
+    const ggml_tensor * gdn_gather_owner = nullptr;  // the node consuming it
+
+    // The row indices are saved at the position the GET_ROWS occupied.  Deferring
+    // execution lets galloc reuse the input tensor's addresses in the meantime, so
+    // reading them at the consumer would be corrupt.
+    int32_t *           gdn_rows_scratch   = nullptr;
+    size_t              gdn_rows_scratch_n = 0;
+    // The tensor the snapshot came from; an identical one is not saved again.
+    const ggml_tensor * gdn_rows_src       = nullptr;
+
+    // Called on every consumption; does not forget gdn_rows_src
+    void gdn_gather_clear() {
+        gdn_gather_node  = nullptr;
+        gdn_gather_owner = nullptr;
+    }
+    void gdn_gather_reset_graph() {
+        gdn_gather_clear();
+        gdn_rows_src = nullptr;
+    }
+    void gdn_gather_free() {
+        if (gdn_rows_scratch != nullptr) {
+            cudaFree(gdn_rows_scratch);
+            gdn_rows_scratch = nullptr;
+        }
+        gdn_rows_scratch_n = 0;
+        gdn_gather_reset_graph();
+    }
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

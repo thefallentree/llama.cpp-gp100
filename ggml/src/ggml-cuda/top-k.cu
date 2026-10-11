@@ -655,6 +655,14 @@ static bool top_k_select_cuda(const float * src, int * dst, const int ncols, con
     return true;
 }
 
+// every column of the row, in order: a top-k that keeps the whole row
+static __global__ void k_top_k_all(int * __restrict__ dst, const int ncols) {
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        dst[(size_t) row*ncols + i] = i;
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -670,6 +678,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+
+    // the whole row: its columns in order (the consumers here gather and sum, in any order). The sort it went
+    // through (a one-block bitonic sort, 29 us for 512 columns on a P100) was most of an indexer's selection at a
+    // short context: the pools of a 1K context all fit the budget (GGML_CUDA_TOP_K_ALL=0 keeps the sort)
+    static const bool all_fast = getenv("GGML_CUDA_TOP_K_ALL") == nullptr || atoi(getenv("GGML_CUDA_TOP_K_ALL")) != 0;
+    if (all_fast && k == ncols && ncols <= INT_MAX && nrows <= INT_MAX) {
+        k_top_k_all<<<dim3((unsigned int) nrows), dim3(256), 0, stream>>>(dst_d, (int) ncols);
+        return;
+    }
 #ifndef CUB_TOP_K_AVAILABLE
     // without cub::DeviceTopK, selecting a few elements out of a wide row is much cheaper than sorting it:
     // 3.7 ms -> 0.09 ms for 4 rows x 248k on a P100 (k = 16)

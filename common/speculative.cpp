@@ -972,6 +972,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+        if (data.empty()) {
+            // no deferred boundary in the restored state: drop the one left by the previous prompt
+            pending_pos_last[seq_id] = -1;
+            return;
+        }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
             return;
         }
@@ -2281,6 +2286,67 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    // The per-sequence state that the draft context's memory does not hold: the embedding of the next first row and
+    // the deferred catch-up rows (their tokens, positions and embeddings). The server saves it with a prompt (the
+    // host prompt cache) and with a context checkpoint, and restores it when it restores the contexts; the rows of
+    // another prompt must not survive a restore: they would be decoded in front of the restored sequence at
+    // positions the draft memory already holds (the position check of the batch then fails: "X < Y").
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_embd <= 0) {
+            return false;
+        }
+        int32_t n_rows = 0;
+        for (const deferred_row & r : deferred) {
+            n_rows += r.seq_id == seq_id;
+        }
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(int32_t) + sizeof(llama_pos) + row_bytes + (size_t) n_rows * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes));
+        uint8_t * p = data.data();
+        std::memcpy(p, &n_rows,                 sizeof(int32_t));   p += sizeof(int32_t);
+        std::memcpy(p, &deferred_first[seq_id], sizeof(llama_pos)); p += sizeof(llama_pos);
+        std::memcpy(p, pending_h[seq_id].data(), row_bytes);        p += row_bytes;
+        for (size_t i = 0; i < deferred.size(); ++i) {
+            const deferred_row & r = deferred[i];
+            if (r.seq_id != seq_id) {
+                continue;
+            }
+            std::memcpy(p, &r.id,  sizeof(llama_token)); p += sizeof(llama_token);
+            std::memcpy(p, &r.pos, sizeof(llama_pos));   p += sizeof(llama_pos);
+            std::memcpy(p, deferred_h.data() + i * n_embd, row_bytes); p += row_bytes;
+        }
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_embd <= 0) {
+            return;
+        }
+        // whatever the previous prompt left for this sequence is stale now
+        deferred_drop(seq_id, std::numeric_limits<llama_pos>::min());
+        deferred_first[seq_id] = -1;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() < sizeof(int32_t) + sizeof(llama_pos) + row_bytes) {
+            return;
+        }
+        const uint8_t * p = data.data();
+        int32_t n_rows = 0;
+        std::memcpy(&n_rows,                 p, sizeof(int32_t));   p += sizeof(int32_t);
+        std::memcpy(&deferred_first[seq_id], p, sizeof(llama_pos)); p += sizeof(llama_pos);
+        std::memcpy(pending_h[seq_id].data(), p, row_bytes);        p += row_bytes;
+        if (data.size() != sizeof(int32_t) + sizeof(llama_pos) + row_bytes + (size_t) n_rows * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes)) {
+            deferred_first[seq_id] = -1;
+            return;
+        }
+        for (int32_t i = 0; i < n_rows; ++i) {
+            deferred_row r;
+            r.seq_id = seq_id;
+            std::memcpy(&r.id,  p, sizeof(llama_token)); p += sizeof(llama_token);
+            std::memcpy(&r.pos, p, sizeof(llama_pos));   p += sizeof(llama_pos);
+            deferred.push_back(r);
+            deferred_h.insert(deferred_h.end(), (const float *) p, (const float *) p + n_embd); p += row_bytes;
+        }
     }
 };
 

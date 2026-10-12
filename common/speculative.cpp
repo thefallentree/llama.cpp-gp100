@@ -1841,7 +1841,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+        const int32_t cap_dft   = (int32_t) llama_n_batch(ctx_dft); // rows the draft batch holds (llama_batch_ext_init)
 
         bool defer_now = false;
 
@@ -1893,6 +1894,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     deferred.push_back({ t.id, t.pos[0], seq_id });
                     deferred_h.insert(deferred_h.end(), h_row, h_row + n_embd);
                     continue;
+                }
+
+                // The draft batch holds n_batch rows; the deferred rows taken above sit in front of this batch's
+                // tokens, so a prompt sub-batch of n_batch tokens overflows it by their number (the server crashed
+                // on a 2048-token sub-batch after a generation: 2049 rows). The rows so far are decoded as a batch of
+                // their own then (positions are sequential, the decode is the same catch-up).
+                if (batch.size() >= cap_dft && !eval && !chain_heads) {
+                    const int64_t t_d0 = timing ? ggml_time_us() : 0;
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (timing) { t_phase_us[1] += ggml_time_us() - t_d0; }
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) failed rc=%d on a full catch-up batch (pos=%d)\n", (int) rc, (int) t.pos[0]);
+                        return false;
+                    }
+                    batch.clear();
                 }
 
                 // vision tokens carry an embedding instead of an id

@@ -6207,7 +6207,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // The sm_60 activation cache keys on a tensor pointer a later graph may reuse.
     cuda_ctx->a16_cache_clear();
-    cuda_ctx->gdn_gather_reset_graph();
+    if (!cuda_ctx->window_active) {
+        // the parts of a window share its input tensors: the row-index snapshot of the folded GET_ROWS (one 4-byte
+        // copy, 2.7 us as a graph node) is taken once per window (ggml_backend_cuda_comm_window_begin), not per part
+        cuda_ctx->gdn_gather_reset_graph();
+    } else {
+        cuda_ctx->gdn_gather_clear();
+    }
     cuda_ctx->mmid16_cache_clear();
     if (!cuda_ctx->window_active) {
         // within a window the graphs are the parts of one graph, and an AllReduce epilogue leaves activations for
@@ -7769,6 +7775,7 @@ static void ggml_backend_cuda_comm_window_begin(void * comm_ctx_v, bool capture)
         cuda_ctx->window_active   = true;
         cuda_ctx->window_needs_ec = false;
         cuda_ctx->fn_act_clear();
+        cuda_ctx->gdn_gather_reset_graph();
         if (!(capture && gate)) {
             ggml_cuda_in_flush(*cuda_ctx);
         }

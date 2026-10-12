@@ -1595,7 +1595,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        bool                 cont_tail) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -1637,7 +1638,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // the GDN layers' fused input kernel (fn_gdn_pre) matches VIEW, CONT, VIEW, CPY per slot and writes the slots
+        // itself; without that kernel (the PLE conv) the strided copy alone is one kernel instead of a copy and a
+        // memcpy (the CONT of a strided view is a 2D memcpy of ~20 us for 368 KB on the P100)
+        ggml_tensor * src = cont_tail ? ggml_cont(ctx0, tail) : tail;
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
     }
 
     return conv_input;
@@ -1731,36 +1736,37 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
     ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il);
+            hist, hc_dim, il, /*cont_tail =*/ false);
 
-    ggml_tensor * conv_out = nullptr;
+    // the [kern, hc_dim] kernel keeps the file type: cast it once, the taps are then strided views of it (column k:
+    // one weight per channel, stride kern). The taps multiply the padded input where it lies (tokens on ne[0]: a
+    // tap is a view with the tokens contiguous and the channel stride of padded), so nothing is transposed or made
+    // contiguous per tap; one transpose at the end puts the channels first. Per window this is 10 kernels instead
+    // of the 21 and 8 copies the per-tap transposes and casts took (~0.4 ms of a 20 ms window).
+    ggml_tensor * w_all = model.layers[il].ple_conv1d;
+    if (w_all->type != GGML_TYPE_F32) {
+        w_all = ggml_cast(ctx0, w_all, GGML_TYPE_F32);
+    }
+
+    ggml_tensor * conv_out = nullptr; // [n_seq_tokens, hc_dim, n_seqs]
     for (int64_t k = 0; k < kern; ++k) {
         // tap k reads (kern-1-k)*dilation positions back
         const int64_t start = hist - (kern - 1 - k) * dil;
 
-        ggml_tensor * shifted = ggml_cont(ctx0,
-                ggml_transpose(ctx0,
-                        ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
-                                padded->nb[1], padded->nb[2],
-                                ggml_row_size(padded->type, start))));
+        ggml_tensor * shifted = ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
+                padded->nb[1], padded->nb[2],
+                ggml_row_size(padded->type, start));
 
-        // column k of the [kern, hc_dim] kernel is one weight per channel
-        ggml_tensor * wk = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
-                        model.layers[il].ple_conv1d->nb[1],
-                        k * model.layers[il].ple_conv1d->nb[0]));
-        // this kernel keeps the file type, so cast it before it multiplies an f32 activation
-        wk = ggml_reshape_1d(ctx0, wk, hc_dim);
-        if (wk->type != GGML_TYPE_F32) {
-            wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
-        }
+        ggml_tensor * wk = ggml_view_2d(ctx0, w_all, 1, hc_dim, w_all->nb[1], k * w_all->nb[0]);
 
         ggml_tensor * term = ggml_mul(ctx0, shifted, wk);
         conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
     }
 
     conv_out = ggml_silu(ctx0, conv_out);
-    conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
+    // [n_seq_tokens, hc_dim, n_seqs] -> [hc_dim, n_seq_tokens, n_seqs] -> [n_embd, hc, n_tokens]
+    conv_out = ggml_cont(ctx0, ggml_transpose(ctx0, conv_out));
+    conv_out = ggml_reshape_3d(ctx0, conv_out, n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));

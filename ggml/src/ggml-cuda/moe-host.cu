@@ -12,7 +12,11 @@
 
 #define MH_DSTATE_SEQ  0 // last request number
 #define MH_DSTATE_NEED 1 // cold pairs of the last request
-#define MH_DSTATE_PAIR 2 // their t*n_used + k, cap_pairs entries
+#define MH_DSTATE_RSEQ 2 // routing kernels launched (mh_route: the quantize blocks' counter is compared against it)
+#define MH_DSTATE_QCNT 3 // quantize blocks done, monotonic
+#define MH_DSTATE_PAIR 4 // their t*n_used + k, cap_pairs entries
+
+#define MH_ROUTE_QBLOCKS 8 // blocks of mh_route that quantize the rows while block 0 routes
 
 #define MH_PUBLISH_THREADS 256 // decode batches: one fused publish block, one thread per (token, slot) pair
 #define MH_RING_THREADS    1024
@@ -214,9 +218,12 @@ static __global__ void mh_publish(
 #define MH_ROUTE_EXPERTS 512
 #define MH_ROUTE_EPT     (MH_ROUTE_EXPERTS/WARP_SIZE) // experts per thread
 
-// Decode batches, with the routing: warp w takes the top n_used of token w's logits (softmax, the weights divided by
-// their clamped sum, as topk_moe_cuda does), a thread per pair then writes the expert's position (expert-cache.cuh)
-// and its weight, and the block goes on as mh_publish. logits, weights and ids may share memory.
+// Decode batches, with the routing: warp w of block 0 takes the top n_used of token w's logits (softmax, the weights
+// divided by their clamped sum, as topk_moe_cuda does), a thread per pair then writes the expert's position
+// (expert-cache.cuh) and its weight, and the block goes on as mh_publish. The quantized rows the host kernels read
+// are written by blocks 1..MH_ROUTE_QBLOCKS meanwhile (the quantize on one block took 13 us after the routing's 16;
+// the host does not read them before the doorbell, which block 0 rings once their counter says they are done).
+// logits, weights and ids may share memory.
 static __global__ void mh_route(
         const float * logits, const float * __restrict__ logits2, float * weights, int32_t * ids, const int si1, const int n_used, const int n_tokens,
         const float clamp_val, const int32_t * __restrict__ perm, uint32_t * counts, const int n_hot,
@@ -226,11 +233,42 @@ static __global__ void mh_route(
     __shared__ float s_wt[MH_PUBLISH_THREADS];
     __shared__ float s_norm[MH_PUBLISH_THREADS/WARP_SIZE];
     __shared__ int   wcount[MH_PUBLISH_THREADS/WARP_SIZE];
+    __shared__ mh_act_block s_blk[MH_PUBLISH_THREADS/WARP_SIZE];
 
     const int i     = threadIdx.x;
     const int lane  = i % WARP_SIZE;
     const int w     = i / WARP_SIZE;
     const int n_all = n_tokens*n_used;
+    const int nb_t  = n_embd/64;
+
+    if (blockIdx.x > 0) {
+        // a quantize block: its share of the rows' blocks into the mailbox, fenced, then counted
+        constexpr int nw = MH_PUBLISH_THREADS/WARP_SIZE;
+        for (int b0 = (blockIdx.x - 1)*nw; b0 < n_tokens*nb_t; b0 += MH_ROUTE_QBLOCKS*nw) {
+            const int bi = b0 + w;
+            if (bi < n_tokens*nb_t) {
+                mh_quantize_block(x + (bi / nb_t)*sx_tok + 64*(bi % nb_t), s_blk[w], mh_xq(mb) + bi, lane);
+            }
+        }
+        __threadfence_system();
+        __syncthreads();
+        if (i == 0) {
+            atomicAdd(dstate + MH_DSTATE_QCNT, 1u);
+        }
+        return;
+    }
+    uint32_t rseq = 0;
+    if (i == 0) {
+        rseq = dstate[MH_DSTATE_RSEQ] + 1;
+        dstate[MH_DSTATE_RSEQ] = rseq;
+    }
+    // the expert cache's positions, fetched while the warps route (a dependent read of ~1.5 us from a cold L2 after it)
+    __shared__ int s_perm[MH_ROUTE_EXPERTS];
+    if (perm != nullptr) {
+        for (int q = i; q < MH_ROUTE_EXPERTS; q += MH_PUBLISH_THREADS) {
+            s_perm[q] = perm[q];
+        }
+    }
 
     if (w < n_tokens) {
         float wt[MH_ROUTE_EPT];
@@ -309,7 +347,7 @@ static __global__ void mh_route(
         const int ex = s_e[i];
         e = ex;
         if (perm != nullptr) {
-            e = perm[ex];
+            e = s_perm[ex];
             atomicAdd(counts + ex, 1u);
         }
         ids[t*si1 + k]         = e;
@@ -339,19 +377,18 @@ static __global__ void mh_route(
     if (np == 0) {
         return;
     }
-    __shared__ mh_act_block s_blk[MH_PUBLISH_THREADS/WARP_SIZE];
-    const int nb_t = n_embd/64;
-    for (int b0 = 0; b0 < n_tokens*nb_t; b0 += MH_PUBLISH_THREADS/WARP_SIZE) {
-        const int bi = b0 + w;
-        if (bi < n_tokens*nb_t) {
-            mh_quantize_block(x + (bi / nb_t)*sx_tok + 64*(bi % nb_t), s_blk[w], mh_xq(mb) + bi, lane);
-        }
-    }
     if (i == 0) {
         mb->slot     = slot;
         mb->n_tokens = n_tokens;
         mb->n_used   = n_used;
         mb->n_pairs  = np;
+        // the quantize blocks of this launch are done (the counter counts every launch's)
+        const long long t0 = clock64();
+        while ((uint32_t) (atomicAdd(dstate + MH_DSTATE_QCNT, 0u) - rseq*MH_ROUTE_QBLOCKS) & 0x80000000u) {
+            if (clock64() - t0 > 2000000000LL) {
+                __trap(); // the quantize blocks of this launch did not finish (no printf: it costs the kernel a stack)
+            }
+        }
     }
     __threadfence_system();
     __syncthreads();
@@ -714,7 +751,7 @@ bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     const int32_t * perm   = nullptr;
     uint32_t *      counts = nullptr;
     ggml_cuda_expert_cache_take(ctx, node, &perm, &counts);
-    mh_route<<<1, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
+    mh_route<<<1 + MH_ROUTE_QBLOCKS, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
         (const float *) logits->data, ggml_cuda_fn_router_rest(ctx, logits), (float *) weights->data, (int32_t *) ids->data,
         MH_ROUTE_EXPERTS, n_used, n_tokens, clamp_val,
         perm, counts, a.n_hot, (const float *) a.x->data, (int64_t) (a.x->nb[2]/sizeof(float)), a.n_embd,

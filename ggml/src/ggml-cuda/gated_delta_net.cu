@@ -231,7 +231,18 @@ static void launch_gated_delta_net(
     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
     // SMs without a CTA, so small head counts keep the device filled
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-    const int cols_per_warp = gdn_cols_per_warp;
+    // S_v = 128 on Pascal: two columns per warp for decode windows (H=24, T=3: 16.2 us at 4 columns, 11.6 at 2,
+    // 16.6 at 1), four for prompts (T=64: 200 us at 4, 227 at 2). GGML_CUDA_GDN_COLS=1|2|4 overrides (measurement).
+    static const int cols_env = getenv("GGML_CUDA_GDN_COLS") != nullptr ? atoi(getenv("GGML_CUDA_GDN_COLS")) : 0;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    int cols_per_warp = gdn_cols_per_warp;
+    if (S_v == 128) {
+        if (cols_env == 1 || cols_env == 2 || cols_env == 4) {
+            cols_per_warp = cols_env;
+        } else if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA && n_tokens <= 8) {
+            cols_per_warp = 2;
+        }
+    }
     int num_warps = 4;
     while (num_warps > 1 && H*n_seqs*(S_v / (cols_per_warp * num_warps)) < nsm) {
         num_warps /= 2;
@@ -268,11 +279,25 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
-                beta_pre_d, beta_sig_d, s_base_d, s_rows_d, s_row_stride, s_gather_dst_d);
+            if (cols_per_warp == 1) {
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, 1>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+                    beta_pre_d, beta_sig_d, s_base_d, s_rows_d, s_row_stride, s_gather_dst_d);
+            } else if (cols_per_warp == 2) {
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, 2>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+                    beta_pre_d, beta_sig_d, s_base_d, s_rows_d, s_row_stride, s_gather_dst_d);
+            } else {
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+                    beta_pre_d, beta_sig_d, s_base_d, s_rows_d, s_row_stride, s_gather_dst_d);
+            }
             break;
         }
         default:

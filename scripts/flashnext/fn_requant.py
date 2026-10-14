@@ -16,11 +16,12 @@ a width, so convert them together, e.g.
 """
 import argparse
 import re
+import os
 import sys
 
 import numpy as np
 
-sys.path.insert(0, '/home/sunyc/models/llama.cpp-flashnext/gguf-py')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'gguf-py'))  # this repo's gguf-py (Q2_0, Q4_16)
 import gguf  # noqa: E402
 from gguf import GGMLQuantizationType as T  # noqa: E402
 

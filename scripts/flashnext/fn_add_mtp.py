@@ -10,9 +10,10 @@ are dropped (the trunk's are used). block_count grows by one, nextn_predict_laye
 usage: fn_add_mtp.py TRUNK-00001-of-0000S.gguf MTP.gguf OUT-00001-of-0000S.gguf [--no-head]
 """
 import argparse
+import os
 import sys
 
-sys.path.insert(0, '/home/sunyc/models/llama.cpp-p100stack/gguf-py')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'gguf-py'))  # this repo's gguf-py (Q2_0, Q4_16)
 import gguf  # noqa: E402
 
 ap = argparse.ArgumentParser()

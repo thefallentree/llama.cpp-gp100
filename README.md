@@ -1,5 +1,10 @@
 # llama.cpp
 
+> **This fork (`flashnext-p100-wip`)**: Qwen3.8-Flash-Next on two Tesla P100s at 75–90 tok/s — a tensor-parallel
+> decode engine for sm_60, an expert cache with a CPU host tier, selected-cells sparse attention and MTP drafting.
+> See [README-FLASHNEXT-P100.md](README-FLASHNEXT-P100.md). Everything below is upstream llama.cpp's README.
+
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">

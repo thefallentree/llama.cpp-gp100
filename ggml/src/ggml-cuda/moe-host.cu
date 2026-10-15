@@ -532,7 +532,9 @@ static bool mh_is_cold_q2(const ggml_tensor * n) {
     }
     if (n->src[0]->type == GGML_TYPE_Q2_K) {
         // glm5-next: the hot pairs run the generic mul_mat_id (mmvq Q2_K), the cold ones the host's Q2_K kernels
-        return true;
+        // (GGML_CUDA_MMID_ALLGPU=1: the whole layer on the GPU instead, a correctness bisect)
+        static const bool allgpu = getenv("GGML_CUDA_MMID_ALLGPU") != nullptr && atoi(getenv("GGML_CUDA_MMID_ALLGPU")) != 0;
+        return !allgpu;
     }
     // the hot pairs go to the sm_60 kernels: the mat-vec for decode batches, the GEMM for prompt batches
     return n->ne[2] <= MMVQ_MAX_BATCH_SIZE ? ggml_cuda_mmid_vec_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)

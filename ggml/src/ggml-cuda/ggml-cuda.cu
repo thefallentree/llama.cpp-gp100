@@ -1722,8 +1722,10 @@ static void ggml_cuda_host_numa_bind(const bool on) {
         return;
     }
     const unsigned long mask = on ? 1ul << node : 0;
-    // MPOL_DEFAULT 0, MPOL_BIND 2
-    if (syscall(SYS_set_mempolicy, on ? 2 : 0, on ? &mask : nullptr, on ? 64 : 0) != 0) {
+    // MPOL_DEFAULT 0, MPOL_PREFERRED 1 (that node first, the others when it is full: a cold set larger than the node
+    // spills over instead of an OOM kill; GGML_CUDA_HOST_NUMA_STRICT=1 keeps MPOL_BIND 2)
+    static const int mode = getenv("GGML_CUDA_HOST_NUMA_STRICT") != nullptr && atoi(getenv("GGML_CUDA_HOST_NUMA_STRICT")) != 0 ? 2 : 1;
+    if (syscall(SYS_set_mempolicy, on ? mode : 0, on ? &mask : nullptr, on ? 64 : 0) != 0) {
         GGML_LOG_WARN("%s: set_mempolicy failed for NUMA node %d\n", __func__, node);
     }
 }
@@ -2617,12 +2619,95 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// Q2_K hot/cold layers (glm5-next): the sm_60 Q2_0 kernels do not read Q2_K, so the hot pairs go through the generic
+// kernels on the hot tensor with the cold ids pointed at expert 0, and the cold pairs' rows are zeroed afterwards
+// (the host tier computes them and mh_collect_weighted adds them).
+static __global__ void k_mmid_mask_cold_ids(const int32_t * __restrict__ ids, int32_t * __restrict__ out,
+        const int n_used, const int n_tokens, const int64_t si1, const int n_hot) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_used*n_tokens) {
+        return;
+    }
+    const int t = i/n_used, s = i % n_used;
+    const int e = ids[t*si1 + s];
+    out[i] = e >= n_hot ? 0 : e;
+}
+
+static __global__ void k_mmid_zero_cold_rows(const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int n_used, const int64_t si1, const int n_hot, const int ne0, const int64_t s1, const int64_t s2) {
+    const int t = blockIdx.y, s = blockIdx.x;
+    if (ids[t*si1 + s] < n_hot) {
+        return;
+    }
+    float * row = dst + t*s2 + s*s1;
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+        row[i] = 0.0f;
+    }
+}
+
+static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * ids  = dst->src[2];
+    const int     n_hot    = (int) src0->ne[2];
+    const int     n_used   = (int) ids->ne[0];
+    const int     n_tokens = (int) ids->ne[1];
+    const int64_t si1      = ids->nb[1]/sizeof(int32_t);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && dst->type == GGML_TYPE_F32);
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<int32_t> ids_tmp(ctx.pool(), (size_t) n_used*n_tokens);
+    k_mmid_mask_cold_ids<<<(n_used*n_tokens + 255)/256, 256, 0, stream>>>(
+            (const int32_t *) ids->data, ids_tmp.get(), n_used, n_tokens, si1, n_hot);
+    CUDA_CHECK(cudaGetLastError());
+    ggml_tensor ids2 = *ids;
+    ids2.data  = ids_tmp.get();
+    ids2.nb[1] = (size_t) n_used*sizeof(int32_t);
+    ids2.nb[2] = ids2.nb[1]*n_tokens;
+    ids2.nb[3] = ids2.nb[2];
+    ids2.view_src = nullptr;
+    static const bool dbg_sync_env = getenv("GGML_CUDA_MMID_SYNC") != nullptr && atoi(getenv("GGML_CUDA_MMID_SYNC")) != 0;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (dbg_sync_env) {
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+    }
+    const bool dbg_sync = dbg_sync_env && cap == cudaStreamCaptureStatusNone;   // no syncs inside a graph capture
+    if (dbg_sync) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        GGML_LOG_INFO("%s: mask ok (%s: %d x %d, n_hot %d)\n", __func__, dst->name, n_used, n_tokens, n_hot);
+    }
+    ggml_tensor dst2 = *dst;
+    dst2.src[2] = &ids2;
+    dst2.op_params[GGML_CUDA_EXPS_COLD_PARAM] = 0;   // a plain MUL_MAT_ID for the generic kernels
+    ctx.mmid_no_mmq = true;                          // the generic path's MMQ Q2_K kernel is not used on sm_60 here
+    ggml_cuda_mul_mat_id_generic(ctx, &dst2);
+    ctx.mmid_no_mmq = false;
+    if (dbg_sync) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        GGML_LOG_INFO("%s: generic ok (%s)\n", __func__, dst->name);
+    }
+    k_mmid_zero_cold_rows<<<dim3(n_used, n_tokens), 256, 0, stream>>>(
+            (const int32_t *) ids->data, (float *) dst->data, n_used, si1, n_hot, (int) dst->ne[0],
+            (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)));
+    CUDA_CHECK(cudaGetLastError());
+    if (dbg_sync) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        GGML_LOG_INFO("%s: zero ok (%s)\n", __func__, dst->name);
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
     if (ggml_cuda_mmid_cold(dst)) {
+        if (src0->type == GGML_TYPE_Q2_K) {
+            GGML_ASSERT(ggml_cuda_moe_host_active(ctx, dst) &&
+                        "Q2_K cold experts need the host tier (GGML_CUDA_MOE_HOST_PROMPT=1 for prompt batches)");
+            ggml_cuda_mmid_hot_generic(ctx, dst);
+            return;
+        }
         // experts beyond src0->ne[2] are only known to the sm_60 Q2_0 kernels
         if (ggml_cuda_moe_host_active(ctx, dst)) {
             if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
@@ -2643,6 +2728,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
         return;
     }
+
+    ggml_cuda_mul_mat_id_generic(ctx, dst);
+}
+
+static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -2677,7 +2770,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!ctx.mmid_no_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2689,7 +2782,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
-    GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+    // (the Q2_K hot/cold path takes it on purpose with MMQ off: mmid_no_mmq)
+    GGML_ASSERT(ctx.mmid_no_mmq || ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);

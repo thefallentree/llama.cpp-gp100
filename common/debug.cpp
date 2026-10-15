@@ -147,10 +147,6 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
 
-    if (ask) {
-        return true;  // Always retrieve data
-    }
-
     bool matches_filter = pimpl->tensor_filters.empty();
 
     if (!matches_filter) {
@@ -160,6 +156,12 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
                 break;
             }
         }
+    }
+
+    if (ask) {
+        // with filters, only the matching nodes end a split: the rest of the graph runs as it does without the
+        // callback (fusions, multi-node kernels), so the observed values are the engine's own
+        return matches_filter;
     }
 
     char src1_str[128] = { 0 };

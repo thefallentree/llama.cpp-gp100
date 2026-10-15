@@ -525,9 +525,14 @@ bool ggml_cuda_moe_host_active(const ggml_backend_cuda_context & ctx, const ggml
 }
 
 static bool mh_is_cold_q2(const ggml_tensor * n) {
-    if (n->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(n) || n->src[0]->type != GGML_TYPE_Q2_0 ||
+    if (n->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(n) ||
+        (n->src[0]->type != GGML_TYPE_Q2_0 && n->src[0]->type != GGML_TYPE_Q2_K) ||
         n->src[1]->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32) {
         return false;
+    }
+    if (n->src[0]->type == GGML_TYPE_Q2_K) {
+        // glm5-next: the hot pairs run the generic mul_mat_id (mmvq Q2_K), the cold ones the host's Q2_K kernels
+        return true;
     }
     // the hot pairs go to the sm_60 kernels: the mat-vec for decode batches, the GEMM for prompt batches
     return n->ne[2] <= MMVQ_MAX_BATCH_SIZE ? ggml_cuda_mmid_vec_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)
@@ -544,7 +549,7 @@ bool ggml_cuda_moe_host_takes_prompts() {
 // The gate/up/swiglu/down triple of a hot/cold Q2_0 layer that the MUL_MAT_ID node i opens: the other two
 // MUL_MAT_IDs on the same ids and the swiglu between gate/up and down.
 static bool mh_triple(const ggml_cgraph * cgraph, const int i, const ggml_tensor *& up, const ggml_tensor *& gate,
-                      const ggml_tensor *& down) {
+                      const ggml_tensor *& down, const ggml_tensor ** glu_out = nullptr) {
     const ggml_tensor * node = cgraph->nodes[i];
     const ggml_tensor * ids  = node->src[2];
     if (ids->type != GGML_TYPE_I32 || !mh_is_cold_q2(node)) {
@@ -564,8 +569,12 @@ static bool mh_triple(const ggml_cgraph * cgraph, const int i, const ggml_tensor
             glu = n;
         }
     }
-    if (n_mm != 3 || glu == nullptr || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
+    if (n_mm != 3 || glu == nullptr || ggml_get_op_params_i32(glu, 1) != 0 ||
+        (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU && ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP)) {
         return false;
+    }
+    if (glu_out != nullptr) {
+        *glu_out = glu;
     }
     gate = glu->src[0];
     up   = glu->src[1];
@@ -640,8 +649,8 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     if (ctx.moe_host_mb != nullptr && (n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs)) {
         return false;
     }
-    const ggml_tensor * up = nullptr, * gate = nullptr, * down = nullptr;
-    if (!mh_triple(cgraph, i, up, gate, down)) {
+    const ggml_tensor * up = nullptr, * gate = nullptr, * down = nullptr, * glu = nullptr;
+    if (!mh_triple(cgraph, i, up, gate, down, &glu)) {
         return false;
     }
     const ggml_tensor * x = up->src[1];
@@ -672,6 +681,8 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     d.down_nb2 = down->src[0]->nb[2];
     d.n_embd   = (int) n_embd;
     d.n_ff     = (int) n_ff;
+    d.wtype    = up->src[0]->type == GGML_TYPE_Q2_K ? 1 : 0;
+    d.clamp    = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
 
     a.ids      = ids;
     a.x        = x;

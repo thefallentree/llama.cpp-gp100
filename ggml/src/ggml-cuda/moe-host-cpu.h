@@ -85,6 +85,8 @@ struct mh_slot_desc {
     size_t down_nb1, down_nb2;
     int    n_embd;
     int    n_ff;
+    int    wtype;   // 0: Q2_0 blocks of 64, 1: Q2_K super-blocks of 256 (glm5-next)
+    float  clamp;   // > 0: swiglu_clamp(limit) between gate/up and down instead of swiglu
 };
 
 bool mh_cpu_supported();

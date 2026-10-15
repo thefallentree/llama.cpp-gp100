@@ -82,7 +82,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     if (!mtp_only) {
         int64_t n_hot = hparams.n_expert_hot;
         if (getenv("LLAMA_EXPERT_HOT") != nullptr) {
-            n_hot = std::max(1, atoi(getenv("LLAMA_EXPERT_HOT")));
+            n_hot = std::max(0, atoi(getenv("LLAMA_EXPERT_HOT")));   // 0: no split, whatever the file's expert_hot_count says
         }
         for (int il = (int) hparams.n_layer_dense_lead; il < n_layer; ++il) {
             n_hot_layer[il] = n_hot;

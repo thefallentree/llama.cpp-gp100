@@ -168,9 +168,10 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     if (matches_filter) {
+        // a node without sources (ggml_arange, ggml_fill): nothing to describe on the left
         LOG("%s: %24s = (%s) %10s(%s{%s}, %s}) = {%s}\n", __func__, t->name, ggml_type_name(t->type),
-            ggml_op_desc(t), src0->name, common_ggml_ne_string(src0).c_str(), src1 ? src1_str : "",
-            common_ggml_ne_string(t).c_str());
+            ggml_op_desc(t), src0 ? src0->name : "(none)", src0 ? common_ggml_ne_string(src0).c_str() : "",
+            src1 ? src1_str : "", common_ggml_ne_string(t).c_str());
     }
 
     const bool is_host = ggml_backend_buffer_is_host(t->buffer);

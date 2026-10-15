@@ -2083,11 +2083,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (const int64_t e : { (int64_t) 0, n_loaded - 1 }) {
                 buf.resize(nb2);
                 ggml_backend_tensor_get(t, buf.data(), (size_t) e*nb2, nb2);
-                uint64_t head = 1469598103934665603ULL, tail = 1469598103934665603ULL, sum = 0;
+                uint64_t head = 14695981039346656037ULL, tail = 14695981039346656037ULL, sum = 0;   // FNV-1a 64
                 for (size_t i = 0; i < 4096 && i < nb2; ++i) { head = (head ^ buf[i])*1099511628211ULL; }
                 for (size_t i = nb2 >= 4096 ? nb2 - 4096 : 0; i < nb2; ++i) { tail = (tail ^ buf[i])*1099511628211ULL; }
                 for (size_t i = 0; i < nb2; ++i) { sum += buf[i]; }
-                LLAMA_LOG_INFO("split-check: %s[%" PRId64 "] head %016" PRIx64 " tail %016" PRIx64 " sum %" PRIu64 "\n", name.c_str(), e, head, tail, sum);
+                // WARN: the server hides the loader's INFO lines at its default verbosity
+                LLAMA_LOG_WARN("split-check: %s[%" PRId64 "] head %016" PRIx64 " tail %016" PRIx64 " sum %" PRIu64 "\n", name.c_str(), e, head, tail, sum);
             }
         }
     }

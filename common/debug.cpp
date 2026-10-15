@@ -184,6 +184,29 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
     }
 
+    // LLAMA_DEBUG_FULL=<regex>: every value of the matching F32 tensors, one line per row (a full dump of a few
+    // small tensors, e.g. the routing probabilities of one layer)
+    // a comma-separated list of name substrings (no regex metacharacters: the value crosses shells and systemd)
+    static const char * full_env = getenv("LLAMA_DEBUG_FULL");
+    static const std::regex full_re([]() {
+        std::string pat = full_env ? full_env : "^$";
+        for (char & c : pat) { if (c == ',') { c = '|'; } }
+        return pat;
+    }());
+    if (full_env && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && std::regex_search(t->name, full_re)) {
+        const float * d = (const float *) (is_host ? t->data : (void *) pimpl->data.data());
+        const int64_t n_rows = ggml_nelements(t)/t->ne[0];
+        for (int64_t r = 0; r < n_rows; ++r) {
+            std::string line = "full: " + std::string(t->name) + " [" + std::to_string(r) + "]";
+            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), " %.6g", d[r*t->ne[0] + i]);
+                line += buf;
+            }
+            LOG("%s\n", line.c_str());
+        }
+    }
+
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);

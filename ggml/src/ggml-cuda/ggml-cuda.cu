@@ -3479,9 +3479,17 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
+static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx);
+
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    // whatever was staged or enqueued lands before the context (its streams, its stage blob) goes away
+    if (!cuda_ctx->in_gate_pending) {
+        ggml_cuda_in_flush(*cuda_ctx);
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
     ggml_cuda_node_time_print(cuda_ctx->device);
     delete cuda_ctx;
     delete backend;
@@ -3770,7 +3778,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    if (ggml_cuda_in_stage(*cuda_ctx, (char *) tensor->data + offset, data, size)) {
+    // the staging is for the inputs of a graph (a few small copies the window scatters at once); the model
+    // loader's staged uploads of weights (1 MB chunks through this call) must go straight to the stream: the
+    // loader waits on events it recorded before the stage's flush, then frees the upload backend with the last
+    // blob's scatter still pending (glm5-next: the tail of a few dense tensors never arrived)
+    if (ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            ggml_cuda_in_stage(*cuda_ctx, (char *) tensor->data + offset, data, size)) {
         return;
     }
     GGML_ASSERT(!cuda_ctx->in_gate_pending && "an input too large to stage while a window waits for its inputs");

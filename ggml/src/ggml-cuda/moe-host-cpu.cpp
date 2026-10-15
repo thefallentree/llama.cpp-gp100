@@ -399,6 +399,68 @@ static void dot2_q2k_avx2(const uint8_t * w0b, const uint8_t * w1b, const nat_bl
     *s0 = mh_hsum256(acc0) - mins0;
     *s1 = mh_hsum256(acc1) - mins1;
 }
+
+// 64 codes per op: lanes 0-31 = half 0 of the super-block at shift j (elements 32j..), lanes 32-63 = half 1 at the
+// same shift (elements 128 + 32j..); the activations of those come from the nat blocks j/2 and 2 + j/2, half j%2.
+// The min term of a super-block is one 16-lane fmadd over its sub-blocks.
+__attribute__((target("avx512f,avx512bw,avx512dq,avx2,f16c,fma")))
+static void dot2_q2k_avx512(const uint8_t * w0b, const uint8_t * w1b, const nat_block * a, int nb64, float * s0, float * s1) {
+    const q2k_block * w0 = (const q2k_block *) w0b;
+    const q2k_block * w1 = (const q2k_block *) w1b;
+    const __m512i m3 = _mm512_set1_epi8(3);
+    // lane permutes: int16 lanes 0-7 <- sub-block 2j, 8-15 <- 2j+1, 16-23 <- 8+2j, 24-31 <- 8+2j+1 (the scales of
+    // the two 32-element groups at shift j in the two halves); float lanes 0-7 <- group j, 8-15 <- group 4+j
+    static const __m512i sidx[4] = {
+        _mm512_set_epi16( 9, 9, 9, 9, 9, 9, 9, 9,  8, 8, 8, 8, 8, 8, 8, 8,  1, 1, 1, 1, 1, 1, 1, 1,  0, 0, 0, 0, 0, 0, 0, 0),
+        _mm512_set_epi16(11,11,11,11,11,11,11,11, 10,10,10,10,10,10,10,10,  3, 3, 3, 3, 3, 3, 3, 3,  2, 2, 2, 2, 2, 2, 2, 2),
+        _mm512_set_epi16(13,13,13,13,13,13,13,13, 12,12,12,12,12,12,12,12,  5, 5, 5, 5, 5, 5, 5, 5,  4, 4, 4, 4, 4, 4, 4, 4),
+        _mm512_set_epi16(15,15,15,15,15,15,15,15, 14,14,14,14,14,14,14,14,  7, 7, 7, 7, 7, 7, 7, 7,  6, 6, 6, 6, 6, 6, 6, 6),
+    };
+    static const __m512i aidx[4] = {
+        _mm512_set_epi32( 8, 8, 8, 8, 8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0),
+        _mm512_set_epi32(10,10,10,10,10,10,10,10, 2, 2, 2, 2, 2, 2, 2, 2),
+        _mm512_set_epi32(12,12,12,12,12,12,12,12, 4, 4, 4, 4, 4, 4, 4, 4),
+        _mm512_set_epi32(14,14,14,14,14,14,14,14, 6, 6, 6, 6, 6, 6, 6, 6),
+    };
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    __m512 accm0 = _mm512_setzero_ps(), accm1 = _mm512_setzero_ps();
+    for (int k = 0; k < nb64/4; ++k) {
+        const q2k_block & x0 = w0[k];
+        const q2k_block & x1 = w1[k];
+        const nat_block * ab = a + 4*k;
+        const __m512 d0 = _mm512_set1_ps(fp16_to_fp32(x0.d)), dm0 = _mm512_set1_ps(fp16_to_fp32(x0.dmin));
+        const __m512 d1 = _mm512_set1_ps(fp16_to_fp32(x1.d)), dm1 = _mm512_set1_ps(fp16_to_fp32(x1.dmin));
+        const __m512i q0 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x0.qs)), _mm256_loadu_si256((const __m256i *) (x0.qs + 32)), 1);
+        const __m512i q1 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x1.qs)), _mm256_loadu_si256((const __m256i *) (x1.qs + 32)), 1);
+        // the 16 sub-block scales (low nibbles) and mins (high nibbles) of each row, int16 lanes 0..15 (16..31 zero)
+        const __m512i sc0 = _mm512_cvtepu8_epi16(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) x0.scales)));
+        const __m512i sc1 = _mm512_cvtepu8_epi16(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) x1.scales)));
+        const __m512i lo0 = _mm512_and_si512(sc0, _mm512_set1_epi16(0x0f)), hi0 = _mm512_srli_epi16(sc0, 4);
+        const __m512i lo1 = _mm512_and_si512(sc1, _mm512_set1_epi16(0x0f)), hi1 = _mm512_srli_epi16(sc1, 4);
+        // the activations' sums per sub-block and scales per sub-block (s/4 -> nat block, (s%4)/2 -> half)
+        const __m512 bsum = _mm512_cvtepi32_ps(_mm512_inserti32x4(_mm512_inserti32x4(_mm512_inserti32x4(_mm512_castsi128_si512(
+                          _mm_loadu_si128((const __m128i *) ab[0].bsum)), _mm_loadu_si128((const __m128i *) ab[1].bsum), 1),
+                          _mm_loadu_si128((const __m128i *) ab[2].bsum), 2), _mm_loadu_si128((const __m128i *) ab[3].bsum), 3));
+        const __m512 as16 = _mm512_set_ps(ab[3].s[1], ab[3].s[1], ab[3].s[0], ab[3].s[0], ab[2].s[1], ab[2].s[1], ab[2].s[0], ab[2].s[0],
+                                          ab[1].s[1], ab[1].s[1], ab[1].s[0], ab[1].s[0], ab[0].s[1], ab[0].s[1], ab[0].s[0], ab[0].s[0]);
+        const __m512 ba = _mm512_mul_ps(bsum, as16);
+        accm0 = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(hi0))), dm0), ba, accm0);
+        accm1 = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(hi1))), dm1), ba, accm1);
+        for (int j = 0; j < 4; ++j) {
+            const __m512i c0 = _mm512_and_si512(_mm512_srli_epi16(q0, 2*j), m3);
+            const __m512i c1 = _mm512_and_si512(_mm512_srli_epi16(q1, 2*j), m3);
+            const __m512i y  = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) (ab[j/2].q + 32*(j % 2)))),
+                                                  _mm256_loadu_si256((const __m256i *) (ab[2 + j/2].q + 32*(j % 2))), 1);
+            const __m512i p0 = _mm512_madd_epi16(_mm512_maddubs_epi16(c0, y), _mm512_permutexvar_epi16(sidx[j], lo0));
+            const __m512i p1 = _mm512_madd_epi16(_mm512_maddubs_epi16(c1, y), _mm512_permutexvar_epi16(sidx[j], lo1));
+            const __m512  asv = _mm512_permutexvar_ps(aidx[j], as16);
+            acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p0), _mm512_mul_ps(asv, d0), acc0);
+            acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1), _mm512_mul_ps(asv, d1), acc1);
+        }
+    }
+    *s0 = _mm512_reduce_add_ps(acc0) - _mm512_reduce_add_ps(accm0);
+    *s1 = _mm512_reduce_add_ps(acc1) - _mm512_reduce_add_ps(accm1);
+}
 #endif // MH_X86
 
 static inline void mh_prefetch(const void * p) {
@@ -453,8 +515,9 @@ static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, qua
         name   = "AVX2";
     }
     if (has512 && has2 && !(force != nullptr && strcmp(force, "avx2") == 0)) {
-        dot2 = dot2_avx512;
-        name = "AVX-512";
+        dot2  = dot2_avx512;
+        dot2k = dot2_q2k_avx512;
+        name  = "AVX-512";
     }
 #endif
 }

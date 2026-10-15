@@ -2629,6 +2629,69 @@ static bool ggml_cuda_mmid_allgpu() {
     return on;
 }
 
+// GGML_CUDA_MMID_CHECK=N: for the first N hot/cold MUL_MAT_ID calls, every (token, expert) pair's output row is
+// compared against a double-precision dot product over the expert's rows dequantized on the host by ggml's own
+// to_float (hot slices copied from the device, cold ones read in place) and the token's input row
+static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const char * cold, const int n_cold) {
+    static int left = getenv("GGML_CUDA_MMID_CHECK") != nullptr ? atoi(getenv("GGML_CUDA_MMID_CHECK")) : 0;
+    if (left <= 0) {
+        return;
+    }
+    left--;
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const int64_t n_hot = src0->ne[2], ne00 = src0->ne[0], ne01 = src0->ne[1];
+    const int n_used = (int) ids->ne[0], n_tokens = (int) ids->ne[1];
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    std::vector<int32_t> ids_h((size_t) n_used*n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        CUDA_CHECK(cudaMemcpy(ids_h.data() + (size_t) t*n_used, (const char *) ids->data + t*ids->nb[1], n_used*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    }
+    const auto * tt = ggml_get_type_traits(src0->type);
+    std::vector<char>  wq(src0->nb[2]);
+    std::vector<float> w((size_t) ne00*ne01), x(ne00), y(ne01);
+    int n_bad = 0, n_pairs = 0;
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int s = 0; s < n_used; ++s) {
+            const int e = ids_h[(size_t) t*n_used + s];
+            const bool hot = e < n_hot;
+            if (!hot && (cold == nullptr || e - n_hot >= n_cold)) {
+                GGML_LOG_WARN("mmid-check: %s t%d s%d expert %d out of range\n", dst->name, t, s, e);
+                continue;
+            }
+            const char * src = hot ? nullptr : cold + (size_t) (e - n_hot)*src0->nb[2];
+            if (hot) {
+                CUDA_CHECK(cudaMemcpy(wq.data(), (const char *) src0->data + (size_t) e*src0->nb[2], src0->nb[2], cudaMemcpyDeviceToHost));
+                src = wq.data();
+            }
+            for (int64_t r = 0; r < ne01; ++r) {
+                tt->to_float(src + r*src0->nb[1], w.data() + r*ne00, ne00);
+            }
+            // the token's input row (src1 is [ne00, 1 or n_used, n_tokens])
+            const int64_t i11 = src1->ne[1] == 1 ? 0 : s;
+            CUDA_CHECK(cudaMemcpy(x.data(), (const char *) src1->data + t*src1->nb[2] + i11*src1->nb[1], ne00*sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(y.data(), (const char *) dst->data + t*dst->nb[2] + s*dst->nb[1], ne01*sizeof(float), cudaMemcpyDeviceToHost));
+            double max_err = 0.0, max_ref = 0.0;
+            float ref0 = 0.0f;
+            for (int64_t r = 0; r < ne01; ++r) {
+                double acc = 0.0;
+                for (int64_t k = 0; k < ne00; ++k) {
+                    acc += (double) w[r*ne00 + k]*x[k];
+                }
+                if (r == 0) { ref0 = (float) acc; }
+                max_err = std::max(max_err, std::fabs(acc - y[r]));
+                max_ref = std::max(max_ref, std::fabs(acc));
+            }
+            const double rel = max_err/std::max(max_ref, 1e-6);
+            n_pairs++;
+            n_bad += rel > 0.05 ? 1 : 0;
+            GGML_LOG_WARN("mmid-check: %s t%d s%d expert %3d (%s) rel err %.3g  gpu[0] %.4f ref[0] %.4f\n", dst->name, t, s, e, hot ? "hot " : "cold", rel, y[0], ref0);
+        }
+    }
+    GGML_LOG_WARN("mmid-check: %s: %d of %d pairs beyond 5%%\n", dst->name, n_bad, n_pairs);
+}
+
 static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids  = dst->src[2];
@@ -2653,6 +2716,7 @@ static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_ten
         ctx.mmid_n_cold = 0;
         ctx.mmid_force_fallback = false;
         ctx.mmid_no_mmq = false;
+        ggml_cuda_mmid_check_pairs(ctx, dst, cold, n_cold);
         return;
     }
     ggml_cuda_pool_alloc<int32_t> ids_tmp(ctx.pool(), (size_t) n_used*n_tokens);
@@ -2917,7 +2981,14 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
 
-        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+        // GGML_CUDA_MMID_CUBLAS=1: the slices through dequantize + cuBLAS (F16 activations) instead of the
+        // vector kernels (q8_1 activations) - a precision bisect
+        static const bool slices_cublas = getenv("GGML_CUDA_MMID_CUBLAS") != nullptr && atoi(getenv("GGML_CUDA_MMID_CUBLAS")) != 0;
+        if (slices_cublas) {
+            ggml_cuda_mul_mat_cublas(ctx, &src0_slice, &src1_slice, &dst_slice);
+        } else {
+            ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         src1_data_cur += src1_slice.nb[2];

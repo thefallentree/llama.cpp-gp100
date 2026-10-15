@@ -2637,6 +2637,20 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
     if (left <= 0) {
         return;
     }
+    // GGML_CUDA_MMID_CHECK_NAME=a,b,...: only the nodes whose name contains one of the substrings
+    static const std::string names = getenv("GGML_CUDA_MMID_CHECK_NAME") != nullptr ? getenv("GGML_CUDA_MMID_CHECK_NAME") : "";
+    if (!names.empty()) {
+        bool hit = false;
+        for (size_t pos = 0; pos < names.size();) {
+            size_t end = names.find(',', pos);
+            if (end == std::string::npos) { end = names.size(); }
+            hit = hit || strstr(dst->name, names.substr(pos, end - pos).c_str()) != nullptr;
+            pos = end + 1;
+        }
+        if (!hit) {
+            return;
+        }
+    }
     left--;
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2664,6 +2678,16 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
             if (hot) {
                 CUDA_CHECK(cudaMemcpy(wq.data(), (const char *) src0->data + (size_t) e*src0->nb[2], src0->nb[2], cudaMemcpyDeviceToHost));
                 src = wq.data();
+            }
+            {
+                // the slice's fingerprint at compute time, in the split-check format (vs fn_glm_split_check.py --all)
+                uint64_t head = 14695981039346656037ULL, tail = 14695981039346656037ULL, sum = 0;
+                const size_t nb2 = src0->nb[2];
+                const uint8_t * b8 = (const uint8_t *) src;
+                for (size_t i = 0; i < 4096 && i < nb2; ++i) { head = (head ^ b8[i])*1099511628211ULL; }
+                for (size_t i = nb2 >= 4096 ? nb2 - 4096 : 0; i < nb2; ++i) { tail = (tail ^ b8[i])*1099511628211ULL; }
+                for (size_t i = 0; i < nb2; ++i) { sum += b8[i]; }
+                GGML_LOG_WARN("slice-fp: %s expert %d (%s) head %016" PRIx64 " tail %016" PRIx64 " sum %" PRIu64 "\n", dst->name, e, hot ? "hot" : "cold", head, tail, sum);
             }
             for (int64_t r = 0; r < ne01; ++r) {
                 tt->to_float(src + r*src0->nb[1], w.data() + r*ne00, ne00);

@@ -2049,18 +2049,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (getenv("LLAMA_EXPERT_SPLIT_CHECK") != nullptr) {
         // LLAMA_EXPERT_SPLIT_CHECK=1: fingerprints of the first and the last loaded slice of every expert tensor, hot
-        // and cold (scripts/flashnext/fn_glm_split_check.py prints the same lines straight from the file)
+        // and cold (scripts/flashnext/fn_glm_split_check.py prints the same lines straight from the file);
+        // =L1,L2,...: every slice of those layers
+        const std::string check_spec = getenv("LLAMA_EXPERT_SPLIT_CHECK");
         std::vector<uint8_t> buf;
         for (const auto & it : tensors_by_name) {
             const std::string & name = it.first;
             ggml_tensor * t = it.second;
-            if (name.find("_exps") == std::string::npos || name.find(".weight") == std::string::npos || t->ne[2] <= 1 || t->buffer == nullptr) {
+            const bool is_exps = name.find("_exps") != std::string::npos && t->ne[2] > 1;
+            if (t->buffer == nullptr || (check_spec == "1" && !is_exps)) {
                 continue;
             }
-            const size_t nb2 = t->nb[2];
+            // for listed layers every tensor of the layer: the dense ones as one slice [0] (their whole bytes)
+            const size_t nb2 = is_exps ? t->nb[2] : ggml_nbytes(t);
             const auto it_f = ml.n_bytes_file.find(name);
-            const int64_t n_loaded = it_f != ml.n_bytes_file.end() ? (int64_t) (it_f->second/nb2) : t->ne[2];
-            for (const int64_t e : { (int64_t) 0, n_loaded - 1 }) {
+            const int64_t n_loaded = !is_exps ? 1 : it_f != ml.n_bytes_file.end() ? (int64_t) (it_f->second/nb2) : t->ne[2];
+            std::vector<int64_t> slices = { (int64_t) 0, n_loaded - 1 };
+            if (check_spec != "1") {
+                if (name.compare(0, 4, "blk.") != 0) {
+                    continue;
+                }
+                const std::string il_s = name.substr(4, name.find('.', 4) - 4);   // blk.<il>.
+                bool listed = false;
+                for (size_t pos = 0; pos < check_spec.size();) {
+                    size_t end = check_spec.find(',', pos);
+                    if (end == std::string::npos) { end = check_spec.size(); }
+                    listed = listed || check_spec.substr(pos, end - pos) == il_s;
+                    pos = end + 1;
+                }
+                if (!listed) {
+                    continue;
+                }
+                slices.clear();
+                for (int64_t e = 0; e < n_loaded; ++e) { slices.push_back(e); }
+            }
+            for (const int64_t e : slices) {
                 buf.resize(nb2);
                 ggml_backend_tensor_get(t, buf.data(), (size_t) e*nb2, nb2);
                 uint64_t head = 14695981039346656037ULL, tail = 14695981039346656037ULL, sum = 0;   // FNV-1a 64

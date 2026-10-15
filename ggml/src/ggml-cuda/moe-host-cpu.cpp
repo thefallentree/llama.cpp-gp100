@@ -215,6 +215,192 @@ static void dot2_avx2(const q2_block * w0, const q2_block * w1, const act_block 
 }
 #endif // MH_X86
 
+// ---- Q2_K cold experts (glm5-next): super-blocks of 256 = 16 sub-blocks of 16 with a 4-bit scale and a 4-bit min
+// each (scales[s] & 0xF, scales[s] >> 4) under fp16 d/dmin; element e: half h = e/128, shift j = (e%128)/32,
+// byte l = e%32: code = (qs[32h + l] >> 2j) & 3, value = d*sc*code - dmin*min. The activations come in natural
+// order with two scales per 64 (one per 32) and the sums of each 16 (for the min term).
+constexpr int QK_K_ = 256;
+
+struct q2k_block {
+    uint8_t  scales[16];
+    uint8_t  qs[64];
+    uint16_t d;
+    uint16_t dmin;
+};
+static_assert(sizeof(q2k_block) == 84, "unexpected Q2_K block size");
+
+struct alignas(32) nat_block {
+    int8_t  q[64];
+    float   s[2];
+    int32_t bsum[4];
+    int32_t pad[2];
+};
+static_assert(sizeof(nat_block) == 96, "unexpected nat block size");
+
+typedef void (*dot2k_fn)(const uint8_t *, const uint8_t *, const nat_block *, int, float *, float *);
+typedef void (*quantn_fn)(const float *, int, nat_block *);
+
+// the GPU's act blocks (element e at q[16*(e%4) + e/4], scales s[0] and s[2]) -> natural order
+static void act_to_nat(const act_block * a, int nb, nat_block * o) {
+    for (int b = 0; b < nb; ++b) {
+        int sum[4] = {0, 0, 0, 0};
+        for (int e = 0; e < 64; ++e) {
+            const int8_t v = a[b].q[16*(e % 4) + e/4];
+            o[b].q[e] = v;
+            sum[e/16] += v;
+        }
+        o[b].s[0] = a[b].s[0];
+        o[b].s[1] = a[b].s[2];
+        for (int i = 0; i < 4; ++i) {
+            o[b].bsum[i] = sum[i];
+        }
+    }
+}
+
+static void quantize_nat_generic(const float * x, int n, nat_block * out) {
+    for (int b = 0; b < n/QK; ++b) {
+        const float * xb = x + b*QK;
+        int sum[4] = {0, 0, 0, 0};
+        for (int h = 0; h < 2; ++h) {
+            float amax = 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                amax = std::max(amax, std::fabs(xb[32*h + i]));
+            }
+            const float d  = amax/127.0f;
+            const float id = d != 0.0f ? 1.0f/d : 0.0f;
+            out[b].s[h] = d;
+            for (int i = 0; i < 32; ++i) {
+                const int v = (int) nearbyintf(xb[32*h + i]*id);
+                out[b].q[32*h + i] = (int8_t) v;
+                sum[2*h + i/16] += v;
+            }
+        }
+        for (int i = 0; i < 4; ++i) {
+            out[b].bsum[i] = sum[i];
+        }
+    }
+}
+
+static void dot2_q2k_generic(const uint8_t * w0b, const uint8_t * w1b, const nat_block * a, int nb64, float * s0, float * s1) {
+    const q2k_block * w0 = (const q2k_block *) w0b;
+    const q2k_block * w1 = (const q2k_block *) w1b;
+    float r0 = 0.0f, r1 = 0.0f;
+    for (int k = 0; k < nb64/4; ++k) {
+        const q2k_block & x0 = w0[k];
+        const q2k_block & x1 = w1[k];
+        const float d0 = fp16_to_fp32(x0.d), m0 = fp16_to_fp32(x0.dmin);
+        const float d1 = fp16_to_fp32(x1.d), m1 = fp16_to_fp32(x1.dmin);
+        for (int g = 0; g < 8; ++g) {   // 32-element groups: half g/4, shift g%4; act block 4k + g/2, its half g%2
+            const nat_block & ab = a[4*k + g/2];
+            const int8_t  * y  = ab.q + 32*(g % 2);
+            const uint8_t * q0 = x0.qs + 32*(g/4);
+            const uint8_t * q1 = x1.qs + 32*(g/4);
+            const int sh = 2*(g % 4);
+            int A0a = 0, A0b = 0, A1a = 0, A1b = 0;
+            for (int l = 0; l < 16; ++l) {
+                A0a += ((q0[l] >> sh) & 3)*y[l];
+                A1a += ((q1[l] >> sh) & 3)*y[l];
+            }
+            for (int l = 16; l < 32; ++l) {
+                A0b += ((q0[l] >> sh) & 3)*y[l];
+                A1b += ((q1[l] >> sh) & 3)*y[l];
+            }
+            const int   Ba = ab.bsum[2*(g % 2)], Bb = ab.bsum[2*(g % 2) + 1];
+            const int   sa = 2*g, sb = 2*g + 1;
+            const float as = ab.s[g % 2];
+            r0 += as*(d0*(float) ((x0.scales[sa] & 15)*A0a + (x0.scales[sb] & 15)*A0b) - m0*(float) ((x0.scales[sa] >> 4)*Ba + (x0.scales[sb] >> 4)*Bb));
+            r1 += as*(d1*(float) ((x1.scales[sa] & 15)*A1a + (x1.scales[sb] & 15)*A1b) - m1*(float) ((x1.scales[sa] >> 4)*Ba + (x1.scales[sb] >> 4)*Bb));
+        }
+    }
+    *s0 = r0;
+    *s1 = r1;
+}
+
+#if MH_X86
+__attribute__((target("avx2,f16c,fma")))
+static void quantize_nat_avx2(const float * x, int n, nat_block * out) {
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    for (int b = 0; b < n/QK; ++b) {
+        const float * xb = x + b*QK;
+        alignas(32) int32_t v[64];
+        for (int h = 0; h < 2; ++h) {
+            const __m256 x0 = _mm256_loadu_ps(xb + 32*h +  0);
+            const __m256 x1 = _mm256_loadu_ps(xb + 32*h +  8);
+            const __m256 x2 = _mm256_loadu_ps(xb + 32*h + 16);
+            const __m256 x3 = _mm256_loadu_ps(xb + 32*h + 24);
+            __m256 m = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, x0), _mm256_andnot_ps(sign, x1)),
+                                     _mm256_max_ps(_mm256_andnot_ps(sign, x2), _mm256_andnot_ps(sign, x3)));
+            __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+            m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+            m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+            const float d = _mm_cvtss_f32(m4)/127.0f;
+            out[b].s[h] = d;
+            const __m256 id = _mm256_set1_ps(d != 0.0f ? 1.0f/d : 0.0f);
+            _mm256_store_si256((__m256i *) (v + 32*h +  0), _mm256_cvtps_epi32(_mm256_mul_ps(x0, id)));
+            _mm256_store_si256((__m256i *) (v + 32*h +  8), _mm256_cvtps_epi32(_mm256_mul_ps(x1, id)));
+            _mm256_store_si256((__m256i *) (v + 32*h + 16), _mm256_cvtps_epi32(_mm256_mul_ps(x2, id)));
+            _mm256_store_si256((__m256i *) (v + 32*h + 24), _mm256_cvtps_epi32(_mm256_mul_ps(x3, id)));
+        }
+        int sum[4] = {0, 0, 0, 0};
+        for (int e = 0; e < 64; ++e) {
+            out[b].q[e] = (int8_t) v[e];
+            sum[e/16] += v[e];
+        }
+        for (int i = 0; i < 4; ++i) {
+            out[b].bsum[i] = sum[i];
+        }
+    }
+}
+
+__attribute__((target("avx2,f16c,fma")))
+static inline float mh_hsum256(__m256 v) {
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+    return _mm_cvtss_f32(lo);
+}
+
+__attribute__((target("avx2,f16c,fma")))
+static void dot2_q2k_avx2(const uint8_t * w0b, const uint8_t * w1b, const nat_block * a, int nb64, float * s0, float * s1) {
+    const q2k_block * w0 = (const q2k_block *) w0b;
+    const q2k_block * w1 = (const q2k_block *) w1b;
+    const __m256i m3 = _mm256_set1_epi8(3);
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    float  mins0 = 0.0f, mins1 = 0.0f;
+    for (int k = 0; k < nb64/4; ++k) {
+        const q2k_block & x0 = w0[k];
+        const q2k_block & x1 = w1[k];
+        const float d0 = fp16_to_fp32(x0.d), m0 = fp16_to_fp32(x0.dmin);
+        const float d1 = fp16_to_fp32(x1.d), m1 = fp16_to_fp32(x1.dmin);
+        for (int h = 0; h < 2; ++h) {
+            const __m256i qh0 = _mm256_loadu_si256((const __m256i *) (x0.qs + 32*h));
+            const __m256i qh1 = _mm256_loadu_si256((const __m256i *) (x1.qs + 32*h));
+            for (int j = 0; j < 4; ++j) {
+                const int g = 4*h + j;
+                const nat_block & ab = a[4*k + g/2];
+                const __m256i y  = _mm256_loadu_si256((const __m256i *) (ab.q + 32*(g % 2)));
+                const __m256i q0 = _mm256_and_si256(_mm256_srli_epi16(qh0, 2*j), m3);
+                const __m256i q1 = _mm256_and_si256(_mm256_srli_epi16(qh1, 2*j), m3);
+                const int sa = 2*g, sb = 2*g + 1;
+                const __m256i sc0 = _mm256_set_m128i(_mm_set1_epi16(x0.scales[sb] & 15), _mm_set1_epi16(x0.scales[sa] & 15));
+                const __m256i sc1 = _mm256_set_m128i(_mm_set1_epi16(x1.scales[sb] & 15), _mm_set1_epi16(x1.scales[sa] & 15));
+                const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(q0, y), sc0);
+                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q1, y), sc1);
+                const float as = ab.s[g % 2];
+                acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), _mm256_set1_ps(as*d0), acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), _mm256_set1_ps(as*d1), acc1);
+                const int Ba = ab.bsum[2*(g % 2)], Bb = ab.bsum[2*(g % 2) + 1];
+                mins0 += as*m0*(float) ((x0.scales[sa] >> 4)*Ba + (x0.scales[sb] >> 4)*Bb);
+                mins1 += as*m1*(float) ((x1.scales[sa] >> 4)*Ba + (x1.scales[sb] >> 4)*Bb);
+            }
+        }
+    }
+    *s0 = mh_hsum256(acc0) - mins0;
+    *s1 = mh_hsum256(acc1) - mins1;
+}
+#endif // MH_X86
+
 static inline void mh_prefetch(const void * p) {
 #if MH_X86
     _mm_prefetch((const char *) p, _MM_HINT_T0);
@@ -245,10 +431,12 @@ typedef void (*dot2_fn)(const q2_block *, const q2_block *, const act_block *, i
 typedef void (*quant_fn)(const float *, int, act_block *);
 
 // GGML_CUDA_MOE_HOST_ISA=generic|avx2 forces a narrower kernel
-static void pick_kernels(dot2_fn & dot2, quant_fn & quant, const char *& name) {
-    dot2  = dot2_generic;
-    quant = quantize_act_generic;
-    name  = "generic";
+static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, quantn_fn & quantn, const char *& name) {
+    dot2   = dot2_generic;
+    quant  = quantize_act_generic;
+    dot2k  = dot2_q2k_generic;
+    quantn = quantize_nat_generic;
+    name   = "generic";
 #if MH_X86
     const char * force = getenv("GGML_CUDA_MOE_HOST_ISA");
     __builtin_cpu_init();
@@ -258,9 +446,11 @@ static void pick_kernels(dot2_fn & dot2, quant_fn & quant, const char *& name) {
         return;
     }
     if (has2) {
-        quant = quantize_act_avx2;
-        dot2  = dot2_avx2;
-        name  = "AVX2";
+        quant  = quantize_act_avx2;
+        dot2   = dot2_avx2;
+        dot2k  = dot2_q2k_avx2;
+        quantn = quantize_nat_avx2;
+        name   = "AVX2";
     }
     if (has512 && has2 && !(force != nullptr && strcmp(force, "avx2") == 0)) {
         dot2 = dot2_avx512;
@@ -331,6 +521,8 @@ struct pool {
     int          id        = 0;
     dot2_fn      dot2  = nullptr;
     quant_fn     quant = nullptr;
+    dot2k_fn     dot2k  = nullptr;   // Q2_K cold experts (natural-order activations)
+    quantn_fn    quantn = nullptr;
     const char * isa   = nullptr;
     void (*keep_warm)() = nullptr; // called by the spinning threads
     bool spin_pause = true;
@@ -352,6 +544,8 @@ struct pool {
     float *              jy  = nullptr;  // [n_pairs][n_embd], in the mailbox
     std::vector<float>     h;    // [n_pairs][n_ff]: the swiglu outputs
     std::vector<act_block> hq;   // [n_pairs][n_ff/64]: ... quantized
+    std::vector<nat_block> xqn;  // Q2_K layers: the input rows in natural order, [n_tokens][n_embd/64]
+    std::vector<nat_block> hqn;  // ... and the swiglu outputs, [n_pairs][n_ff/64]
     size_t                 cap_blk = 0;
     std::unique_ptr<std::atomic<int>[]> blk_cnt;   // [n_groups][n_ff/64]: finished CH1-row chunks per expert block
     std::unique_ptr<std::atomic<int>[]> grp_ready; // [n_groups]: quantized activation blocks per expert
@@ -436,7 +630,8 @@ struct pool {
                 // the rows of a chunk are collected here: neighbouring chunks of h are other threads' and share its cache lines
                 float hl[64];
                 for (int i = 0; i < g.n; ++i) {
-                    const act_block * xq = jxq + (size_t) gt[i]*nb_e;
+                    const act_block * xq  = jxq + (size_t) gt[i]*nb_e;
+                    const nat_block * xqk = s.wtype == 1 ? xqn.data() + (size_t) gt[i]*nb_e : nullptr;
                     for (int r = r0; r < r0 + CH1; ++r) {
                         const q2_block * wg = (const q2_block *) (gate + (size_t) r*s.gate_nb1);
                         const q2_block * wu = (const q2_block *) (up   + (size_t) r*s.up_nb1);
@@ -450,7 +645,15 @@ struct pool {
                             }
                         }
                         float vg, vu;
-                        dot2(wg, wu, xq, nb_e, &vg, &vu);
+                        if (s.wtype == 1) {
+                            dot2k((const uint8_t *) wg, (const uint8_t *) wu, xqk, nb_e, &vg, &vu);
+                        } else {
+                            dot2(wg, wu, xq, nb_e, &vg, &vu);
+                        }
+                        if (s.clamp > 0.0f) {   // swiglu_clamp(limit): silu(min(g, limit)) * clamp(u, -limit, limit)
+                            vg = std::min(vg, s.clamp);
+                            vu = std::max(std::min(vu, s.clamp), -s.clamp);
+                        }
                         hl[r - r0] = vg/(1.0f + expf(-vg))*vu;
                     }
                     memcpy(h.data() + (size_t) gp[i]*s.n_ff + r0, hl, CH1*sizeof(float));
@@ -460,7 +663,11 @@ struct pool {
                 if (blk_cnt[(size_t) gi*nb_f + kb].fetch_add(1, std::memory_order_acq_rel) == QK/CH1 - 1) {
                     for (int i = 0; i < g.n; ++i) {
                         const int p = gp[i];
-                        quant(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hq.data() + (size_t) p*nb_f + kb);
+                        if (s.wtype == 1) {
+                            quantn(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hqn.data() + (size_t) p*nb_f + kb);
+                        } else {
+                            quant(h.data() + (size_t) p*s.n_ff + kb*QK, QK, hq.data() + (size_t) p*nb_f + kb);
+                        }
                     }
                     grp_ready[gi].fetch_add(1, std::memory_order_release);
                     if (stat_every > 0 && p1_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -494,7 +701,11 @@ struct pool {
                 for (int i = 0; i < g.n; ++i) {
                     const int p = gp[i];
                     float v0, v1;
-                    dot2(w0, w1, hq.data() + (size_t) p*nb_f, nb_f, &v0, &v1);
+                    if (s.wtype == 1) {
+                        dot2k((const uint8_t *) w0, (const uint8_t *) w1, hqn.data() + (size_t) p*nb_f, nb_f, &v0, &v1);
+                    } else {
+                        dot2(w0, w1, hq.data() + (size_t) p*nb_f, nb_f, &v0, &v1);
+                    }
                     float * y = jy + (size_t) p*s.n_embd;
                     y[r + 0] = v0;
                     y[r + 1] = v1;
@@ -588,6 +799,9 @@ struct pool {
             h.resize((size_t) n_pairs*js->n_ff);
             hq.resize((size_t) n_pairs*nb_f);
         }
+        if (js->wtype == 1 && hqn.size() < (size_t) n_pairs*nb_f) {
+            hqn.resize((size_t) n_pairs*nb_f);
+        }
         if (cap_blk < (size_t) n_groups*nb_f) {
             cap_blk = (size_t) n_groups*nb_f;
             blk_cnt.reset(new std::atomic<int>[cap_blk]);
@@ -602,6 +816,15 @@ struct pool {
         // the GPU quantized the input rows (mh_publish)
         jxq = mh_xq(m);
         jy  = mh_y(m);
+        if (js->wtype == 1) {
+            // Q2_K: the dot wants the activations in natural order with their 16-sums
+            const int    nb_e = js->n_embd/QK;
+            const size_t n    = (size_t) m->n_tokens*nb_e;
+            if (xqn.size() < n) {
+                xqn.resize(n);
+            }
+            act_to_nat(jxq, (int) n, xqn.data());
+        }
         const auto t_quant = std::chrono::steady_clock::now();
         p1_left.store(n_groups*nb_f, std::memory_order_relaxed);
         MH_TR(t_job_ns.store(tns());)
@@ -682,7 +905,7 @@ struct pool {
     // n_pools pools share the threads: pool i serves the mailboxes i, i + n_pools, ...
     void start(const int pool_id, const int n_pools) {
         id = pool_id;
-        pick_kernels(dot2, quant, isa);
+        pick_kernels(dot2, quant, dot2k, quantn, isa);
         stat_every = getenv("GGML_CUDA_MOE_HOST_STATS") ? atoll(getenv("GGML_CUDA_MOE_HOST_STATS")) : 0;
         const char * env = getenv("GGML_CUDA_MOE_HOST_THREADS");
         const int hw = (int) std::thread::hardware_concurrency();

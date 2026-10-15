@@ -234,6 +234,13 @@ struct llama_model_loader {
     // as allocated. Call it before the tensor is created. False if the tensor is not in the file.
     bool pad_dim(const std::string & name, int axis, int64_t n_extra);
 
+    // Cuts one array of the file into two tensors along `axis` (the hot and the cold experts of a MoE layer when
+    // the file stores them as one tensor): `first` keeps n_first slices, a new tensor `second` is synthesized over
+    // the remaining slices of the same file bytes. Call it before the tensors are created. False, and nothing
+    // changed, if `first` is not in the file, `second` already is, or the cut is not inside the array.
+    bool split_single(const std::string & first, const std::string & second, int64_t n_first, int axis);
+    ggml_context_ptr ctx_synth; // metas of the tensors split_single synthesizes
+
     // the bytes the file holds for a tensor padded with pad_dim (ggml_nbytes otherwise)
     std::map<std::string, size_t> n_bytes_file;
 

@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-hybrid-idx.h"
+#include <cinttypes>
+#include <cstdlib>
 
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
@@ -14,6 +16,7 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
     ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound, false);
+    ml.get_key(LLM_KV_EXPERT_HOT_COUNT,            hparams.n_expert_hot, false);
 
     // the MLA cache holds the compressed latent
     hparams.n_embd_head_v_full = hparams.n_lora_kv;
@@ -67,6 +70,77 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     const auto nf = nextn_flags(ml);
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
+    const bool mtp_only   = (trunk_flags & TENSOR_NOT_REQUIRED) != 0;
+
+    // Hot/cold routed experts for the engine's expert cache and host tier, as llama_model_qwen4exp: the file keeps
+    // a layer's experts hot first (scripts/flashnext/fn_permute_inplace.py) as one array per matrix, the hot count
+    // comes from the file (expert_hot_count) or LLAMA_EXPERT_HOT / LLAMA_EXPERT_HOT_LAYERS ("il:n,..." or "n,n,..."),
+    // and the cold part is cut off at load (split_single; resplit when the file already has the pair). The NextN
+    // block keeps its experts whole.
+    std::vector<int64_t> n_hot_layer(n_layer, 0);
+    int64_t n_spare = 0;
+    if (!mtp_only) {
+        int64_t n_hot = hparams.n_expert_hot;
+        if (getenv("LLAMA_EXPERT_HOT") != nullptr) {
+            n_hot = std::max(1, atoi(getenv("LLAMA_EXPERT_HOT")));
+        }
+        for (int il = (int) hparams.n_layer_dense_lead; il < n_layer; ++il) {
+            n_hot_layer[il] = n_hot;
+        }
+        if (n_hot > 0 && getenv("LLAMA_EXPERT_HOT_LAYERS") != nullptr) {
+            std::string spec = getenv("LLAMA_EXPERT_HOT_LAYERS");
+            size_t pos = 0;
+            int    il_next = (int) hparams.n_layer_dense_lead;
+            while (pos < spec.size()) {
+                size_t end = spec.find(',', pos);
+                if (end == std::string::npos) {
+                    end = spec.size();
+                }
+                const std::string tok = spec.substr(pos, end - pos);
+                pos = end + 1;
+                if (tok.empty()) {
+                    continue;
+                }
+                const size_t colon = tok.find(':');
+                const int il = colon == std::string::npos ? il_next : atoi(tok.substr(0, colon).c_str());
+                const int n  = atoi(tok.substr(colon == std::string::npos ? 0 : colon + 1).c_str());
+                if (il < (int) hparams.n_layer_dense_lead || il >= n_layer || n < 1 || n >= (int) n_expert) {
+                    throw std::runtime_error(format("LLAMA_EXPERT_HOT_LAYERS: bad entry '%s'", tok.c_str()));
+                }
+                n_hot_layer[il] = n;
+                il_next = il + 1;
+            }
+        }
+        if (n_hot > 0) {
+            n_spare = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
+            static const llm_tensor pairs[3][2] = {
+                { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
+                { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
+                { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
+            };
+            int64_t total = 0;
+            int n_padded = 0;
+            for (int il = (int) hparams.n_layer_dense_lead; il < n_layer; ++il) {
+                total += n_hot_layer[il];
+                for (const auto & pair : pairs) {
+                    const std::string hot  = tn(pair[0], "weight", il).str();
+                    const std::string cold = tn(pair[1], "weight", il).str();
+                    if (!ml.resplit(hot, cold, n_hot_layer[il], 2) && !ml.split_single(hot, cold, n_hot_layer[il], 2)) {
+                        throw std::runtime_error(format("LLAMA_EXPERT_HOT: cannot cut the experts of layer %d at %" PRId64, il, n_hot_layer[il]));
+                    }
+                    if (n_spare > 0) {
+                        n_padded += ml.pad_dim(hot,  2, n_spare) ? 1 : 0;
+                        n_padded += ml.pad_dim(cold, 2, n_spare) ? 1 : 0;
+                    }
+                }
+            }
+            if (n_padded == 0) {
+                n_spare = 0;
+            }
+            LLAMA_LOG_INFO("%s: %.1f hot experts per layer on average of %" PRId64 " (file: %u), %" PRId64 " spare slots per side\n", __func__,
+                    (double) total/(n_layer - hparams.n_layer_dense_lead), (int64_t) n_expert, hparams.n_expert_hot, n_spare);
+        }
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -163,9 +237,23 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, flags);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, flags);
 
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
+            const int64_t n_hot    = i < n_layer ? n_hot_layer[i] : 0;
+            const int64_t n_s      = n_hot > 0 ? n_spare : 0;
+            const int64_t n_exp_ho = n_hot > 0 ? n_hot + n_s : n_expert;
+
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_exp_ho}, flags);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_exp_ho}, flags);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_exp_ho}, flags);
+
+            if (n_hot > 0) {
+                // the cold experts: pinned host memory (-ot _exps_cold=CUDA_Host), the host tier computes them
+                layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", i), {  n_embd, n_ff_exp, n_expert - n_hot + n_s}, flags);
+                layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", i), {n_ff_exp,   n_embd, n_expert - n_hot + n_s}, flags);
+                layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", i), {  n_embd, n_ff_exp, n_expert - n_hot + n_s}, flags);
+                exps_cold[layer.ffn_down_exps] = layer.ffn_down_exps_cold;
+                exps_cold[layer.ffn_gate_exps] = layer.ffn_gate_exps_cold;
+                exps_cold[layer.ffn_up_exps]   = layer.ffn_up_exps_cold;
+            }
 
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, flags);
@@ -673,6 +761,19 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
 
 llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
+
+    if (!model.exps_cold.empty()) {
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            // a split hot tensor needs a cold tensor that is split the same way
+            for (const auto & it : model.exps_cold) {
+                if (it.second->buffer != nullptr && !ggml_backend_buffer_is_meta(it.second->buffer)) {
+                    throw std::runtime_error(std::string("tensor split: ") + it.second->name +
+                        " must be in the host memory of the split device (e.g. -ot _exps_cold=CUDA_Host)");
+                }
+            }
+        }
+        exps_cold = &model.exps_cold;
+    }
 
     ggml_tensor * cur;
 

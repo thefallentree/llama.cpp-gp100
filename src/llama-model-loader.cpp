@@ -911,6 +911,55 @@ bool llama_model_loader::pad_dim(const std::string & name, const int axis, const
     return true;
 }
 
+bool llama_model_loader::split_single(const std::string & first, const std::string & second, const int64_t n_first, const int axis) {
+    const auto it_a = weights_map.find(first);
+    if (it_a == weights_map.end() || weights_map.find(second) != weights_map.end() || axis < 1 || axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    llama_tensor_weight & a = it_a->second;
+    ggml_tensor * ta = a.tensor;
+    const int64_t n_a   = ta->ne[axis];
+    const size_t  slice = ta->nb[axis];
+    if (n_first < 1 || n_first >= n_a) {
+        return false;
+    }
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        if (ta->ne[d] != 1) {
+            return false;
+        }
+    }
+    if (!ctx_synth) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*1024,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_synth.reset(ggml_init(params));
+        if (!ctx_synth) {
+            return false;
+        }
+    }
+    int64_t ne[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        ne[d] = ta->ne[d];
+    }
+    ne[axis] = n_a - n_first;
+    ggml_tensor * tb = ggml_new_tensor(ctx_synth.get(), ta->type, GGML_MAX_DIMS, ne);
+    if (tb == nullptr) {
+        return false;
+    }
+    ggml_set_name(tb, second.c_str());
+    ta->ne[axis] = n_first;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        ta->nb[d] = ta->nb[d - 1]*ta->ne[d - 1];
+    }
+    llama_tensor_weight b = a;
+    b.tensor = tb;
+    b.offs   = a.offs + (size_t) n_first*slice;
+    weights_map.emplace(second, b);
+    return true;
+}
+
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
     const auto * weight = get_weight(name);
     if (!weight) {

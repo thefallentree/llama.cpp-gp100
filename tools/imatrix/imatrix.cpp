@@ -563,6 +563,9 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
+    if (src0 == nullptr) {
+        return false;   // ops without sources (arange, fill: glm5-next's indexer) have nothing to collect
+    }
     std::string wname = filter_tensor_name(src0->name);
 
     const int32_t chunk_size = m_params.n_ctx / m_params.n_parallel;

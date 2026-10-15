@@ -1483,6 +1483,7 @@ struct ggml_cuda_cold_prefetch {
 };
 
 struct ggml_backend_cuda_context {
+    bool mmid_no_mmq = false; // the Q2_K hot/cold path (glm5-next) keeps the generic mul_mat_id off MMQ
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

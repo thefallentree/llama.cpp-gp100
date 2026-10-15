@@ -957,6 +957,7 @@ bool llama_model_loader::split_single(const std::string & first, const std::stri
     b.tensor = tb;
     b.offs   = a.offs + (size_t) n_first*slice;
     weights_map.emplace(second, b);
+    n_tensors++;   // done_getting_tensors counts the synthesized tensor like one of the file's
     return true;
 }
 

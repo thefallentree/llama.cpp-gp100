@@ -564,7 +564,9 @@ void ggml_cuda_mmid_vec_f16_sm60(
 // prefetch of the cold experts for prompt batches
 
 bool ggml_cuda_mmid_cold_prompt(const ggml_tensor * node) {
-    return node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(node) && node->ne[2] > MMVQ_MAX_BATCH_SIZE;
+    // Q2_K cold experts (glm5-next) are the host tier's: nothing to stage for the sm_60 Q2_0 GEMM
+    return node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(node) && node->ne[2] > MMVQ_MAX_BATCH_SIZE &&
+           node->src[0]->type != GGML_TYPE_Q2_K;
 }
 
 static bool ggml_cuda_cold_prefetch_enabled() {

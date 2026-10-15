@@ -26,6 +26,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cinttypes>
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <cerrno>
@@ -2063,6 +2064,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (getenv("LLAMA_EXPERT_SPLIT_CHECK") != nullptr) {
+        // LLAMA_EXPERT_SPLIT_CHECK=1: fingerprints of the first and the last loaded slice of every expert tensor, hot
+        // and cold (scripts/flashnext/fn_glm_split_check.py prints the same lines straight from the file)
+        std::vector<uint8_t> buf;
+        for (const auto & it : tensors_by_name) {
+            const std::string & name = it.first;
+            ggml_tensor * t = it.second;
+            if (name.find("_exps") == std::string::npos || name.find(".weight") == std::string::npos || t->ne[2] <= 1 || t->buffer == nullptr) {
+                continue;
+            }
+            const size_t nb2 = t->nb[2];
+            const auto it_f = ml.n_bytes_file.find(name);
+            const int64_t n_loaded = it_f != ml.n_bytes_file.end() ? (int64_t) (it_f->second/nb2) : t->ne[2];
+            for (const int64_t e : { (int64_t) 0, n_loaded - 1 }) {
+                buf.resize(nb2);
+                ggml_backend_tensor_get(t, buf.data(), (size_t) e*nb2, nb2);
+                uint64_t head = 1469598103934665603ULL, tail = 1469598103934665603ULL, sum = 0;
+                for (size_t i = 0; i < 4096 && i < nb2; ++i) { head = (head ^ buf[i])*1099511628211ULL; }
+                for (size_t i = nb2 >= 4096 ? nb2 - 4096 : 0; i < nb2; ++i) { tail = (tail ^ buf[i])*1099511628211ULL; }
+                for (size_t i = 0; i < nb2; ++i) { sum += buf[i]; }
+                LLAMA_LOG_INFO("split-check: %s[%" PRId64 "] head %016" PRIx64 " tail %016" PRIx64 " sum %" PRIu64 "\n", name.c_str(), e, head, tail, sum);
+            }
         }
     }
 

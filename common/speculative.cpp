@@ -1064,6 +1064,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        if (mask_token_id == LLAMA_TOKEN_NULL) {
+            // a draft without a vocab keeps its noise token in the metadata
+            char buf[32] = {};
+            if (llama_model_meta_val_str(model_dft, "dflash.mask_token_id", buf, sizeof(buf)) >= 0) {
+                mask_token_id = std::atoi(buf);
+            }
+        }
+        if (mask_token_id < 0) {
+            throw std::runtime_error("DFlash draft has no mask token");
+        }
 
         if (is_dspark && this->params.p_min > 0.0f) {
             char buf[16] = {};
@@ -1352,7 +1362,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                         LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                                 seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                                common_token_to_piece(params.ctx_tgt, cur_p->data[k].id).c_str());
                     }
 
                     const llama_token id = cur_p->data[0].id;
@@ -1371,7 +1381,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                         LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                                 seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                                common_token_to_piece(params.ctx_tgt, cur_p->data[k].id).c_str());
                     }
 
                     const llama_token id = cur_p->data[0].id;
@@ -2789,7 +2799,9 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     }
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
-    if (arch != "dflash") {
+    // Lucebox drafts have their own arch id and tensor names, the loader reads them as dflash (llama-gguf-compat.cpp)
+    const bool lucebox = arch == "deepseek41-dflash-draft";
+    if (arch != "dflash" && !lucebox) {
         const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
 
         if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
@@ -2800,7 +2812,7 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     }
 
     // the Markov head distinguishes draft-dspark from draft-dflash
-    const auto type = gguf_find_tensor(gguf_ctx.get(), "markov_w1.weight") >= 0
+    const auto type = gguf_find_tensor(gguf_ctx.get(), lucebox ? "dflash.dspark.markov.w1" : "markov_w1.weight") >= 0
                     ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK
                     : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
 

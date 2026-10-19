@@ -79,6 +79,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
     RPC_CMD_NONE,
+    RPC_CMD_ALLOC_HOST_BUFFER,   // a buffer of the device's host buffer type (pinned memory on the server; the engine's cold experts)
     RPC_CMD_COUNT,
 };
 
@@ -101,6 +102,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_INIT_TENSOR:       return "INIT_TENSOR";
         case RPC_CMD_GET_ALLOC_SIZE:    return "GET_ALLOC_SIZE";
         case RPC_CMD_HELLO:             return "HELLO";
+        case RPC_CMD_ALLOC_HOST_BUFFER: return "ALLOC_HOST_BUFFER";
         case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
         case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
         case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
@@ -291,6 +293,7 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+    bool        host = false;   // the device's host buffer type on the server (pinned memory next to its GPU)
 };
 
 class rpc_dispatcher;
@@ -986,7 +989,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     rpc_msg_alloc_buffer_rsp response;
 
     auto dispatcher = get_dispatcher(buft_ctx->endpoint);
-    dispatcher->send(RPC_CMD_ALLOC_BUFFER, request, sizeof(*request), &response, sizeof(response));
+    dispatcher->send(buft_ctx->host ? RPC_CMD_ALLOC_HOST_BUFFER : RPC_CMD_ALLOC_BUFFER, request, sizeof(*request), &response, sizeof(response));
     if (response.remote_ptr != 0) {
         LOG_DBG("[%s] endpoint: %s, device: %u, size: %s -> remote_ptr: 0x%" PRIx64 ", remote_size: %s\n",
                 __func__, buft_ctx->endpoint.c_str(), buft_ctx->device, rpc_log_format_size(request->size).c_str(),
@@ -1347,6 +1350,40 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     return buft;
 }
 
+// the host buffer type of a remote device: pinned memory on the server, allocated with the device's own host buffer
+// type (CUDA_Host for a CUDA device), reachable by every backend of that server. The fork's engine keeps the cold
+// experts of a layer there (-ot "..._exps_cold=RPC0[host:port]_Host") and the remote CUDA backend runs its cold
+// path (host tier, expert cache) on them as on one node.
+ggml_backend_buffer_type_t ggml_backend_rpc_host_buffer_type(const char * endpoint, uint32_t device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::string buft_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]_Host";
+    static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
+    auto it = buft_map.find(buft_name);
+    if (it != buft_map.end()) {
+        return it->second;
+    }
+    auto dispatcher = get_dispatcher(endpoint);
+    size_t alignment = get_alignment(dispatcher, device);
+    size_t max_size = get_max_size(dispatcher, device);
+    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
+        /* .endpoint  = */ endpoint,
+        /* .device    = */ device,
+        /* .name      = */ buft_name,
+        /* .alignment = */ alignment,
+        /* .max_size  = */ max_size,
+        /* .host      = */ true,
+    };
+    auto reg = ggml_backend_rpc_add_server(endpoint);
+    ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
+        /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
+        /* .device  = */ ggml_backend_reg_dev_get(reg, device),
+        /* .context = */ buft_ctx
+    };
+    buft_map[buft_name] = buft;
+    return buft;
+}
+
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
     auto dispatcher = get_dispatcher(endpoint);
@@ -1408,6 +1445,7 @@ public:
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool alloc_host_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
@@ -1508,6 +1546,33 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     response.remote_ptr = 0;
     response.remote_size = 0;
+    if (buffer != nullptr) {
+        response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
+        response.remote_size = buffer->size;
+        LOG_DBG("[%s] device: %u, size: %s -> remote_ptr: 0x%" PRIx64 ", remote_size: %s\n",
+                __func__, dev_id, rpc_log_format_size(request.size).c_str(), response.remote_ptr,
+                rpc_log_format_size(response.remote_size).c_str());
+        buffers.insert(buffer);
+    } else {
+        LOG_WARN("[%s] device: %u, size: %s -> failed\n", __func__, dev_id, rpc_log_format_size(request.size).c_str());
+    }
+    return true;
+}
+
+bool rpc_server::alloc_host_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response) {
+    uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        return false;
+    }
+    response.remote_ptr = 0;
+    response.remote_size = 0;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (buft == nullptr) {
+        LOG_WARN("[%s] device: %u has no host buffer type\n", __func__, dev_id);
+        return true;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     if (buffer != nullptr) {
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
@@ -2511,6 +2576,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_ALLOC_HOST_BUFFER: {
+                rpc_msg_alloc_buffer_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_alloc_buffer_rsp response;
+                if (!server.alloc_host_buffer(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_ALLOC_SIZE: {
                 rpc_msg_get_alloc_size_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2862,7 +2941,7 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ true,
-        /* .host_buffer           = */ false,
+        /* .host_buffer           = */ false,   // kept off: the loader's chunked pinned upload path is for local devices
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ true,
         /* .mmap_support          = */ true,
@@ -2892,13 +2971,23 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     return true;
 }
 
+static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+
+    return ggml_backend_rpc_host_buffer_type(ctx->endpoint.c_str(), ctx->device);
+}
+
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     if (!buft || buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
         return false;
     }
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
-    return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;
+    if (buft_ctx->endpoint != dev_ctx->endpoint) {
+        return false;
+    }
+    // a host buffer on the server is visible to all of its backends (pinned memory), a device buffer to its own
+    return buft_ctx->host || buft_ctx->device == dev_ctx->device;
 }
 
 static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
@@ -2927,7 +3016,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_props            = */ ggml_backend_rpc_device_get_props,
     /* .init_backend         = */ ggml_backend_rpc_device_init,
     /* .get_buffer_type      = */ ggml_backend_rpc_device_get_buffer_type,
-    /* .get_host_buffer_type = */ NULL,
+    /* .get_host_buffer_type = */ ggml_backend_rpc_device_get_host_buffer_type,
     /* .buffer_from_host_ptr = */ NULL,
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,

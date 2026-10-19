@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    8
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    2   // the fork's ops (fn-engine, flash_attn_sel, dsv4 hc, delta net): client and server are the same build
+#define RPC_PROTO_PATCH_VERSION    3   // the fork's ops (fn-engine, flash_attn_sel, dsv4 hc, delta net) + ALLOC_HOST_BUFFER: client and server are the same build
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

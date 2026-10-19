@@ -316,6 +316,69 @@ static void dot2_q2k_generic(const uint8_t * w0b, const uint8_t * w1b, const nat
     *s1 = r1;
 }
 
+// ---- Q3_K cold experts (deepseek41's down projections): super-blocks of 256 = 16 sub-blocks of 16 with a 6-bit
+// scale each (packed in scales[12], value - 32) under fp16 d; element e: half h = e/128, shift j = (e%128)/32,
+// byte l = e%32: code = ((qs[32h + l] >> 2j) & 3) | (((hmask[l] >> (4h + j)) & 1) << 2), value = d*sc*(code - 4).
+struct q3k_block {
+    uint8_t  hmask[32];
+    uint8_t  qs[64];
+    uint8_t  scales[12];
+    uint16_t d;
+};
+static_assert(sizeof(q3k_block) == 110, "unexpected Q3_K block size");
+
+// the 16 sub-block scales of a Q3_K block, 6 bits each as ggml packs them, minus the 32 offset
+static inline void q3k_scales(const uint8_t * sc12, int8_t out[16]) {
+    uint32_t aux[4];
+    memcpy(aux, sc12, 12);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);
+    aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);
+    aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);
+    aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);
+    const int8_t * sc = (const int8_t *) aux;
+    for (int i = 0; i < 16; ++i) {
+        out[i] = (int8_t) (sc[i] - 32);
+    }
+}
+
+static void dot2_q3k_generic(const uint8_t * w0b, const uint8_t * w1b, const nat_block * a, int nb64, float * s0, float * s1) {
+    const q3k_block * w0 = (const q3k_block *) w0b;
+    const q3k_block * w1 = (const q3k_block *) w1b;
+    float r0 = 0.0f, r1 = 0.0f;
+    for (int k = 0; k < nb64/4; ++k) {
+        const q3k_block & x0 = w0[k];
+        const q3k_block & x1 = w1[k];
+        const float d0 = fp16_to_fp32(x0.d), d1 = fp16_to_fp32(x1.d);
+        int8_t sc0[16], sc1[16];
+        q3k_scales(x0.scales, sc0);
+        q3k_scales(x1.scales, sc1);
+        for (int g = 0; g < 8; ++g) {   // 32-element groups: half g/4, shift g%4; act block 4k + g/2, its half g%2
+            const nat_block & ab = a[4*k + g/2];
+            const int8_t  * y  = ab.q + 32*(g % 2);
+            const uint8_t * q0 = x0.qs + 32*(g/4);
+            const uint8_t * q1 = x1.qs + 32*(g/4);
+            const int sh = 2*(g % 4), hb = 4*(g/4) + g % 4;
+            int A0a = 0, A0b = 0, A1a = 0, A1b = 0;
+            for (int l = 0; l < 16; ++l) {
+                A0a += (((q0[l] >> sh) & 3) | (((x0.hmask[l] >> hb) & 1) << 2))*y[l];
+                A1a += (((q1[l] >> sh) & 3) | (((x1.hmask[l] >> hb) & 1) << 2))*y[l];
+            }
+            for (int l = 16; l < 32; ++l) {
+                A0b += (((q0[l] >> sh) & 3) | (((x0.hmask[l] >> hb) & 1) << 2))*y[l];
+                A1b += (((q1[l] >> sh) & 3) | (((x1.hmask[l] >> hb) & 1) << 2))*y[l];
+            }
+            const int   Ba = ab.bsum[2*(g % 2)], Bb = ab.bsum[2*(g % 2) + 1];
+            const int   sa = 2*g, sb = 2*g + 1;
+            const float as = ab.s[g % 2];
+            r0 += as*d0*(float) (sc0[sa]*(A0a - 4*Ba) + sc0[sb]*(A0b - 4*Bb));
+            r1 += as*d1*(float) (sc1[sa]*(A1a - 4*Ba) + sc1[sb]*(A1b - 4*Bb));
+        }
+    }
+    *s0 = r0;
+    *s1 = r1;
+}
+
 #if MH_X86
 __attribute__((target("avx2,f16c,fma")))
 static void quantize_nat_avx2(const float * x, int n, nat_block * out) {
@@ -461,6 +524,81 @@ static void dot2_q2k_avx512(const uint8_t * w0b, const uint8_t * w1b, const nat_
     *s0 = _mm512_reduce_add_ps(acc0) - _mm512_reduce_add_ps(accm0);
     *s1 = _mm512_reduce_add_ps(acc1) - _mm512_reduce_add_ps(accm1);
 }
+
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,f16c,fma")))
+static void dot2_q3k_avx512(const uint8_t * w0b, const uint8_t * w1b, const nat_block * a, int nb64, float * s0, float * s1) {
+    const q3k_block * w0 = (const q3k_block *) w0b;
+    const q3k_block * w1 = (const q3k_block *) w1b;
+    const __m512i m3 = _mm512_set1_epi8(3);
+    const __m512i m1 = _mm512_set1_epi8(1);
+    // the same lane permutes as the Q2_K kernel: int16 lanes 0-7 <- sub-block 2j, 8-15 <- 2j+1, 16-23 <- 8+2j,
+    // 24-31 <- 8+2j+1; float lanes 0-7 <- group j, 8-15 <- group 4+j
+    static const __m512i sidx[4] = {
+        _mm512_set_epi16( 9, 9, 9, 9, 9, 9, 9, 9,  8, 8, 8, 8, 8, 8, 8, 8,  1, 1, 1, 1, 1, 1, 1, 1,  0, 0, 0, 0, 0, 0, 0, 0),
+        _mm512_set_epi16(11,11,11,11,11,11,11,11, 10,10,10,10,10,10,10,10,  3, 3, 3, 3, 3, 3, 3, 3,  2, 2, 2, 2, 2, 2, 2, 2),
+        _mm512_set_epi16(13,13,13,13,13,13,13,13, 12,12,12,12,12,12,12,12,  5, 5, 5, 5, 5, 5, 5, 5,  4, 4, 4, 4, 4, 4, 4, 4),
+        _mm512_set_epi16(15,15,15,15,15,15,15,15, 14,14,14,14,14,14,14,14,  7, 7, 7, 7, 7, 7, 7, 7,  6, 6, 6, 6, 6, 6, 6, 6),
+    };
+    static const __m512i aidx[4] = {
+        _mm512_set_epi32( 8, 8, 8, 8, 8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0),
+        _mm512_set_epi32(10,10,10,10,10,10,10,10, 2, 2, 2, 2, 2, 2, 2, 2),
+        _mm512_set_epi32(12,12,12,12,12,12,12,12, 4, 4, 4, 4, 4, 4, 4, 4),
+        _mm512_set_epi32(14,14,14,14,14,14,14,14, 6, 6, 6, 6, 6, 6, 6, 6),
+    };
+    // the high bit of the codes: byte l of half h at shift j sits at bit 4h + j of hmask[l]; the 512-bit hmask
+    // vector carries the 32 bytes twice, the lanes of half 1 shifted by 4 more
+    static const __m512i hshift[4] = {
+        _mm512_set_epi16(4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+        _mm512_set_epi16(5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1),
+        _mm512_set_epi16(6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2),
+        _mm512_set_epi16(7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, 3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3),
+    };
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    __m512 accm0 = _mm512_setzero_ps(), accm1 = _mm512_setzero_ps();
+    for (int k = 0; k < nb64/4; ++k) {
+        const q3k_block & x0 = w0[k];
+        const q3k_block & x1 = w1[k];
+        const nat_block * ab = a + 4*k;
+        const __m512 d0 = _mm512_set1_ps(fp16_to_fp32(x0.d)), d1 = _mm512_set1_ps(fp16_to_fp32(x1.d));
+        const __m512i q0 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x0.qs)), _mm256_loadu_si256((const __m256i *) (x0.qs + 32)), 1);
+        const __m512i q1 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x1.qs)), _mm256_loadu_si256((const __m256i *) (x1.qs + 32)), 1);
+        const __m256i hm0h = _mm256_loadu_si256((const __m256i *) x0.hmask);
+        const __m256i hm1h = _mm256_loadu_si256((const __m256i *) x1.hmask);
+        const __m512i hm0 = _mm512_inserti64x4(_mm512_castsi256_si512(hm0h), hm0h, 1);
+        const __m512i hm1 = _mm512_inserti64x4(_mm512_castsi256_si512(hm1h), hm1h, 1);
+        // the 16 sub-block scales (6 bits - 32, signed) of each row, int16 lanes 0..15
+        alignas(16) int8_t s0b[16], s1b[16];
+        q3k_scales(x0.scales, s0b);
+        q3k_scales(x1.scales, s1b);
+        const __m512i sc0 = _mm512_cvtepi8_epi16(_mm256_castsi128_si256(_mm_load_si128((const __m128i *) s0b)));
+        const __m512i sc1 = _mm512_cvtepi8_epi16(_mm256_castsi128_si256(_mm_load_si128((const __m128i *) s1b)));
+        // the activations' sums per sub-block and scales per sub-block (s/4 -> nat block, (s%4)/2 -> half)
+        const __m512 bsum = _mm512_cvtepi32_ps(_mm512_inserti32x4(_mm512_inserti32x4(_mm512_inserti32x4(_mm512_castsi128_si512(
+                          _mm_loadu_si128((const __m128i *) ab[0].bsum)), _mm_loadu_si128((const __m128i *) ab[1].bsum), 1),
+                          _mm_loadu_si128((const __m128i *) ab[2].bsum), 2), _mm_loadu_si128((const __m128i *) ab[3].bsum), 3));
+        const __m512 as16 = _mm512_set_ps(ab[3].s[1], ab[3].s[1], ab[3].s[0], ab[3].s[0], ab[2].s[1], ab[2].s[1], ab[2].s[0], ab[2].s[0],
+                                          ab[1].s[1], ab[1].s[1], ab[1].s[0], ab[1].s[0], ab[0].s[1], ab[0].s[1], ab[0].s[0], ab[0].s[0]);
+        // the - 4 of every code: 4 * bsum * scale * d per sub-block
+        const __m512 ba4 = _mm512_mul_ps(_mm512_mul_ps(bsum, as16), _mm512_set1_ps(4.0f));
+        accm0 = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(sc0))), d0), ba4, accm0);
+        accm1 = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(sc1))), d1), ba4, accm1);
+        for (int j = 0; j < 4; ++j) {
+            const __m512i h0 = _mm512_slli_epi16(_mm512_and_si512(_mm512_srlv_epi16(hm0, hshift[j]), m1), 2);
+            const __m512i h1 = _mm512_slli_epi16(_mm512_and_si512(_mm512_srlv_epi16(hm1, hshift[j]), m1), 2);
+            const __m512i c0 = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(q0, 2*j), m3), h0);
+            const __m512i c1 = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(q1, 2*j), m3), h1);
+            const __m512i y  = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) (ab[j/2].q + 32*(j % 2)))),
+                                                  _mm256_loadu_si256((const __m256i *) (ab[2 + j/2].q + 32*(j % 2))), 1);
+            const __m512i p0 = _mm512_madd_epi16(_mm512_maddubs_epi16(c0, y), _mm512_permutexvar_epi16(sidx[j], sc0));
+            const __m512i p1 = _mm512_madd_epi16(_mm512_maddubs_epi16(c1, y), _mm512_permutexvar_epi16(sidx[j], sc1));
+            const __m512  asv = _mm512_permutexvar_ps(aidx[j], as16);
+            acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p0), _mm512_mul_ps(asv, d0), acc0);
+            acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1), _mm512_mul_ps(asv, d1), acc1);
+        }
+    }
+    *s0 = _mm512_reduce_add_ps(acc0) - _mm512_reduce_add_ps(accm0);
+    *s1 = _mm512_reduce_add_ps(acc1) - _mm512_reduce_add_ps(accm1);
+}
 #endif // MH_X86
 
 static inline void mh_prefetch(const void * p) {
@@ -493,10 +631,11 @@ typedef void (*dot2_fn)(const q2_block *, const q2_block *, const act_block *, i
 typedef void (*quant_fn)(const float *, int, act_block *);
 
 // GGML_CUDA_MOE_HOST_ISA=generic|avx2 forces a narrower kernel
-static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, quantn_fn & quantn, const char *& name) {
+static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, dot2k_fn & dot2k3, quantn_fn & quantn, const char *& name) {
     dot2   = dot2_generic;
     quant  = quantize_act_generic;
     dot2k  = dot2_q2k_generic;
+    dot2k3 = dot2_q3k_generic;
     quantn = quantize_nat_generic;
     name   = "generic";
 #if MH_X86
@@ -515,9 +654,10 @@ static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, qua
         name   = "AVX2";
     }
     if (has512 && has2 && !(force != nullptr && strcmp(force, "avx2") == 0)) {
-        dot2  = dot2_avx512;
-        dot2k = dot2_q2k_avx512;
-        name  = "AVX-512";
+        dot2   = dot2_avx512;
+        dot2k  = dot2_q2k_avx512;
+        dot2k3 = dot2_q3k_avx512;
+        name   = "AVX-512";
     }
 #endif
 }
@@ -585,6 +725,7 @@ struct pool {
     dot2_fn      dot2  = nullptr;
     quant_fn     quant = nullptr;
     dot2k_fn     dot2k  = nullptr;   // Q2_K cold experts (natural-order activations)
+    dot2k_fn     dot2k3 = nullptr;   // Q3_K cold experts (the down of deepseek41's Q2_K files)
     quantn_fn    quantn = nullptr;
     const char * isa   = nullptr;
     void (*keep_warm)() = nullptr; // called by the spinning threads
@@ -765,7 +906,7 @@ struct pool {
                     const int p = gp[i];
                     float v0, v1;
                     if (s.wtype == 1) {
-                        dot2k((const uint8_t *) w0, (const uint8_t *) w1, hqn.data() + (size_t) p*nb_f, nb_f, &v0, &v1);
+                        (s.wtype_down == 2 ? dot2k3 : dot2k)((const uint8_t *) w0, (const uint8_t *) w1, hqn.data() + (size_t) p*nb_f, nb_f, &v0, &v1);
                     } else {
                         dot2(w0, w1, hq.data() + (size_t) p*nb_f, nb_f, &v0, &v1);
                     }
@@ -968,7 +1109,7 @@ struct pool {
     // n_pools pools share the threads: pool i serves the mailboxes i, i + n_pools, ...
     void start(const int pool_id, const int n_pools) {
         id = pool_id;
-        pick_kernels(dot2, quant, dot2k, quantn, isa);
+        pick_kernels(dot2, quant, dot2k, dot2k3, quantn, isa);
         stat_every = getenv("GGML_CUDA_MOE_HOST_STATS") ? atoll(getenv("GGML_CUDA_MOE_HOST_STATS")) : 0;
         const char * env = getenv("GGML_CUDA_MOE_HOST_THREADS");
         const int hw = (int) std::thread::hardware_concurrency();

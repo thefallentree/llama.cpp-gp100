@@ -11104,6 +11104,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // DeepSeek-V4.1-Flash attention and dense projections at the decode widths (the sm_60 K-quant mat-vec of plain MUL_MAT):
+    // attn_q_a, attn_q_b, attn_kv, attn_output_b, ffn_gate/up_shexp and ffn_down_shexp as (m, k)
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+        for (int n : {1, 2, 8}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1280, 5120}, {32768, 1280}, {512, 5120}, {5120, 8192}, {2304, 5120}, {5120, 2304}}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+            // a src1 with a nonzero mean (the mins and the Q3_K offset ride on the activation sums), two ops on one src1
+            test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 2304, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2304, n, 5120, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 2));
+            // attn_output_a: 8 groups of [4096 -> 1024], also with every operand permuted
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 4096, {8, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 4096, {8, 1}, {1, 1}, {0, 2, 1, 3}));
+            // src1 channels that broadcast one matrix or each matrix of a group, a row count that is no multiple of the tile,
+            // a k with an odd super-block count (the Q3_K row stride is then no multiple of 4 bytes)
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 1024, {1, 1}, {4, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 1024, {3, 1}, {2, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 100, n, 2304, {1, 1}, {1, 1}));
+        }
+        for (int n : {3, 4, 5, 6, 7}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2304, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -12440,6 +12464,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n : {1, 2, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 16, 6, true,  2304, n, 5120));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 16, 6, false, 5120, n, 2304));
+    }
+
+    // DeepSeek-V4.1-Flash attention and dense projections at the decode widths: Q2_K attn_q_a, attn_q_b, attn_kv, attn_output_b,
+    // ffn_gate/up_shexp and the 8 groups of attn_output_a, Q3_K ffn_down_shexp (the sm_60 K-quant mat-vec of plain MUL_MAT;
+    // GGML_CUDA_MM_KQ_SM60=0 for the generic path)
+    for (int n : {1, 2, 4, 8}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1280, 5120}, {32768, 1280}, {512, 5120}, {5120, 8192}, {2304, 5120}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 1024, n, 4096, {8, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 5120, n, 2304, {1, 1}, {1, 1}));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

@@ -254,3 +254,24 @@ KQ_DEV bool kq_vec_lane(const char * __restrict__ w, const char * __restrict__ x
     sum = q3 ? kq_q3k_lane(wr, nsb, part, xr) : kq_q2k_lane(wr, nsb, part, xr);
     return true;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// MUL_MAT (no ids): a block is (column c, row tile, weight matrix i02) with KQ_NWARPS warps of 8 rows. The ncols = ne11*r2 columns of
+// a matrix are the src1 rows i1 of the r2 channels i2 = i02*r2 + i2r that broadcast it (c = i2r*ne11 + i1). They are the fastest grid
+// index, so the blocks that read the same weights run together (one DRAM read, the rest hit L2). The converted rows are in the order
+// (i2, i1): the row of a column is i02*ncols + c.
+
+// The work of one lane: its part of row row0 of dst[., i1, i2]
+template <bool q3>
+KQ_DEV float kq_mm_lane(const char * __restrict__ w, const char * __restrict__ x, const int c, const int tile, const int i02,
+        const int warp, const int lane, const int nsb, const int ne01, const int64_t nb01, const int64_t nb02, const int ne11, const int r2,
+        int & i1, int & i2, int & row0) {
+    const int i2r = r2 > 1 ? c / ne11 : 0;
+    i1   = c - i2r*ne11;
+    i2   = i02*r2 + i2r;
+    row0 = tile*KQ_ROWS + warp*8 + (lane >> 2);
+    const int row = row0 < ne01 ? row0 : ne01 - 1; // rows past the end read the last row and do not store
+    const char * wr = w + (int64_t) i02*nb02 + (int64_t) row*nb01;
+    const char * xr = x + (int64_t) (i2*ne11 + i1)*nsb*KQ_REC_BYTES;
+    return q3 ? kq_q3k_lane(wr, nsb, lane & 3, xr) : kq_q2k_lane(wr, nsb, lane & 3, xr);
+}

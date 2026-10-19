@@ -111,6 +111,14 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
+// set while this thread captures a CUDA graph: a pool allocation cannot synchronize then
+static thread_local bool ggml_cuda_capturing = false;
+
+// GGML_CUDA_GRAPH_RECOVER=1: a CUDA error while a graph is captured (ggml_backend_cuda_graph_compute) throws this instead of
+// aborting, and the graph is computed without capture
+struct ggml_cuda_capture_failure {};
+static thread_local bool ggml_cuda_graph_capture = false;
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -119,6 +127,9 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
+    if (ggml_cuda_graph_capture && ggml_cuda_capturing) {
+        throw ggml_cuda_capture_failure();
+    }
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
@@ -580,9 +591,6 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 }
 
 // #define DEBUG_CUDA_MALLOC
-
-// set while this thread captures a CUDA graph: a pool allocation cannot synchronize then
-static thread_local bool ggml_cuda_capturing = false;
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
@@ -2538,6 +2546,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // Q2_K / Q3_K on sm_60: the HFMA2 mat-vec of the MUL_MAT_ID kernels (the generic mmvq emulates every DP4A)
+    if (ggml_cuda_mm_vec_kq_sm60_supported(src0, src1, dst)) {
+        ggml_cuda_mm_vec_kq_sm60(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         // Q4_1_G64 has no generic MMVQ kernel: only shapes the sm_60 HFMA2 hook accepts may
         // route here; everything else must fall through to dequant + cuBLAS below.
@@ -3956,7 +3969,7 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, const ggml_tensor ** blocker = nullptr) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -3975,6 +3988,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
+                if (blocker != nullptr) {
+                    *blocker = node;
+                }
                 if (ggml_cuda_graph_debug_enabled()) {
                     GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
                 }
@@ -6659,6 +6675,85 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// the capture failed (ggml_cuda_capture_failure): nothing of the graph ran. End the capture, forget what the aborted node loop
+// left in the context and stop capturing this graph; the caller computes it directly.
+static void ggml_cuda_graph_capture_abort(ggml_backend_cuda_context * cuda_ctx, const void * graph_key, const int n_nodes) {
+    ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->curr_stream_no = 0;
+    // an invalidated capture returns an error here and is over; a stream that is not capturing (any more) returns one too
+    cudaGraph_t partial = nullptr;
+    (void) cudaStreamEndCapture(cuda_ctx->stream(), &partial);
+    if (partial != nullptr) {
+        (void) cudaGraphDestroy(partial);
+    }
+    (void) cudaGetLastError();
+    if (ggml_cuda_capturing) {
+        ggml_cuda_capturing = false;
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+    cuda_ctx->moe_host = {};
+    cuda_ctx->mmid_no_mmq         = false;
+    cuda_ctx->mmid_skip_from      = -1;
+    cuda_ctx->mmid_cold_data      = nullptr;
+    cuda_ctx->mmid_n_cold         = 0;
+    cuda_ctx->mmid_force_fallback = false;
+    cuda_ctx->mmid_cold_stage     = false;
+#ifdef USE_CUDA_GRAPH
+    // the flag is named after the GPU arch, any reason to leave a graph out of capture sets it
+    cuda_ctx->cuda_graph(graph_key)->disable_due_to_gpu_arch = true;
+#endif // USE_CUDA_GRAPH
+    GGML_UNUSED(graph_key);
+    GGML_LOG_WARN("%s: capture of a CUDA graph (%d nodes) failed on device %d, it runs without capture from now on\n",
+                  __func__, n_nodes, cuda_ctx->device);
+}
+
+// GGML_CUDA_GRAPH_STATS=n: every n graph computes of a device, a line on stderr with how they ran, and the node that
+// kept a graph out of capture (the first 16 times)
+enum ggml_cuda_graph_run {
+    GGML_CUDA_GRAPH_RUN_REPLAY,  // launched a captured graph
+    GGML_CUDA_GRAPH_RUN_CAPTURE, // captured, then launched
+    GGML_CUDA_GRAPH_RUN_WARMUP,  // direct: the first call, or the properties changed
+    GGML_CUDA_GRAPH_RUN_NOCAP,   // direct: a node of the graph cannot be captured
+    GGML_CUDA_GRAPH_RUN_OFF,     // direct: graphs are off
+    GGML_CUDA_GRAPH_RUN_FAILED,  // a capture failed (it is also counted as captured, its direct run as off)
+    GGML_CUDA_GRAPH_RUN_COUNT,
+};
+
+static int ggml_cuda_graph_stats_every() {
+    static const int every = getenv("GGML_CUDA_GRAPH_STATS") != nullptr ? atoi(getenv("GGML_CUDA_GRAPH_STATS")) : 0;
+    return every;
+}
+
+static void ggml_cuda_graph_stat(const int device, const ggml_cuda_graph_run run) {
+    static std::atomic<unsigned long long> n[GGML_CUDA_MAX_DEVICES][GGML_CUDA_GRAPH_RUN_COUNT];
+    const int every = ggml_cuda_graph_stats_every();
+    if (every <= 0) {
+        return;
+    }
+    n[device][run]++;
+    unsigned long long total = 0;
+    for (int k = 0; k < GGML_CUDA_GRAPH_RUN_FAILED; ++k) {
+        total += n[device][k];
+    }
+    if (run != GGML_CUDA_GRAPH_RUN_FAILED && total % every == 0) {
+        fprintf(stderr, "cuda-graph dev%d: %llu computes: %llu replayed, %llu captured (%llu failed), direct: %llu warming up, %llu not capturable, %llu graphs off\n",
+                device, total, (unsigned long long) n[device][GGML_CUDA_GRAPH_RUN_REPLAY], (unsigned long long) n[device][GGML_CUDA_GRAPH_RUN_CAPTURE],
+                (unsigned long long) n[device][GGML_CUDA_GRAPH_RUN_FAILED], (unsigned long long) n[device][GGML_CUDA_GRAPH_RUN_WARMUP],
+                (unsigned long long) n[device][GGML_CUDA_GRAPH_RUN_NOCAP], (unsigned long long) n[device][GGML_CUDA_GRAPH_RUN_OFF]);
+    }
+}
+
+static void ggml_cuda_graph_log_blocker(const int device, const int n_nodes, const ggml_tensor * node) {
+    static std::atomic<int> n_logged { 0 };
+    if (node != nullptr && ggml_cuda_graph_stats_every() > 0 && n_logged.fetch_add(1) < 16) {
+        fprintf(stderr, "cuda-graph dev%d: %d nodes not captured because of %s (%s, ne2 %lld)\n", device, n_nodes, node->name,
+                ggml_op_name(node->op), (long long) node->ne[2]);
+    }
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -6748,6 +6843,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+    ggml_cuda_graph_run graph_run = GGML_CUDA_GRAPH_RUN_OFF;
 
 #ifdef USE_CUDA_GRAPH
     if (cuda_ctx->window_active) {
@@ -6763,7 +6859,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const ggml_tensor * blocker = nullptr;
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, &blocker);
+        graph_run = graph_compatible ? GGML_CUDA_GRAPH_RUN_WARMUP : GGML_CUDA_GRAPH_RUN_NOCAP;
+        ggml_cuda_graph_log_blocker(cuda_ctx->device, cgraph->n_nodes, blocker);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -6802,6 +6901,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (use_cuda_graph) {
+        graph_run = cuda_graph_update_required ? GGML_CUDA_GRAPH_RUN_CAPTURE : GGML_CUDA_GRAPH_RUN_REPLAY;
+    }
+    ggml_cuda_graph_stat(cuda_ctx->device, graph_run);
+
     FN_PROF_ADD("gc.pre", t_gc0);
     FN_PROF_T(t_gc1);
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -6813,9 +6917,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
         ggml_cuda_capturing = true;
+        static const bool recover = ggml_cuda_env_flag("GGML_CUDA_GRAPH_RECOVER");
+        ggml_cuda_graph_capture = recover;
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    bool capture_failed = false;
+    try {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    } catch (const ggml_cuda_capture_failure &) {
+        capture_failed = true;
+    }
+    ggml_cuda_graph_capture = false;
+    if (capture_failed) {
+        ggml_cuda_graph_capture_abort(cuda_ctx, graph_key, cgraph->n_nodes);
+        ggml_cuda_graph_stat(cuda_ctx->device, GGML_CUDA_GRAPH_RUN_FAILED);
+        return ggml_backend_cuda_graph_compute(backend, cgraph);
+    }
     FN_PROF_ADD(use_cuda_graph ? (cuda_graph_update_required ? "gc.capture+launch" : "gc.launch") : "gc.direct", t_gc1);
 
     return GGML_STATUS_SUCCESS;

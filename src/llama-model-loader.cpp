@@ -1861,7 +1861,9 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                // Only for buffers that backend can write: a tensor on another device (an RPC device over the network)
+                // would otherwise go out as one synchronous set per chunk - a round trip per MB.
+                if (upload_backend && ggml_backend_supports_buft(upload_backend, ggml_backend_buffer_get_type(cur->buffer))) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);

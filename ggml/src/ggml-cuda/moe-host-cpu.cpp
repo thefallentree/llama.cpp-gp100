@@ -950,6 +950,7 @@ struct pool {
 
     // GGML_CUDA_MOE_HOST_STATS=N: every N jobs, print the mean job time, cold pairs and distinct experts per job
     int64_t stat_every = 0, stat_jobs = 0, stat_pairs = 0, stat_groups = 0;
+    int     n_dumped = 0;   // the first jobs of this pool are logged (parameters from the mailbox)
     double  stat_us = 0.0, stat_quant_us = 0.0, stat_p1_us = 0.0, stat_work_us = 0.0;
     std::atomic<int>     p1_left { 0 };
     std::atomic<int64_t> t_p1_ns { 0 };
@@ -977,17 +978,24 @@ struct pool {
             min_c = std::min(min_c, (int) pexp[p]);
         }
         {
-            static std::atomic<int> n_logged{0};
-            const bool bad = min_c < 0 || (js->n_cold > 0 && max_c >= js->n_cold) || m->n_tokens <= 0 || n_used <= 0;
-            if (n_logged.load() < 3 || bad) {
-                n_logged++;
+            int max_i = 0, min_i = 0;
+            for (int p = 0; p < n_pairs; ++p) {
+                max_i = std::max(max_i, (int) pidx[p]);
+                min_i = std::min(min_i, (int) pidx[p]);
+            }
+            const bool bad = min_c < 0 || (js->n_cold > 0 && max_c >= js->n_cold) || m->n_tokens <= 0 || n_used <= 0 ||
+                             min_i < 0 || max_i >= m->n_tokens*n_used || js->n_ff <= 0 || js->n_embd <= 0;
+            if (n_dumped < 2 || bad) {
+                n_dumped++;
                 char pairs[256]; int o = 0;
                 for (int p = 0; p < std::min(n_pairs, 8) && o < 200; ++p) {
                     o += snprintf(pairs + o, sizeof(pairs) - o, " (%d,%d)", (int) pidx[p], (int) pexp[p]);
                 }
-                GGML_LOG_WARN("moe-host: job slot %d: n_tokens %d n_used %d n_pairs %d (cap %d) experts %d..%d of %d, n_ff %d n_embd %d wtype %d/%d:%s%s\n",
-                              slot, (int) m->n_tokens, n_used, n_pairs, (int) m->cap_pairs, min_c, max_c, js->n_cold, js->n_ff, js->n_embd,
-                              js->wtype, js->wtype_down, pairs, bad ? "  <- OUT OF RANGE, job dropped" : "");
+                GGML_LOG_WARN("moe-host: pool %d job slot %d: n_tokens %d n_used %d n_pairs %d (cap %d) experts %d..%d of %d, pairs %d..%d, n_ff %d n_embd %d wtype %d/%d, "
+                              "gate %p/%zu/%zu up %p/%zu/%zu down %p/%zu/%zu xq %p:%s%s\n",
+                              id, slot, (int) m->n_tokens, n_used, n_pairs, (int) m->cap_pairs, min_c, max_c, js->n_cold, min_i, max_i, js->n_ff, js->n_embd,
+                              js->wtype, js->wtype_down, (const void *) js->gate, js->gate_nb1, js->gate_nb2, (const void *) js->up, js->up_nb1, js->up_nb2,
+                              (const void *) js->down, js->down_nb1, js->down_nb2, (const void *) mh_xq(m), pairs, bad ? "  <- OUT OF RANGE, job dropped" : "");
             }
             if (bad) {
                 return;

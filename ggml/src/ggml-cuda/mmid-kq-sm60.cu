@@ -270,6 +270,25 @@ bool ggml_cuda_mm_vec_kq_sm60_supported(const ggml_tensor * src0, const ggml_ten
     return true;
 }
 
+// GGML_CUDA_MM_KQ_SM60_STATS=n: log the first n dispatches of the plain MUL_MAT path (the node, its type and shape) and then one
+// line per 1000 with the totals, in every process - the proof that the attention / dense matvecs take this path in a model run
+static void mm_kq_log(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const int n_log = getenv("GGML_CUDA_MM_KQ_SM60_STATS") != nullptr ? atoi(getenv("GGML_CUDA_MM_KQ_SM60_STATS")) : 0;
+    if (n_log <= 0) {
+        return;
+    }
+    static std::atomic<int64_t> n_calls { 0 }, n_bytes { 0 };
+    const int64_t i = n_calls.fetch_add(1);
+    n_bytes += ggml_nbytes(src0);
+    if (i < n_log) {
+        GGML_LOG_WARN("mm-kq-sm60: %-26s %s src0 %d x %d x %d (%.1f MiB) src1 n %d x %d | src1 nb1 %zu | dst nb1 %zu\n", dst->name,
+                      ggml_type_name(src0->type), (int) src0->ne[0], (int) src0->ne[1], (int) src0->ne[2], ggml_nbytes(src0)/1048576.0,
+                      (int) src1->ne[1], (int) src1->ne[2], src1->nb[1], dst->nb[1]);
+    } else if (i % 1000 == 0) {
+        GGML_LOG_WARN("mm-kq-sm60: %lld dispatches, %.1f GiB of weights\n", (long long) i, n_bytes.load()/1073741824.0);
+    }
+}
+
 void ggml_cuda_mm_vec_kq_sm60(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
@@ -279,6 +298,8 @@ void ggml_cuda_mm_vec_kq_sm60(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t ne12 = src1->ne[2];
     const int     nsb  = src0->ne[0]/256;
     const int     r2   = ne12/ne02;
+
+    mm_kq_log(src0, src1, dst);
 
     // converted per op into pool scratch: no cache, so the Q2_0 / MUL_MAT_ID gate-up cache (mmid16_cache) is never touched
     // and a temporary src1 (the slices of the generic MUL_MAT_ID path) cannot hit a stale entry

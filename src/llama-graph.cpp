@@ -1765,8 +1765,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             const int32_t tag[2] = { (int32_t) LLAMA_EXPS_COLD_MAGIC, (int32_t) cold->ne[2] };
             memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM, tag, sizeof(tag));
             memcpy(res->op_params + LLAMA_EXPS_COLD_PARAM + 2, &cold->data, sizeof(void *));
-            // on a tensor-split device the cold tensor is a source of the node, so that each device gets its own slice
-            if (cold->buffer != nullptr && ggml_backend_buffer_is_meta(cold->buffer)) {
+            // on a tensor-split device the cold tensor is a source of the node, so that each device gets its own slice;
+            // in a buffer this process cannot address (pinned memory on an RPC server) it must be one too: the raw
+            // pointer above only means something here, the source travels with the graph and resolves over there
+            if (cold->buffer != nullptr && (ggml_backend_buffer_is_meta(cold->buffer) || !ggml_backend_buffer_is_host(cold->buffer))) {
                 res->src[LLAMA_EXPS_COLD_SRC] = cold;
             }
         }

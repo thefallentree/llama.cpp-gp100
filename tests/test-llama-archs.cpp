@@ -169,6 +169,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
 
+    const bool is_dsv4 = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
+
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
     uint32_t n_head  = 2;
@@ -189,7 +191,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head = 1;
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
-    } else if (arch == LLM_ARCH_DEEPSEEK4) {
+    } else if (is_dsv4) {
         // head size 64 so that GPU flash attention kernels support the model
         n_embd  = 512;
         n_head  = 8;
@@ -285,11 +287,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head_kv);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, is_dsv4 ? uint32_t(1) : n_head_kv);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
-    if (arch == LLM_ARCH_DEEPSEEK4) {
+    if (is_dsv4) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,   n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head/2);
@@ -337,7 +339,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(64) : uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            is_dsv4 ? uint32_t(64) : uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,           uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
@@ -462,7 +464,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
     }
 
-    if (arch == LLM_ARCH_DEEPSEEK4) {
+    if (is_dsv4) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,          uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,            uint32_t(32));
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,             std::vector<uint32_t>({0, 0, 4, 128}));
@@ -474,6 +476,43 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
+    }
+
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        // engram on two layers, 3-grams over 2 heads: the table rows are the primes of its buckets one after the other
+        constexpr uint32_t n_eg_layers = 2;
+        constexpr uint32_t n_gram      = 3;
+        constexpr uint32_t n_eg_heads  = 2;
+        constexpr uint32_t n_bucket    = (n_gram - 1)*n_eg_heads;
+        const uint64_t prime_list[n_bucket] = { 61, 67, 71, 73 };
+
+        std::vector<uint64_t> multipliers;
+        std::vector<uint64_t> primes;
+        std::vector<uint64_t> offsets;
+        for (uint32_t e = 0; e < n_eg_layers; ++e) {
+            for (uint32_t g = 0; g < n_gram; ++g) {
+                multipliers.push_back(10007 + 1000*(e*n_gram + g));
+            }
+            uint64_t row = 0;
+            for (uint32_t b = 0; b < n_bucket; ++b) {
+                primes.push_back(prime_list[b]);
+                offsets.push_back(row);
+                row += prime_list[b];
+            }
+        }
+        std::vector<int32_t> token_map(n_vocab);
+        for (uint32_t i = 0; i < n_vocab; ++i) {
+            token_map[i] = (int32_t) (i % 61); // case and accent folding stands in as a modulo
+        }
+        ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,       std::vector<uint32_t>({1, 3}));
+        ms.add_kv(LLM_KV_ENGRAM_HEAD_COUNT,      n_eg_heads);
+        ms.add_kv(LLM_KV_ENGRAM_KEY_LENGTH,      uint32_t(16));
+        ms.add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE,  n_gram);
+        ms.add_kv(LLM_KV_ENGRAM_PAD_ID,          uint32_t(0));
+        ms.add_kv(LLM_KV_ENGRAM_MULTIPLIERS,     multipliers);
+        ms.add_kv(LLM_KV_ENGRAM_PRIMES,          primes);
+        ms.add_kv(LLM_KV_ENGRAM_OFFSETS,         offsets);
+        ms.add_kv(LLM_KV_ENGRAM_TOKEN_MAP,       token_map);
     }
 
     if (arch == LLM_ARCH_HRM_TEXT) {
@@ -519,6 +558,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
                 gating_func = 1;
                 break;
             case LLM_ARCH_DEEPSEEK4:
+            case LLM_ARCH_DEEPSEEK41:
                 gating_func = 4;
                 break;
             default:
@@ -780,6 +820,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:

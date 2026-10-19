@@ -5,7 +5,7 @@
 #include "common.cuh"
 #include "sum.cuh"
 
-static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
+static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols, const bool nonneg) {
     const int64_t row = blockIdx.x;
 
     float maxval = -FLT_MAX;
@@ -62,7 +62,8 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     }
 
     if (warp_id == 0 && lane_id == 0) {
-        dst[row] = argmax;
+        // a row of NaN has no maximum: -1, or column 0 for a consumer that indexes with it (ggml_argmax_set_nonneg)
+        dst[row] = nonneg && argmax < 0 ? 0 : argmax;
     }
 }
 
@@ -174,6 +175,6 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaMemsetAsync(dst->data, 0, nrows*sizeof(uint64_t), stream));
         argmax_maxloc_f32<<<dim3(nsplit, nrows, 1), blocks_dim, 0, stream>>>(src0_d, (uint64_t *) dst->data, ne00);
     } else {
-        argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, (int32_t *) dst->data, ne00);
+        argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, (int32_t *) dst->data, ne00, ((const int32_t *) dst->op_params)[0] != 0);
     }
 }

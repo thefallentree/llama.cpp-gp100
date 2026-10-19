@@ -85,6 +85,7 @@ struct mh_slot_desc {
     size_t down_nb1, down_nb2;
     int    n_embd;
     int    n_ff;
+    int    n_cold;     // experts in the cold tensors (a pair's expert index is < n_cold)
     int    wtype;      // gate/up: 0: Q2_0 blocks of 64, 1: Q2_K super-blocks of 256 (glm5-next, deepseek41)
     int    wtype_down; // down: as wtype, or 2: Q3_K super-blocks (deepseek41's Q2_K files keep the down at Q3_K)
     float  clamp;      // > 0: swiglu_clamp(limit) between gate/up and down instead of swiglu

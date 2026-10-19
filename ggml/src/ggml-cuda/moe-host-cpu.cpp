@@ -971,9 +971,27 @@ struct pool {
         const int32_t * pexp = mh_pair_exp(m);
 
         // group the pairs by cold expert (counting sort, stable in pair order)
-        int max_c = 0;
+        int max_c = 0, min_c = 0;
         for (int p = 0; p < n_pairs; ++p) {
             max_c = std::max(max_c, (int) pexp[p]);
+            min_c = std::min(min_c, (int) pexp[p]);
+        }
+        {
+            static std::atomic<int> n_logged{0};
+            const bool bad = min_c < 0 || (js->n_cold > 0 && max_c >= js->n_cold) || m->n_tokens <= 0 || n_used <= 0;
+            if (n_logged.load() < 3 || bad) {
+                n_logged++;
+                char pairs[256]; int o = 0;
+                for (int p = 0; p < std::min(n_pairs, 8) && o < 200; ++p) {
+                    o += snprintf(pairs + o, sizeof(pairs) - o, " (%d,%d)", (int) pidx[p], (int) pexp[p]);
+                }
+                GGML_LOG_WARN("moe-host: job slot %d: n_tokens %d n_used %d n_pairs %d (cap %d) experts %d..%d of %d, n_ff %d n_embd %d wtype %d/%d:%s%s\n",
+                              slot, (int) m->n_tokens, n_used, n_pairs, (int) m->cap_pairs, min_c, max_c, js->n_cold, js->n_ff, js->n_embd,
+                              js->wtype, js->wtype_down, pairs, bad ? "  <- OUT OF RANGE, job dropped" : "");
+            }
+            if (bad) {
+                return;
+            }
         }
         grp_of_exp.assign((size_t) max_c + 1, -1);
         groups.clear();

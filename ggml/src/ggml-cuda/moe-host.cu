@@ -693,6 +693,8 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     d.down_nb2 = down->src[0]->nb[2];
     d.n_embd   = (int) n_embd;
     d.n_ff     = (int) n_ff;
+    d.n_cold   = 0;
+    ggml_cuda_mmid_cold(up, nullptr, &d.n_cold);
     d.wtype    = up->src[0]->type == GGML_TYPE_Q2_K ? 1 : 0;
     d.wtype_down = down->src[0]->type == GGML_TYPE_Q3_K ? 2 : d.wtype;
     GGML_ASSERT((d.wtype == 1 || d.wtype_down != 2) && "a Q3_K down needs Q2_K gate/up (natural-order activations)");

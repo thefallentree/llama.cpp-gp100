@@ -214,20 +214,27 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
 }
 
 // a crash in a worker thread (the host tier's pools run inside this process) leaves no trace otherwise
-static void rpc_crash_handler(int sig) {
+static void rpc_crash_handler(int sig, siginfo_t * info, void *) {
     void * frames[64];
     const int n = backtrace(frames, 64);
-    const char msg[] = "ggml-rpc-server: fatal signal, backtrace:\n";
-    (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    char msg[128];
+    const int len = snprintf(msg, sizeof(msg), "ggml-rpc-server: fatal signal %d at address %p (thread %ld), backtrace:\n",
+                             sig, info ? info->si_addr : nullptr, (long) gettid());
+    (void) !write(STDERR_FILENO, msg, len);
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
 int main(int argc, char * argv[]) {
-    signal(SIGSEGV, rpc_crash_handler);
-    signal(SIGBUS,  rpc_crash_handler);
-    signal(SIGABRT, rpc_crash_handler);
+    {
+        struct sigaction sa = {};
+        sa.sa_sigaction = rpc_crash_handler;
+        sa.sa_flags     = SA_SIGINFO;
+        sigaction(SIGSEGV, &sa, nullptr);
+        sigaction(SIGBUS,  &sa, nullptr);
+        sigaction(SIGABRT, &sa, nullptr);
+    }
     std::setlocale(LC_NUMERIC, "C");
 
     ggml_backend_load_all();

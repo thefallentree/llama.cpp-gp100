@@ -577,6 +577,373 @@ struct case_spec_rounds : ctx_test {
     }
 };
 
+// requests one after the other on the same contexts, the way the server serves a client that repeats a prompt:
+//  - a request makes its own sampler chain (the old one is freed before the context learns of the new one), bare greedy or the pre-selection chain of --ignore-eos
+//  - its memory is emptied (cache_prompt: false) or restored from the checkpoint taken 4 tokens before the end of the prompt (a prompt cache hit)
+//  - then the verification rounds of case_spec_rounds
+// a repeat of a request must give the rows of the first one up to rounding, and every decision of the backend sampler must be a maximum of the plain batch
+struct case_spec_requests : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "specreq"; }
+
+    const char * description() const override {
+        return "a repeated prompt after a speculative request (new sampler chain, emptied or restored memory) reproduces the first request";
+    }
+
+    // --spec-draft-n-max 3 and 5 of the 3-node run: verification batches of 4 and 6 rows, n_rs_seq 3 and 5
+    case_result run(model_run & mr) const override {
+        for (const uint32_t n_draft_max : { 3u, 5u }) {
+            case_result res = run_n_max(mr, n_draft_max);
+            if (res.status != test_status::PASS) {
+                res.reason = "n_draft_max " + std::to_string(n_draft_max) + ": " + res.reason;
+                return res;
+            }
+        }
+
+        return case_result::pass();
+    }
+
+    static case_result run_n_max(model_run & mr, const uint32_t n_draft_max) {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t n_ubatch    = 64;
+        constexpr uint32_t n_total     = 160; // positions of the stream
+        constexpr double   nmse_eps    = 1e-4;
+        constexpr double   nmse_repeat = 1e-6; // a repeat of a request: a restored memory gives the logits of the live one up to rounding, not bit for bit
+
+        // the tokens --ignore-eos biases away: 1 and 2
+        constexpr int32_t n_bias = 2;
+        if (n_vocab < 16) {
+            return case_result::skip("the vocabulary is too small");
+        }
+
+        const auto is_biased = [](llama_token t) {
+            return t == 1 || t == 2;
+        };
+
+        ctx_opts opts_spec;
+        opts_spec.n_ctx         = 256;
+        opts_spec.n_batch       = 256;
+        opts_spec.n_ubatch      = n_ubatch;
+        opts_spec.n_seq_max     = 1;
+        opts_spec.n_rs_seq      = n_draft_max;
+        opts_spec.n_graph_slots = 8;
+        opts_spec.n_outputs_max         = 2*(n_draft_max + 1);
+        opts_spec.n_outputs_max_per_seq = n_draft_max + 1;
+
+        llama_context_ptr ctx_spec = mr.ctx(opts_spec);
+        llama_context_ptr ctx_bs   = mr.ctx(opts_spec);
+        if (!ctx_spec || !ctx_bs) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx_spec.get()) < n_draft_max) {
+            return case_result::skip("n_rs_seq is disabled");
+        }
+
+        enum chain_kind { CHAIN_GREEDY, CHAIN_PRESELECT };
+        enum start_kind { START_FRESH, START_RESTORE };
+
+        // common_sampler_init: bare greedy on the backend, or logit biases then greedy with the backend pre-selecting 1 + n_bias candidates
+        const auto make_chain = [&](chain_kind kind) {
+            llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            if (kind == CHAIN_PRESELECT) {
+                const llama_logit_bias bias[n_bias] = { { 1, -INFINITY }, { 2, -INFINITY } };
+                llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, n_bias, bias));
+            }
+            llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+            if (kind == CHAIN_PRESELECT) {
+                llama_sampler_chain_set_preselect_k(chain, 1 + n_bias);
+            }
+            return chain;
+        };
+
+        ctx_opts opts_ref;
+        opts_ref.n_ctx     = 256;
+        opts_ref.n_batch   = 256;
+        opts_ref.n_ubatch  = 128;
+        opts_ref.n_seq_max = 1;
+
+        llama_context_ptr ctx_ref = mr.ctx(opts_ref);
+        if (!ctx_ref) {
+            return case_result::fail();
+        }
+
+        const auto tok = [&](llama_pos pos) {
+            return gen_token(n_vocab, 0, pos);
+        };
+
+        {
+            common_batch batch(ctx_ref.get());
+            for (uint32_t i = 0; i < n_total; ++i) {
+                batch.add(tok((llama_pos) i), (llama_pos) i, 0, true);
+            }
+            CTX_REQUIRE(llama_process(ctx_ref.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "the reference decode failed");
+        }
+
+        std::vector<float> logits_ref((size_t) n_total*n_vocab);
+        for (uint32_t i = 0; i < n_total; ++i) {
+            const float * l = llama_get_logits_ith(ctx_ref.get(), (int) i);
+            CTX_REQUIRE(l != nullptr, "missing reference logits at position " + std::to_string(i));
+            std::copy(l, l + n_vocab, logits_ref.begin() + (size_t) i*n_vocab);
+        }
+
+        // the row of a position without the biased tokens: what the pre-selection chain picks from
+        const auto best_unbiased = [&](llama_pos pos) {
+            const float * l = logits_ref.data() + (size_t) pos*n_vocab;
+            float best = -INFINITY;
+            for (int t = 0; t < n_vocab; ++t) {
+                if (!is_biased(t)) {
+                    best = std::max(best, l[t]);
+                }
+            }
+            return best;
+        };
+
+        struct row_t {
+            llama_token tok;
+            llama_pos   pos;
+            bool        output;
+        };
+
+        // what a request leaves behind: the plain logits of every verified position and the decision of the backend sampler there
+        struct trace_t {
+            std::vector<llama_pos>          pos;
+            std::vector<std::vector<float>> logits;
+            std::vector<llama_token>        decision;
+            std::vector<std::string>        where; // the round of each verified row
+        };
+
+        std::vector<uint8_t> ckpt_spec;
+        std::vector<uint8_t> ckpt_bs;
+
+        llama_sampler_ptr smpl;
+
+        // one request, the error text when it does not hold
+        const auto request = [&](chain_kind kind, uint32_t n_prompt, start_kind start, trace_t & tr) -> std::string {
+            const auto ctxs = { ctx_spec.get(), ctx_bs.get() };
+
+            // slot.smpl.reset(common_sampler_init(...)): the old chain is gone while the context still has it, then the context is told
+            smpl.reset(make_chain(kind));
+            if (!llama_set_sampler(ctx_bs.get(), 0, smpl.get())) {
+                return "the backend refused the sampler chain";
+            }
+
+            // the server cuts the prompt 4 + n_ubatch and 4 tokens before its end and takes a checkpoint before each part
+            std::vector<uint32_t> bounds = { 0 };
+            if (n_prompt > 4 + n_ubatch) {
+                bounds.push_back(n_prompt - (4 + n_ubatch));
+            }
+            if (n_prompt > 4) {
+                bounds.push_back(n_prompt - 4);
+            }
+            bounds.push_back(n_prompt);
+
+            size_t c0 = 0;
+            if (start == START_RESTORE) {
+                if (ckpt_spec.empty() || bounds.size() < 3) {
+                    return "no checkpoint to restore";
+                }
+                c0 = bounds.size() - 2; // the last part, the 4 new tokens
+                if (!set_seq_state(ctx_spec.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, ckpt_spec) ||
+                    !set_seq_state(ctx_bs.get(),   0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, ckpt_bs)) {
+                    return "the checkpoint did not restore";
+                }
+            }
+
+            // slot.mem.seq_rm(slot.id, p0, -1) with the end of the cached prompt as p0
+            for (llama_context * ctx : ctxs) {
+                if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) bounds[c0], -1)) {
+                    return "the memory was not emptied from position " + std::to_string(bounds[c0]);
+                }
+            }
+
+            const auto decode_rows = [&](const std::vector<row_t> & rows) {
+                for (llama_context * ctx : ctxs) {
+                    common_batch batch(ctx);
+                    for (const auto & r : rows) {
+                        batch.add(r.tok, r.pos, 0, r.output);
+                    }
+                    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            std::string where = "prompt";
+
+            // the verified row i_row of the batch at position pos: the plain logits against the reference, the decision against the plain row
+            const auto verify = [&](int i_row, llama_pos pos) -> std::string {
+                const float * l = llama_get_logits_ith(ctx_spec.get(), i_row);
+                if (l == nullptr) {
+                    return "missing logits at position " + std::to_string(pos);
+                }
+                const double nmse = compare_logits(l, logits_ref.data() + (size_t) pos*n_vocab, n_vocab).nmse();
+                if (!(nmse <= nmse_eps)) {
+                    return "logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(nmse);
+                }
+
+                llama_token decision = LLAMA_TOKEN_NULL;
+                if (kind == CHAIN_GREEDY) {
+                    decision = llama_get_sampled_token_ith(ctx_bs.get(), i_row);
+                    if (decision < 0 || decision >= n_vocab) {
+                        return "no sampled token at position " + std::to_string(pos);
+                    }
+                    const float * r = logits_ref.data() + (size_t) pos*n_vocab;
+                    if (!(r[decision] >= *std::max_element(r, r + n_vocab) - 1e-3f)) {
+                        return "the sampled token at position " + std::to_string(pos) + " is not a maximum";
+                    }
+                } else {
+                    // the chain on the candidates: the best one that no bias lowered
+                    const uint32_t n_cand = llama_get_sampled_candidates_count_ith(ctx_bs.get(), i_row);
+                    const llama_token * cand = llama_get_sampled_candidates_ith(ctx_bs.get(), i_row);
+                    const float * cand_logit = llama_get_sampled_logits_ith(ctx_bs.get(), i_row);
+                    if (cand == nullptr || cand_logit == nullptr || n_cand != 1 + n_bias) {
+                        return "the pre-selection gave " + std::to_string(n_cand) + " candidates at position " + std::to_string(pos);
+                    }
+                    float best = -INFINITY;
+                    for (uint32_t k = 0; k < n_cand; ++k) {
+                        if (cand[k] < 0 || cand[k] >= n_vocab || !(std::fabs(cand_logit[k] - logits_ref[(size_t) pos*n_vocab + cand[k]]) <= 1e-3f)) {
+                            return "candidate " + std::to_string(k) + " is not a token of the row at position " + std::to_string(pos);
+                        }
+                        if (!is_biased(cand[k]) && cand_logit[k] > best) {
+                            best  = cand_logit[k];
+                            decision = cand[k];
+                        }
+                    }
+                    if (!(best >= best_unbiased(pos) - 1e-3f)) {
+                        return "the pre-selected candidates miss the maximum at position " + std::to_string(pos);
+                    }
+                }
+
+                tr.pos.push_back(pos);
+                tr.logits.emplace_back(l, l + n_vocab);
+                tr.decision.push_back(decision);
+                tr.where.push_back(where);
+                return {};
+            };
+
+            for (size_t c = c0; c + 1 < bounds.size(); ++c) {
+                // create_checkpoint: before the part that starts 4 tokens before the end
+                if (start == START_FRESH && n_prompt > 4 + n_ubatch && c + 2 == bounds.size()) {
+                    if (!get_seq_state(ctx_spec.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, ckpt_spec) ||
+                        !get_seq_state(ctx_bs.get(),   0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, ckpt_bs)) {
+                        return "the checkpoint was not taken";
+                    }
+                }
+
+                std::vector<row_t> rows;
+                for (uint32_t i = bounds[c]; i < bounds[c + 1]; ++i) {
+                    rows.push_back({ tok((llama_pos) i), (llama_pos) i, i + 1 == n_prompt });
+                }
+                if (!decode_rows(rows)) {
+                    return "prompt part " + std::to_string(c) + " did not decode";
+                }
+            }
+
+            std::string err = verify(-1, (llama_pos) n_prompt - 1); // the last output row
+            if (!err.empty()) {
+                return "prompt: " + err;
+            }
+
+            llama_pos pos = (llama_pos) n_prompt;
+
+            for (uint32_t r = 0; pos + (llama_pos) n_draft_max < (llama_pos) n_total; ++r) {
+                const uint32_t k = n_draft_max - (r % 4 == 3 ? 3 : 0); // a plain decode now and then
+                const uint32_t a = (r*5 + n_prompt) % (k + 1);         // accepted drafts
+
+                std::vector<row_t> rows = { { tok(pos), pos, true } };
+                for (uint32_t i = 1; i <= k; ++i) {
+                    const llama_token t = i <= a ? tok(pos + (llama_pos) i) : (llama_token) ((tok(pos + (llama_pos) i) + i) % n_vocab);
+                    rows.push_back({ t, pos + (llama_pos) i, true });
+                }
+                if (!decode_rows(rows)) {
+                    return "round " + std::to_string(r) + " did not decode";
+                }
+
+                where = "round " + std::to_string(r) + " (" + std::to_string(a) + "/" + std::to_string(k) + " accepted)";
+                for (uint32_t i = 0; i <= a; ++i) {
+                    err = verify((int) i, pos + (llama_pos) i);
+                    if (!err.empty()) {
+                        return "round " + std::to_string(r) + ": " + err;
+                    }
+                }
+
+                if (a < k) {
+                    for (llama_context * ctx : ctxs) {
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + (llama_pos) a + 1, -1)) {
+                            return "the rollback of " + std::to_string(k - a) + " tokens was refused in round " + std::to_string(r);
+                        }
+                    }
+                }
+
+                pos += (llama_pos) a + 1;
+            }
+
+            return {};
+        };
+
+        // what the bench and the serve check of the 3-node DeepSeek run did, in its order
+        struct req_t {
+            const char * what;
+            chain_kind   chain;
+            uint32_t     n_prompt;
+            start_kind   start;
+            int          same_as; // the request whose rows this one repeats, -1: none
+        };
+
+        const std::vector<req_t> reqs = {
+            { "sanity",                CHAIN_GREEDY,    5,   START_FRESH,   -1 },
+            { "sanity",                CHAIN_GREEDY,    6,   START_FRESH,   -1 },
+            { "warmup",                CHAIN_GREEDY,    20,  START_FRESH,   -1 },
+            { "bench run 1",           CHAIN_PRESELECT, 100, START_FRESH,   -1 },
+            { "bench run 2",           CHAIN_PRESELECT, 100, START_FRESH,    3 }, // cache_prompt: false, the memory emptied
+            { "cache hit",             CHAIN_PRESELECT, 100, START_RESTORE,  3 },
+            { "cache hit, bare",       CHAIN_GREEDY,    100, START_RESTORE,  3 },
+            { "cache hit again",       CHAIN_GREEDY,    100, START_RESTORE,  3 },
+            { "bench run 3",           CHAIN_PRESELECT, 100, START_FRESH,    3 },
+            { "short",                 CHAIN_GREEDY,    33,  START_FRESH,   -1 },
+        };
+
+        std::vector<trace_t> traces(reqs.size());
+
+        const auto sci = [](double v) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.3g", v);
+            return std::string(buf);
+        };
+
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            const auto & rq = reqs[i];
+
+            const std::string err = request(rq.chain, rq.n_prompt, rq.start, traces[i]);
+            CTX_REQUIRE(err.empty(), std::string("request ") + std::to_string(i) + " (" + rq.what + "): " + err);
+
+            if (rq.same_as >= 0) {
+                const trace_t & a = traces[rq.same_as];
+                const trace_t & b = traces[i];
+                CTX_REQUIRE(a.pos == b.pos, std::string("request ") + std::to_string(i) + " (" + rq.what + ") verified other positions than request " + std::to_string(rq.same_as));
+                for (size_t k = 0; k < a.pos.size(); ++k) {
+                    const logits_diff d = compare_logits(b.logits[k].data(), a.logits[k].data(), n_vocab);
+                    CTX_REQUIRE(d.nmse() <= nmse_repeat, std::string("request ") + std::to_string(i) + " (" + rq.what + ") differs from request " + std::to_string(rq.same_as) +
+                            " at position " + std::to_string(a.pos[k]) + " (" + a.where[k] + " against " + b.where[k] + "), max diff " + std::to_string(d.diff_max) + ", nmse " + sci(d.nmse()));
+                    if (reqs[rq.same_as].chain == rq.chain) {
+                        CTX_REQUIRE(a.decision[k] == b.decision[k], std::string("request ") + std::to_string(i) + " (" + rq.what + ") decided another token than request " +
+                                std::to_string(rq.same_as) + " at position " + std::to_string(a.pos[k]));
+                    }
+                }
+            }
+        }
+
+        llama_set_sampler(ctx_bs.get(), 0, nullptr);
+
+        TLOG_INF("%s: n_draft_max %u: %zu requests, the repeats of a prompt gave the rows of the first\n", __func__, n_draft_max, reqs.size());
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -584,6 +951,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
     cases.push_back(std::make_unique<case_spec_rounds>());
+    cases.push_back(std::make_unique<case_spec_requests>());
 
     return cases;
 }

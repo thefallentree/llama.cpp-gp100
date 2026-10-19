@@ -1062,6 +1062,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return on;
     }
 
+    // LLAMA_SPEC_INJECT_ROWS=n: at most n rows in a feature injection call. On sm_60 the matmuls of up to 32 columns run on the mat-vec kernels, wider ones on cuBLAS in F16
+    static int32_t inject_rows_max() {
+        static const int32_t n = getenv("LLAMA_SPEC_INJECT_ROWS") != nullptr ? std::max(1, atoi(getenv("LLAMA_SPEC_INJECT_ROWS"))) : INT32_MAX;
+        return n;
+    }
+
+    // LLAMA_SPEC_TRACE_FEATURES=x: log the injection calls whose largest target feature is above x
+    static float trace_features() {
+        static const float x = getenv("LLAMA_SPEC_TRACE_FEATURES") != nullptr ? (float) atof(getenv("LLAMA_SPEC_TRACE_FEATURES")) : -1.0f;
+        return x;
+    }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1260,7 +1272,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        const int32_t n_ubatch = std::min((int32_t) llama_n_ubatch(ctx_dft), inject_rows_max());
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1294,7 +1306,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
 
                 // a NaN or inf feature poisons the keys the draft keeps for a window of positions: zero it and say so
-                for (float & v : features_buf) {
+                float  max_abs = 0.0f;
+                size_t i_max   = 0;
+                for (size_t k = 0; k < features_buf.size(); ++k) {
+                    float & v = features_buf[k];
                     if (!std::isfinite(v)) {
                         static int n_warned = 0;
                         if (n_warned++ < 8) {
@@ -1303,6 +1318,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         v = 0.0f;
                     }
+                    if (std::fabs(v) > max_abs) {
+                        max_abs = std::fabs(v);
+                        i_max   = k;
+                    }
+                }
+                if (trace_features() >= 0.0f && max_abs > trace_features()) {
+                    const size_t row = i_max / (size_t) n_embd_enc;
+                    const auto & tk  = batch_in.tokens[i_batch_beg[seq_id] + offset + row];
+                    LOG_WRN("%s: seq %d, %d rows from pos %d: largest feature %g at pos %d (token %d), extract layer %d, column %d\n", __func__,
+                            (int) seq_id, (int) n_chunk, (int) batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0], (double) max_abs,
+                            (int) tk.pos[0], (int) tk.id, (int) (i_max % (size_t) n_embd_enc) / n_embd_tgt, (int) (i_max % (size_t) n_embd_tgt));
                 }
 
                 batch_inject.clear();
@@ -1515,11 +1541,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
 
                     if (!spec_row_finite(ctx_dft, idx)) {
-                        // keep the first reports only
+                        // the first reports, then every 64th
                         static int n_warned = 0;
-                        if (n_warned++ < 8) {
-                            LOG_WRN("%s: non-finite draft logits at block row %d (pos %d, anchor %d), no draft\n", __func__, (int) i,
-                                    (int) batch.tokens[beg].pos[0] + (int) i, (int) batch.tokens[beg].id);
+                        if (n_warned++ < 8 || n_warned % 64 == 0) {
+                            LOG_WRN("%s: non-finite draft logits at block row %d (pos %d, anchor %d), no draft (%d so far)\n", __func__, (int) i,
+                                    (int) batch.tokens[beg].pos[0] + (int) i, (int) batch.tokens[beg].id, n_warned);
                         }
                         result.clear();
                         if (dp.result_q) {
@@ -1554,9 +1580,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     if (!spec_row_finite(ctx_dft, beg + i)) {
                         static int n_warned = 0;
-                        if (n_warned++ < 8) {
-                            LOG_WRN("%s: non-finite draft logits at block row %d (pos %d, anchor %d), no draft\n", __func__, (int) i,
-                                    (int) batch.tokens[beg].pos[0] + (int) i, (int) batch.tokens[beg].id);
+                        if (n_warned++ < 8 || n_warned % 64 == 0) {
+                            LOG_WRN("%s: non-finite draft logits at block row %d (pos %d, anchor %d), no draft (%d so far)\n", __func__, (int) i,
+                                    (int) batch.tokens[beg].pos[0] + (int) i, (int) batch.tokens[beg].id, n_warned);
                         }
                         result.clear();
                         if (dp.result_q) {

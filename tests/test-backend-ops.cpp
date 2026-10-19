@@ -12226,6 +12226,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the DeepSeek V4.1 indexer: 32 heads, one stream, a q8_0 or f16 K cache, row counts off the key block of the kernels
+    for (int kv : { 65, 1000 }) {
+        for (int bs : { 1, 3, 512 }) {
+            for (ggml_type type_K : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 32, kv, bs, 1, 1, type_K));
+            }
+        }
+    }
+
     // flash_attn_sel: a decode window, its chunk blocks, a prompt
     for (int64_t nt : { 1, 4, 8, 16, 100, 1024 }) {
         for (int64_t nsel : { 35, 259, 2051 }) {

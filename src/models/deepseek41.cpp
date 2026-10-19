@@ -26,12 +26,19 @@
 //
 // The sparse attention also differs. V4 compresses KV on every layer at one of two fixed ratios;
 // V4.1 compresses on a few source layers and the layers after each source read the same rows, and
-// it derives index keys from that shared latent rather than from a second compressor. See
+// it derives index keys from that shared latent rather than from a second compressor. Only the
+// index sources run an indexer, and the layers after a source attend to the rows it picked. See
 // build_attention_v41().
 //
 // Not implemented: the two level candidate mask. Measured against the reference, it selects every
 // block until the compressed length passes candidate_topk_blocks * candidate_block_size, so it
 // changes nothing below that and the context is capped there instead.
+
+// A/B switches for the indexer, both on by default
+static bool dsv41_env_on(const char * name) {
+    const char * value = getenv(name);
+    return value == nullptr || atoi(value) != 0;
+}
 
 // mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
 static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -326,6 +333,13 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             throw std::runtime_error(format("layer %d compresses at ratio %u but reads layer %d, compressed at %u",
                                             i, hparams.dsv4_compress_ratios[i],
                                             last_kv_source, hparams.dsv4_compress_ratios[last_kv_source]));
+        }
+
+        // the same holds for the picks a reader attends to: they are row numbers of a stream at the source's ratio
+        if (hparams.dsv4_compress_ratios[i] != hparams.dsv4_compress_ratios[last_index_source]) {
+            throw std::runtime_error(format("layer %d compresses at ratio %u but attends to the picks of layer %d, compressed at %u",
+                                            i, hparams.dsv4_compress_ratios[i],
+                                            last_index_source, hparams.dsv4_compress_ratios[last_index_source]));
         }
 
         hparams.dsv41_kv_source[i]        = last_kv_source;
@@ -647,25 +661,36 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
             idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
             idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
 
-    idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
-    idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
+    // The fused op needs an F16 mask, which the attention mask is when flash attention is on. It
+    // spares the two F32 copies of the per-head scores the chain holds, 256 B per (row, token).
+    static const bool allow_fused = dsv41_env_on("LLAMA_DSV41_FUSED_LID");
 
-    ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+    ggml_tensor * score = nullptr;
 
-    score = ggml_relu(ctx0, score);
-    score = ggml_mul(ctx0, score, idx_w);
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+    if (allow_fused && cparams.fused_lid && inp_comp.kq_mask->type == GGML_TYPE_F16) {
+        score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, inp_comp.kq_mask);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
+        idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
 
-    // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
-    // ever holds 0 or -inf, so widening it is exact.
-    ggml_tensor * mask = inp_comp.kq_mask;
-    if (mask->type != score->type) {
-        mask = ggml_cast(ctx0, mask, score->type);
+        score = ggml_mul_mat(ctx0, idx_k, idx_q);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        score = ggml_relu(ctx0, score);
+        score = ggml_mul(ctx0, score, idx_w);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
+        // ever holds 0 or -inf, so widening it is exact.
+        ggml_tensor * mask = inp_comp.kq_mask;
+        if (mask->type != score->type) {
+            mask = ggml_cast(ctx0, mask, score->type);
+        }
+
+        score = ggml_add(ctx0, score, mask);
     }
-
-    score = ggml_add(ctx0, score, mask);
     cb(score, "idx_score", il);
 
     const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
@@ -681,12 +706,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 //
 // Only a source layer compresses. The layers after it read the same rows, which the KV cache
 // hands them through the reuse callback, so a reader builds no compressor at all.
+//
+// Only an index source runs the indexer. The layers after it attend to the rows it picked, as the
+// reference does (it hands the picks down the stack and never rescores), so a reader builds no
+// indexer either and shares the mask its source built.
 ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
+        int il) {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
 
@@ -832,10 +861,18 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                     ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
     }
 
-    // an index source picks the positions; the layers in between reuse what it picked
-    ggml_tensor * top_k = nullptr;
+    // an index source picks the positions; the layers in between attend to the same ones
+    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+
     if (hparams.dsv41_is_index_source(il)) {
-        top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        ggml_tensor * top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+
+        ggml_tensor * comp_mask = build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il);
+
+        ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+        cb(kq_mask, "kq_mask", il);
+
+        comp_picks[il] = { kq_mask, std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0] };
     }
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
@@ -868,17 +905,22 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
     cb(k_all, "k_all", il);
 
-    ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
-    ggml_tensor * comp_mask = top_k
-        ? build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il)
-        : inp_comp.kq_mask;
+    // LLAMA_DSV41_READER_TOPK=0 lets a reader attend to every visible compressed row instead
+    static const bool reader_top_k = dsv41_env_on("LLAMA_DSV41_READER_TOPK");
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
-    cb(kq_mask, "kq_mask", il);
+    ggml_tensor * kq_mask  = nullptr;
+    int64_t       n_kv_max = 0;
 
-    const int64_t n_kv_max = top_k
-        ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0]
-        : 0;
+    if (reader_top_k || hparams.dsv41_is_index_source(il)) {
+        const comp_pick & pick = comp_picks[hparams.dsv41_topk_source[il]];
+        GGML_ASSERT(pick.kq_mask && "a reader needs the picks of the index source before it");
+
+        kq_mask  = pick.kq_mask;
+        n_kv_max = pick.n_kv_max;
+    } else {
+        kq_mask = ggml_concat(ctx0, raw_mask, inp_comp.kq_mask, 0);
+        cb(kq_mask, "kq_mask", il);
+    }
 
     out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
             nullptr, n_kv_max, kq_scale, il);
@@ -906,6 +948,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     }
 
     const auto & pmodel = static_cast<const llama_model_deepseek41 &>(model);
+
+    comp_picks.resize(n_layer);
 
     ggml_tensor * cur;
 

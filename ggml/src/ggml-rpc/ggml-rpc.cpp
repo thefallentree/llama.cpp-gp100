@@ -2978,12 +2978,6 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     return true;
 }
 
-static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
-
-    return ggml_backend_rpc_host_buffer_type(ctx->endpoint.c_str(), ctx->device);
-}
-
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     if (!buft || buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
         return false;
@@ -3023,7 +3017,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_props            = */ ggml_backend_rpc_device_get_props,
     /* .init_backend         = */ ggml_backend_rpc_device_init,
     /* .get_buffer_type      = */ ggml_backend_rpc_device_get_buffer_type,
-    /* .get_host_buffer_type = */ ggml_backend_rpc_device_get_host_buffer_type,
+    /* .get_host_buffer_type = */ NULL,   // the remote pinned type is not host-accessible here: an explicit -ot target only
     /* .buffer_from_host_ptr = */ NULL,
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
@@ -3194,6 +3188,9 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_host_buffer_type") == 0) {
+        return (void *)ggml_backend_rpc_host_buffer_type;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;

@@ -5808,6 +5808,118 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+// MUL_MAT_ID with a src1 that is not zero-mean uniform. The sm_60 K-quant kernels carry the Q2_K mins and the Q3_K offset on sums of
+// the activations and scale every 256 values by their maximum; the CPU reference rounds src1 to 8 bits per 256 values, which is the
+// larger part of the difference, so the bound is loose (a wrong result is off by the signal itself)
+struct test_mul_mat_id_act : public test_mul_mat_id {
+    const int mode; // 0: values in [1, 3], 1: values in [0, 2] with every 100th one six times larger, 2: values in [-1000, 1000]
+
+    using test_mul_mat_id::max_nmse_err;
+
+    test_mul_mat_id_act(int mode, ggml_type type_a, ggml_type type_b, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k), mode(mode) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",act=" + std::to_string(mode);
+    }
+
+    double max_nmse_err() override {
+        return 2e-3;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(std::random_device{}());
+        std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                continue;
+            }
+            if (t->type != GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); i++) {
+                const float u = ud(rng);
+                switch (mode) {
+                    case 0:  data[i] = 1.0f + 2.0f*u; break;
+                    case 1:  data[i] = 2.0f*u*(i % 100 == 7 ? 6.0f : 1.0f); break;
+                    default: data[i] = 1000.0f*(2.0f*u - 1.0f); break;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+        }
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// A MoE FFN as a decode runs it, on K-quant experts, over several layers of one graph: gate and up read the same activations (the sm_60
+// K-quant kernels convert the rows once for both), down reads the swiglu output (one row per used expert), every layer has its own ids
+// (a view with a padded row) and its input comes from the layer before, at whatever address the allocator gives it. A converted-row
+// cache that serves a stale entry (the next layer's gate, a down projection) gives a result that is off by the signal itself.
+struct test_mul_mat_id_chain : public test_case {
+    const ggml_type type_gu;  // gate and up
+    const ggml_type type_dn;  // down
+    const int n_layers;
+    const int n_mats;
+    const int n_used;
+    const int64_t n;          // tokens
+    const int64_t k;          // the model width: k of gate and up, rows of down
+    const int64_t m;          // the expert width: rows of gate and up, k of down
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_gu, type_dn, n_layers, n_mats, n_used, n, k, m);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_CHAIN";
+    }
+
+    // every matmul adds the rounding of the reference's 8-bit activations and the result goes through the next layers
+    double max_nmse_err() override {
+        return 3e-3;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_id_chain(ggml_type type_gu, ggml_type type_dn, int n_layers, int n_mats, int n_used, int64_t n, int64_t k, int64_t m)
+        : type_gu(type_gu), type_dn(type_dn), n_layers(n_layers), n_mats(n_mats), n_used(n_used), n(n), k(k), m(m) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        for (int l = 0; l < n_layers; ++l) {
+            ggml_tensor * gate_exps = ggml_new_tensor_3d(ctx, type_gu, k, m, n_mats);
+            ggml_tensor * up_exps   = ggml_new_tensor_3d(ctx, type_gu, k, m, n_mats);
+            ggml_tensor * down_exps = ggml_new_tensor_3d(ctx, type_dn, m, k, n_mats);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            }
+            ggml_tensor * cur = ggml_reshape_3d(ctx, ggml_rms_norm(ctx, x, 1e-6f), k, 1, n);
+            ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_exps, cur, ids);
+            ggml_tensor * up   = ggml_mul_mat_id(ctx, up_exps,   cur, ids);
+            ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+            ggml_tensor * down = ggml_mul_mat_id(ctx, down_exps, act, ids);
+            ggml_tensor * moe  = nullptr;
+            for (int s = 0; s < n_used; ++s) {
+                ggml_tensor * v = ggml_view_2d(ctx, down, k, n, down->nb[2], (size_t) s*down->nb[1]);
+                moe = moe ? ggml_add(ctx, moe, v) : v;
+            }
+            x = ggml_add(ctx, x, moe);
+        }
+        ggml_set_name(x, "out");
+        return x;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -11237,7 +11349,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
-    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
@@ -11275,6 +11387,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true, 100, 3, 1024));
+    }
+
+    // What a model run has and the single ops above do not (the sm_60 K-quant kernels): an ids view with a padded row and an offset,
+    // experts strided in memory (m_v rows each), activations with an offset / outliers / a large magnitude, the batch widths of short
+    // prompts, and a whole MoE FFN over several layers (gate and up share their converted activations, down does not)
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+        for (int n : {1, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 2304, 1.0f, 0, true));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, false, 512, n, 1024, 1.0f, 544, true));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 5120, 1.0f, 544, false));
+            for (int mode : {0, 1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id_act(mode, type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 5120));
+                test_cases.emplace_back(new test_mul_mat_id_act(mode, type_a, GGML_TYPE_F32, 16, 6, false, 512, n, 2304));
+            }
+        }
+    }
+    for (int n : {1, 3, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id_chain(GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 3, 16, 6, n, 1024, 768));
+        test_cases.emplace_back(new test_mul_mat_id_chain(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 2, 16, 6, n, 768, 1024));
     }
 
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]

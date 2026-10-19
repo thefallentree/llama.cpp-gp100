@@ -9,9 +9,12 @@
 // weight bytes are read once. One blockIdx.y per (token, expert) slot, as in the Q2_0 mat-vec (mmid-f16-sm60.cu).
 
 #include "mmid-kq-sm60.cuh"
+#include "mmid-f16-sm60.cuh"
 #include "mmvq.cuh"
 
 #include "mmid-kq-sm60-math.cuh"
+
+#include <atomic>
 
 // one src1 row (i11, i12) per block, in src1 order; a warp per super-block (up to 32 warps)
 static __global__ void __launch_bounds__(1024) mmid_kq_convert_rows(
@@ -31,7 +34,8 @@ static __global__ void __launch_bounds__(1024) mmid_kq_convert_rows(
         for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
         }
-        const float s   = amax > 0.0f ? amax : 1.0f;
+        // a block of (near) zeros keeps the scale 1: 1/amax would overflow, and what it holds cannot show in the dot product
+        const float s   = amax > 1e-30f ? amax : 1.0f;
         const float inv = 1.0f/s;
         ((uint2 *) rec)[kq_conv_xh_index(sb, 0, lane)] = kq_conv_pairs(v0, inv, lane);
         ((uint2 *) rec)[kq_conv_xh_index(sb, 1, lane)] = kq_conv_pairs(v1, inv, lane);
@@ -118,6 +122,35 @@ bool ggml_cuda_mmid_vec_kq_sm60_supported(
     return true;
 }
 
+// whether the last dispatch of this thread found its converted rows in the cache (for the log of GGML_CUDA_MMID_CHECK)
+static thread_local bool g_last_hit = false;
+
+bool ggml_cuda_mmid_vec_kq_sm60_last_hit() {
+    return g_last_hit;
+}
+
+// GGML_CUDA_MMID_KQ_SM60_STATS=n: log the first n dispatches (the node, its shapes and strides, the cache) and then one line per
+// 1000 dispatches with the totals, in every process
+static void mmid_kq_log(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst,
+        const int nsb, const bool hit) {
+    static const int n_log = getenv("GGML_CUDA_MMID_KQ_SM60_STATS") != nullptr ? atoi(getenv("GGML_CUDA_MMID_KQ_SM60_STATS")) : 0;
+    if (n_log <= 0) {
+        return;
+    }
+    static std::atomic<int64_t> n_calls { 0 }, n_hits { 0 }, n_pairs { 0 };
+    const int64_t i = n_calls.fetch_add(1);
+    n_hits  += hit ? 1 : 0;
+    n_pairs += ids->ne[0]*ids->ne[1];
+    if (i < n_log) {
+        GGML_LOG_WARN("mmid-kq-sm60: %-26s %s %s tokens %d used %d n_hot %d ne01 %d nsb %d ne11 %d ne12 %d | ids nb1 %zu | src1 nb1 %zu nb2 %zu | "
+                      "dst nb1 %zu nb2 %zu | %s\n", dst->name, ggml_type_name(src0->type), ggml_cuda_mmid_cold(dst) ? "cold-tagged" : "plain",
+                      (int) ids->ne[1], (int) ids->ne[0], (int) src0->ne[2], (int) src0->ne[1], nsb, (int) src1->ne[1], (int) src1->ne[2],
+                      ids->nb[1], src1->nb[1], src1->nb[2], dst->nb[1], dst->nb[2], hit ? "cache hit" : "converted");
+    } else if (i % 1000 == 0) {
+        GGML_LOG_WARN("mmid-kq-sm60: %lld dispatches, %lld cache hits, %lld pairs\n", (long long) i, (long long) n_hits.load(), (long long) n_pairs.load());
+    }
+}
+
 void ggml_cuda_mmid_vec_kq_sm60(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
@@ -136,8 +169,12 @@ void ggml_cuda_mmid_vec_kq_sm60(
     const size_t  total   = nrows1*nsb*KQ_REC_BYTES;
     const int64_t key     = ((nrows1 << 20) ^ ((int64_t) nsb << 8) ^ (s11 << 32) ^ s12) ^ (0x4b51LL << 48);
 
-    const bool hit = ctx.mmid16_cache_mem != nullptr && ctx.mmid16_cache_src1 == src1 &&
+    // GGML_CUDA_MMID_KQ_SM60_NOCACHE=1: every op converts its own rows (a bisect against the sharing)
+    static const bool nocache = getenv("GGML_CUDA_MMID_KQ_SM60_NOCACHE") != nullptr && atoi(getenv("GGML_CUDA_MMID_KQ_SM60_NOCACHE")) != 0;
+    const bool hit = !nocache && ctx.mmid16_cache_mem != nullptr && ctx.mmid16_cache_src1 == src1 &&
                      ctx.mmid16_cache_data == src1->data && ctx.mmid16_cache_key == key;
+    g_last_hit = hit;
+    mmid_kq_log(src0, src1, ids, dst, nsb, hit);
     if (!hit) {
         if (total > ctx.mmid16_cache_cap) {
             ctx.retire_mem(ctx.mmid16_cache_mem, ctx.mmid16_cache_cap);

@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/mmid-f16-sm60.cuh"
+#include "ggml-cuda/mmid-kq-sm60.cuh"
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/moe-host-cpu.h"
 #include "ggml-cuda/hc-mix.cuh"
@@ -2698,7 +2699,7 @@ static bool ggml_cuda_mmid_allgpu() {
 // GGML_CUDA_MMID_CHECK=N: for the first N hot/cold MUL_MAT_ID calls, every (token, expert) pair's output row is
 // compared against a double-precision dot product over the expert's rows dequantized on the host by ggml's own
 // to_float (hot slices copied from the device, cold ones read in place) and the token's input row
-static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const char * cold, const int n_cold) {
+static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const char * cold, const int n_cold, const bool hot_only = false) {
     static int left = getenv("GGML_CUDA_MMID_CHECK") != nullptr ? atoi(getenv("GGML_CUDA_MMID_CHECK")) : 0;
     if (left <= 0) {
         return;
@@ -2736,6 +2737,9 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
         for (int s = 0; s < n_used; ++s) {
             const int e = ids_h[(size_t) t*n_used + s];
             const bool hot = e < n_hot;
+            if (!hot && hot_only) {
+                continue;   // a cold pair: the host tier computes it later
+            }
             if (!hot && (cold == nullptr || e - n_hot >= n_cold)) {
                 GGML_LOG_WARN("mmid-check: %s t%d s%d expert %d out of range\n", dst->name, t, s, e);
                 continue;
@@ -2871,6 +2875,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K) {
             GGML_ASSERT((ggml_cuda_moe_host_active(ctx, dst) || ggml_cuda_mmid_allgpu()) &&
                         "Q2_K cold experts need the host tier (GGML_CUDA_MOE_HOST_PROMPT=1 for prompt batches)");
+            // decode batches on sm_60: the mat-vec skips the cold pairs itself (their rows are the host tier's)
+            if (!ggml_cuda_mmid_allgpu() && ggml_cuda_mmid_vec_kq_sm60_supported(src0, src1, ids, dst)) {
+                ggml_cuda_mmid_vec_kq_sm60(ctx, src0, src1, ids, dst);
+                ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ true);
+                return;
+            }
             ggml_cuda_mmid_hot_generic(ctx, dst);
             return;
         }
@@ -2892,6 +2902,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
         ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+        return;
+    }
+
+    if (ggml_cuda_mmid_vec_kq_sm60_supported(src0, src1, ids, dst)) {
+        ggml_cuda_mmid_vec_kq_sm60(ctx, src0, src1, ids, dst);
+        ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0);
         return;
     }
 

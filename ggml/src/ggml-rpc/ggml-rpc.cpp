@@ -1391,6 +1391,18 @@ ggml_backend_buffer_type_t ggml_backend_rpc_host_buffer_type(const char * endpoi
     return buft;
 }
 
+static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev);
+
+// the remote pinned type of an RPC device object: its endpoint and its index on that server (device names are
+// numbered across all servers, so they must not be parsed for the index)
+ggml_backend_buffer_type_t ggml_backend_rpc_device_host_buffer_type(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return nullptr;
+    }
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
+    return ggml_backend_rpc_host_buffer_type(ctx->endpoint.c_str(), ctx->device);
+}
+
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
     auto dispatcher = get_dispatcher(endpoint);
@@ -3191,6 +3203,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_host_buffer_type") == 0) {
         return (void *)ggml_backend_rpc_host_buffer_type;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_device_host_buffer_type") == 0) {
+        return (void *)ggml_backend_rpc_device_host_buffer_type;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;

@@ -11648,6 +11648,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
 
+    // DeepSeek-V4.1-Flash experts, decode batches (the sm_60 K-quant mat-vec): Q2_K gate/up (k = 5120, one activation per token),
+    // Q3_K down (k = 2304, one per expert), 6 of 16 experts; the other k and the unaligned row counts cover the loop and the row guard
+    for (int n : {1, 2, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 16, 6, true,  2304, n, 5120));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 16, 6, false, 5120, n, 2304));
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+        for (int k : {5120, 2304, 256}) {
+            for (bool b : {false, true}) {
+                for (int n : {1, 8}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, b, 512, n, k));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true, 100, 3, 1024));
+    }
+
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0
     // repeated expert ids within a row
@@ -12752,6 +12769,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n : {4, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 124160, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, 124160, n, 5120, {1, 1}, {1, 1}));
+    }
+
+    // DeepSeek-V4.1-Flash routed experts at the decode widths (6 of 16 experts here): Q2_K gate/up (k = 5120, one activation
+    // per token) and Q3_K down (k = 2304), the sm_60 K-quant mat-vec; GGML_CUDA_MMID_KQ_SM60=0 for the generic path
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 16, 6, true,  2304, n, 5120));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 16, 6, false, 5120, n, 2304));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

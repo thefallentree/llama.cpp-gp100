@@ -1725,6 +1725,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
+    {
+        // the layer ranges per device, at a level the server log keeps
+        std::string ranges;
+        ggml_backend_dev_t prev = nullptr; int first = 0;
+        for (int il = 0; il <= n_layer_all; ++il) {
+            ggml_backend_dev_t dev = il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers ? cpu_dev :
+                devices.at(std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin()).dev;
+            if (il > 0 && dev != prev) {
+                ranges += format(" %d-%d:%s", first, il - 1, ggml_backend_dev_name(prev));
+                first = il;
+            }
+            prev = dev;
+        }
+        ranges += format(" %d-%d:%s", first, n_layer_all, prev ? ggml_backend_dev_name(prev) : "?");
+        LLAMA_LOG_WARN("load_tensors: layers per device (the last one is the output):%s\n", ranges.c_str());
+    }
+
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };

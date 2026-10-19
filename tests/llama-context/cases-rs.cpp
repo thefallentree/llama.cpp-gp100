@@ -393,12 +393,197 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// the speculative rounds of the server on a cache with rollback
+// the prompt is cut like the server does (its last n_rs_seq + 1 tokens come last), then each round decodes [last token, draft...] with an output on every row and removes the rejected tail
+// every row with a true history must match a reference context that decodes the stream as one batch
+// the same rounds run on a second context with the greedy sampler of the server on the backend, whose sampled token of a row must be a maximum of the reference logits
+// the prompt lengths and the accepted counts cycle through the alignments of the compressor blocks and of the ubatch splits
+struct case_spec_rounds : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "spec"; }
+
+    const char * description() const override {
+        return "speculative verify rounds with partial rejection match a plain batch of the same tokens";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t n_draft_max = 3;
+        constexpr uint32_t n_total     = 96; // positions of the stream, a few blocks of every compressor ratio of a small model
+        constexpr double   nmse_eps    = 1e-4;
+
+        ctx_opts opts_spec;
+        opts_spec.n_ctx         = 256;
+        opts_spec.n_batch       = 256;
+        opts_spec.n_ubatch      = 64;
+        opts_spec.n_seq_max     = 1;
+        opts_spec.n_rs_seq      = n_draft_max;
+        opts_spec.n_graph_slots = 8;
+        opts_spec.n_outputs_max         = 2*(n_draft_max + 1);
+        opts_spec.n_outputs_max_per_seq = n_draft_max + 1;
+
+        llama_context_ptr ctx_spec = mr.ctx(opts_spec);
+        llama_context_ptr ctx_bs   = mr.ctx(opts_spec);
+        if (!ctx_spec || !ctx_bs) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx_spec.get()) < n_draft_max) {
+            return case_result::skip("n_rs_seq is disabled");
+        }
+
+        // the greedy sampler of the server (-bs) on the backend: one sampled token per output row of the verification batch, no logits
+        llama_sampler_ptr smpl_backend(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(smpl_backend.get(), llama_sampler_init_greedy());
+        const bool on_backend = llama_set_sampler(ctx_bs.get(), 0, smpl_backend.get());
+
+        // the reference: the whole stream in one batch, a logit row per position
+        ctx_opts opts_ref;
+        opts_ref.n_ctx     = 256;
+        opts_ref.n_batch   = 256;
+        opts_ref.n_ubatch  = 128;
+        opts_ref.n_seq_max = 1;
+
+        llama_context_ptr ctx_ref = mr.ctx(opts_ref);
+        if (!ctx_ref) {
+            return case_result::fail();
+        }
+
+        const auto tok = [&](llama_pos pos) {
+            return gen_token(n_vocab, 0, pos);
+        };
+
+        {
+            common_batch batch(ctx_ref.get());
+            for (uint32_t i = 0; i < n_total; ++i) {
+                batch.add(tok((llama_pos) i), (llama_pos) i, 0, true);
+            }
+            CTX_REQUIRE(llama_process(ctx_ref.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "the reference decode failed");
+        }
+
+        std::vector<float> logits_ref((size_t) n_total*n_vocab);
+        for (uint32_t i = 0; i < n_total; ++i) {
+            const float * l = llama_get_logits_ith(ctx_ref.get(), (int) i);
+            CTX_REQUIRE(l != nullptr, "missing reference logits at position " + std::to_string(i));
+            std::copy(l, l + n_vocab, logits_ref.begin() + (size_t) i*n_vocab);
+        }
+
+        struct row_t {
+            llama_token tok;
+            llama_pos   pos;
+            bool        output;
+        };
+
+        // the rows go to both contexts
+        const auto decode_rows = [&](const std::vector<row_t> & rows) {
+            for (llama_context * ctx : { ctx_spec.get(), ctx_bs.get() }) {
+                common_batch batch(ctx);
+                for (const auto & r : rows) {
+                    batch.add(r.tok, r.pos, 0, r.output);
+                }
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const auto check_row = [&](int i_row, llama_pos pos) {
+            const float * l = llama_get_logits_ith(ctx_spec.get(), i_row);
+
+            return l != nullptr ? compare_logits(l, logits_ref.data() + (size_t) pos*n_vocab, n_vocab).nmse() : INFINITY;
+        };
+
+        // the backend sampled token of a row is a maximum of the reference logits of its position (up to the noise of another batch shape)
+        const auto sampled_ok = [&](int i_row, llama_pos pos) {
+            if (!on_backend) {
+                return true;
+            }
+            const llama_token t = llama_get_sampled_token_ith(ctx_bs.get(), i_row);
+            if (t < 0 || t >= n_vocab) {
+                return false;
+            }
+            const float * l = logits_ref.data() + (size_t) pos*n_vocab;
+            return l[t] >= *std::max_element(l, l + n_vocab) - 1e-3f;
+        };
+
+        uint32_t n_rounds = 0;
+        uint32_t n_rolled = 0;
+
+        for (uint32_t n_prompt : { 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 11u, 13u, 16u, 21u, 33u }) {
+            // the rollback state of a previous stream must not leak into the next
+            llama_memory_clear(llama_get_memory(ctx_spec.get()), true);
+            llama_memory_clear(llama_get_memory(ctx_bs.get()), true);
+
+            // the server cuts the last n_rs_seq + 1 prompt tokens off, to checkpoint before them
+            std::vector<uint32_t> bounds = { 0 };
+            if (n_prompt > n_draft_max + 1) {
+                bounds.push_back(n_prompt - (n_draft_max + 1));
+            }
+            bounds.push_back(n_prompt);
+
+            for (size_t c = 0; c + 1 < bounds.size(); ++c) {
+                std::vector<row_t> rows;
+                for (uint32_t i = bounds[c]; i < bounds[c + 1]; ++i) {
+                    rows.push_back({ tok((llama_pos) i), (llama_pos) i, i + 1 == n_prompt });
+                }
+                CTX_REQUIRE(decode_rows(rows), "prompt chunk decode failed, n_prompt " + std::to_string(n_prompt) + ", chunk " + std::to_string(c));
+            }
+
+            const double nmse_p = check_row(-1, (llama_pos) n_prompt - 1); // the last output row
+            CTX_REQUIRE(nmse_p <= nmse_eps, "prompt logits mismatch, n_prompt " + std::to_string(n_prompt) + ", nmse " + std::to_string(nmse_p));
+            CTX_REQUIRE(sampled_ok(-1, (llama_pos) n_prompt - 1), "the sampled token of the prompt is not a maximum, n_prompt " + std::to_string(n_prompt));
+
+            llama_pos pos = (llama_pos) n_prompt; // the true token at pos is the next one to decode, the way the server's sampled token is
+
+            for (uint32_t r = 0; pos + (llama_pos) n_draft_max < (llama_pos) n_total; ++r) {
+                const uint32_t k = n_draft_max - (r % 4 == 3 ? 3 : 0); // a plain decode now and then
+                const uint32_t a = (r*5 + n_prompt) % (k + 1);         // accepted drafts
+
+                std::vector<row_t> rows = { { tok(pos), pos, true } };
+                for (uint32_t i = 1; i <= k; ++i) {
+                    const llama_token t = i <= a ? tok(pos + (llama_pos) i) : (llama_token) ((tok(pos + (llama_pos) i) + i) % n_vocab);
+                    rows.push_back({ t, pos + (llama_pos) i, true });
+                }
+                CTX_REQUIRE(decode_rows(rows), "verify decode failed, n_prompt " + std::to_string(n_prompt) + ", round " + std::to_string(r));
+
+                for (uint32_t i = 0; i <= a; ++i) {
+                    const double nmse = check_row((int) i, pos + (llama_pos) i);
+                    CTX_REQUIRE(nmse <= nmse_eps,
+                            "verify logits mismatch at position " + std::to_string(pos + (llama_pos) i) + " (n_prompt " + std::to_string(n_prompt) +
+                            ", round " + std::to_string(r) + ", " + std::to_string(a) + "/" + std::to_string(k) + " accepted), nmse " + std::to_string(nmse));
+                    CTX_REQUIRE(sampled_ok((int) i, pos + (llama_pos) i),
+                            "the sampled token of row " + std::to_string(i) + " is not a maximum at position " + std::to_string(pos + (llama_pos) i) +
+                            " (n_prompt " + std::to_string(n_prompt) + ", round " + std::to_string(r) + ")");
+                }
+
+                if (a < k) {
+                    for (llama_context * ctx : { ctx_spec.get(), ctx_bs.get() }) {
+                        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + (llama_pos) a + 1, -1),
+                                "the rollback of " + std::to_string(k - a) + " tokens was refused");
+                    }
+                    n_rolled++;
+                }
+
+                pos += (llama_pos) a + 1;
+                n_rounds++;
+            }
+        }
+
+        TLOG_INF("%s: %u speculative rounds (%u rolled back) matched the plain batch, backend sampling %s\n", __func__, n_rounds, n_rolled, on_backend ? "on" : "off");
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_spec_rounds>());
 
     return cases;
 }

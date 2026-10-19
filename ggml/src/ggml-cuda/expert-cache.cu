@@ -100,6 +100,7 @@ struct ec_device {
     uint64_t     n_pairs     = 0;
     uint64_t     n_pairs_cold = 0;
     std::vector<uint64_t> row_pairs, row_cold; // per layer (GGML_CUDA_EXPERT_CACHE_STATS)
+    std::vector<uint32_t> row_bad;             // per layer: the router ids out of range that ec_remap refused, as last reported
 };
 
 static ec_device g_ec[GGML_CUDA_MAX_DEVICES];
@@ -118,14 +119,17 @@ static __global__ void ec_remap(int32_t * ids, const int si1, const int n_used, 
     }
     int32_t * p = ids + (i / n_used)*si1 + i % n_used;
     const int e = *p;
+    if ((unsigned int) e >= EC_MAX_EXPERTS - 1) {
+        // not an expert id (a stale or torn ids tensor): counted in the row's last slot, which no expert uses, and left alone
+        atomicAdd(counts + EC_MAX_EXPERTS - 1, 1u);
+        return;
+    }
     atomicAdd(counts + e, 1u);
     *p = perm[e];
 }
 
-// exchanges the slices of the jobs between VRAM and the host and writes the new positions; block b takes the jobs
-// b, b + grid, ...
-static __global__ void ec_swap(const ec_job * __restrict__ jobs, const int n_jobs, const ec_patch * __restrict__ patches,
-                               const int n_patches, int32_t * __restrict__ perm) {
+// exchanges the slices of the jobs between VRAM and the host; block b takes the jobs b, b + grid, ...
+static __global__ void ec_swap(const ec_job * __restrict__ jobs, const int n_jobs) {
     for (int j = blockIdx.x; j < n_jobs; j += gridDim.x) {
         const ec_job job = jobs[j];
         for (uint32_t i = threadIdx.x; i < job.n16; i += blockDim.x) {
@@ -135,15 +139,22 @@ static __global__ void ec_swap(const ec_job * __restrict__ jobs, const int n_job
             job.host_to[i] = d;
         }
     }
-    if (threadIdx.x == 0) {
-        for (int j = blockIdx.x; j < n_patches; j += gridDim.x) {
-            const ec_patch p = patches[j];
-            perm[p.idx_in]  = p.pos_in;
-            perm[p.idx_out] = p.pos_out;
-        }
-    }
     // the host threads read the slices in the next graph
     __threadfence_system();
+}
+
+// the new positions of the exchanged experts: a kernel of its own after ec_swap on the same stream, so that no graph is
+// routed to a slot before its slice has landed
+static __global__ void ec_patch_perm(const ec_patch * __restrict__ patches, const int n_patches, int32_t * __restrict__ perm) {
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= n_patches) {
+        return;
+    }
+    const ec_patch p = patches[j];
+    if ((unsigned int) p.idx_in < EC_MAX_LAYERS*EC_MAX_EXPERTS && (unsigned int) p.idx_out < EC_MAX_LAYERS*EC_MAX_EXPERTS) {
+        perm[p.idx_in]  = p.pos_in;
+        perm[p.idx_out] = p.pos_out;
+    }
 }
 
 // One block per layer: the use counts of its experts since the last update, and which cold experts that were routed to
@@ -189,6 +200,7 @@ static __global__ void ec_scan(const ec_row * __restrict__ rows, const uint32_t 
             res[row].total  = 0;
             res[row].cold   = 0;
             res[row].n_cand = 0;
+            res[row].pad    = counts[base + EC_MAX_EXPERTS - 1];
         }
         return;
     }
@@ -255,6 +267,7 @@ static __global__ void ec_scan(const ec_row * __restrict__ rows, const uint32_t 
         res[row].total  = total;
         res[row].cold   = s_sum[1];
         res[row].n_cand = s_sum[4];
+        res[row].pad    = counts[base + EC_MAX_EXPERTS - 1];   // the router ids that ec_remap refused so far
     }
 }
 
@@ -384,7 +397,8 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
     // the spare slots at the end of both tensors (llama-model: LLAMA_EXPERT_SPARE pads them past the file's data)
     static const int n_spare_env = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
     const int n_spare = std::min(n_spare_env, std::min(n_hot, n_cold) - 1);
-    bool ok = n_hot + n_cold <= EC_MAX_EXPERTS && n_cold > 0 && d.layers.size() < EC_MAX_LAYERS && n_spare >= 0;
+    // the last slot of a row counts the ids that ec_remap refused: no expert may use it
+    bool ok = n_hot + n_cold < EC_MAX_EXPERTS && n_cold > 0 && d.layers.size() < EC_MAX_LAYERS && n_spare >= 0;
     for (int k = 0; k < 3 && ok; ++k) {
         ok = w[k]->ne[2] == n_hot && w[k]->nb[2] % 16 == 0 && ((uintptr_t) w[k]->data & 0xF) == 0 &&
              ((uintptr_t) cold[k] & 0xF) == 0 && cold[k] != nullptr;
@@ -535,9 +549,14 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     if (d.row_pairs.size() < n_rows) {
         d.row_pairs.resize(n_rows, 0);
         d.row_cold.resize(n_rows, 0);
+        d.row_bad.resize(n_rows, 0);
     }
     for (size_t row = 0; row < n_rows; ++row) {
         const ec_res & r = d.res_host[row];
+        if (r.pad != d.row_bad[row]) {
+            GGML_LOG_ERROR("%s: dev%d layer row %zu: %u router ids out of range so far (ec_remap left them alone)\n", __func__, ctx.device, row, r.pad);
+            d.row_bad[row] = r.pad;
+        }
         d.n_pairs      += r.total;
         d.n_pairs_cold += r.cold;
         if (r.total <= 100) { // decode windows only: a prompt ubatch routes to most experts
@@ -636,8 +655,9 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
         patches = (ec_patch *) (d.jobs_host + n_jobs);
     }
     CUDA_CHECK(cudaMemcpyAsync(d.jobs_dev, d.jobs_host, n_jobs*sizeof(ec_job) + n_taken*sizeof(ec_patch), cudaMemcpyHostToDevice, xs));
-    ec_swap<<<std::min(n_jobs, EC_SWAP_GRID), EC_SWAP_TPB, 0, xs>>>(d.jobs_dev, n_jobs, (const ec_patch *) (d.jobs_dev + n_jobs), n_taken,
-        d.perm_dev);
+    ec_swap<<<std::min(n_jobs, EC_SWAP_GRID), EC_SWAP_TPB, 0, xs>>>(d.jobs_dev, n_jobs);
+    CUDA_CHECK(cudaGetLastError());
+    ec_patch_perm<<<(n_taken + 63)/64, 64, 0, xs>>>((const ec_patch *) (d.jobs_dev + n_jobs), n_taken, d.perm_dev);
     CUDA_CHECK(cudaGetLastError());
     if (ctx.ec_event == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx.ec_event, cudaEventDisableTiming));

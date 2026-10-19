@@ -4480,6 +4480,178 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // The DeepSeek-V4.1-Flash-1017 GGUFs embed the V4 template, but the model writes the V4.1 tag names (leading space)
+    // and a plain <parameter> tag. The parser must accept both spellings, whichever template the file carries.
+    {
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.jinja", detailed_debug);
+
+        // tags as the V4.1 encoder renders them
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls("get_weather", R"({"city": "Paris"})"))
+            .run();
+
+        // behind reasoning
+        tst.test(
+               "I need the weather</think>\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_weather", R"({"city": "Paris"})", "I need the weather"))
+            .run();
+
+        // content before the block stays content
+        tst.test(
+               "Let me check.\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_content_and_tool_call("Let me check.", "get_weather", R"({"city": "Paris"})"))
+            .run();
+
+        // the serve check output, completed: V4.1 block and invoke tags, plain <parameter> tag
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<parameter name=\"city\">Paris</parameter>\n"
+               "</｜DSML｜invoke>\n"
+               "</｜DSML｜calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls("get_weather", R"({"city": "Paris"})"))
+            .run();
+
+        // the serve check output as it was cut
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<parameter name=\"city\">Paris")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .is_partial(true)
+            .expect(simple_assist_msg("", "", "get_weather", "{\"city\":\"Paris"))
+            .run();
+
+        // plain parameter tag with the string attribute and a marked closing tag
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls("get_weather", R"({"city": "Paris"})"))
+            .run();
+
+        // a marked parameter ends at a marked closing tag only
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">a</parameter>b</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls("get_weather", R"({"city": "a</parameter>b"})"))
+            .run();
+
+        // no blank after the marker
+        tst.test(
+               "\n\n<｜DSML｜calls>\n"
+               "<｜DSML｜invoke name=\"get_weather\">\n"
+               "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n"
+               "</｜DSML｜invoke>\n"
+               "</｜DSML｜calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls("get_weather", R"({"city": "Paris"})"))
+            .run();
+
+        // non-string argument
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"special_function\">\n"
+               "<parameter name=\"arg1\">1</parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // parallel calls, both parameter spellings
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<parameter name=\"city\">Paris</parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ get_time_tool, get_weather_tool })
+            .expect(message_with_reasoning_content_and_multiple_tool_calls(
+                "", "",
+                { { "get_time", R"({"city": "Paris"})" }, { "get_weather", R"({"city": "Paris"})" } }))
+            .run();
+    }
+
+    // V4 spelling and the plain parameter tag behind the V4.1 template
+    {
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja", detailed_debug);
+
+        tst.test(
+               "\n\n<｜DSML｜tool_calls>\n"
+               "<｜DSML｜invoke name=\"get_weather\">\n"
+               "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n"
+               "</｜DSML｜invoke>\n"
+               "</｜DSML｜tool_calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls("get_weather", R"({"city": "Paris"})"))
+            .run();
+
+        tst.test(
+               "\n\n<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<parameter name=\"city\">Paris</parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_weather_tool })
+            .expect(message_with_tool_calls("get_weather", R"({"city": "Paris"})"))
+            .run();
+    }
+
     {
         // The DSML separator belongs to the tool call block, not assistant content.
         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja", detailed_debug);

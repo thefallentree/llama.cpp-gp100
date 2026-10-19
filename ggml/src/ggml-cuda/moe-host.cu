@@ -6,6 +6,7 @@
 #include "mmvq.cuh"
 
 #include <atomic>
+#include <climits>
 #include <cstring>
 #include <unordered_set>
 #include <vector>
@@ -548,6 +549,13 @@ bool ggml_cuda_moe_host_takes_prompts() {
     return prompt && ggml_cuda_moe_host_enabled();
 }
 
+// GGML_CUDA_MOE_HOST_PROMPT_MAX_TOK=n: with GGML_CUDA_MOE_HOST_PROMPT=1 the host tier takes prompt batches of up to n tokens only,
+// the larger ones are the GPU's (Q2_K / Q3_K: the cold-expert staging, cold-kq.cuh). Default: no limit.
+static int ggml_cuda_moe_host_prompt_max() {
+    static const int n = getenv("GGML_CUDA_MOE_HOST_PROMPT_MAX_TOK") != nullptr ? atoi(getenv("GGML_CUDA_MOE_HOST_PROMPT_MAX_TOK")) : INT_MAX;
+    return n;
+}
+
 // The gate/up/swiglu/down triple of a hot/cold Q2_0 layer that the MUL_MAT_ID node i opens: the other two
 // MUL_MAT_IDs on the same ids and the swiglu between gate/up and down.
 static bool mh_triple(const ggml_cgraph * cgraph, const int i, const ggml_tensor *& up, const ggml_tensor *& gate,
@@ -645,7 +653,7 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     const ggml_tensor * ids = node->src[2];
     const int n_used   = (int) ids->ne[0];
     const int n_tokens = (int) ids->ne[1];
-    if (n_tokens > MH_SMALL_TOK && !ggml_cuda_moe_host_takes_prompts()) {
+    if (n_tokens > MH_SMALL_TOK && (!ggml_cuda_moe_host_takes_prompts() || n_tokens > ggml_cuda_moe_host_prompt_max())) {
         return false;
     }
     if (ctx.moe_host_mb != nullptr && (n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs)) {

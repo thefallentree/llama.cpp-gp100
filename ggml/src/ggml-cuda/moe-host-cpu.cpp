@@ -601,6 +601,403 @@ static void dot2_q3k_avx512(const uint8_t * w0b, const uint8_t * w1b, const nat_
 }
 #endif // MH_X86
 
+// ---- the "k" kernels of Q2_K / Q3_K cold experts (GGML_CUDA_MOE_HOST_KERNEL, default new). The partial sums of a vector
+// are int32 and are scaled by the sub-block scales with vpmaddwd, so one convert and one fma per 32 weights stay in the
+// float domain (the old kernels converted and scaled twice per 32 and permuted the scales and the activation scales).
+// The activations come in blocks of 256 laid out as the vectors read them:
+//   q:   vector j (j = 0..3) is 64 bytes: the values 32j..32j+31, then 128+32j..128+32j+31 (the two groups of 32 that sit
+//        at 2-bit shift j in the two halves of a super-block)
+//   as:  vector j's float scale for each of its 16 int32 lanes (lanes 0..7 the first group, 8..15 the second)
+//   bs:  the sum of every 16 values (the sub-blocks in element order), asg: the scale of every 32 values (g = 4*half + j)
+struct alignas(64) kact_block {
+    int8_t  q[256];
+    float   as[64];
+    int16_t bs[16];
+    float   asg[8];
+};
+static_assert(sizeof(kact_block) == 576, "unexpected k act block size");
+
+#if MH_X86
+static inline int kact_sum16(const int8_t * q) {
+    // sad works on unsigned bytes: bias by 128 and take it off again
+    const __m128i v = _mm_xor_si128(_mm_loadu_si128((const __m128i *) q), _mm_set1_epi8((char) 0x80));
+    const __m128i s = _mm_sad_epu8(v, _mm_setzero_si128());
+    return _mm_cvtsi128_si32(s) + _mm_cvtsi128_si32(_mm_srli_si128(s, 8)) - 16*128;
+}
+#else
+static inline int kact_sum16(const int8_t * q) {
+    int s = 0;
+    for (int i = 0; i < 16; ++i) {
+        s += q[i];
+    }
+    return s;
+}
+#endif
+
+// fills as and bs from q and asg
+static void kact_finish(kact_block & o) {
+    for (int j = 0; j < 4; ++j) {
+        for (int t = 0; t < 8; ++t) {
+            o.as[16*j + t]     = o.asg[j];
+            o.as[16*j + 8 + t] = o.asg[4 + j];
+        }
+    }
+    for (int g = 0; g < 8; ++g) {
+        const int8_t * q = o.q + 64*(g % 4) + 32*(g/4);
+        o.bs[2*g + 0] = (int16_t) kact_sum16(q);
+        o.bs[2*g + 1] = (int16_t) kact_sum16(q + 16);
+    }
+}
+
+// the GPU's act blocks (64 values, lane order, scales s[0] and s[2]) of nsb super-blocks -> k blocks
+static void kact_from_act_generic(const act_block * a, int nsb, kact_block * o) {
+    for (int k = 0; k < nsb; ++k) {
+        for (int ab = 0; ab < 4; ++ab) {
+            const act_block & x = a[4*k + ab];
+            for (int e = 0; e < 64; ++e) {
+                o[k].q[64*(2*(ab % 2) + e/32) + 32*(ab/2) + e % 32] = x.q[16*(e % 4) + e/4];
+            }
+            o[k].asg[2*ab + 0] = x.s[0];
+            o[k].asg[2*ab + 1] = x.s[2];
+        }
+        kact_finish(o[k]);
+    }
+}
+
+// the same values, rounding like quantize_nat_*: 32 values share a scale
+static void kact_quantize_generic(const float * x, kact_block & o) {
+    for (int g = 0; g < 8; ++g) {
+        const float * xg = x + 32*g;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            amax = std::max(amax, std::fabs(xg[i]));
+        }
+        const float d  = amax/127.0f;
+        const float id = d != 0.0f ? 1.0f/d : 0.0f;
+        o.asg[g] = d;
+        int8_t * q = o.q + 64*(g % 4) + 32*(g/4);
+        for (int i = 0; i < 32; ++i) {
+            q[i] = (int8_t) nearbyintf(xg[i]*id);
+        }
+    }
+    kact_finish(o);
+}
+
+#if MH_X86
+// the 4x16 byte transpose of the lane order is four unpacks per 32 values (SSE2)
+static void kact_from_act_sse(const act_block * a, int nsb, kact_block * o) {
+    for (int k = 0; k < nsb; ++k) {
+        for (int ab = 0; ab < 4; ++ab) {
+            const act_block & x = a[4*k + ab];
+            const __m128i r0 = _mm_loadu_si128((const __m128i *) (x.q +  0));
+            const __m128i r1 = _mm_loadu_si128((const __m128i *) (x.q + 16));
+            const __m128i r2 = _mm_loadu_si128((const __m128i *) (x.q + 32));
+            const __m128i r3 = _mm_loadu_si128((const __m128i *) (x.q + 48));
+            const __m128i t01l = _mm_unpacklo_epi8(r0, r1), t01h = _mm_unpackhi_epi8(r0, r1);
+            const __m128i t23l = _mm_unpacklo_epi8(r2, r3), t23h = _mm_unpackhi_epi8(r2, r3);
+            int8_t * d0 = o[k].q + 64*(2*(ab % 2) + 0) + 32*(ab/2);
+            int8_t * d1 = o[k].q + 64*(2*(ab % 2) + 1) + 32*(ab/2);
+            _mm_store_si128((__m128i *) (d0 +  0), _mm_unpacklo_epi16(t01l, t23l));
+            _mm_store_si128((__m128i *) (d0 + 16), _mm_unpackhi_epi16(t01l, t23l));
+            _mm_store_si128((__m128i *) (d1 +  0), _mm_unpacklo_epi16(t01h, t23h));
+            _mm_store_si128((__m128i *) (d1 + 16), _mm_unpackhi_epi16(t01h, t23h));
+            o[k].asg[2*ab + 0] = x.s[0];
+            o[k].asg[2*ab + 1] = x.s[2];
+        }
+        kact_finish(o[k]);
+    }
+}
+
+__attribute__((target("avx2,fma")))
+static void kact_quantize_avx2(const float * x, kact_block & o) {
+    const __m256  sign = _mm256_set1_ps(-0.0f);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (int g = 0; g < 8; ++g) {
+        const float * xg = x + 32*g;
+        const __m256 x0 = _mm256_loadu_ps(xg +  0);
+        const __m256 x1 = _mm256_loadu_ps(xg +  8);
+        const __m256 x2 = _mm256_loadu_ps(xg + 16);
+        const __m256 x3 = _mm256_loadu_ps(xg + 24);
+        const __m256 m  = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, x0), _mm256_andnot_ps(sign, x1)),
+                                        _mm256_max_ps(_mm256_andnot_ps(sign, x2), _mm256_andnot_ps(sign, x3)));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+        const float d = _mm_cvtss_f32(m4)/127.0f;
+        o.asg[g] = d;
+        const __m256 id = _mm256_set1_ps(d != 0.0f ? 1.0f/d : 0.0f);
+        const __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(x0, id));
+        const __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(x1, id));
+        const __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(x2, id));
+        const __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(x3, id));
+        const __m256i b  = _mm256_packs_epi16(_mm256_packs_epi32(i0, i1), _mm256_packs_epi32(i2, i3));
+        _mm256_store_si256((__m256i *) (o.q + 64*(g % 4) + 32*(g/4)), _mm256_permutevar8x32_epi32(b, perm));
+    }
+    kact_finish(o);
+}
+
+// vpshufb index: 16-bit lane t of 128-bit lane L takes scale byte k_L (the byte lands in the low half of the lane, or in the
+// high half with hi: then the lane is scale*256, which carries the sign of a signed scale)
+static inline uint32_t kshuf_word(int k, bool hi) {
+    return hi ? 0x00800080u + (uint32_t) k*0x01000100u : 0x80008000u + (uint32_t) k*0x00010001u;
+}
+
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,f16c,fma")))
+static inline __m512i kshuf512(int j, bool hi) {
+    // 128-bit lanes: sub-blocks 2j, 2j+1 (first half of the vector) and 8+2j, 9+2j (second half)
+    const int a = (int) kshuf_word(2*j, hi), b = (int) kshuf_word(2*j + 1, hi);
+    const int c = (int) kshuf_word(8 + 2*j, hi), d = (int) kshuf_word(9 + 2*j, hi);
+    return _mm512_set_epi32(d, d, d, d, c, c, c, c, b, b, b, b, a, a, a, a);
+}
+
+__attribute__((target("avx2,f16c,fma")))
+static inline __m256i kshuf256(int g, bool hi) {
+    // group g = 4*half + j: sub-blocks 2g and 2g+1
+    const int a = (int) kshuf_word(2*g, hi), b = (int) kshuf_word(2*g + 1, hi);
+    return _mm256_set_epi32(b, b, b, b, a, a, a, a);
+}
+
+__attribute__((target("avx2,f16c,fma")))
+static inline float kh256(__m256 v) {
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+    return _mm_cvtss_f32(lo);
+}
+
+// ---- Q2_K, NR rows against one activation (nsb super-blocks): out[r] = sum of the dequantized row r times the activation
+template <int NR>
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,f16c,fma")))
+static void kdot_q2k_avx512(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m512i m3  = _mm512_set1_epi8(3);
+    const __m512i m0f = _mm512_set1_epi8(0x0f);
+    const __m128i n0f = _mm_set1_epi8(0x0f);
+    const __m512i ix0 = kshuf512(0, false), ix1 = kshuf512(1, false), ix2 = kshuf512(2, false), ix3 = kshuf512(3, false);
+    __m512 acc[NR];
+    __m256 am[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm512_setzero_ps();
+        am[r]  = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        const __m256  asg = _mm256_load_ps(ab.asg);
+        const __m256i bs  = _mm256_load_si256((const __m256i *) ab.bs);
+        const __m512i y0 = _mm512_load_si512((const void *) (ab.q +   0)), y1 = _mm512_load_si512((const void *) (ab.q +  64));
+        const __m512i y2 = _mm512_load_si512((const void *) (ab.q + 128)), y3 = _mm512_load_si512((const void *) (ab.q + 192));
+        const __m512 as0 = _mm512_load_ps(ab.as +  0), as1 = _mm512_load_ps(ab.as + 16);
+        const __m512 as2 = _mm512_load_ps(ab.as + 32), as3 = _mm512_load_ps(ab.as + 48);
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p  = w[r] + (size_t) k*84;
+            const __m128i  sc  = _mm_loadu_si128((const __m128i *) p);
+            const __m512i  qv  = _mm512_loadu_si512((const void *) (p + 16));
+            int32_t dd;
+            memcpy(&dd, p + 80, 4);
+            const __m128 df = _mm_cvtph_ps(_mm_cvtsi32_si128(dd));      // d, dmin
+            const __m512i scl = _mm512_and_si512(_mm512_broadcast_i32x4(sc), m0f);
+            const __m512i c0 = _mm512_and_si512(qv, m3);
+            const __m512i c1 = _mm512_and_si512(_mm512_srli_epi16(qv, 2), m3);
+            const __m512i c2 = _mm512_and_si512(_mm512_srli_epi16(qv, 4), m3);
+            const __m512i c3 = _mm512_and_si512(_mm512_srli_epi16(qv, 6), m3);
+            const __m512i s0 = _mm512_madd_epi16(_mm512_maddubs_epi16(c0, y0), _mm512_shuffle_epi8(scl, ix0));
+            const __m512i s1 = _mm512_madd_epi16(_mm512_maddubs_epi16(c1, y1), _mm512_shuffle_epi8(scl, ix1));
+            const __m512i s2 = _mm512_madd_epi16(_mm512_maddubs_epi16(c2, y2), _mm512_shuffle_epi8(scl, ix2));
+            const __m512i s3 = _mm512_madd_epi16(_mm512_maddubs_epi16(c3, y3), _mm512_shuffle_epi8(scl, ix3));
+            __m512 sb = _mm512_mul_ps(_mm512_cvtepi32_ps(s0), as0);
+            sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s1), as1, sb);
+            sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s2), as2, sb);
+            sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s3), as3, sb);
+            acc[r] = _mm512_fmadd_ps(sb, _mm512_broadcastss_ps(df), acc[r]);
+            // the mins: dmin * sum over groups of scale * (min_a * sum_a + min_b * sum_b)
+            const __m256i mn = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(sc, 4), n0f));
+            const __m256  mf = _mm256_cvtepi32_ps(_mm256_madd_epi16(mn, bs));
+            const __m256  dm = _mm256_broadcastss_ps(_mm_shuffle_ps(df, df, 0x55));
+            am[r] = _mm256_fmadd_ps(_mm256_mul_ps(mf, dm), asg, am[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = _mm512_reduce_add_ps(acc[r]) - kh256(am[r]);
+    }
+}
+
+template <int NR>
+__attribute__((target("avx2,f16c,fma")))
+static void kdot_q2k_avx2(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m256i m3  = _mm256_set1_epi8(3);
+    const __m128i n0f = _mm_set1_epi8(0x0f);
+    __m256i ix[8];
+    for (int g = 0; g < 8; ++g) {
+        ix[g] = kshuf256(g, false);
+    }
+    __m256 acc[NR];
+    __m256 am[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm256_setzero_ps();
+        am[r]  = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        const __m256  asg = _mm256_load_ps(ab.asg);
+        const __m256i bs  = _mm256_load_si256((const __m256i *) ab.bs);
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p  = w[r] + (size_t) k*84;
+            const __m128i  sc  = _mm_loadu_si128((const __m128i *) p);
+            const __m256i  scl = _mm256_broadcastsi128_si256(_mm_and_si128(sc, n0f));
+            int32_t dd;
+            memcpy(&dd, p + 80, 4);
+            const __m128 df = _mm_cvtph_ps(_mm_cvtsi32_si128(dd));
+            __m256 sb = _mm256_setzero_ps();
+#pragma GCC unroll 2
+            for (int h = 0; h < 2; ++h) {
+                const __m256i qh = _mm256_loadu_si256((const __m256i *) (p + 16 + 32*h));
+#pragma GCC unroll 4
+                for (int j = 0; j < 4; ++j) {
+                    const int g = 4*h + j;
+                    const __m256i c  = _mm256_and_si256(j == 0 ? qh : _mm256_srli_epi16(qh, 2*j), m3);
+                    const __m256i y  = _mm256_load_si256((const __m256i *) (ab.q + 64*j + 32*h));
+                    const __m256i pr = _mm256_madd_epi16(_mm256_maddubs_epi16(c, y), _mm256_shuffle_epi8(scl, ix[g]));
+                    sb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pr), _mm256_broadcast_ss(ab.asg + g), sb);
+                }
+            }
+            acc[r] = _mm256_fmadd_ps(sb, _mm256_broadcastss_ps(df), acc[r]);
+            const __m256i mn = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(sc, 4), n0f));
+            const __m256  mf = _mm256_cvtepi32_ps(_mm256_madd_epi16(mn, bs));
+            const __m256  dm = _mm256_broadcastss_ps(_mm_shuffle_ps(df, df, 0x55));
+            am[r] = _mm256_fmadd_ps(_mm256_mul_ps(mf, dm), asg, am[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = kh256(acc[r]) - kh256(am[r]);
+    }
+}
+
+// the 16 signed sub-block scales of a Q3_K block (12 bytes of 6-bit scales as ggml packs them, minus 32), as bytes
+__attribute__((target("avx2,f16c,fma")))
+static inline __m128i kq3_scales(const uint8_t * sc12) {
+    int64_t lo;
+    int32_t hi;
+    memcpy(&lo, sc12, 8);
+    memcpy(&hi, sc12 + 8, 4);
+    // dwords 0,1 take the low nibbles of scales 0..3 and 4..7, dwords 2,3 the high nibbles; the top two bits of every
+    // scale come from the 4 bytes at 8..11: dword n takes bits 2n, 2n+1 of each byte, shifted to bits 4,5
+    const __m128i a = _mm_shuffle_epi32(_mm_cvtsi64_si128(lo), 0x44);
+    const __m128i x = _mm_and_si128(_mm_srlv_epi32(a, _mm_set_epi32(4, 4, 0, 0)), _mm_set1_epi8(0x0f));
+    const __m128i t = _mm_slli_epi32(_mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(hi), _mm_set_epi32(6, 4, 2, 0)), _mm_set1_epi8(3)), 4);
+    return _mm_sub_epi8(_mm_or_si128(x, t), _mm_set1_epi8(32));
+}
+
+// ---- Q3_K: code = low 2 bits | (high bit << 2), value = d * scale * (code - 4); the - 4 rides on the activation sums
+template <int NR>
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,f16c,fma")))
+static void kdot_q3k_avx512(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m512i m3 = _mm512_set1_epi8(3);
+    const __m512i m4 = _mm512_set1_epi8(4);
+    // the high bits of the second half of a super-block sit 4 bits higher: shift that half down once per block
+    const __m512i hsh = _mm512_set_epi32(0x00040004, 0x00040004, 0x00040004, 0x00040004, 0x00040004, 0x00040004, 0x00040004, 0x00040004, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i ix0 = kshuf512(0, true), ix1 = kshuf512(1, true), ix2 = kshuf512(2, true), ix3 = kshuf512(3, true);
+    __m512 acc[NR];
+    __m256 am[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm512_setzero_ps();
+        am[r]  = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        const __m256  asg = _mm256_load_ps(ab.asg);
+        const __m256i bs  = _mm256_load_si256((const __m256i *) ab.bs);
+        const __m512i y0 = _mm512_load_si512((const void *) (ab.q +   0)), y1 = _mm512_load_si512((const void *) (ab.q +  64));
+        const __m512i y2 = _mm512_load_si512((const void *) (ab.q + 128)), y3 = _mm512_load_si512((const void *) (ab.q + 192));
+        const __m512 as0 = _mm512_load_ps(ab.as +  0), as1 = _mm512_load_ps(ab.as + 16);
+        const __m512 as2 = _mm512_load_ps(ab.as + 32), as3 = _mm512_load_ps(ab.as + 48);
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p  = w[r] + (size_t) k*110;
+            const __m512i  hm  = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) p));
+            const __m512i  hv  = _mm512_srlv_epi16(hm, hsh);
+            const __m512i  qv  = _mm512_loadu_si512((const void *) (p + 32));
+            const __m128i  sc  = kq3_scales(p + 96);
+            uint16_t dh;
+            memcpy(&dh, p + 108, 2);
+            const float d = _cvtsh_ss(dh);
+            const __m512i scl = _mm512_broadcast_i32x4(sc);
+            // code j: low bits of qv >> 2j, bit j of the high byte moved to bit 2
+            const __m512i k0 = _mm512_ternarylogic_epi32(_mm512_and_si512(qv, m3), _mm512_slli_epi16(hv, 2), m4, 0xF8);
+            const __m512i k1 = _mm512_ternarylogic_epi32(_mm512_and_si512(_mm512_srli_epi16(qv, 2), m3), _mm512_slli_epi16(hv, 1), m4, 0xF8);
+            const __m512i k2 = _mm512_ternarylogic_epi32(_mm512_and_si512(_mm512_srli_epi16(qv, 4), m3), hv, m4, 0xF8);
+            const __m512i k3 = _mm512_ternarylogic_epi32(_mm512_and_si512(_mm512_srli_epi16(qv, 6), m3), _mm512_srli_epi16(hv, 1), m4, 0xF8);
+            const __m512i s0 = _mm512_madd_epi16(_mm512_maddubs_epi16(k0, y0), _mm512_shuffle_epi8(scl, ix0));
+            const __m512i s1 = _mm512_madd_epi16(_mm512_maddubs_epi16(k1, y1), _mm512_shuffle_epi8(scl, ix1));
+            const __m512i s2 = _mm512_madd_epi16(_mm512_maddubs_epi16(k2, y2), _mm512_shuffle_epi8(scl, ix2));
+            const __m512i s3 = _mm512_madd_epi16(_mm512_maddubs_epi16(k3, y3), _mm512_shuffle_epi8(scl, ix3));
+            __m512 sb = _mm512_mul_ps(_mm512_cvtepi32_ps(s0), as0);
+            sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s1), as1, sb);
+            sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s2), as2, sb);
+            sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s3), as3, sb);
+            // the scales sat in the high byte of the lanes: the sums are 256 times too big
+            acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(d*(1.0f/256.0f)), acc[r]);
+            const __m256 mf = _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_cvtepi8_epi16(sc), bs));
+            am[r] = _mm256_fmadd_ps(_mm256_mul_ps(mf, _mm256_set1_ps(-4.0f*d)), asg, am[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = _mm512_reduce_add_ps(acc[r]) + kh256(am[r]);
+    }
+}
+
+template <int NR>
+__attribute__((target("avx2,f16c,fma")))
+static void kdot_q3k_avx2(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i m4 = _mm256_set1_epi8(4);
+    __m256i ix[8];
+    for (int g = 0; g < 8; ++g) {
+        ix[g] = kshuf256(g, true);
+    }
+    __m256 acc[NR];
+    __m256 am[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm256_setzero_ps();
+        am[r]  = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        const __m256  asg = _mm256_load_ps(ab.asg);
+        const __m256i bs  = _mm256_load_si256((const __m256i *) ab.bs);
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p  = w[r] + (size_t) k*110;
+            const __m256i  hm  = _mm256_loadu_si256((const __m256i *) p);
+            const __m128i  sc  = kq3_scales(p + 96);
+            const __m256i  scl = _mm256_broadcastsi128_si256(sc);
+            uint16_t dh;
+            memcpy(&dh, p + 108, 2);
+            const float d = _cvtsh_ss(dh);
+            __m256 sb = _mm256_setzero_ps();
+#pragma GCC unroll 2
+            for (int h = 0; h < 2; ++h) {
+                const __m256i qh = _mm256_loadu_si256((const __m256i *) (p + 32 + 32*h));
+#pragma GCC unroll 4
+                for (int j = 0; j < 4; ++j) {
+                    const int g = 4*h + j;
+                    // bit g of the high mask to bit 2
+                    const __m256i hb = g < 2 ? _mm256_slli_epi16(hm, 2 - g) : g == 2 ? hm : _mm256_srli_epi16(hm, g - 2);
+                    const __m256i c  = _mm256_or_si256(_mm256_and_si256(j == 0 ? qh : _mm256_srli_epi16(qh, 2*j), m3), _mm256_and_si256(hb, m4));
+                    const __m256i y  = _mm256_load_si256((const __m256i *) (ab.q + 64*j + 32*h));
+                    const __m256i pr = _mm256_madd_epi16(_mm256_maddubs_epi16(c, y), _mm256_shuffle_epi8(scl, ix[g]));
+                    sb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pr), _mm256_broadcast_ss(ab.asg + g), sb);
+                }
+            }
+            acc[r] = _mm256_fmadd_ps(sb, _mm256_set1_ps(d*(1.0f/256.0f)), acc[r]);
+            const __m256 mf = _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_cvtepi8_epi16(sc), bs));
+            am[r] = _mm256_fmadd_ps(_mm256_mul_ps(mf, _mm256_set1_ps(-4.0f*d)), asg, am[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = kh256(acc[r]) + kh256(am[r]);
+    }
+}
+#endif // MH_X86
+
+typedef void (*kdot_fn)(const uint8_t * const *, const kact_block *, int, float *);
+
 static inline void mh_prefetch(const void * p) {
 #if MH_X86
     _mm_prefetch((const char *) p, _MM_HINT_T0);
@@ -629,6 +1026,8 @@ static void keep_warm_avx2() {
 
 typedef void (*dot2_fn)(const q2_block *, const q2_block *, const act_block *, int, float *, float *);
 typedef void (*quant_fn)(const float *, int, act_block *);
+typedef void (*kfrom_fn)(const act_block *, int, kact_block *);
+typedef void (*kquant_fn)(const float *, kact_block &);
 
 // GGML_CUDA_MOE_HOST_ISA=generic|avx2 forces a narrower kernel
 static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, dot2k_fn & dot2k3, quantn_fn & quantn, const char *& name) {
@@ -659,6 +1058,33 @@ static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, dot
         dot2k3 = dot2_q3k_avx512;
         name   = "AVX-512";
     }
+#endif
+}
+
+// the k kernels (2 rows) and activation converters: AVX-512 where the old kernels are, AVX2 below; false: the old path only
+static bool pick_kkernels(kdot_fn & q2, kdot_fn & q3, kfrom_fn & from, kquant_fn & quant, const char *& name) {
+#if MH_X86
+    const char * force = getenv("GGML_CUDA_MOE_HOST_ISA");
+    __builtin_cpu_init();
+    const bool has512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl");
+    const bool has2   = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+    if (!has2 || (force != nullptr && strcmp(force, "generic") == 0)) {
+        return false;
+    }
+    from  = kact_from_act_sse;
+    quant = kact_quantize_avx2;
+    q2    = kdot_q2k_avx2<2>;
+    q3    = kdot_q3k_avx2<2>;
+    name  = "AVX2";
+    if (has512 && !(force != nullptr && strcmp(force, "avx2") == 0)) {
+        q2   = kdot_q2k_avx512<2>;
+        q3   = kdot_q3k_avx512<2>;
+        name = "AVX-512";
+    }
+    return true;
+#else
+    (void) q2; (void) q3; (void) from; (void) quant; (void) name;
+    return false;
 #endif
 }
 
@@ -753,6 +1179,17 @@ struct pool {
     std::vector<act_block> hq;   // [n_pairs][n_ff/64]: ... quantized
     std::vector<nat_block> xqn;  // Q2_K layers: the input rows in natural order, [n_tokens][n_embd/64]
     std::vector<nat_block> hqn;  // ... and the swiglu outputs, [n_pairs][n_ff/64]
+    // the k kernels (GGML_CUDA_MOE_HOST_KERNEL=old turns them off): Q2_K gate/up with a Q2_K or Q3_K down, blocks of 256
+    bool         knew     = false;
+    int          jmode    = 0;           // this job: 0 old kernels, 2 k kernels
+    kdot_fn      kd_q2k   = nullptr;     // 2 rows
+    kdot_fn      kd_q3k   = nullptr;
+    kfrom_fn     kfrom    = nullptr;
+    kquant_fn    kquant   = nullptr;
+    const char * kisa     = nullptr;
+    int          CH3k     = 64;          // down rows per chunk of the k path
+    std::vector<kact_block> xk;          // the input rows in k format, [n_tokens][n_embd/256]
+    std::vector<kact_block> hk;          // the swiglu outputs, [n_pairs][n_ff/256]
     size_t                 cap_blk = 0;
     std::unique_ptr<std::atomic<int>[]> blk_cnt;   // [n_groups][n_ff/64]: finished CH1-row chunks per expert block
     std::unique_ptr<std::atomic<int>[]> grp_ready; // [n_groups]: quantized activation blocks per expert
@@ -923,8 +1360,128 @@ struct pool {
         MH_TR(T.end += tns() - t_job;)
     }
 
+    // Every thread of the k path works on private copies of the activation rows. Read from the shared buffers (the input rows
+    // that the leader wrote, the swiglu rows that whichever thread completed a block quantized) every kernel call took 3x
+    // longer on the 2-socket Xeon; with a copy per thread and job the same kernel runs at the memory limit.
+    struct kscratch {
+        std::vector<kact_block> x;         // the input row of token x_tok
+        std::vector<kact_block> h;         // the quantized swiglu row of pair h_pair
+        uint32_t x_job = 0, h_job = 0;
+        int      x_tok = -1, h_pair = -1;
+    };
+    uint32_t job_id = 0;                   // counts the jobs of this pool: the scratch of a thread is valid for one job
+
+    // The job of the k path, same queue as work(): the gate/up chunks of every expert, then their down chunks. The thread that
+    // completes the chunks of a block of 256 rows of h quantizes it for all the pairs of the expert.
+    void work2() {
+        static thread_local kscratch ks;
+        const uint32_t job = job_id;
+        const mh_slot_desc & s = *js;
+        MH_TR(trace & T = tr[tr_id()]; const int64_t t_job = t_job_ns.load(); int64_t t_prev = tns(); T.seen += t_prev - t_job; T.n++;)
+        const int nsb_e = s.n_embd/256;
+        const int nsb_f = s.n_ff/256;
+        const int ch1 = CH1;
+        const int rb1 = s.n_ff/ch1;
+        const int n1  = n_groups*rb1;
+        const int ch3 = s.n_embd % CH3k == 0 ? CH3k : 32;
+        const int rb3 = s.n_embd/ch3;
+        const int n3  = n_groups*rb3;
+        const kdot_fn kdn = s.wtype_down == 2 ? kd_q3k : kd_q2k;
+        float * hbase = (float *) (((uintptr_t) h.data() + 63) & ~(uintptr_t) 63);   // 64-byte lines: chunks of 16 rows own whole lines
+        for (int c; (c = chunk1.fetch_add(1, std::memory_order_relaxed)) < n1 + n3; ) {
+            if (c < n1) {
+                const int       gi = c/rb1;
+                const group &   g  = groups[gi];
+                const int       r0 = (c % rb1)*ch1;
+                const uint8_t * gate = s.gate + (size_t) g.c*s.gate_nb2;
+                const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
+                const int * gp = pair_of.data() + g.first;
+                const int * gt = tok_of.data()  + g.first;
+                float hl[64];
+                for (int i = 0; i < g.n; ++i) {
+                    if (ks.x_job != job || ks.x_tok != gt[i]) {
+                        if (ks.x.size() < (size_t) nsb_e) {
+                            ks.x.resize(nsb_e);
+                        }
+                        memcpy(ks.x.data(), xk.data() + (size_t) gt[i]*nsb_e, (size_t) nsb_e*sizeof(kact_block));
+                        ks.x_job = job;
+                        ks.x_tok = gt[i];
+                    }
+                    for (int r = r0; r < r0 + ch1; ++r) {
+                        const uint8_t * pw[2] = { gate + (size_t) r*s.gate_nb1, up + (size_t) r*s.up_nb1 };
+                        float v[2];
+                        kd_q2k(pw, ks.x.data(), nsb_e, v);
+                        float vg = v[0], vu = v[1];
+                        if (s.clamp > 0.0f) {   // swiglu_clamp(limit): silu(min(g, limit)) * clamp(u, -limit, limit)
+                            vg = std::min(vg, s.clamp);
+                            vu = std::max(std::min(vu, s.clamp), -s.clamp);
+                        }
+                        hl[r - r0] = vg/(1.0f + expf(-vg))*vu;
+                    }
+                    memcpy(hbase + (size_t) gp[i]*s.n_ff + r0, hl, ch1*sizeof(float));
+                }
+                MH_TR({ const int64_t t = tns(); T.p1 += t - t_prev; t_prev = t; })
+                const int kb = r0/256;
+                if (blk_cnt[(size_t) gi*nsb_f + kb].fetch_add(1, std::memory_order_acq_rel) == 256/ch1 - 1) {
+                    for (int i = 0; i < g.n; ++i) {
+                        const int p = gp[i];
+                        kquant(hbase + (size_t) p*s.n_ff + (size_t) kb*256, hk[(size_t) p*nsb_f + kb]);
+                    }
+                    grp_ready[gi].fetch_add(1, std::memory_order_release);
+                    if (stat_every > 0 && p1_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        t_p1_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                    }
+                }
+                continue;
+            }
+            const int       c3 = c - n1;
+            const int       gi = c3/rb3;
+            const group &   g  = groups[gi];
+            const int       r0 = (c3 % rb3)*ch3;
+            const uint8_t * down = s.down + (size_t) g.c*s.down_nb2;
+            MH_TR({ const int64_t t = tns(); T.p1 += t - t_prev; t_prev = t; })
+            while (grp_ready[gi].load(std::memory_order_acquire) < nsb_f) {
+#if MH_X86
+                _mm_pause();
+#endif
+            }
+            MH_TR({ const int64_t t = tns(); T.wait += t - t_prev; t_prev = t; })
+            const int * gp = pair_of.data() + g.first;
+            for (int i = 0; i < g.n; ++i) {
+                const int p = gp[i];
+                if (ks.h_job != job || ks.h_pair != p) {
+                    if (ks.h.size() < (size_t) nsb_f) {
+                        ks.h.resize(nsb_f);
+                    }
+                    memcpy(ks.h.data(), hk.data() + (size_t) p*nsb_f, (size_t) nsb_f*sizeof(kact_block));
+                    ks.h_job  = job;
+                    ks.h_pair = p;
+                }
+                float * y = jy + (size_t) p*s.n_embd;
+                for (int r = r0; r < r0 + ch3; r += 2) {
+                    const uint8_t * pw[2] = { down + (size_t) (r + 0)*s.down_nb1, down + (size_t) (r + 1)*s.down_nb1 };
+                    float v[2];
+                    kdn(pw, ks.h.data(), nsb_f, v);
+                    y[r + 0] = v[0];
+                    y[r + 1] = v[1];
+                }
+            }
+            MH_TR({ const int64_t t = tns(); T.p3 += t - t_prev; t_prev = t; })
+        }
+        MH_TR(T.end += tns() - t_job;)
+    }
+
+    void run_work() {
+        if (jmode == 2) {
+            work2();
+        } else {
+            work();
+        }
+    }
+
     void helper() {
-        uint32_t last = job_gen.load(std::memory_order_acquire);
+        // job_gen starts at 0: a helper that the scheduler starts late must still join a job that is already published
+        uint32_t last = 0;
         while (!quit.load(std::memory_order_relaxed)) {
             const uint32_t j = job_gen.load(std::memory_order_acquire);
             if (j == last) {
@@ -946,7 +1503,7 @@ struct pool {
                 continue;
             }
             last = j;
-            work();
+            run_work();
             barrier();
         }
     }
@@ -968,6 +1525,7 @@ struct pool {
         }
         js = &g_slots.tab[slot];
         jm = m;
+        jmode = knew && js->wtype == 1 && (js->wtype_down == 1 || js->wtype_down == 2) && js->n_embd % 256 == 0 && js->n_ff % 256 == 0 ? 2 : 0;
         const int n_used  = m->n_used;
         const int n_pairs = std::min<int>(m->n_pairs, m->cap_pairs);
         const int nb_f    = js->n_ff/QK;
@@ -1028,19 +1586,28 @@ struct pool {
             tok_of [g.first + g.n] = pidx[p]/n_used;
             g.n++;
         }
-        if (h.size() < (size_t) n_pairs*js->n_ff) {
-            h.resize((size_t) n_pairs*js->n_ff);
-            hq.resize((size_t) n_pairs*nb_f);
+        const int n_blk = jmode == 2 ? js->n_ff/256 : nb_f;   // blocks of h per expert: 256 rows (k path) or 64
+        if (h.size() < (size_t) n_pairs*js->n_ff + 16) {
+            h.resize((size_t) n_pairs*js->n_ff + 16);
         }
-        if (js->wtype == 1 && hqn.size() < (size_t) n_pairs*nb_f) {
-            hqn.resize((size_t) n_pairs*nb_f);
+        if (jmode == 2) {
+            if (hk.size() < (size_t) n_pairs*n_blk) {
+                hk.resize((size_t) n_pairs*n_blk);
+            }
+        } else {
+            if (hq.size() < (size_t) n_pairs*nb_f) {
+                hq.resize((size_t) n_pairs*nb_f);
+            }
+            if (js->wtype == 1 && hqn.size() < (size_t) n_pairs*nb_f) {
+                hqn.resize((size_t) n_pairs*nb_f);
+            }
         }
         if (cap_blk < (size_t) n_groups*nb_f) {
             cap_blk = (size_t) n_groups*nb_f;
             blk_cnt.reset(new std::atomic<int>[cap_blk]);
             grp_ready.reset(new std::atomic<int>[cap_blk]);
         }
-        for (size_t i = 0; i < (size_t) n_groups*nb_f; ++i) {
+        for (size_t i = 0; i < (size_t) n_groups*n_blk; ++i) {
             blk_cnt[i].store(0, std::memory_order_relaxed);
         }
         for (int gi = 0; gi < n_groups; ++gi) {
@@ -1049,7 +1616,13 @@ struct pool {
         // the GPU quantized the input rows (mh_publish)
         jxq = mh_xq(m);
         jy  = mh_y(m);
-        if (js->wtype == 1) {
+        if (jmode == 2) {
+            const size_t n = (size_t) m->n_tokens*(js->n_embd/256);
+            if (xk.size() < n) {
+                xk.resize(n);
+            }
+            kfrom(jxq, (int) n, xk.data());
+        } else if (js->wtype == 1) {
             // Q2_K: the dot wants the activations in natural order with their 16-sums
             const int    nb_e = js->n_embd/QK;
             const size_t n    = (size_t) m->n_tokens*nb_e;
@@ -1059,11 +1632,12 @@ struct pool {
             act_to_nat(jxq, (int) n, xqn.data());
         }
         const auto t_quant = std::chrono::steady_clock::now();
-        p1_left.store(n_groups*nb_f, std::memory_order_relaxed);
+        p1_left.store(n_groups*n_blk, std::memory_order_relaxed);
         MH_TR(t_job_ns.store(tns());)
+        job_id++;
         chunk1.store(0, std::memory_order_relaxed);
         job_gen.fetch_add(1, std::memory_order_acq_rel);
-        work();
+        run_work();
         const auto t_work = std::chrono::steady_clock::now();
         barrier();
         std::atomic_thread_fence(std::memory_order_release);
@@ -1076,9 +1650,9 @@ struct pool {
             stat_pairs    += n_pairs;
             stat_groups   += n_groups;
             if (++stat_jobs == stat_every) {
-                fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs, %.2f experts per job\n",
+                fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs, %.2f experts per job, %s kernels\n",
                               id, (long long) stat_jobs, stat_us/stat_jobs, stat_quant_us/stat_jobs, stat_p1_us/stat_jobs, stat_work_us/stat_jobs,
-                              (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs);
+                              (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs, jmode == 2 ? "k" : "old");
                 stat_jobs = stat_pairs = stat_groups = 0;
                 stat_us = stat_quant_us = stat_p1_us = stat_work_us = 0.0;
             }
@@ -1159,6 +1733,17 @@ struct pool {
                 CH3 = v;
             }
         }
+        // GGML_CUDA_MOE_HOST_KERNEL=old: the previous kernels and job loop for every layer (an A/B switch)
+        {
+            const char * ke = getenv("GGML_CUDA_MOE_HOST_KERNEL");
+            knew = (ke == nullptr || strcmp(ke, "old") != 0) && pick_kkernels(kd_q2k, kd_q3k, kfrom, kquant, kisa);
+            if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH3")) {
+                const int v = atoi(e);
+                if (v >= 2 && v % 2 == 0) {
+                    CH3k = v;
+                }
+            }
+        }
         spin_pause = getenv("GGML_CUDA_MOE_HOST_SPIN_PAUSE") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_SPIN_PAUSE")) != 0;
         hot_ms     = getenv("GGML_CUDA_MOE_HOST_HOT_MS") != nullptr ? std::max(1, atoi(getenv("GGML_CUDA_MOE_HOST_HOT_MS"))) : 50;
 #if MH_X86
@@ -1198,7 +1783,8 @@ struct pool {
             g_pinned_cpus.push_back(cpu);
         }
 #endif
-        GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s)\n", __func__, pool_id, n_pools, n_threads, isa);
+        GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s; %s%s)\n", __func__, pool_id, n_pools, n_threads, isa,
+                      knew ? "Q2_K/Q3_K layers on the k kernels: " : "old kernels", knew ? kisa : "");
     }
 
     ~pool() {

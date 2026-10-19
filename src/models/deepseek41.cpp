@@ -276,10 +276,6 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             // but each token only touches n_cols of them, so read those rows on demand.
             const std::string embd_name = tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i).str();
             const auto * embd_w = ml.get_weight(embd_name.c_str());
-            if (embd_w == nullptr) {
-                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
-            }
-            const int64_t n_rows = embd_w->tensor->ne[1];
 
             // a row index is a bucket offset plus a hash, so the last bucket has to end inside
             uint64_t max_row = 0;
@@ -287,6 +283,12 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                 const size_t k = (size_t) eg*n_cols + b;
                 max_row = std::max(max_row, engram_offsets[k] + engram_primes[k]);
             }
+
+            // a model made in memory (llama_model_init_from_user) has no file to take the row count from
+            if (embd_w == nullptr && !ml.files.empty()) {
+                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
+            }
+            const int64_t n_rows = embd_w != nullptr ? embd_w->tensor->ne[1] : (int64_t) max_row;
             if ((int64_t) max_row > n_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the engram buckets (%" PRIu64 ")",
                                                 embd_name.c_str(), n_rows, max_row));

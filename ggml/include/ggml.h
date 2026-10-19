@@ -1078,6 +1078,10 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // a must be GGML_OP_ARGMAX: a row without a finite maximum (all NaN) gives column 0 instead of -1 on every backend, for a consumer that indexes with the result
+    GGML_API struct ggml_tensor * ggml_argmax_set_nonneg(
+            struct ggml_tensor  * a);
+
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(
             struct ggml_context * ctx,

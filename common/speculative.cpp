@@ -31,6 +31,23 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+// the backend candidates of a draft row have a NaN or +inf logit: a NaN hidden state, the sampler chain cannot order such a row
+static bool spec_row_finite(llama_context * ctx, int32_t idx) {
+    const float * logits = llama_get_sampled_logits_ith(ctx, idx);
+    if (logits == nullptr) {
+        return true; // no backend candidates: the full row is not scanned
+    }
+
+    const uint32_t n = llama_get_sampled_logits_count_ith(ctx, idx);
+    for (uint32_t k = 0; k < n; ++k) {
+        if (std::isnan(logits[k]) || logits[k] == INFINITY) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
 static void spec_retune(
@@ -999,6 +1016,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    std::vector<common_params_sampling> smpls_cfg; // the temperature and seed of a retuned smpls entry (spec_retune)
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1024,6 +1043,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+
+    // LLAMA_SPEC_TRACE_SYNC=1: log every call on the draft context and wait for it, so that a device fault is reported by the call that caused it
+    static bool trace_sync() {
+        static const bool on = getenv("LLAMA_SPEC_TRACE_SYNC") != nullptr && atoi(getenv("LLAMA_SPEC_TRACE_SYNC")) != 0;
+        return on;
+    }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1241,6 +1266,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                // a NaN or inf feature poisons the keys the draft keeps for a window of positions: zero it and say so
+                for (float & v : features_buf) {
+                    if (!std::isfinite(v)) {
+                        static int n_warned = 0;
+                        if (n_warned++ < 8) {
+                            LOG_WRN("%s: non-finite target feature in the rows at pos %d (%d rows), replaced by zero\n", __func__,
+                                    (int) batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0], (int) n_chunk);
+                        }
+                        v = 0.0f;
+                    }
+                }
+
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
@@ -1252,6 +1289,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
+                }
+                if (trace_sync()) {
+                    LOG_WRN("%s: inject seq %d, %d rows at pos %d\n", __func__, (int) seq_id, (int) n_chunk,
+                            (int) batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0]);
+                    llama_synchronize(ctx_dft);
                 }
             }
         }
@@ -1275,7 +1317,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            common_sampler_reset(smpls[seq_id].get());
+            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
+            if (!params.probabilistic) {
+                dp.result_q = nullptr;
+            }
+
+            // result_q is only set when the caller wants rejection (temp > 0), so it also gates the retune
+            if (dp.result_q) {
+                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
+            }
+
+            // a reset reseeds the chain, which breaks probabilistic drafting
+            if (!dp.result_q) {
+                common_sampler_reset(smpls[seq_id].get());
+            }
 
             const int32_t n = (int32_t) dp.pos0;
 
@@ -1298,6 +1353,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
+        }
+        if (trace_sync()) {
+            LOG_WRN("%s: block of %d rows, first at pos %d, anchor %d\n", __func__, (int) batch.size(),
+                    (int) batch.tokens[0].pos[0], (int) batch.tokens[0].id);
+            llama_synchronize(ctx_dft);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1355,7 +1415,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         break;
                     }
 
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
+                    if (!spec_row_finite(ctx_dft, idx)) {
+                        // keep the first reports only
+                        static int n_warned = 0;
+                        if (n_warned++ < 8) {
+                            LOG_WRN("%s: non-finite draft logits at block row %d (pos %d, anchor %d), no draft\n", __func__, (int) i,
+                                    (int) batch.tokens[beg].pos[0] + (int) i, (int) batch.tokens[beg].id);
+                        }
+                        result.clear();
+                        if (dp.result_q) {
+                            dp.result_q->clear();
+                        }
+                        break;
+                    }
+
+                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1365,16 +1439,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(params.ctx_tgt, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    // probabilistic drafting samples the token and hands the candidates it was drawn from to the verifier
+                    const llama_token id = dp.result_q ? id_sampled : cur_p->data[0].id;
 
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+
+                    if (dp.result_q) {
+                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    }
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
+                    if (!spec_row_finite(ctx_dft, beg + i)) {
+                        static int n_warned = 0;
+                        if (n_warned++ < 8) {
+                            LOG_WRN("%s: non-finite draft logits at block row %d (pos %d, anchor %d), no draft\n", __func__, (int) i,
+                                    (int) batch.tokens[beg].pos[0] + (int) i, (int) batch.tokens[beg].id);
+                        }
+                        result.clear();
+                        if (dp.result_q) {
+                            dp.result_q->clear();
+                        }
+                        break;
+                    }
+
+                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1384,7 +1476,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(params.ctx_tgt, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    const llama_token id = dp.result_q ? id_sampled : cur_p->data[0].id;
 
                     if (cur_p->data[0].p < params.p_min) {
                         break;
@@ -1393,11 +1485,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+
+                    if (dp.result_q) {
+                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    }
                 }
             }
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }

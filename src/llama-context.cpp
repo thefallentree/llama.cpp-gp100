@@ -2453,7 +2453,10 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
     // every cold expert it routes to streamed to the devices, the batched kernels; the windows take ~40 ms each
     static const uint32_t ub_small     = getenv("LLAMA_UBATCH_SMALL") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_UBATCH_SMALL"))) : 8;
     static const uint32_t ub_small_max = getenv("LLAMA_UBATCH_SMALL_MAX") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_UBATCH_SMALL_MAX"))) : 256;
-    const uint32_t n_ubatch_eff = ub_small > 0 && n_tokens_all > ub_small && n_tokens_all <= ub_small_max ? ub_small : cparams.n_ubatch;
+    // the trailing n_rs_seq + 1 tokens of a sequence stay in one ubatch (split_equal), so a ubatch needs more than that many
+    const uint32_t ub_small_eff = std::max(ub_small, cparams.n_rs_seq > 0 ? cparams.n_rs_seq + 2 : 0u);
+    const uint32_t n_ubatch_eff = ub_small > 0 && n_tokens_all > ub_small_eff && n_tokens_all <= ub_small_max && ub_small_eff < cparams.n_ubatch ?
+        ub_small_eff : cparams.n_ubatch;
 
     // the draft chain: the last n_chain rows each in a ubatch of their own (llama_set_draft_chain, this decode only)
     const uint32_t n_chain = draft_chain.tok != nullptr && !prepare && draft_chain.n > 0 && (uint32_t) draft_chain.n < n_tokens_all ? draft_chain.n : 0;

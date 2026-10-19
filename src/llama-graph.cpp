@@ -1771,6 +1771,19 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             if (cold->buffer != nullptr && (ggml_backend_buffer_is_meta(cold->buffer) || !ggml_backend_buffer_is_host(cold->buffer))) {
                 res->src[LLAMA_EXPS_COLD_SRC] = cold;
             }
+            // the device computing the layer reads the cold tensor directly (pinned host memory, or its own server's
+            // memory over RPC): both must belong to the same backend registry, or the pointer means nothing there
+            if (cold->buffer != nullptr && w->buffer != nullptr) {
+                ggml_backend_dev_t dev_w = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
+                ggml_backend_dev_t dev_c = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cold->buffer));
+                ggml_backend_reg_t reg_w = dev_w ? ggml_backend_dev_backend_reg(dev_w) : nullptr;
+                ggml_backend_reg_t reg_c = dev_c ? ggml_backend_dev_backend_reg(dev_c) : nullptr;
+                const bool cold_is_cpu = dev_c == nullptr || ggml_backend_dev_type(dev_c) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (reg_w != nullptr && !cold_is_cpu && reg_w != reg_c) {
+                    GGML_ABORT("%s: cold experts %s live in %s, unreachable from %s's device %s (place them with -ot on that device's pinned memory, or leave them unplaced)",
+                               __func__, cold->name, ggml_backend_buffer_name(cold->buffer), w->name, ggml_backend_dev_name(dev_w));
+                }
+            }
         }
     }
 

@@ -477,7 +477,8 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
 
         if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
+            // the chain gathers a row of w1 with the result: a row of NaN must not give -1
+            prev = ggml_argmax_set_nonneg(ggml_argmax(ctx0, col));
         }
     }
 

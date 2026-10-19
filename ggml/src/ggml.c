@@ -2596,6 +2596,14 @@ struct ggml_tensor * ggml_argmax(
     return result;
 }
 
+struct ggml_tensor * ggml_argmax_set_nonneg(
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->op == GGML_OP_ARGMAX);
+
+    ggml_set_op_params_i32(a, 0, 1);
+    return a;
+}
+
 // ggml_count_equal
 
 struct ggml_tensor * ggml_count_equal(

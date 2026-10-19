@@ -252,7 +252,8 @@ static void ggml_cuda_mem_checkpoint(int device, const char * what, const char *
 }
 
 // temporary: GGML_CUDA_NODE_TIMING=1 waits for the device after every node that is not run from a captured graph and adds
-// the time to its op and name (layer numbers removed). Printed when a backend is freed. For the prompt path.
+// the time to its op and name (layer numbers removed). Printed when a backend is freed. For the prompt path. A fault is
+// reported at the node that ran it (named), which makes this the way to find the kernel of an asynchronous illegal access.
 static std::mutex                                               ggml_cuda_node_time_mutex;
 static std::map<std::string, std::pair<double, int64_t>>        ggml_cuda_node_time[GGML_CUDA_MAX_DEVICES];
 
@@ -3094,7 +3095,9 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
                 used.push_back((int32_t) j);
             }
         }
-        cold_staged = ggml_cuda_cold_kq_begin(ctx, ctx.mmid_cold_data, used, nb02, (size_t) ne00*ne01*sizeof(half));
+        // scratch of the slices next to the staging: the F16 expert, and the F16 activations and result of the widest slice (up to every token)
+        const size_t reserve = (size_t) ne00*ne01*sizeof(half) + (size_t) ne12*(ne10 + ne0)*sizeof(half);
+        cold_staged = ggml_cuda_cold_kq_begin(ctx, ctx.mmid_cold_data, used, nb02, reserve, ctx.mmid_n_cold);
     }
     int64_t n_pairs = 0;
     for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -3199,14 +3202,14 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
     }
-    if (cold_staged) {
-        ggml_cuda_cold_kq_end(ctx);
-    }
-
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
         ne0, ne0*ts_dst_sorted, (n_pairs + 1)*ne0*ts_dst_sorted, (n_pairs + 1)*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+    if (cold_staged) {
+        // after the last kernel of the op: GGML_CUDA_COLD_PREFETCH_SYNC waits for the whole op here
+        ggml_cuda_cold_kq_end(ctx);
+    }
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -6745,7 +6748,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 ggml_cuda_mem_checkpoint(cuda_ctx->device, ggml_op_name(node->op), node->name);
                 if (t_node != 0) {
-                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    // a fault of this node (or of the fused ones since the last wait) is named here, not at a later sync of the caller
+                    const cudaError_t err_node = cudaStreamSynchronize(cuda_ctx->stream());
+                    if (err_node != cudaSuccess) {
+                        GGML_LOG_ERROR("%s: dev%d: node %s (%s) of a graph of %d nodes: %s\n", __func__, cuda_ctx->device, node->name,
+                                ggml_op_name(node->op), cgraph->n_nodes, cudaGetErrorString(err_node));
+                    }
+                    CUDA_CHECK(err_node);
                     ggml_cuda_node_time_add(cuda_ctx->device, node, (double) (ggml_time_us() - t_node));
                 }
                 if (!ok) {
@@ -6930,13 +6939,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // window marks the window instead: its launches wait (ggml_backend_cuda_comm_window_launch).
     {
         bool needs_ec = false;
+        bool prompt_ec = false;   // the first hot/cold node is a prompt batch of K-quants (the layers of a graph have the same tokens)
         for (int i = 0; i < cgraph->n_nodes && !needs_ec; ++i) {
-            needs_ec = ggml_cuda_mmid_cold(cgraph->nodes[i]);
+            needs_ec  = ggml_cuda_mmid_cold(cgraph->nodes[i]);
+            prompt_ec = needs_ec && ggml_cuda_cold_kq_node(cgraph->nodes[i]);
         }
         if (needs_ec && cuda_ctx->window_active) {
             cuda_ctx->window_needs_ec = true;
         }
         if (needs_ec && !ggml_cuda_capturing) {
+            // a prompt batch right behind another one: the ids may name a slot whose slice an exchange has not written yet
+            // (the patch of the positions does not wait for the copies, and the spare slots do not make a graph wait)
+            if (prompt_ec && cuda_ctx->ec_pend) {
+                cuda_ctx->ec_wait = true;
+            }
             ggml_cuda_expert_cache_wait(*cuda_ctx);
         }
     }

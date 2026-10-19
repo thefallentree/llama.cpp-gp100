@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-gguf-compat.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
@@ -576,6 +577,9 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
         }
 
+        llama_gguf_compat compat;
+        llama_gguf_compat_apply(metadata, compat);
+
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
@@ -586,17 +590,27 @@ llama_model_loader::llama_model_loader(
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            // the offset is looked up by the name in the file, the weight is registered under ours
+            llama_tensor_weight weight(files.back().get(), 0, metadata, cur);
             std::string tensor_name = std::string(cur->name);
+            const auto it_rename = compat.tensor_rename.find(tensor_name);
+            if (it_rename != compat.tensor_rename.end()) {
+                tensor_name = it_rename->second;
+                ggml_set_name(cur, tensor_name.c_str());
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, weight);
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        if (n_split > 1 && !compat.dialect.empty()) {
+            throw std::runtime_error(format("%s: split files are not supported for the %s dialect", __func__, compat.dialect.c_str()));
+        }
 
         // Load additional GGML contexts
         if (n_split > 1) {

@@ -666,6 +666,16 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     ggml_cuda_mmid_cold(up,   &c_up);
     ggml_cuda_mmid_cold(gate, &c_gate);
     ggml_cuda_mmid_cold(down, &c_down);
+    {
+        static int n_logged = 0;
+        if (n_logged < 4) {
+            n_logged++;
+            const ggml_tensor * cs = up->src[GGML_CUDA_EXPS_COLD_SRC];
+            GGML_LOG_WARN("moe-host: route %s: cold up %p gate %p down %p (src[3] %s%s, buffer %s)\n", up->name,
+                          (const void *) c_up, (const void *) c_gate, (const void *) c_down, cs ? cs->name : "none",
+                          cs ? "" : ": op_params pointer", cs && cs->buffer ? ggml_backend_buffer_name(cs->buffer) : "-");
+        }
+    }
     if (!ggml_cuda_moe_host_init(ctx, (int) n_embd, n_used) ||
         n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs) {
         return false;

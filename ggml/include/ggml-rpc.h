@@ -24,6 +24,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 // pinned host memory on the server next to its device (the engine's cold experts of a remote layer); not
 // host-accessible from the client: an explicit -ot target ("RPC<i>[host:port]_Host"), never a device's host buffer type
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_host_buffer_type(const char * endpoint, uint32_t device);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_device_host_buffer_type(ggml_backend_dev_t dev);
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 

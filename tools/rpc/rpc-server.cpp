@@ -10,6 +10,9 @@
 #endif
 #include <algorithm>
 #include <clocale>
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
 #include <codecvt>
 #include <filesystem>
 #include <regex>
@@ -210,7 +213,21 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
     return devices;
 }
 
+// a crash in a worker thread (the host tier's pools run inside this process) leaves no trace otherwise
+static void rpc_crash_handler(int sig) {
+    void * frames[64];
+    const int n = backtrace(frames, 64);
+    const char msg[] = "ggml-rpc-server: fatal signal, backtrace:\n";
+    (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(int argc, char * argv[]) {
+    signal(SIGSEGV, rpc_crash_handler);
+    signal(SIGBUS,  rpc_crash_handler);
+    signal(SIGABRT, rpc_crash_handler);
     std::setlocale(LC_NUMERIC, "C");
 
     ggml_backend_load_all();

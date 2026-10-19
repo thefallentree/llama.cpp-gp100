@@ -1545,12 +1545,20 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * inp_pos,
                 int il) const;
 
+        // what an index source picked, kept for the layers that read it
+        struct comp_pick {
+            ggml_tensor * kq_mask  = nullptr; // the window and the picked compressed rows
+            int64_t       n_kv_max = 0;       // bound on the finite entries in a row of kq_mask
+        };
+
+        std::vector<comp_pick> comp_picks; // per layer, set by the index sources
+
         ggml_tensor * build_attention_v41(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

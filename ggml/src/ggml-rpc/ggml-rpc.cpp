@@ -501,6 +501,12 @@ public:
 
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    // the server discards every cached graph when a buffer is freed (nodes may point into it): forget ours too, so
+    // the next compute serializes the graph again instead of asking for a uid the server no longer has
+    void forget_graphs() {
+        std::lock_guard<std::mutex> lock(graph_mutex);
+        graph_uids.clear();
+    }
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
 
@@ -731,6 +737,7 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto request = std::make_shared<rpc_msg_free_buffer_req>();
     request->remote_ptr = ctx->remote_ptr;
     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
+    ctx->dispatcher->forget_graphs();
     ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
     delete ctx;
 }

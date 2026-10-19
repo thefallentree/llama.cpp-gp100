@@ -2868,7 +2868,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * ids  = dst->src[2];
 
     if (ggml_cuda_mmid_cold(dst)) {
-        if (src0->type == GGML_TYPE_Q2_K) {
+        if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K) {
             GGML_ASSERT((ggml_cuda_moe_host_active(ctx, dst) || ggml_cuda_mmid_allgpu()) &&
                         "Q2_K cold experts need the host tier (GGML_CUDA_MOE_HOST_PROMPT=1 for prompt batches)");
             ggml_cuda_mmid_hot_generic(ctx, dst);

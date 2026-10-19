@@ -267,17 +267,12 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
     }
     // the RPC devices' pinned memory on their server ("RPC<i>[host:port]_Host"): the cold experts of a remote layer
     if (ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC")) {
-        typedef ggml_backend_buffer_type_t (*rpc_host_buft_t)(const char * endpoint, uint32_t device);
-        auto rpc_host_buft_fn = (rpc_host_buft_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_host_buffer_type");
-        // every server registers its devices under its own registry: walk the global device list for the RPC ones
-        for (size_t i = 0; rpc_host_buft_fn && i < ggml_backend_dev_count(); ++i) {
-            auto * dev = ggml_backend_dev_get(i);
-            const std::string name = ggml_backend_dev_name(dev);   // RPC<i>; the description is the endpoint
-            if (name.rfind("RPC", 0) != 0 || name.size() < 4 || !isdigit((unsigned char) name[3])) {
-                continue;
-            }
-            const uint32_t device = (uint32_t) std::stoul(name.substr(3));
-            auto * buft = rpc_host_buft_fn(ggml_backend_dev_description(dev), device);
+        typedef ggml_backend_buffer_type_t (*rpc_dev_host_buft_t)(ggml_backend_dev_t dev);
+        auto rpc_dev_host_buft_fn = (rpc_dev_host_buft_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_device_host_buffer_type");
+        // every server registers its devices under its own registry: walk the global device list (the function
+        // answers nullptr for a device that is not an RPC one)
+        for (size_t i = 0; rpc_dev_host_buft_fn && i < ggml_backend_dev_count(); ++i) {
+            auto * buft = rpc_dev_host_buft_fn(ggml_backend_dev_get(i));
             if (buft) {
                 buft_list[ggml_backend_buft_name(buft)] = buft;
             }

@@ -730,6 +730,9 @@ struct pool {
     const char * isa   = nullptr;
     void (*keep_warm)() = nullptr; // called by the spinning threads
     bool spin_pause = true;
+    // the helpers spin for this long after the last job before they sleep (GGML_CUDA_MOE_HOST_HOT_MS, default 50): a
+    // node that serves a slice of the layers over RPC idles for the other nodes' slices between its bursts
+    int  hot_ms = 50;
 
     std::vector<std::thread> threads;
     mh_mailbox * mb[MH_MAX_DEVICES] = {};
@@ -1113,7 +1116,7 @@ struct pool {
                 continue;
             }
             if (hot.load(std::memory_order_relaxed)) {
-                if (std::chrono::steady_clock::now() - last_job > std::chrono::milliseconds(50)) {
+                if (std::chrono::steady_clock::now() - last_job > std::chrono::milliseconds(hot_ms)) {
                     hot.store(false);
                 }
 #if MH_X86
@@ -1157,6 +1160,7 @@ struct pool {
             }
         }
         spin_pause = getenv("GGML_CUDA_MOE_HOST_SPIN_PAUSE") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_SPIN_PAUSE")) != 0;
+        hot_ms     = getenv("GGML_CUDA_MOE_HOST_HOT_MS") != nullptr ? std::max(1, atoi(getenv("GGML_CUDA_MOE_HOST_HOT_MS"))) : 50;
 #if MH_X86
         if (getenv("GGML_CUDA_MOE_HOST_KEEP_WARM") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_KEEP_WARM")) != 0) {
             keep_warm = dot2 == dot2_avx512 ? keep_warm_avx512 : dot2 == dot2_avx2 ? keep_warm_avx2 : nullptr;

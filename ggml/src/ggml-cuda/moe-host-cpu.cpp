@@ -985,7 +985,7 @@ struct pool {
             }
             const bool bad = min_c < 0 || (js->n_cold > 0 && max_c >= js->n_cold) || m->n_tokens <= 0 || n_used <= 0 ||
                              min_i < 0 || max_i >= m->n_tokens*n_used || js->n_ff <= 0 || js->n_embd <= 0;
-            if (n_dumped < 2 || bad) {
+            if (n_dumped < 40 || bad) {
                 n_dumped++;
                 char pairs[256]; int o = 0;
                 for (int p = 0; p < std::min(n_pairs, 8) && o < 200; ++p) {

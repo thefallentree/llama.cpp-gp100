@@ -2715,7 +2715,8 @@ static bool ggml_cuda_mmid_allgpu() {
 // GGML_CUDA_MMID_CHECK=N: for the first N hot/cold MUL_MAT_ID calls, every (token, expert) pair's output row is
 // compared against a double-precision dot product over the expert's rows dequantized on the host by ggml's own
 // to_float (hot slices copied from the device, cold ones read in place) and the token's input row
-static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const char * cold, const int n_cold, const bool hot_only = false) {
+static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const char * cold, const int n_cold, const bool hot_only = false,
+                                       const char * path = "") {
     static int left = getenv("GGML_CUDA_MMID_CHECK") != nullptr ? atoi(getenv("GGML_CUDA_MMID_CHECK")) : 0;
     if (left <= 0) {
         return;
@@ -2724,6 +2725,14 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
     static const int min_tokens = getenv("GGML_CUDA_MMID_CHECK_MIN_TOKENS") != nullptr ? atoi(getenv("GGML_CUDA_MMID_CHECK_MIN_TOKENS")) : 0;
     if (dst->ne[2] < min_tokens) {
         return;
+    }
+    {
+        // the check synchronizes the stream: not while a CUDA graph is being captured (the call does not use up N then)
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+        if (cap != cudaStreamCaptureStatusNone) {
+            return;
+        }
     }
     // GGML_CUDA_MMID_CHECK_NAME=a,b,...: only the nodes whose name contains one of the substrings
     static const std::string names = getenv("GGML_CUDA_MMID_CHECK_NAME") != nullptr ? getenv("GGML_CUDA_MMID_CHECK_NAME") : "";
@@ -2740,6 +2749,7 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
         }
     }
     left--;
+    path = path[0] != '\0' ? path : "-";
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2754,9 +2764,14 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
     std::vector<char>  wq(src0->nb[2]);
     std::vector<float> w((size_t) ne00*ne01), x(ne00), y(ne01);
     int n_bad = 0, n_pairs = 0;
+    double max_rel = 0.0;
     for (int t = 0; t < n_tokens; ++t) {
         for (int s = 0; s < n_used; ++s) {
             const int e = ids_h[(size_t) t*n_used + s];
+            if (e < 0) {
+                GGML_LOG_WARN("mmid-check: %s t%d s%d expert %d: a negative id, skipped (the kernels leave its row alone)\n", dst->name, t, s, e);
+                continue;
+            }
             const bool hot = e < n_hot;
             if (!hot && hot_only) {
                 continue;   // a cold pair: the host tier computes it later
@@ -2787,24 +2802,48 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
             const int64_t i11 = src1->ne[1] == 1 ? 0 : s;
             CUDA_CHECK(cudaMemcpy(x.data(), (const char *) src1->data + t*src1->nb[2] + i11*src1->nb[1], ne00*sizeof(float), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(y.data(), (const char *) dst->data + t*dst->nb[2] + s*dst->nb[1], ne01*sizeof(float), cudaMemcpyDeviceToHost));
-            double max_err = 0.0, max_ref = 0.0;
+            double max_err = 0.0, max_ref = 0.0, ss_err = 0.0, ss_ref = 0.0;
             float ref0 = 0.0f;
+            int64_t n_nonfinite = 0;   // std::max would drop a NaN row from the error
             for (int64_t r = 0; r < ne01; ++r) {
                 double acc = 0.0;
                 for (int64_t k = 0; k < ne00; ++k) {
                     acc += (double) w[r*ne00 + k]*x[k];
                 }
                 if (r == 0) { ref0 = (float) acc; }
+                if (!std::isfinite(y[r])) {
+                    n_nonfinite++;
+                    continue;
+                }
                 max_err = std::max(max_err, std::fabs(acc - y[r]));
                 max_ref = std::max(max_ref, std::fabs(acc));
+                ss_err += (acc - y[r])*(acc - y[r]);
+                ss_ref += acc*acc;
             }
-            const double rel = max_err/std::max(max_ref, 1e-6);
+            // the activation row: its largest value and rms, and the largest ratio of a 256-block's max to its rms (outliers)
+            double x_amax = 0.0, x_ss = 0.0, blk_ratio = 0.0;
+            for (int64_t b0 = 0; b0 < ne00; b0 += 256) {
+                const int64_t b1 = std::min<int64_t>(b0 + 256, ne00);
+                double a = 0.0, ss = 0.0;
+                for (int64_t k = b0; k < b1; ++k) {
+                    a   = std::max(a, (double) std::fabs(x[k]));
+                    ss += (double) x[k]*x[k];
+                }
+                x_amax    = std::max(x_amax, a);
+                x_ss     += ss;
+                blk_ratio = std::max(blk_ratio, a/std::max(std::sqrt(ss/(double) (b1 - b0)), 1e-30));
+            }
+            const double rel = n_nonfinite > 0 ? INFINITY : max_err/std::max(max_ref, 1e-6);
             n_pairs++;
             n_bad += rel > 0.05 ? 1 : 0;
-            GGML_LOG_WARN("mmid-check: %s t%d s%d expert %3d (%s) rel err %.3g  gpu[0] %.4f ref[0] %.4f\n", dst->name, t, s, e, hot ? "hot " : "cold", rel, y[0], ref0);
+            max_rel = std::max(max_rel, rel);
+            GGML_LOG_WARN("mmid-check: %s t%d s%d expert %3d (%s) rel err %.3g  gpu[0] %.4f ref[0] %.4f  | rms err %.3g, non-finite rows %lld | x amax %.3g rms %.3g blk max/rms %.1f | %s\n",
+                          dst->name, t, s, e, hot ? "hot " : "cold", rel, y[0], ref0, std::sqrt(ss_err/std::max(ss_ref, 1e-30)), (long long) n_nonfinite,
+                          x_amax, std::sqrt(x_ss/(double) ne00), blk_ratio, path);
         }
     }
-    GGML_LOG_WARN("mmid-check: %s: %d of %d pairs beyond 5%%\n", dst->name, n_bad, n_pairs);
+    GGML_LOG_WARN("mmid-check: %s: %d of %d pairs beyond 5%% (max rel err %.3g; n_hot %d, n_used %d, n_tokens %d, %s)\n", dst->name, n_bad, n_pairs, max_rel,
+                  (int) n_hot, n_used, n_tokens, path);
 }
 
 // gpu_cold: a prompt batch that the host tier does not take, all its pairs go through the dequant fallback and the cold
@@ -2889,6 +2928,8 @@ static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_ten
         CUDA_CHECK(cudaStreamSynchronize(stream));
         GGML_LOG_INFO("%s: copy ok (%s)\n", __func__, dst->name);
     }
+    // the same oracle on the generic path (hot pairs), to compare the two numerics (GGML_CUDA_MMID_KQ_SM60=0)
+    ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ true, "generic");
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2906,7 +2947,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             // decode batches on sm_60: the mat-vec skips the cold pairs itself (their rows are the host tier's)
             if (!ggml_cuda_mmid_allgpu() && ggml_cuda_mmid_vec_kq_sm60_supported(src0, src1, ids, dst)) {
                 ggml_cuda_mmid_vec_kq_sm60(ctx, src0, src1, ids, dst);
-                ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ true);
+                ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ true,
+                                           ggml_cuda_mmid_vec_kq_sm60_last_hit() ? "sm60 kernel, cache hit" : "sm60 kernel, converted");
                 return;
             }
             ggml_cuda_mmid_hot_generic(ctx, dst, gpu_cold);
@@ -2935,11 +2977,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (ggml_cuda_mmid_vec_kq_sm60_supported(src0, src1, ids, dst)) {
         ggml_cuda_mmid_vec_kq_sm60(ctx, src0, src1, ids, dst);
-        ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0);
+        ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ false,
+                                   ggml_cuda_mmid_vec_kq_sm60_last_hit() ? "sm60 kernel, cache hit" : "sm60 kernel, converted");
         return;
     }
 
     ggml_cuda_mul_mat_id_generic(ctx, dst);
+    if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K) {
+        // the same oracle on the generic path, to compare the two numerics (GGML_CUDA_MMID_KQ_SM60=0)
+        ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ false, "generic");
+    }
 }
 
 static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

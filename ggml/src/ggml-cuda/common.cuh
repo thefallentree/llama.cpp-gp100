@@ -35,6 +35,8 @@
 #include <unordered_set>
 #include <set>
 
+#include "cold-kq-ring.h"
+
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
 #elif defined(GGML_USE_MUSA)
@@ -1485,17 +1487,36 @@ struct ggml_cuda_cold_prefetch {
     bool         started  = false;        // the first copies are issued
 };
 
+// prompt batches of a Q2_K / Q3_K hot/cold layer: the cold experts an op touches are copied to a VRAM staging buffer on a
+// second stream, in chunks of a ring (cold-kq.cu)
+struct ggml_cuda_cold_kq {
+    cudaStream_t copy   = nullptr;
+    cudaEvent_t  fork   = nullptr;        // orders the copy stream after the work enqueued before the op
+    std::vector<cudaEvent_t> ready;       // per buffer of the ring: the copies into it are done
+    std::vector<cudaEvent_t> freed;       // ... the reads of it are enqueued
+    char *       buf    = nullptr;        // the staging buffer
+    size_t       cap    = 0;
+    size_t       limit  = SIZE_MAX;       // a larger buffer did not fit: the most that does
+    bool         failed = false;          // no VRAM for it: the cold experts are read in place
+    const char * host   = nullptr;        // the op in hand: its cold tensor and the size of an expert
+    size_t       nb02   = 0;
+    cold_kq_ring ring;
+    int64_t      n_ops = 0, n_experts = 0, n_bytes = 0;
+};
+
 struct ggml_backend_cuda_context {
     bool mmid_no_mmq = false; // the Q2_K hot/cold path (glm5-next) keeps the generic mul_mat_id off MMQ
     int  mmid_skip_from = -1; // >= 0: the dequant fallback skips the pairs whose expert id is >= this (their rows are zeroed)
     const char * mmid_cold_data = nullptr; // the dequant fallback also computes the cold experts [n_hot, n_hot + n_cold) from this host memory
     int  mmid_n_cold = 0;
     bool mmid_force_fallback = false; // the generic mul_mat_id takes the dequant fallback whatever the batch size
+    bool mmid_cold_stage = false; // ... and copies the cold experts it reads to VRAM first (cold-kq.cuh)
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
     ggml_cuda_cold_prefetch cold_pf;
+    ggml_cuda_cold_kq       cold_kq;
     std::set<int64_t> prompt_graph_ntok; // ubatch sizes of the prompt graphs run so far, see ggml_backend_cuda_graph_compute
 
     // cold experts on the host: the open triple, the mapped mailbox and the request state on the device

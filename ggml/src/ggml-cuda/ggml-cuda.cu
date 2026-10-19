@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/mmid-kq-sm60.cuh"
+#include "ggml-cuda/cold-kq.cuh"
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/moe-host-cpu.h"
 #include "ggml-cuda/hc-mix.cuh"
@@ -1022,6 +1023,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     ggml_cuda_moe_host_free(*this);
     ggml_cuda_cold_prefetch_free(*this);
+    ggml_cuda_cold_kq_free(*this);
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2586,7 +2588,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     if (ggml_cuda_mmid_cold(dst)) {
-        return false;
+        // the Q2_K / Q3_K prompt batches go through the generic path below, which reads the ids on the host
+        return ggml_cuda_cold_kq_node(dst);
     }
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -2662,6 +2665,11 @@ static bool ggml_cuda_mmid_allgpu() {
 static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const char * cold, const int n_cold, const bool hot_only = false) {
     static int left = getenv("GGML_CUDA_MMID_CHECK") != nullptr ? atoi(getenv("GGML_CUDA_MMID_CHECK")) : 0;
     if (left <= 0) {
+        return;
+    }
+    // GGML_CUDA_MMID_CHECK_MIN_TOKENS=n: only batches of at least n tokens, so that the warmup's and the decode steps' calls do not use up N
+    static const int min_tokens = getenv("GGML_CUDA_MMID_CHECK_MIN_TOKENS") != nullptr ? atoi(getenv("GGML_CUDA_MMID_CHECK_MIN_TOKENS")) : 0;
+    if (dst->ne[2] < min_tokens) {
         return;
     }
     // GGML_CUDA_MMID_CHECK_NAME=a,b,...: only the nodes whose name contains one of the substrings
@@ -2746,7 +2754,9 @@ static void ggml_cuda_mmid_check_pairs(ggml_backend_cuda_context & ctx, const gg
     GGML_LOG_WARN("mmid-check: %s: %d of %d pairs beyond 5%%\n", dst->name, n_bad, n_pairs);
 }
 
-static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// gpu_cold: a prompt batch that the host tier does not take, all its pairs go through the dequant fallback and the cold
+// experts it touches are copied to VRAM first (cold-kq.cuh)
+static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool gpu_cold = false) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids  = dst->src[2];
     const int     n_hot    = (int) src0->ne[2];
@@ -2755,7 +2765,7 @@ static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t si1      = ids->nb[1]/sizeof(int32_t);
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && dst->type == GGML_TYPE_F32);
     cudaStream_t stream = ctx.stream();
-    if (ggml_cuda_mmid_allgpu()) {
+    if (ggml_cuda_mmid_allgpu() || gpu_cold) {
         const char * cold = nullptr;
         int n_cold = 0;
         ggml_cuda_mmid_cold(dst, &cold, &n_cold);
@@ -2765,7 +2775,9 @@ static void ggml_cuda_mmid_hot_generic(ggml_backend_cuda_context & ctx, ggml_ten
         ctx.mmid_force_fallback = true;
         ctx.mmid_cold_data = cold;
         ctx.mmid_n_cold = n_cold;
+        ctx.mmid_cold_stage = gpu_cold;
         ggml_cuda_mul_mat_id_generic(ctx, &dst2);
+        ctx.mmid_cold_stage = false;
         ctx.mmid_cold_data = nullptr;
         ctx.mmid_n_cold = 0;
         ctx.mmid_force_fallback = false;
@@ -2833,15 +2845,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (ggml_cuda_mmid_cold(dst)) {
         if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K) {
-            GGML_ASSERT((ggml_cuda_moe_host_active(ctx, dst) || ggml_cuda_mmid_allgpu()) &&
-                        "Q2_K cold experts need the host tier (GGML_CUDA_MOE_HOST_PROMPT=1 for prompt batches)");
+            // a prompt batch that the host tier does not take: the cold experts it touches are staged in VRAM and the
+            // dequant fallback computes every pair (GGML_CUDA_COLD_PREFETCH_KQ=0: not allowed)
+            const bool gpu_cold = !ggml_cuda_moe_host_active(ctx, dst) && !ggml_cuda_mmid_allgpu() && ggml_cuda_cold_kq_node(dst) && ggml_cuda_cold_kq_enabled();
+            GGML_ASSERT((ggml_cuda_moe_host_active(ctx, dst) || gpu_cold || ggml_cuda_mmid_allgpu()) &&
+                        "Q2_K cold experts need the host tier, or the cold-expert staging for prompt batches (GGML_CUDA_COLD_PREFETCH_KQ=1, GGML_CUDA_MOE_HOST_PROMPT=0)");
             // decode batches on sm_60: the mat-vec skips the cold pairs itself (their rows are the host tier's)
             if (!ggml_cuda_mmid_allgpu() && ggml_cuda_mmid_vec_kq_sm60_supported(src0, src1, ids, dst)) {
                 ggml_cuda_mmid_vec_kq_sm60(ctx, src0, src1, ids, dst);
                 ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ true);
                 return;
             }
-            ggml_cuda_mmid_hot_generic(ctx, dst);
+            ggml_cuda_mmid_hot_generic(ctx, dst, gpu_cold);
             return;
         }
         // experts beyond src0->ne[2] are only known to the sm_60 Q2_0 kernels
@@ -2959,6 +2974,28 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
     // come from one zero row past the computed ones, the host tier adds the real values later
     const int64_t skip_from = ctx.mmid_skip_from >= 0 ? ctx.mmid_skip_from : INT64_MAX;
     const int64_t ne02_all  = ne02 + (ctx.mmid_cold_data != nullptr ? ctx.mmid_n_cold : 0);   // the cold experts after the hot slots
+
+    // the cold experts that the batch routes to are copied to VRAM, in the order of the slices below (else read in place over UVA);
+    // started before the sort, which takes a few ms on a big batch
+    bool cold_staged = false;
+    if (ctx.mmid_cold_stage && ctx.mmid_cold_data != nullptr) {
+        std::vector<char> routed(ne02_all - ne02, 0);
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                const int32_t e = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (e >= ne02 && e < ne02_all) {
+                    routed[e - ne02] = 1;
+                }
+            }
+        }
+        std::vector<int32_t> used;
+        for (size_t j = 0; j < routed.size(); ++j) {
+            if (routed[j]) {
+                used.push_back((int32_t) j);
+            }
+        }
+        cold_staged = ggml_cuda_cold_kq_begin(ctx, ctx.mmid_cold_data, used, nb02, (size_t) ne00*ne01*sizeof(half));
+    }
     int64_t n_pairs = 0;
     for (int64_t i12 = 0; i12 < ne12; ++i12) {
         for (int64_t iex = 0; iex < n_expert_used; ++iex) {
@@ -3017,7 +3054,8 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
         src0_slice.data     = i02 < ne02 ? (char *) src0->data + i02*nb02
-                                         : (char *) ctx.mmid_cold_data + (i02 - ne02)*nb02;   // a cold expert, host memory over UVA
+                            : cold_staged ? ggml_cuda_cold_kq_next(ctx)   // a cold expert, copied to VRAM
+                                          : (char *) ctx.mmid_cold_data + (i02 - ne02)*nb02;   // host memory over UVA
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -3060,6 +3098,9 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
+    }
+    if (cold_staged) {
+        ggml_cuda_cold_kq_end(ctx);
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,

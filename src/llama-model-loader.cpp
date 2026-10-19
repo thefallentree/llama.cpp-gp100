@@ -1374,6 +1374,41 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // the engine's cold expert tensors (the part of a hot/cold split that stays in host memory) follow their
+        // layer's device: the pinned host memory next to a local GPU (CUDA_Host), the pinned memory on the server of
+        // an RPC device, so that the device computing the layer can reach them; an explicit override still wins
+        if (!buft && tn.str().find("_exps_cold") != std::string::npos && !buft_list->empty()) {
+            ggml_backend_dev_t dev = buft_list->front().first;
+            ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (host_buft == nullptr && dev != nullptr) {
+                // an RPC device advertises no host buffer type (the memory is not addressable here): ask its registry
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                const std::string reg_name = reg ? ggml_backend_reg_name(reg) : "";
+                const std::string dev_name = ggml_backend_dev_name(dev);   // RPC<i>, the description is the endpoint
+                if (reg_name.rfind("RPC", 0) == 0 && dev_name.rfind("RPC", 0) == 0 && dev_name.size() > 3 && isdigit((unsigned char) dev_name[3])) {
+                    if (ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC")) {
+                        typedef ggml_backend_buffer_type_t (*rpc_host_buft_t)(const char * endpoint, uint32_t device);
+                        auto fn = (rpc_host_buft_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_host_buffer_type");
+                        if (fn) {
+                            host_buft = fn(ggml_backend_dev_description(dev), (uint32_t) std::stoul(dev_name.substr(3)));
+                        }
+                    }
+                }
+            }
+            if (host_buft != nullptr) {
+                buft = host_buft;
+                ggml_backend_buffer_type_t buft_split = ggml_backend_meta_device_host_split_buffer_type(dev, buft);
+                if (buft_split != nullptr) {
+                    buft = buft_split;
+                }
+                static std::once_flag once;
+                std::call_once(once, [&] {
+                    LLAMA_LOG_WARN("%s: cold expert tensors follow their layer's device: %s -> %s (and so on per device)\n",
+                                   __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(buft));
+                });
+            }
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {

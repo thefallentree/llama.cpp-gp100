@@ -1845,8 +1845,23 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 
 static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    // very large pinned allocations can fail (e.g. on Windows) and fall back to pageable memory, smaller ones succeed
-    return 4ull*1024*1024*1024;
+    // very large pinned allocations can fail (e.g. on Windows) and fall back to pageable memory, smaller ones succeed.
+    // The hot/cold expert engine keeps a layer's cold experts in one pinned tensor per projection (tens of GB in all) that
+    // the kernels and the host threads address as a single range, so the cap is Windows-only by default and
+    // GGML_CUDA_HOST_MAX_SIZE_MB overrides it (0 = unlimited)
+    static const size_t max_size = [] {
+        const char * env = getenv("GGML_CUDA_HOST_MAX_SIZE_MB");
+        if (env != nullptr) {
+            const unsigned long long mb = strtoull(env, nullptr, 10);
+            return mb == 0 ? SIZE_MAX : (size_t) (mb << 20);
+        }
+#ifdef _WIN32
+        return (size_t) 4ull*1024*1024*1024;
+#else
+        return (size_t) SIZE_MAX;
+#endif
+    }();
+    return max_size;
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {

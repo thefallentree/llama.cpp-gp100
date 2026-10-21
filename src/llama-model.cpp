@@ -2170,6 +2170,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_WARN("%s: mlock of the PLE table (%.1f GB) failed: %s\n", __func__, size/1e9, strerror(errno));
         }
     }
+
+    // LLAMA_ENGRAM_MLOCK=1: the same for the DeepSeek-V4.1 engram tables (2 x 32 GB, a few dozen random rows per token and layer).
+    // On a node whose RAM is mostly pinned experts (expert parallelism: 100 GB on a 192 GB head) the page cache cannot hold them
+    // and every row read is a disk read: 28-36 ms per engram layer and step. Opt-in: the layer-split nodes have the RAM and do not need it.
+    if (getenv("LLAMA_ENGRAM_MLOCK") != nullptr && atoi(getenv("LLAMA_ENGRAM_MLOCK")) != 0) {
+        for (const auto & it : tensors_by_name) {
+            ggml_tensor * t = it.second;
+            if (it.first.find("engram_embd") == std::string::npos || t->data == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const int64_t t0 = ggml_time_us();
+            if (mlock(t->data, ggml_nbytes(t)) == 0) {
+                LLAMA_LOG_WARN("%s: %s (%.1f GB) locked in memory in %.1f s\n", __func__, it.first.c_str(), ggml_nbytes(t)/1e9, (ggml_time_us() - t0)/1e6);
+            } else {
+                LLAMA_LOG_WARN("%s: mlock of %s (%.1f GB) failed: %s\n", __func__, it.first.c_str(), ggml_nbytes(t)/1e9, strerror(errno));
+            }
+        }
+    }
 #endif
 
     return true;

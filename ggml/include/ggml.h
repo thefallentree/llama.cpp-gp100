@@ -669,6 +669,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_LATE    = 32, // ...is read late: the scheduler starts a new split before a node that copies it from another backend (see ggml_set_late)
     };
 
     enum ggml_tri_type {
@@ -896,6 +897,11 @@ extern "C" {
     // Tensor flags
     GGML_API void ggml_set_input(struct ggml_tensor * tensor);
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
+    // Marks a tensor that another backend computes (an expert-parallel node's partial sum) and a node of this backend reads
+    // after independent work of its own: the scheduler copies the inputs of a split before the split's nodes run, so without a
+    // split boundary before the reader that independent work would wait for the other backend. With the boundary it is
+    // launched first and the copy waits for the producer meanwhile.
+    GGML_API void ggml_set_late(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
 

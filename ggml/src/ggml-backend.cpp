@@ -1492,6 +1492,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
+            // a node that reads a late tensor (ggml_set_late) from another backend starts a new split when the current one has work
+            // before it: the split's inputs are copied before its nodes run, which would hold that work back
+            if (!need_new_split && node_backend_id == cur_backend_id && i > split->i_start) {
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src != NULL && (src->flags & GGML_TENSOR_FLAG_LATE) && tensor_backend_id(src) != cur_backend_id &&
+                            !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        need_new_split = true;
+                        break;
+                    }
+                }
+            }
+
             if (node_backend_id != cur_backend_id || need_new_split) {
                 split->i_end = i;
                 i_split++;

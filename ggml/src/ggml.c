@@ -8092,6 +8092,10 @@ void ggml_set_input(struct ggml_tensor * tensor) {
     tensor->flags |= GGML_TENSOR_FLAG_INPUT;
 }
 
+void ggml_set_late(struct ggml_tensor * tensor) {
+    tensor->flags |= GGML_TENSOR_FLAG_LATE;
+}
+
 void ggml_set_output(struct ggml_tensor * tensor) {
     for (struct ggml_tensor * cur = tensor; cur != NULL; cur = cur->view_src) {
         cur->flags |= GGML_TENSOR_FLAG_OUTPUT;

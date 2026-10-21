@@ -2694,6 +2694,7 @@ std::vector<ggml_tensor *> * ep_remote) const {
         if (i == 0) {
             moe_out = part;
         } else {
+            ggml_set_late(part);   // read after the head's own experts and the shared expert (see ggml_set_late)
             remote.push_back(part);
             ggml_build_forward_expand(gf, part);
         }

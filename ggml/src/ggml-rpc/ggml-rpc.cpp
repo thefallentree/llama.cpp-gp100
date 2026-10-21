@@ -662,6 +662,9 @@ void rpc_dispatcher::start(const std::string & endpoint) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    if (const char * e = std::getenv("GGML_RPC_SPIN_US")) {
+        if (atol(e) > 0) { busy_spin_users.store(1); } // the command queue is polled too (until RPC_BUSY_SPIN_IDLE_TIME of silence)
+    }
     running = true;
     thread = std::thread(rpc_dispatcher_trampoline, this);
 }

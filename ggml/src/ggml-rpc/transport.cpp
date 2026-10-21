@@ -17,7 +17,9 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <cerrno>
 #include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -568,6 +570,27 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
     }
 #endif
     size_t bytes_recv = 0;
+#ifndef _WIN32
+    // GGML_RPC_SPIN_US: poll the socket for up to that long before sleeping in recv (a woken thread costs ~50-100 us
+    // on the cluster nodes; the expert-parallel layer round trip is ~150 us on the wire). 0 = off.
+    static const long spin_us = [] { const char * e = std::getenv("GGML_RPC_SPIN_US"); return e ? atol(e) : 0L; }();
+    if (spin_us > 0) {
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        while (bytes_recv < size) {
+            ssize_t n = recv(fd, (char *)data + bytes_recv, std::min(size - bytes_recv, MAX_CHUNK_SIZE), MSG_DONTWAIT);
+            if (n > 0) { bytes_recv += (size_t)n; clock_gettime(CLOCK_MONOTONIC, &t0); continue; }
+            if (n == 0) { LOG_WARN("recv returned 0 (peer closed?)\n"); return false; }
+            if (errno != EAGAIN && errno != EINTR) { LOG_ERROR("recv failed (bytes_recv=%zu)\n", bytes_recv); return false; }
+            struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+            if ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L > spin_us) {
+                break; // idle too long: fall back to the blocking loop below
+            }
+#  if defined(__x86_64__)
+            __builtin_ia32_pause();
+#  endif
+        }
+    }
+#endif
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);

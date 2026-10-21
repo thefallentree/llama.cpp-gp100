@@ -6,7 +6,8 @@ order, layer by layer as gate, up, down (each tensor on a 4096 boundary) after a
 The node's rpc-server reads the file from its own disk (GGML_RPC_FILE_ROOT) - the weights never travel over the network.
 Plain python (no numpy, no gguf package); reads each expert slice with one pread and writes sequentially.
 
-usage: ds41_ep_shard.py --partition P.part --node K --gguf FIRST.gguf -o /path/shard.bin [--layers N]
+usage: ds41_ep_shard.py --partition P.part --node K --gguf FIRST.gguf -o /path/shard.bin|- [--layers N]
+       (-o -: the shard goes to stdout, for `... | ssh pve-N 'cat > /mnt/gpuwork/models/ep/shard.bin'`)
        (--layers N writes only layers 0..N-1: the shard of a reduced-layer test; the loader's layer count must match)
 """
 import argparse, os, struct, sys, time
@@ -59,7 +60,7 @@ def main():
         if path not in fds:
             fds[path] = os.open(path, os.O_RDONLY)
         return fds[path]
-    out = open(a.o, 'wb')
+    out = sys.stdout.buffer if a.o == '-' else open(a.o, 'wb')   # '-': stream to a pipe (ssh pve-N 'cat > file'): no disk needed here
     hdr = b'DS41EPSH' + struct.pack('<Q', p['shard'][a.node])
     out.write(hdr + b'\0' * (4096 - len(hdr)))
     t0 = time.time()
@@ -80,8 +81,10 @@ def main():
             out.write(b'\0' * pad)
             total += n + pad
         if L % 4 == 3 or L == n_layer - 1:
-            print('layer %d done: %.1f GB, %.0f s' % (L, total / 1e9, time.time() - t0), flush=True)
-    out.close()
-    print('wrote %s: %d bytes' % (a.o, total))
+            print('layer %d done: %.1f GB, %.0f s' % (L, total / 1e9, time.time() - t0), flush=True, file=sys.stderr if a.o == '-' else sys.stdout)
+    out.flush()
+    if a.o != '-':
+        out.close()
+    print('wrote %s: %d bytes' % (a.o, total), file=sys.stderr if a.o == '-' else sys.stdout)
 
 main()

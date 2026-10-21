@@ -437,7 +437,7 @@ ggml_backend_buffer_type_t ggml_backend_meta_device_host_split_buffer_type(ggml_
     {
         auto it = meta_bufts.find(dev);
         if (it != meta_bufts.end()) {
-            return ggml_backend_meta_buft_simple_buft(&it->second, 0) == host_buft ? &it->second : nullptr;
+            return strcmp(ggml_backend_buft_name(ggml_backend_meta_buft_simple_buft(&it->second, 0)), ggml_backend_buft_name(host_buft)) == 0 ? &it->second : nullptr;
         }
     }
 
@@ -445,10 +445,12 @@ ggml_backend_buffer_type_t ggml_backend_meta_device_host_split_buffer_type(ggml_
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
     simple_bufts.reserve(n_devs);
     for (size_t i = 0; i < n_devs; i++) {
-        if (ggml_backend_dev_host_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i)) != host_buft) {
+        // the host buffer types of the devices may differ in their NUMA node (GGML_CUDA_MOE_HOST_NUMA_POOLS) but not in kind
+        ggml_backend_buffer_type_t simple_host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i));
+        if (simple_host_buft == nullptr || strcmp(ggml_backend_buft_name(simple_host_buft), ggml_backend_buft_name(host_buft)) != 0) {
             return nullptr;
         }
-        simple_bufts.push_back(host_buft);
+        simple_bufts.push_back(simple_host_buft);
     }
     ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
     buft_ctx->host_split = true;

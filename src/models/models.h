@@ -1512,6 +1512,18 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     // position of layer il in the engram constants, or -1 if that layer has no engram
     int engram_index(int il) const;
 
+    // Expert parallelism (llama-ep.h, LLAMA_EP_PARTITION): node 0's experts are the layer's normal expert tensors, the other
+    // nodes' are ep_layers[il][node - 1]; ep_tab[(il*n_nodes + node)*n_expert + e] is the slot of expert e in the node's
+    // tensors of layer il, or -1
+    struct ep_tensors {
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up   = nullptr;
+        ggml_tensor * down = nullptr;
+    };
+    std::shared_ptr<llama_ep_partition> ep;
+    std::vector<std::vector<ep_tensors>> ep_layers;
+    std::vector<int32_t> ep_tab;
+
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 

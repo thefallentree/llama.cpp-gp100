@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-ep.h"
 
 #include "ggml-cpp.h"
 
@@ -240,6 +241,23 @@ struct llama_model_loader {
     // changed, if `first` is not in the file, `second` already is, or the cut is not inside the array.
     bool split_single(const std::string & first, const std::string & second, int64_t n_first, int axis);
     ggml_context_ptr ctx_synth; // metas of the tensors split_single synthesizes
+
+    // Expert parallelism (llama-ep.h): where the slices of an expert tensor come from. Node 0's tensor keeps its name and
+    // gathers the node's experts from the model file; the tensors of the other nodes are synthesized (like split_single does)
+    // and read from the node's shard file, by the node's rpc-server when the tensor lives on it.
+    struct ep_source {
+        std::shared_ptr<llama_ep_partition> part;
+        int node = 0, il = 0, kind = 0;
+        int64_t s0 = 0;                  // the first slice of the node's shard that this tensor holds (a cut moves it)
+        uint16_t idx = 0; size_t offs = 0; // node 0: the model file and the tensor's offset in it
+    };
+    std::unordered_map<std::string, ep_source> ep_src;
+
+    // Gives tensor `name` the experts of `node` in layer `il`: node 0 reshapes the file's tensor `name` in place, other nodes
+    // synthesize `name` like the file's tensor `like` (do these before node 0's, which changes `like`). Call before the
+    // tensors are created. Throws if the tensor does not fit the partition.
+    void ep_assign(const std::string & name, const std::string & like, const std::shared_ptr<llama_ep_partition> & part, int node, int il, int kind);
+    void load_ep_tensor(ggml_tensor * cur, const ep_source & s, size_t n_size);
 
     // the bytes the file holds for a tensor padded with pad_dim (ggml_nbytes otherwise)
     std::map<std::string, size_t> n_bytes_file;

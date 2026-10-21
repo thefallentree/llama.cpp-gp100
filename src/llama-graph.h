@@ -105,6 +105,15 @@ struct llm_graph_params;
 // llm_graph_input
 //
 
+// Expert parallelism: one node's experts of a layer, and the table that translates the router's expert ids to the slots of
+// the node's tensors ([1, n_expert] I32, -1 = another node's expert)
+struct llm_ep_shard {
+    ggml_tensor * up   = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_tensor * tab  = nullptr;
+};
+
 class llm_graph_input_i {
 public:
     llm_graph_input_i() {
@@ -134,6 +143,26 @@ public:
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
+};
+
+// Expert parallelism: the tables that translate the router's expert ids to each node's slots (model.ep_tab), constant
+class llm_graph_input_ep_tab : public llm_graph_input_i {
+public:
+    llm_graph_input_ep_tab(const std::vector<int32_t> * tab) : tab(tab) {}
+    ~llm_graph_input_ep_tab() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        ggml_backend_tensor_set(t, tab->data(), 0, ggml_nbytes(t));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true;
+    }
+
+    ggml_tensor * t = nullptr; // I32 [n_expert, n_layer*n_nodes]
+    const std::vector<int32_t> * tab;
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
@@ -1256,7 +1285,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+    const std::vector<llm_ep_shard> * ep_shards = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1284,7 +1314,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+    const std::vector<llm_ep_shard> * ep_shards = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(

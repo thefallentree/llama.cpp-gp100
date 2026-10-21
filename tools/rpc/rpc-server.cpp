@@ -10,6 +10,7 @@
 #endif
 #include <algorithm>
 #include <clocale>
+#include <cstdlib>
 #include <csignal>
 #include <execinfo.h>
 #include <unistd.h>
@@ -111,6 +112,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -r, --file-root DIR              expert parallelism: the head may tell this server to read tensor data from files under DIR\n");
+    fprintf(stderr, "                                   (ds41_ep_shard.py shard files; sets GGML_RPC_FILE_ROOT)\n");
     fprintf(stderr, "\n");
 }
 
@@ -158,6 +161,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "-r" || arg == "--file-root") {
+            if (++i >= argc) {
+                return false;
+            }
+            setenv("GGML_RPC_FILE_ROOT", argv[i], 1);
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);

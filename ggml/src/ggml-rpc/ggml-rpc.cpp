@@ -24,6 +24,12 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cstdlib>
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -80,6 +86,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_FREE,
     RPC_CMD_NONE,
     RPC_CMD_ALLOC_HOST_BUFFER,   // a buffer of the device's host buffer type (pinned memory on the server; the engine's cold experts)
+    RPC_CMD_LOAD_FILE,           // the server reads a byte range of one of its own files into a tensor (expert-parallel shards: no weights over the wire)
     RPC_CMD_COUNT,
 };
 
@@ -103,6 +110,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_GET_ALLOC_SIZE:    return "GET_ALLOC_SIZE";
         case RPC_CMD_HELLO:             return "HELLO";
         case RPC_CMD_ALLOC_HOST_BUFFER: return "ALLOC_HOST_BUFFER";
+        case RPC_CMD_LOAD_FILE:         return "LOAD_FILE";
         case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
         case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
         case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
@@ -211,6 +219,22 @@ struct rpc_msg_set_tensor_hash_req {
 
 struct rpc_msg_set_tensor_hash_rsp {
     uint8_t result;
+};
+
+#define RPC_LOAD_FILE_PATH_MAX 480
+struct rpc_msg_load_file_req {
+    rpc_tensor tensor;
+    uint64_t   offset;      // into the tensor
+    uint64_t   size;        // bytes
+    uint64_t   file_off;    // into the file
+    uint64_t   shard_id;    // must equal the id in the first 16 bytes of the file after the 8-byte magic
+    char       path[RPC_LOAD_FILE_PATH_MAX];
+};
+
+struct rpc_msg_load_file_rsp {
+    uint8_t  result;        // 1 ok; 0 refused (no GGML_RPC_FILE_ROOT, path outside it); 2 cannot open / short file; 3 id mismatch
+    uint8_t  pad[7];
+    uint64_t bytes;
 };
 
 struct rpc_msg_get_tensor_req {
@@ -972,6 +996,34 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     ctx->dispatcher->send(RPC_CMD_BUFFER_CLEAR, request, sizeof(*request));
 }
 
+static bool ggml_backend_rpc_buffer_is_rpc(ggml_backend_buffer_t buffer);
+
+// The server reads size bytes at file_off of its own file `path` into the tensor at `offset`. False if the buffer is not
+// an RPC buffer, or the server refused (the caller then loads the bytes some other way).
+bool ggml_backend_rpc_buffer_load_file(ggml_backend_buffer_t buffer, ggml_tensor * tensor, size_t offset, size_t size,
+        const char * path, uint64_t file_off, uint64_t shard_id) {
+    if (buffer == nullptr || !ggml_backend_rpc_buffer_is_rpc(buffer) || strlen(path) >= RPC_LOAD_FILE_PATH_MAX) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    auto request = std::make_shared<rpc_msg_load_file_req>();
+    memset(request.get(), 0, sizeof(*request));
+    request->tensor   = serialize_tensor(tensor);
+    request->offset   = offset;
+    request->size     = size;
+    request->file_off = file_off;
+    request->shard_id = shard_id;
+    strncpy(request->path, path, RPC_LOAD_FILE_PATH_MAX - 1);
+    rpc_msg_load_file_rsp response;
+    memset(&response, 0, sizeof(response));
+    ctx->dispatcher->send(RPC_CMD_LOAD_FILE, request, sizeof(*request), &response, sizeof(response));
+    if (response.result != 1) {
+        LOG_ERROR("[%s] tensor %s: the server answered %u for %s at %" PRIu64 "\n", __func__, tensor->name, (unsigned) response.result, path, file_off);
+        return false;
+    }
+    return true;
+}
+
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_rpc_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_rpc_buffer_get_base,
@@ -985,6 +1037,10 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .clear           = */ ggml_backend_rpc_buffer_clear,
     /* .reset           = */ NULL,
 };
+
+static bool ggml_backend_rpc_buffer_is_rpc(ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
+}
 
 static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
@@ -1464,6 +1520,7 @@ public:
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool load_file(const rpc_msg_load_file_req & request, rpc_msg_load_file_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1966,6 +2023,92 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
     response.result = 1;
+    return true;
+}
+
+// Expert-parallel shards: the weights are read from a file on this node (GGML_RPC_FILE_ROOT is the directory the files must be in).
+// The file starts with the 8 bytes "DS41EPSH" and the shard id (u64) that the head's partition file names.
+bool rpc_server::load_file(const rpc_msg_load_file_req & request, rpc_msg_load_file_rsp & response) {
+    sync_all_backends();
+    memset(&response, 0, sizeof(response));
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    const size_t size = request.size;
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (request.tensor.data + request.offset < p0 || request.tensor.data + request.offset >= p1 || size > (p1 - request.tensor.data - request.offset)) {
+            LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                      __func__, request.tensor.data, request.offset, size, p0, p1);
+            return false;
+        }
+    }
+    const char * root_env = getenv("GGML_RPC_FILE_ROOT");
+    char path_c[RPC_LOAD_FILE_PATH_MAX];
+    memcpy(path_c, request.path, sizeof(path_c));
+    path_c[sizeof(path_c) - 1] = '\0';
+    char real[PATH_MAX], root[PATH_MAX];
+    if (root_env == nullptr || realpath(root_env, root) == nullptr || realpath(path_c, real) == nullptr ||
+            strncmp(real, root, strlen(root)) != 0 || (real[strlen(root)] != '/' && real[strlen(root)] != '\0')) {
+        LOG_ERROR("[%s] refused: GGML_RPC_FILE_ROOT=%s, path %s\n", __func__, root_env ? root_env : "(unset)", path_c);
+        response.result = 0;
+        return true;
+    }
+    FILE * f = fopen(real, "rb");
+    if (f == nullptr) {
+        response.result = 2;
+        return true;
+    }
+    uint8_t head[16];
+    if (fread(head, 1, sizeof(head), f) != sizeof(head) || memcmp(head, "DS41EPSH", 8) != 0) {
+        fclose(f);
+        response.result = 2;
+        return true;
+    }
+    uint64_t id;
+    memcpy(&id, head + 8, 8);
+    if (id != request.shard_id) {
+        fclose(f);
+        response.result = 3;
+        return true;
+    }
+    const int fd = fileno(f);
+    const size_t chunk = std::min<size_t>(size, 64u << 20);
+    std::vector<uint8_t> buf(chunk);
+    size_t done = 0;
+    while (done < size) {
+        const size_t n = std::min(chunk, size - done);
+        size_t got = 0;
+        while (got < n) {
+            const ssize_t r = pread(fd, buf.data() + got, n - got, (off_t) (request.file_off + done + got));
+            if (r <= 0) {
+                break;
+            }
+            got += (size_t) r;
+        }
+        if (got < n) {
+            fclose(f);
+            response.result = 2;
+            response.bytes  = done + got;
+            return true;
+        }
+        ggml_backend_tensor_set(tensor, buf.data(), request.offset + done, n);
+        done += n;
+    }
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    fclose(f);
+    response.result = 1;
+    response.bytes  = done;
     return true;
 }
 
@@ -2746,6 +2889,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_LOAD_FILE: {
+                rpc_msg_load_file_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_load_file_rsp response;
+                if (!server.load_file(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_INIT_TENSOR: {
                 rpc_msg_init_tensor_req request;
                 if (!recv_msg(sock, &request,sizeof(request))) {
@@ -3209,6 +3366,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_device_host_buffer_type") == 0) {
         return (void *)ggml_backend_rpc_device_host_buffer_type;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_load_file") == 0) {
+        return (void *)ggml_backend_rpc_buffer_load_file;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;

@@ -542,8 +542,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : 2));
-        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
+        // LLAMA_TEST_N_EXPERT / LLAMA_TEST_N_EXPERT_USED: a wider router for the models that --out saves (tools/ep/ep-model-test)
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(getenv("LLAMA_TEST_N_EXPERT") ? atoi(getenv("LLAMA_TEST_N_EXPERT")) : host_experts_test(arch) ? 64 : 2));
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(getenv("LLAMA_TEST_N_EXPERT_USED") ? atoi(getenv("LLAMA_TEST_N_EXPERT_USED")) : 2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
 
         uint32_t gating_func = 2;

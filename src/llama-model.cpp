@@ -1927,7 +1927,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.done_getting_tensors();
+    // LLAMA_PARTIAL_LAYERS=1 with --override-kv <arch>.block_count=int:N: a run on the first N layers of a file (reduced-layer tests)
+    ml.done_getting_tensors(getenv("LLAMA_PARTIAL_LAYERS") != nullptr);
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);

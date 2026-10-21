@@ -973,7 +973,139 @@ bool llama_model_loader::split_single(const std::string & first, const std::stri
     b.offs   = a.offs + (size_t) n_first*slice;
     weights_map.emplace(second, b);
     n_tensors++;   // done_getting_tensors counts the synthesized tensor like one of the file's
+    if (const auto it_ep = ep_src.find(first); it_ep != ep_src.end()) {
+        ep_source e = it_ep->second;   // the expert-parallel shard goes on from where the cut is
+        e.s0 += n_first;
+        ep_src[second] = e;
+    }
     return true;
+}
+
+void llama_model_loader::ep_assign(const std::string & name, const std::string & like, const std::shared_ptr<llama_ep_partition> & part,
+        const int node, const int il, const int kind) {
+    if (use_mmap) {
+        throw std::runtime_error("expert parallelism needs --load-mode none: the experts are gathered from the file, not mapped");
+    }
+    if (use_direct_io) {
+        throw std::runtime_error("expert parallelism does not support direct I/O loading");
+    }
+    const auto it = weights_map.find(like);
+    if (it == weights_map.end()) {
+        throw std::runtime_error(format("expert parallelism: tensor '%s' not found", like.c_str()));
+    }
+    llama_tensor_weight & a = it->second;
+    ggml_tensor * ta = a.tensor;
+    if (ta->ne[3] != 1 || (uint64_t) ta->nb[2] != part->slice[kind] || ta->ne[2] != part->n_expert || il >= part->n_layer) {
+        throw std::runtime_error(format("expert parallelism: tensor '%s' (%lld experts of %zu bytes) does not match the partition (%d experts of %llu bytes, %d layers)",
+                like.c_str(), (long long) ta->ne[2], (size_t) ta->nb[2], part->n_expert, (unsigned long long) part->slice[kind], part->n_layer));
+    }
+    const int64_t n_k = part->n_local(il, node);
+    ep_source e;
+    e.part = part;
+    e.node = node;
+    e.il   = il;
+    e.kind = kind;
+    e.idx  = a.idx;
+    e.offs = a.offs;
+    if (node == 0) {
+        GGML_ASSERT(name == like);
+        ta->ne[2] = n_k;
+        ta->nb[3] = ta->nb[2]*n_k;
+        ep_src[name] = e;
+        return;
+    }
+    if (!ctx_synth) {
+        ggml_init_params params = { ggml_tensor_overhead()*1024, NULL, true };
+        ctx_synth.reset(ggml_init(params));
+        if (!ctx_synth) {
+            throw std::runtime_error("expert parallelism: cannot create a context");
+        }
+    }
+    int64_t ne[GGML_MAX_DIMS] = { ta->ne[0], ta->ne[1], n_k, 1 };
+    ggml_tensor * tb = ggml_new_tensor(ctx_synth.get(), ta->type, GGML_MAX_DIMS, ne);
+    if (tb == nullptr) {
+        throw std::runtime_error("expert parallelism: cannot synthesize a tensor");
+    }
+    ggml_set_name(tb, name.c_str());
+    llama_tensor_weight b = a;
+    b.tensor = tb;
+    weights_map.emplace(name, b);
+    n_tensors++;
+    ep_src[name] = e;
+}
+
+// The bytes of an expert-parallel tensor: node 0 gathers its experts' slices from the model file (in shard order); another
+// node's tensor is a range of its shard file, read by that node's rpc-server when the tensor lives there (no weights on
+// the wire), or here when the file is reachable and the tensor is local.
+void llama_model_loader::load_ep_tensor(ggml_tensor * cur, const ep_source & s, const size_t n_size) {
+    const llama_ep_partition & part = *s.part;
+    const size_t slice = part.slice[s.kind];
+    const size_t n_slices = n_size/slice;
+    const auto & ids = part.ids[s.il][s.node];
+    if ((size_t) s.s0 + n_slices > ids.size()) {
+        throw std::runtime_error(format("expert parallelism: tensor '%s' holds more slices than the shard", ggml_get_name(cur)));
+    }
+    const bool host = ggml_backend_buffer_is_host(cur->buffer);
+    const size_t chunk_slices = std::max<size_t>(1, (64u << 20)/slice);
+    std::vector<no_init<uint8_t>> stage;
+    if (s.node == 0) {
+        llama_file * file = files.at(s.idx).get();
+        for (size_t j0 = 0; j0 < n_slices; j0 += chunk_slices) {
+            const size_t nj = std::min(chunk_slices, n_slices - j0);
+            uint8_t * dst;
+            if (host) {
+                dst = (uint8_t *) cur->data + j0*slice;
+            } else {
+                stage.resize(nj*slice);
+                dst = (uint8_t *) stage.data();
+            }
+            for (size_t j = 0; j < nj; ++j) {
+                file->seek(s.offs + (size_t) ids[s.s0 + j0 + j]*slice, SEEK_SET);
+                file->read_raw(dst + j*slice, slice);
+            }
+            if (!host) {
+                ggml_backend_tensor_set(cur, dst, j0*slice, nj*slice);
+            }
+        }
+        return;
+    }
+    const std::string & path = part.shard_path[s.node];
+    const uint64_t id = part.shard_id[s.node];
+    const uint64_t off0 = part.shard_offset(s.node, s.il, s.kind) + (uint64_t) s.s0*slice;
+    if (!host && cur->buffer != nullptr) {
+        if (ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC")) {
+            typedef bool (*load_file_t)(ggml_backend_buffer_t, ggml_tensor *, size_t, size_t, const char *, uint64_t, uint64_t);
+            auto fn = (load_file_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_buffer_load_file");
+            if (fn && fn(cur->buffer, cur, 0, n_slices*slice, path.c_str(), off0, id)) {
+                return;
+            }
+        }
+    }
+    // a local tensor: the shard file is read here (a test on one machine, or a worker's own cards)
+    llama_file file(path.c_str(), "rb");
+    uint8_t head[16];
+    file.seek(0, SEEK_SET);
+    file.read_raw(head, sizeof(head));
+    uint64_t fid;
+    memcpy(&fid, head + 8, 8);
+    if (memcmp(head, "DS41EPSH", 8) != 0 || fid != id) {
+        throw std::runtime_error(format("expert parallelism: %s is not the shard file of node %d (id mismatch)", path.c_str(), s.node));
+    }
+    for (size_t j0 = 0; j0 < n_slices; j0 += chunk_slices) {
+        const size_t nj = std::min(chunk_slices, n_slices - j0);
+        uint8_t * dst;
+        if (host) {
+            dst = (uint8_t *) cur->data + j0*slice;
+        } else {
+            stage.resize(nj*slice);
+            dst = (uint8_t *) stage.data();
+        }
+        file.seek(off0 + j0*slice, SEEK_SET);
+        file.read_raw(dst, nj*slice);
+        if (!host) {
+            ggml_backend_tensor_set(cur, dst, j0*slice, nj*slice);
+        }
+    }
 }
 
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
@@ -1852,6 +1984,17 @@ bool llama_model_loader::load_all_data(
             const auto it_pad = n_bytes_file.find(ggml_get_name(cur));
             if (it_pad != n_bytes_file.end()) {
                 n_size = std::min(n_size, it_pad->second);
+            }
+        }
+
+        if (!ep_src.empty()) {
+            if (const auto it_ep = ep_src.find(ggml_get_name(cur)); it_ep != ep_src.end()) {
+                load_ep_tensor(cur, it_ep->second, n_size);
+                size_done += n_size;
+                if (n_size < ggml_nbytes(cur)) {
+                    size_done += ggml_nbytes(cur) - n_size;
+                }
+                continue;
             }
         }
 

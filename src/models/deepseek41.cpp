@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -81,6 +82,9 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     }
 
     for (uint32_t e = 0; e < engram_n_layer; ++e) {
+        if (hparams.engram_layer_ids[e] >= hparams.n_layer() && getenv("LLAMA_PARTIAL_LAYERS") != nullptr) {
+            continue;   // a model cut to its first layers (test runs): the engram of a later layer is not used
+        }
         if (hparams.engram_layer_ids[e] >= hparams.n_layer()) {
             throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
         }
@@ -128,6 +132,43 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                                         engram_token_map.size(), n_vocab));
     }
 
+    // Expert parallelism: LLAMA_EP_PARTITION names a partition file (llama-ep.h, scripts/ds41_ep_partition.py). This process is
+    // node 0: it keeps the experts that the file gives it, in the layer's normal tensors (the hot/cold split below applies
+    // to that shard); node k's experts become tensors blk.N.ffn_{gate,up,down}_exps.epK.weight, placed on node k's devices
+    // with -ot and loaded from node k's shard file by its rpc-server. The router and the shared expert stay here.
+    std::vector<int64_t> n_exp_layer(n_layer, n_expert);
+    std::vector<std::string> ep_sfx;
+    if (const char * ep_file = getenv("LLAMA_EP_PARTITION"); ep_file != nullptr && *ep_file != '\0') {
+        ep = llama_ep_partition::load(ep_file);
+        if (ep->n_expert != (int) n_expert || ep->n_layer < (int) n_layer) {
+            throw std::runtime_error(format("LLAMA_EP_PARTITION: %s covers %d experts and %d layers, the model has %" PRId64 " and %d",
+                                            ep_file, ep->n_expert, ep->n_layer, (int64_t) n_expert, (int) n_layer));
+        }
+        for (int k = 0; k < ep->n_nodes; ++k) {
+            ep_sfx.push_back(format("ep%d.weight", k));
+        }
+        static const llm_tensor kinds[3] = { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS };
+        for (int il = 0; il < n_layer; ++il) {
+            for (int kd = 0; kd < 3; ++kd) {
+                const std::string like = tn(kinds[kd], "weight", il).str();
+                for (int k = 1; k < ep->n_nodes; ++k) {   // before node 0's reshape of `like`
+                    ml.ep_assign(tn(kinds[kd], ep_sfx[k].c_str(), il).str(), like, ep, k, il, kd);
+                }
+                ml.ep_assign(like, like, ep, 0, il, kd);
+            }
+            n_exp_layer[il] = ep->n_local(il, 0);
+        }
+        ep_layers.assign(n_layer, std::vector<ep_tensors>(ep->n_nodes - 1));
+        ep_tab.assign((size_t) n_layer*ep->n_nodes*n_expert, -1);
+        for (int il = 0; il < n_layer; ++il) {
+            for (int k = 0; k < ep->n_nodes; ++k) {
+                ep->table(il, k, ep_tab.data() + ((size_t) il*ep->n_nodes + k)*n_expert);
+            }
+        }
+        LLAMA_LOG_WARN("%s: expert parallelism over %d nodes: this node keeps %.1f experts per layer of %" PRId64 "\n", __func__,
+                ep->n_nodes, (double) std::accumulate(n_exp_layer.begin(), n_exp_layer.end(), (int64_t) 0)/n_layer, (int64_t) n_expert);
+    }
+
     // Hot/cold routed experts for the engine's expert cache and host tier, as llama_model_glm5_next: the file keeps a
     // layer's experts hot first (scripts/flashnext/fn_permute_inplace.py) as one array per matrix, the hot count comes
     // from the file (expert_hot_count) or LLAMA_EXPERT_HOT / LLAMA_EXPERT_HOT_LAYERS ("il:n,..." or "n,n,..."), and the
@@ -166,6 +207,12 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                 il_next = il + 1;
             }
         }
+        for (int il = 0; il < n_layer; ++il) {
+            // a node whose shard has no more experts than the hot count keeps the whole shard in VRAM (no cold tensor)
+            if (n_hot_layer[il] >= n_exp_layer[il]) {
+                n_hot_layer[il] = n_exp_layer[il] < n_expert ? 0 : n_hot_layer[il];
+            }
+        }
         if (n_hot > 0) {
             n_spare = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
             static const llm_tensor pairs[3][2] = {
@@ -177,6 +224,9 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             int n_padded = 0;
             for (int il = 0; il < n_layer; ++il) {
                 total += n_hot_layer[il];
+                if (n_hot_layer[il] == 0) {
+                    continue;   // the whole shard of this layer stays in VRAM
+                }
                 for (const auto & pair : pairs) {
                     const std::string hot  = tn(pair[0], "weight", il).str();
                     const std::string cold = tn(pair[1], "weight", il).str();
@@ -246,7 +296,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         {
             const int64_t n_hot    = n_hot_layer[i];
             const int64_t n_s      = n_hot > 0 ? n_spare : 0;
-            const int64_t n_exp_ho = n_hot > 0 ? n_hot + n_s : n_expert;
+            const int64_t n_exp_ho = n_hot > 0 ? n_hot + n_s : n_exp_layer[i];
 
             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_exp_ho}, 0);
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_exp_ho}, 0);
@@ -254,13 +304,21 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
             if (n_hot > 0) {
                 // the cold experts: host memory of the layer's device (-ot _exps_cold=CUDA_Host), the host tier computes them
-                layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", i), {n_embd,   n_ff_exp, n_expert - n_hot + n_s}, 0);
-                layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", i), {n_ff_exp, n_embd,   n_expert - n_hot + n_s}, 0);
-                layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", i), {n_embd,   n_ff_exp, n_expert - n_hot + n_s}, 0);
+                layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", i), {n_embd,   n_ff_exp, n_exp_layer[i] - n_hot + n_s}, 0);
+                layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", i), {n_ff_exp, n_embd,   n_exp_layer[i] - n_hot + n_s}, 0);
+                layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", i), {n_embd,   n_ff_exp, n_exp_layer[i] - n_hot + n_s}, 0);
                 exps_cold[layer.ffn_down_exps] = layer.ffn_down_exps_cold;
                 exps_cold[layer.ffn_gate_exps] = layer.ffn_gate_exps_cold;
                 exps_cold[layer.ffn_up_exps]   = layer.ffn_up_exps_cold;
             }
+        }
+
+        for (int k = 1; ep != nullptr && k < ep->n_nodes; ++k) {
+            const int64_t n_k = ep->n_local(i, k);
+            ep_tensors & et = ep_layers[i][k - 1];
+            et.gate = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_k}, 0);
+            et.down = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, ep_sfx[k].c_str(), i), {n_ff_exp, n_embd,   n_k}, 0);
+            et.up   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_k}, 0);
         }
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
@@ -953,6 +1011,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
     comp_picks.resize(n_layer);
 
+    // expert parallelism: the node tables as one constant input
+    ggml_tensor * inp_ep_tab = nullptr;
+    if (pmodel.ep) {
+        auto inp = std::make_unique<llm_graph_input_ep_tab>(&pmodel.ep_tab);
+        inp->t = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert, (int64_t) n_layer*pmodel.ep->n_nodes);
+        ggml_set_input(inp->t);
+        ggml_set_name(inp->t, "ep_tab");
+        inp_ep_tab = inp->t;
+        res->add_input(std::move(inp));
+    }
+
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
@@ -1037,6 +1106,22 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
+        std::vector<llm_ep_shard> ep_shards;
+        if (pmodel.ep) {
+            const int K = pmodel.ep->n_nodes;
+            ep_shards.resize(K);
+            for (int k = 0; k < K; ++k) {
+                ggml_tensor * tab = ggml_view_2d(ctx0, inp_ep_tab, 1, n_expert, sizeof(int32_t),
+                        ((size_t) il*K + k)*n_expert*sizeof(int32_t));   // [1, n_expert]
+                if (k == 0) {
+                    ep_shards[k] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, tab };
+                } else {
+                    const auto & et = pmodel.ep_layers[il][k - 1];
+                    ep_shards[k] = { et.up, et.gate, et.down, tab };
+                }
+            }
+        }
+
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -1047,7 +1132,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+                il,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1e-5f,
+                pmodel.ep ? &ep_shards : nullptr);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,

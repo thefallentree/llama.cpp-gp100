@@ -26,6 +26,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_host_buffer_type(const char * endpoint, uint32_t device);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_device_host_buffer_type(ggml_backend_dev_t dev);
 
+// Expert-parallel shards: the server reads `size` bytes at `file_off` of its own file `path` (which must lie under its
+// GGML_RPC_FILE_ROOT and start with "DS41EPSH" + the u64 `shard_id`) into the tensor at `offset`. False if the buffer is
+// not an RPC buffer or the server refused: the caller loads the bytes some other way.
+GGML_BACKEND_API bool ggml_backend_rpc_buffer_load_file(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, size_t offset,
+        size_t size, const char * path, uint64_t file_off, uint64_t shard_id);
+
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,

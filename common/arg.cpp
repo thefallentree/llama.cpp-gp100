@@ -2742,6 +2742,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
+        {"--ep-partition"}, "FILE",
+        "expert parallelism (DeepSeek-V4.1): the partition file that says which routed experts each node owns "
+        "(scripts/ds41_ep_partition.py); this process is node 0, the others' experts are placed with -ot on their RPC devices "
+        "(tensors blk.N.ffn_{gate,up,down}_exps.epK.weight) and loaded by their rpc-servers from their own shard files (requires -lm none)",
+        [](common_params & params, const std::string & value) {
+            GGML_UNUSED(params);
+            setenv("LLAMA_EP_PARTITION", value.c_str(), 1);
+        }
+    ).set_env("LLAMA_EP_PARTITION"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

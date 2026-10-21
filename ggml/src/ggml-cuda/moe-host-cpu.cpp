@@ -994,6 +994,47 @@ static void kdot_q3k_avx2(const uint8_t * const * w, const kact_block * a, int n
         out[r] = kh256(acc[r]) + kh256(am[r]);
     }
 }
+
+// ---- Q4_0 (glm5-next's NextN block): blocks of 32 = fp16 d + 16 bytes (element i: low nibble of byte i, element 16 + i:
+// high nibble), value = d*(code - 8). One block per activation group of 32 (scale asg[G] in element order G, the codes
+// against the group's int8 values, the -8 on the sums of its two 16-halves).
+template <int NR>
+__attribute__((target("avx2,f16c,fma")))
+static void kdot_q40_avx2(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m128i m4   = _mm_set1_epi8(0x0F);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc[NR];
+    float  cor[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm256_setzero_ps();
+        cor[r] = 0.0f;
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+#pragma GCC unroll 8
+        for (int G = 0; G < 8; ++G) {
+            const __m256i y  = _mm256_load_si256((const __m256i *) (ab.q + 64*(G & 3) + 32*(G >> 2)));
+            const float   as = ab.asg[G];
+            const int     bs = ab.bs[2*G] + ab.bs[2*G + 1];
+            for (int r = 0; r < NR; ++r) {
+                const uint8_t * p = w[r] + (size_t) (8*k + G)*18;
+                uint16_t dh;
+                memcpy(&dh, p, 2);
+                const __m128i qs = _mm_loadu_si128((const __m128i *) (p + 2));
+                const __m128i lo = _mm_and_si128(qs, m4);
+                const __m128i hi = _mm_and_si128(_mm_srli_epi16(qs, 4), m4);
+                const __m256i c  = _mm256_set_m128i(hi, lo);
+                const __m256i pr = _mm256_madd_epi16(_mm256_maddubs_epi16(c, y), ones);
+                const float   da = _cvtsh_ss(dh)*as;
+                acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pr), _mm256_set1_ps(da), acc[r]);
+                cor[r] += da*8.0f*(float) bs;
+            }
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = kh256(acc[r]) - cor[r];
+    }
+}
 #endif // MH_X86
 
 typedef void (*kdot_fn)(const uint8_t * const *, const kact_block *, int, float *);
@@ -1062,7 +1103,7 @@ static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, dot
 }
 
 // the k kernels (2 rows) and activation converters: AVX-512 where the old kernels are, AVX2 below; false: the old path only
-static bool pick_kkernels(kdot_fn & q2, kdot_fn & q3, kfrom_fn & from, kquant_fn & quant, const char *& name) {
+static bool pick_kkernels(kdot_fn & q2, kdot_fn & q3, kdot_fn & q4, kfrom_fn & from, kquant_fn & quant, const char *& name) {
 #if MH_X86
     const char * force = getenv("GGML_CUDA_MOE_HOST_ISA");
     __builtin_cpu_init();
@@ -1075,6 +1116,7 @@ static bool pick_kkernels(kdot_fn & q2, kdot_fn & q3, kfrom_fn & from, kquant_fn
     quant = kact_quantize_avx2;
     q2    = kdot_q2k_avx2<2>;
     q3    = kdot_q3k_avx2<2>;
+    q4    = kdot_q40_avx2<2>;
     name  = "AVX2";
     if (has512 && !(force != nullptr && strcmp(force, "avx2") == 0)) {
         q2   = kdot_q2k_avx512<2>;
@@ -1083,7 +1125,7 @@ static bool pick_kkernels(kdot_fn & q2, kdot_fn & q3, kfrom_fn & from, kquant_fn
     }
     return true;
 #else
-    (void) q2; (void) q3; (void) from; (void) quant; (void) name;
+    (void) q2; (void) q3; (void) q4; (void) from; (void) quant; (void) name;
     return false;
 #endif
 }
@@ -1184,6 +1226,7 @@ struct pool {
     int          jmode    = 0;           // this job: 0 old kernels, 2 k kernels
     kdot_fn      kd_q2k   = nullptr;     // 2 rows
     kdot_fn      kd_q3k   = nullptr;
+    kdot_fn      kd_q40   = nullptr;     // Q4_0 gate/up/down (wtype 3)
     kfrom_fn     kfrom    = nullptr;
     kquant_fn    kquant   = nullptr;
     const char * kisa     = nullptr;
@@ -1386,7 +1429,8 @@ struct pool {
         const int ch3 = s.n_embd % CH3k == 0 ? CH3k : 32;
         const int rb3 = s.n_embd/ch3;
         const int n3  = n_groups*rb3;
-        const kdot_fn kdn = s.wtype_down == 2 ? kd_q3k : kd_q2k;
+        const kdot_fn kdn = s.wtype_down == 3 ? kd_q40 : s.wtype_down == 2 ? kd_q3k : kd_q2k;
+        const kdot_fn kdg = s.wtype == 3 ? kd_q40 : kd_q2k;
         float * hbase = (float *) (((uintptr_t) h.data() + 63) & ~(uintptr_t) 63);   // 64-byte lines: chunks of 16 rows own whole lines
         for (int c; (c = chunk1.fetch_add(1, std::memory_order_relaxed)) < n1 + n3; ) {
             if (c < n1) {
@@ -1410,7 +1454,7 @@ struct pool {
                     for (int r = r0; r < r0 + ch1; ++r) {
                         const uint8_t * pw[2] = { gate + (size_t) r*s.gate_nb1, up + (size_t) r*s.up_nb1 };
                         float v[2];
-                        kd_q2k(pw, ks.x.data(), nsb_e, v);
+                        kdg(pw, ks.x.data(), nsb_e, v);
                         float vg = v[0], vu = v[1];
                         if (s.clamp > 0.0f) {   // swiglu_clamp(limit): silu(min(g, limit)) * clamp(u, -limit, limit)
                             vg = std::min(vg, s.clamp);
@@ -1525,7 +1569,9 @@ struct pool {
         }
         js = &g_slots.tab[slot];
         jm = m;
-        jmode = knew && js->wtype == 1 && (js->wtype_down == 1 || js->wtype_down == 2) && js->n_embd % 256 == 0 && js->n_ff % 256 == 0 ? 2 : 0;
+        jmode = knew && ((js->wtype == 1 && (js->wtype_down == 1 || js->wtype_down == 2)) || (js->wtype == 3 && js->wtype_down == 3)) &&
+                js->n_embd % 256 == 0 && js->n_ff % 256 == 0 ? 2 : 0;
+        GGML_ASSERT((js->wtype != 3 || jmode == 2) && "Q4_0 cold experts need the k kernels (GGML_CUDA_MOE_HOST_KERNEL, AVX2)");
         const int n_used  = m->n_used;
         const int n_pairs = std::min<int>(m->n_pairs, m->cap_pairs);
         const int nb_f    = js->n_ff/QK;
@@ -1736,7 +1782,7 @@ struct pool {
         // GGML_CUDA_MOE_HOST_KERNEL=old: the previous kernels and job loop for every layer (an A/B switch)
         {
             const char * ke = getenv("GGML_CUDA_MOE_HOST_KERNEL");
-            knew = (ke == nullptr || strcmp(ke, "old") != 0) && pick_kkernels(kd_q2k, kd_q3k, kfrom, kquant, kisa);
+            knew = (ke == nullptr || strcmp(ke, "old") != 0) && pick_kkernels(kd_q2k, kd_q3k, kd_q40, kfrom, kquant, kisa);
             if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH3")) {
                 const int v = atoi(e);
                 if (v >= 2 && v % 2 == 0) {

@@ -234,7 +234,15 @@ static void rpc_crash_handler(int sig, siginfo_t * info, void *) {
     raise(sig);
 }
 
+// FN_PROF / GGML_CUDA_NODE_TIMING print their tables when the process exits: a SIGTERM (systemctl stop) is a normal exit then
+static void rpc_term_handler(int) {
+    exit(0);
+}
+
 int main(int argc, char * argv[]) {
+    if (getenv("FN_PROF") != nullptr || getenv("GGML_CUDA_NODE_TIMING") != nullptr) {
+        signal(SIGTERM, rpc_term_handler);
+    }
     {
         struct sigaction sa = {};
         sa.sa_sigaction = rpc_crash_handler;

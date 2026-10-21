@@ -1764,7 +1764,7 @@ struct pool {
         const int hw = (int) std::thread::hardware_concurrency();
         const int total = env != nullptr ? atoi(env) : std::max(1, std::min(16, hw - 4));
         n_threads = std::max(1, total/n_pools);
-        // GGML_CUDA_MOE_HOST_POOL_CPUS=c,c,...;c,c,...: the CPUs of each pool (the NUMA-pool layout: pool i = device i's
+        // GGML_CUDA_MOE_HOST_POOL_CPUS=c,c,...:c,c,... (separator : or | or ;): the CPUs of each pool (the NUMA-pool layout: pool i = device i's
         // socket); the list of a pool sets its thread count
         std::vector<int> pool_cpus;
         if (const char * e = getenv("GGML_CUDA_MOE_HOST_POOL_CPUS")) {
@@ -1781,7 +1781,7 @@ struct pool {
                 p = end;
                 if (*p == ',') {
                     ++p;
-                } else if (*p == ';') {
+                } else if (*p == ';' || *p == '|' || *p == ':') {
                     ++p;
                     ++i;
                 }

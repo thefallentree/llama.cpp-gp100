@@ -77,7 +77,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     // comes from the file (expert_hot_count) or LLAMA_EXPERT_HOT / LLAMA_EXPERT_HOT_LAYERS ("il:n,..." or "n,n,..."),
     // and the cold part is cut off at load (split_single; resplit when the file already has the pair). The NextN
     // block keeps its experts whole.
-    std::vector<int64_t> n_hot_layer(n_layer, 0);
+    std::vector<int64_t> n_hot_layer(n_layer_all, 0);
     int64_t n_spare = 0;
     if (!mtp_only) {
         int64_t n_hot = hparams.n_expert_hot;
@@ -111,6 +111,14 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
                 il_next = il + 1;
             }
         }
+        if (n_hot > 0 && getenv("LLAMA_EXPERT_HOT_MTP") != nullptr && !(mtp_flags & TENSOR_SKIP)) {
+            // the NextN block's experts get a hot/cold split too (the draft's MoE then runs on the host tier instead of
+            // the CPU backend); LLAMA_EXPERT_HOT_MTP=n hot experts, unset/0: whole, as before
+            const int64_t n_mtp = std::max(0, atoi(getenv("LLAMA_EXPERT_HOT_MTP")));
+            for (int il = n_layer; il < n_layer_all; ++il) {
+                n_hot_layer[il] = n_mtp < (int64_t) n_expert ? n_mtp : 0;
+            }
+        }
         if (n_hot > 0) {
             n_spare = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
             static const llm_tensor pairs[3][2] = {
@@ -120,7 +128,10 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             };
             int64_t total = 0;
             int n_padded = 0;
-            for (int il = (int) hparams.n_layer_dense_lead; il < n_layer; ++il) {
+            for (int il = (int) hparams.n_layer_dense_lead; il < n_layer_all; ++il) {
+                if (n_hot_layer[il] == 0) {
+                    continue;
+                }
                 total += n_hot_layer[il];
                 for (const auto & pair : pairs) {
                     const std::string hot  = tn(pair[0], "weight", il).str();
@@ -237,7 +248,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, flags);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, flags);
 
-            const int64_t n_hot    = i < n_layer ? n_hot_layer[i] : 0;
+            const int64_t n_hot    = n_hot_layer[i];
             const int64_t n_s      = n_hot > 0 ? n_spare : 0;
             const int64_t n_exp_ho = n_hot > 0 ? n_hot + n_s : n_expert;
 
@@ -645,6 +656,10 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
                 "nextn_layer_offset out of range [0, n_layer_nextn)");
 
     const auto & layer = model.layers[il];
+
+    if (layer.ffn_up_exps_cold != nullptr) {
+        exps_cold = &model.exps_cold; // the NextN block's experts are split hot/cold (LLAMA_EXPERT_HOT_MTP)
+    }
 
     GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm &&
                 "GLM5-Next MTP block is missing - load the model with MTP enabled");

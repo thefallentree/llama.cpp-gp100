@@ -1195,6 +1195,7 @@ int thread_node() {
             }
             fclose(f);
         }
+        GGML_LOG_WARN("moe-host: a pool thread on cpu %d is on node %d\n", cpu, node);
 #endif
     }
     return node;
@@ -1811,6 +1812,10 @@ struct pool {
                 fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs, %.2f experts per job, %s kernels\n",
                               id, (long long) stat_jobs, stat_us/stat_jobs, stat_quant_us/stat_jobs, stat_p1_us/stat_jobs, stat_work_us/stat_jobs,
                               (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs, jmode == 2 ? "k" : "old");
+                if (nsplit) {
+                    fprintf(stderr, "moe-host: pool %d: NUMA split: %lld chunks from the thread's own node, %lld from the other\n", id,
+                            (long long) st_own.exchange(0), (long long) st_steal.exchange(0));
+                }
                 stat_jobs = stat_pairs = stat_groups = 0;
                 stat_us = stat_quant_us = stat_p1_us = stat_work_us = 0.0;
             }

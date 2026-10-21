@@ -1764,6 +1764,32 @@ struct pool {
         const int hw = (int) std::thread::hardware_concurrency();
         const int total = env != nullptr ? atoi(env) : std::max(1, std::min(16, hw - 4));
         n_threads = std::max(1, total/n_pools);
+        // GGML_CUDA_MOE_HOST_POOL_CPUS=c,c,...;c,c,...: the CPUs of each pool (the NUMA-pool layout: pool i = device i's
+        // socket); the list of a pool sets its thread count
+        std::vector<int> pool_cpus;
+        if (const char * e = getenv("GGML_CUDA_MOE_HOST_POOL_CPUS")) {
+            int i = 0;
+            for (const char * p = e; *p != 0 && i <= pool_id;) {
+                char * end = nullptr;
+                const long c = strtol(p, &end, 10);
+                if (end == p) {
+                    break;
+                }
+                if (i == pool_id) {
+                    pool_cpus.push_back((int) c);
+                }
+                p = end;
+                if (*p == ',') {
+                    ++p;
+                } else if (*p == ';') {
+                    ++p;
+                    ++i;
+                }
+            }
+            if (!pool_cpus.empty()) {
+                n_threads = (int) pool_cpus.size();
+            }
+        }
         if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH1")) {
             const int v = atoi(e);
             if (v == 4 || v == 8 || v == 16 || v == 32 || v == 64) {
@@ -1806,7 +1832,9 @@ struct pool {
         // GGML_CUDA_MOE_HOST_CPUS=c,c,...: the threads on these CPUs (one each, in order; the GPUs' NUMA node where
         // the process may run on both: the cold slices are read from memory next to it, GGML_CUDA_HOST_NUMA)
         std::vector<int> cpus;
-        if (const char * e = getenv("GGML_CUDA_MOE_HOST_CPUS")) {
+        if (!pool_cpus.empty()) {
+            cpus = pool_cpus;
+        } else if (const char * e = getenv("GGML_CUDA_MOE_HOST_CPUS")) {
             for (const char * p = e; *p != 0;) {
                 char * end = nullptr;
                 const long c = strtol(p, &end, 10);
@@ -1820,7 +1848,7 @@ struct pool {
             cpus = cpu_list();
         }
         for (int t = 0; t < n_threads && !cpus.empty(); ++t) {
-            const int cpu = cpus[(size_t) (pool_id*n_threads + t) % cpus.size()];
+            const int cpu = cpus[(size_t) ((pool_cpus.empty() ? pool_id*n_threads : 0) + t) % cpus.size()];
             cpu_set_t set;
             CPU_ZERO(&set);
             CPU_SET(cpu, &set);
@@ -1867,7 +1895,7 @@ std::vector<int> mh_pinned_cpus() {
     return g_pinned_cpus;
 }
 
-void mh_pool_attach(int index, mh_mailbox * m, int n_devices) {
+void mh_pool_attach(int index, mh_mailbox * m, int n_devices, int device) {
     GGML_ASSERT(index >= 0 && index < MH_MAX_POOLS*MH_MAX_DEVICES);
     std::lock_guard<std::mutex> lock(g_start_mtx);
     if (g_n_pools == 0) {
@@ -1876,9 +1904,10 @@ void mh_pool_attach(int index, mh_mailbox * m, int n_devices) {
         const char * env = getenv("GGML_CUDA_MOE_HOST_POOLS");
         g_n_pools = std::max(1, std::min(MH_MAX_POOLS, env != nullptr ? atoi(env) : n_devices));
     }
-    const int ip = index % g_n_pools;
-    const int im = index / g_n_pools;
+    const int ip = device >= 0 ? device % g_n_pools : index % g_n_pools;
     pool * p = g_pool(ip);
+    const int im = device >= 0 ? p->n_mb.load() : index / g_n_pools;
+    GGML_ASSERT(im < MH_MAX_DEVICES);
     if (p->threads.empty()) {
         p->start(ip, g_n_pools);
     }

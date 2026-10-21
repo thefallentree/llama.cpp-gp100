@@ -94,7 +94,8 @@ struct mh_slot_desc {
 bool mh_cpu_supported();
 // Starts the workers on first call; later calls only attach the context's mailbox (index: 0, 1, ... in the order of
 // the calls). n_devices: how many devices compute a layer together; each gets a pool of its own.
-void mh_pool_attach(int index, mh_mailbox * mb, int n_devices);
+// device >= 0 (GGML_CUDA_MOE_HOST_NUMA_POOLS): the mailbox goes to pool device % n_pools whatever the order of the calls.
+void mh_pool_attach(int index, mh_mailbox * mb, int n_devices, int device = -1);
 // the CPUs the host threads were pinned to (GGML_CUDA_MOE_HOST_CPUS / _PIN): other threads that spin stay off them
 std::vector<int> mh_pinned_cpus();
 // Returns the slot id of the layer (registered once, looked up by its down tensor afterwards).

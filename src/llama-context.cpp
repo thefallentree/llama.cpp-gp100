@@ -194,8 +194,16 @@ llama_context::llama_context(
 
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
-        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
-                        __func__, cparams.n_rs_seq);
+        // a model with recurrent state and no in-place rollback makes speculative decoding fall back to saving the whole
+        // recurrent state every round (tens of ms per step): say so loudly, it is easy to lose an arch from the list
+        if (llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch)) {
+            LLAMA_LOG_WARN("%s: n_rs_seq=%u requested but %s is not in llm_arch_supports_rs_rollback(); speculative "
+                           "rollback falls back to full recurrent-state checkpoints (slow); clamping to 0\n",
+                           __func__, cparams.n_rs_seq, llm_arch_name(model.arch));
+        } else {
+            LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
+                            __func__, cparams.n_rs_seq);
+        }
         cparams.n_rs_seq = 0;
     }
 

@@ -2954,7 +2954,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * ids  = dst->src[2];
 
     if (ggml_cuda_mmid_cold(dst)) {
-        if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K) {
+        if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_0) {
             // a prompt batch that the host tier does not take: the cold experts it touches are staged in VRAM and the
             // dequant fallback computes every pair (GGML_CUDA_COLD_PREFETCH_KQ=0: not allowed)
             const bool gpu_cold = !ggml_cuda_moe_host_active(ctx, dst) && !ggml_cuda_mmid_allgpu() && ggml_cuda_cold_kq_node(dst) && ggml_cuda_cold_kq_enabled();

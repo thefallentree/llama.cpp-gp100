@@ -1743,11 +1743,14 @@ static bool ggml_cuda_host_numa_pools() {
 }
 
 int ggml_cuda_host_numa_node_of_device(const int device) {
-    if (!ggml_cuda_host_numa_pools()) {
-        return -1;
-    }
+    // GGML_CUDA_MOE_HOST_NUMA_INTERLEAVE=1 (alone enough): the cold experts' pages alternate over NUMA nodes 0 and 1, so one
+    // job's reads use both sockets' memory controllers (GLM-5.3-Flash on 2x Xeon 6132: job 2.4-2.8 -> 1.5 ms, with ONE pool
+    // (GGML_CUDA_MOE_HOST_POOLS=1) whose threads sit on both sockets (GGML_CUDA_MOE_HOST_CPUS)
     if (getenv("GGML_CUDA_MOE_HOST_NUMA_INTERLEAVE") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_NUMA_INTERLEAVE")) != 0) {
         return 7;
+    }
+    if (!ggml_cuda_host_numa_pools()) {
+        return -1;
     }
     static const std::vector<int> nodes = [] {
         std::vector<int> v;

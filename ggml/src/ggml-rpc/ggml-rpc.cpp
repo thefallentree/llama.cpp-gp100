@@ -2701,10 +2701,26 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
+    // GGML_RPC_SLOW_MS=x: log the commands that take longer than x ms to serve, and the wait for them (expert-parallel latency hunts)
+    static const double slow_ms = getenv("GGML_RPC_SLOW_MS") != nullptr ? atof(getenv("GGML_RPC_SLOW_MS")) : 0.0;
+    auto t_prev = std::chrono::steady_clock::now();
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        const auto t_arr = std::chrono::steady_clock::now();
+        struct slow_log {
+            double ms; std::chrono::steady_clock::time_point t_prev, t_arr; uint8_t & cmd; std::chrono::steady_clock::time_point & t_out;
+            ~slow_log() {
+                const auto t_end = std::chrono::steady_clock::now();
+                const double proc = std::chrono::duration<double, std::milli>(t_end - t_arr).count();
+                const double gap  = std::chrono::duration<double, std::milli>(t_arr - t_prev).count();
+                if (ms > 0 && (proc > ms || gap > 5*ms)) {
+                    fprintf(stderr, "rpc-slow: %-12s served in %.2f ms, waited %.2f ms for it\n", cmd < RPC_CMD_COUNT ? rpc_cmd_name((enum rpc_cmd) cmd) : "?", proc, gap);
+                }
+                t_out = t_end;
+            }
+        } slow_guard { slow_ms, t_prev, t_arr, cmd, t_prev };
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
             LOG_ERROR("Unknown command: %d\n", cmd);

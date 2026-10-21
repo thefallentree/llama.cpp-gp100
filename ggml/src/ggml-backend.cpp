@@ -1879,10 +1879,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // GGML_SCHED_TRACE=K: the timeline of the splits of the K-th graph with more than 10 splits (a decode step), printed when it ends
+    static const int trace_k = getenv("GGML_SCHED_TRACE") != nullptr ? atoi(getenv("GGML_SCHED_TRACE")) : 0;
+    static int trace_calls = 0;
+    // GGML_SCHED_TRACE_SLOW=ms: the timelines of the first graphs (> 10 splits) that take longer than that to launch (at most 4)
+    static const int64_t trace_slow_us = getenv("GGML_SCHED_TRACE_SLOW") != nullptr ? (int64_t) (atof(getenv("GGML_SCHED_TRACE_SLOW"))*1000) : 0;
+    static int trace_slow_n = 0;
+    const bool trace_slow = trace_slow_us > 0 && sched->n_splits > 10 && trace_slow_n < 4;
+    const bool trace = (trace_k > 0 && sched->n_splits > 10 && ++trace_calls == trace_k) || trace_slow;
+    struct trace_ent { int64_t t_in0, t_in1, t_gc1; };
+    std::vector<trace_ent> tr;
+    const int64_t tr_t0 = trace ? ggml_time_us() : 0;
+    if (trace) { tr.resize(sched->n_splits); }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (trace) { tr[split_id].t_in0 = ggml_time_us() - tr_t0; }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1966,6 +1980,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         static const char * fn_in_names[4] = { "sched.inputs.s0", "sched.inputs.s1", "sched.inputs.s2", "sched.inputs.s3+" };
         static const char * fn_gc_names[4] = { "sched.gc.s0", "sched.gc.s1", "sched.gc.s2", "sched.gc.s3+" };
         FN_PROF_ADD(fn_in_names[split_id < 3 ? split_id : 3], t_in0);
+        if (trace) { tr[split_id].t_in1 = ggml_time_us() - tr_t0; }
         FN_PROF_T(t_gc0);
         if (!sched->callback_eval) {
             // the split's inputs are all staged: a gated window launched now passes its gate at once (unless the
@@ -2024,7 +2039,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        if (trace) { tr[split_id].t_gc1 = ggml_time_us() - tr_t0; }
         prev_backend_id = split_backend_id;
+    }
+
+    if (trace && trace_slow && tr[sched->n_splits - 1].t_gc1 < trace_slow_us) {
+        // fast enough: not printed
+    } else if (trace) {
+        if (trace_slow) { trace_slow_n++; }
+        for (int i = 0; i < sched->n_splits; ++i) {
+            const struct ggml_backend_sched_split * sp = &splits[i];
+            fprintf(stderr, "sched-trace %3d %-22s nodes %3d inputs %2d  in %7lld..%7lld (%6lld us)  launched %7lld (%5lld us)  %s\n", i,
+                    ggml_backend_name(sched->backends[sp->backend_id]), sp->graph.n_nodes, sp->n_inputs,
+                    (long long) tr[i].t_in0, (long long) tr[i].t_in1, (long long) (tr[i].t_in1 - tr[i].t_in0),
+                    (long long) tr[i].t_gc1, (long long) (tr[i].t_gc1 - tr[i].t_in1), sp->graph.n_nodes > 0 ? sp->graph.nodes[0]->name : "");
+        }
     }
 
     return GGML_STATUS_SUCCESS;

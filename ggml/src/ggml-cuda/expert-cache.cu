@@ -390,6 +390,9 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
     if (!d.ready.load(std::memory_order_acquire)) {
         return;
     }
+    if (down->src[0]->flags & GGML_TENSOR_FLAG_EXPERT_FIXED) {
+        return; // the NextN block (its own context, a fixed hot set): not part of the device's cache, no second context
+    }
     std::lock_guard<std::mutex> lock(d.mtx);
     const ggml_tensor * w[3]    = { up->src[0], gate->src[0], down->src[0] };
     const char *        cold[3] = { c_up, c_gate, c_down };

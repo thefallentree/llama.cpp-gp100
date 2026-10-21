@@ -139,7 +139,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
                     if (!ml.resplit(hot, cold, n_hot_layer[il], 2) && !ml.split_single(hot, cold, n_hot_layer[il], 2)) {
                         throw std::runtime_error(format("LLAMA_EXPERT_HOT: cannot cut the experts of layer %d at %" PRId64, il, n_hot_layer[il]));
                     }
-                    if (n_spare > 0) {
+                    if (n_spare > 0 && il < n_layer) {   // the NextN block's hot set is fixed: no spare slots
                         n_padded += ml.pad_dim(hot,  2, n_spare) ? 1 : 0;
                         n_padded += ml.pad_dim(cold, 2, n_spare) ? 1 : 0;
                     }
@@ -249,7 +249,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, flags);
 
             const int64_t n_hot    = n_hot_layer[i];
-            const int64_t n_s      = n_hot > 0 ? n_spare : 0;
+            const int64_t n_s      = n_hot > 0 && i < n_layer ? n_spare : 0;
             const int64_t n_exp_ho = n_hot > 0 ? n_hot + n_s : n_expert;
 
             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_exp_ho}, flags);
@@ -264,6 +264,11 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
                 exps_cold[layer.ffn_down_exps] = layer.ffn_down_exps_cold;
                 exps_cold[layer.ffn_gate_exps] = layer.ffn_gate_exps_cold;
                 exps_cold[layer.ffn_up_exps]   = layer.ffn_up_exps_cold;
+                if (is_nextn) {
+                    layer.ffn_down_exps->flags |= GGML_TENSOR_FLAG_EXPERT_FIXED;
+                    layer.ffn_gate_exps->flags |= GGML_TENSOR_FLAG_EXPERT_FIXED;
+                    layer.ffn_up_exps->flags   |= GGML_TENSOR_FLAG_EXPERT_FIXED;
+                }
             }
 
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);

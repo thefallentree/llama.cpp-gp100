@@ -1719,10 +1719,13 @@ static void ggml_cuda_host_numa_bind(const bool on, const int node_override = -1
     if (node < 0 || node >= 64) {
         return;
     }
-    const unsigned long mask = on ? 1ul << node : 0;
+    // node 7 (ggml_cuda_host_numa_node_of_device with GGML_CUDA_MOE_HOST_NUMA_INTERLEAVE=1): the pages alternate over nodes 0 and 1
+    const bool inter = node == 7;
+    const unsigned long mask = on ? (inter ? 3ul : 1ul << node) : 0;
     // MPOL_DEFAULT 0, MPOL_PREFERRED 1 (that node first, the others when it is full: a cold set larger than the node
-    // spills over instead of an OOM kill; GGML_CUDA_HOST_NUMA_STRICT=1 keeps MPOL_BIND 2)
-    static const int mode = getenv("GGML_CUDA_HOST_NUMA_STRICT") != nullptr && atoi(getenv("GGML_CUDA_HOST_NUMA_STRICT")) != 0 ? 2 : 1;
+    // spills over instead of an OOM kill; GGML_CUDA_HOST_NUMA_STRICT=1 keeps MPOL_BIND 2), MPOL_INTERLEAVE 3
+    static const int mode_pref = getenv("GGML_CUDA_HOST_NUMA_STRICT") != nullptr && atoi(getenv("GGML_CUDA_HOST_NUMA_STRICT")) != 0 ? 2 : 1;
+    const int mode = inter ? 3 : mode_pref;
     if (syscall(SYS_set_mempolicy, on ? mode : 0, on ? &mask : nullptr, on ? 64 : 0) != 0) {
         GGML_LOG_WARN("%s: set_mempolicy failed for NUMA node %d\n", __func__, node);
     }
@@ -1742,6 +1745,9 @@ static bool ggml_cuda_host_numa_pools() {
 int ggml_cuda_host_numa_node_of_device(const int device) {
     if (!ggml_cuda_host_numa_pools()) {
         return -1;
+    }
+    if (getenv("GGML_CUDA_MOE_HOST_NUMA_INTERLEAVE") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_NUMA_INTERLEAVE")) != 0) {
+        return 7;
     }
     static const std::vector<int> nodes = [] {
         std::vector<int> v;

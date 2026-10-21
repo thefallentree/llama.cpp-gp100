@@ -22,6 +22,8 @@
 
 #if defined(__linux__)
 #include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <sched.h>
 #endif
 
@@ -1145,6 +1147,59 @@ struct slot_table {
 
 slot_table g_slots;
 
+// GGML_CUDA_MOE_HOST_NUMA_SPLIT=1: the NUMA node that holds each cold expert's gate and down rows of a layer (asked of the
+// kernel with move_pages when the layer is registered), so that the threads of a socket take the experts of their own
+// node first (work2). Indexed like g_slots.tab.
+struct slot_nodes {
+    std::vector<int8_t> gate, down;
+};
+std::vector<slot_nodes> g_slot_nodes(1024);
+
+bool numa_split_enabled() {
+    static const bool on = getenv("GGML_CUDA_MOE_HOST_NUMA_SPLIT") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_NUMA_SPLIT")) != 0;
+    return on;
+}
+
+std::vector<int8_t> expert_nodes(const uint8_t * base, const size_t nb2, const int n) {
+    std::vector<int8_t> r((size_t) n, 0);
+#if defined(__linux__)
+    std::vector<void *> pages((size_t) n);
+    std::vector<int>    status((size_t) n, -1);
+    for (int e = 0; e < n; ++e) {
+        pages[e] = (void *) (((uintptr_t) (base + (size_t) e*nb2 + nb2/2)) & ~(uintptr_t) 4095);
+    }
+    if (syscall(SYS_move_pages, 0, (unsigned long) n, pages.data(), nullptr, status.data(), 0) == 0) {
+        for (int e = 0; e < n; ++e) {
+            r[e] = (int8_t) (status[e] >= 0 && status[e] < 64 ? status[e] : 0);
+        }
+    }
+#else
+    GGML_UNUSED(base); GGML_UNUSED(nb2);
+#endif
+    return r;
+}
+
+// the NUMA node (CPU package) of the calling thread's CPU
+int thread_node() {
+    static thread_local int node = -2;
+    if (node == -2) {
+        node = 0;
+#if defined(__linux__)
+        const int cpu = sched_getcpu();
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+        if (FILE * f = fopen(path, "r")) {
+            int id = 0;
+            if (fscanf(f, "%d", &id) == 1 && id >= 0 && id < 8) {
+                node = id;
+            }
+            fclose(f);
+        }
+#endif
+    }
+    return node;
+}
+
 std::mutex       g_pinned_mtx;
 std::vector<int> g_pinned_cpus; // mh_pinned_cpus
 
@@ -1240,6 +1295,13 @@ struct pool {
     alignas(64) std::atomic<uint32_t> job_gen { 0 };
     alignas(64) std::atomic<int>      chunk1 { 0 };
     alignas(64) std::atomic<int>      chunk3 { 0 };
+    // NUMA split of the k path's queue: per node, its gate/up chunks, then its down chunks (ids as in the single queue);
+    // threads take their node's gate/up chunks, then the other node's, then the down chunks the same way
+    static constexpr int MH_NODES = 2;
+    bool                              nsplit = false;
+    std::vector<int>                  qgu[MH_NODES], qdn[MH_NODES];
+    struct alignas(64) counter { std::atomic<int> v { 0 }; };
+    counter                           qcnt_gu[MH_NODES], qcnt_dn[MH_NODES];
     alignas(64) std::atomic<int>      bar_count { 0 };
     alignas(64) std::atomic<uint32_t> bar_gen { 0 };
     alignas(64) std::atomic<bool>     hot { false };
@@ -1432,7 +1494,28 @@ struct pool {
         const kdot_fn kdn = s.wtype_down == 3 ? kd_q40 : s.wtype_down == 2 ? kd_q3k : kd_q2k;
         const kdot_fn kdg = s.wtype == 3 ? kd_q40 : kd_q2k;
         float * hbase = (float *) (((uintptr_t) h.data() + 63) & ~(uintptr_t) 63);   // 64-byte lines: chunks of 16 rows own whole lines
-        for (int c; (c = chunk1.fetch_add(1, std::memory_order_relaxed)) < n1 + n3; ) {
+        const bool split = nsplit;
+        const int  my    = std::min(thread_node(), MH_NODES - 1);
+        int        phase = 0;   // NUMA split: 0 own node's gate/up chunks, 1 the other's, 2 own down chunks, 3 the other's
+        auto next_chunk = [&]() -> int {
+            if (!split) {
+                const int c = chunk1.fetch_add(1, std::memory_order_relaxed);
+                return c < n1 + n3 ? c : -1;
+            }
+            for (; phase < 4; ++phase) {
+                const int k = (phase & 1) ? 1 - my : my;
+                const std::vector<int> & q = phase < 2 ? qgu[k] : qdn[k];
+                std::atomic<int> & cnt = phase < 2 ? qcnt_gu[k].v : qcnt_dn[k].v;
+                if (cnt.load(std::memory_order_relaxed) < (int) q.size()) {
+                    const int j = cnt.fetch_add(1, std::memory_order_relaxed);
+                    if (j < (int) q.size()) {
+                        return q[j];
+                    }
+                }
+            }
+            return -1;
+        };
+        for (int c; (c = next_chunk()) >= 0; ) {
             if (c < n1) {
                 const int       gi = c/rb1;
                 const group &   g  = groups[gi];
@@ -1681,6 +1764,31 @@ struct pool {
         p1_left.store(n_groups*n_blk, std::memory_order_relaxed);
         MH_TR(t_job_ns.store(tns());)
         job_id++;
+        nsplit = jmode == 2 && numa_split_enabled() && slot < (int) g_slot_nodes.size() && !g_slot_nodes[slot].gate.empty();
+        if (nsplit) {
+            const int ch1 = CH1;
+            const int rb1 = js->n_ff/ch1;
+            const int n1  = n_groups*rb1;
+            const int ch3 = js->n_embd % CH3k == 0 ? CH3k : 32;
+            const int rb3 = js->n_embd/ch3;
+            for (int k = 0; k < MH_NODES; ++k) {
+                qgu[k].clear();
+                qdn[k].clear();
+                qcnt_gu[k].v.store(0, std::memory_order_relaxed);
+                qcnt_dn[k].v.store(0, std::memory_order_relaxed);
+            }
+            for (int gi = 0; gi < n_groups; ++gi) {
+                const int c  = groups[gi].c;
+                const int kg = std::min<int>(g_slot_nodes[slot].gate[c], MH_NODES - 1);
+                const int kd = std::min<int>(g_slot_nodes[slot].down[c], MH_NODES - 1);
+                for (int r = 0; r < rb1; ++r) {
+                    qgu[kg].push_back(gi*rb1 + r);
+                }
+                for (int r = 0; r < rb3; ++r) {
+                    qdn[kd].push_back(n1 + gi*rb3 + r);
+                }
+            }
+        }
         chunk1.store(0, std::memory_order_relaxed);
         job_gen.fetch_add(1, std::memory_order_acq_rel);
         run_work();
@@ -1929,6 +2037,13 @@ int mh_pool_register(const mh_slot_desc & d) {
     GGML_ASSERT(n < (int) (sizeof(g_slots.tab)/sizeof(g_slots.tab[0])));
     GGML_ASSERT(d.n_embd % 64 == 0 && d.n_embd <= MH_MAX_EMBD && d.n_ff % 64 == 0 && d.n_ff <= MH_MAX_FF);
     g_slots.tab[n] = d;
+    if (numa_split_enabled() && n < (int) g_slot_nodes.size()) {
+        g_slot_nodes[n].gate = expert_nodes(d.gate, d.gate_nb2, d.n_cold);
+        g_slot_nodes[n].down = expert_nodes(d.down, d.down_nb2, d.n_cold);
+        int c[8] = {};
+        for (const int8_t v : g_slot_nodes[n].gate) { c[v & 7]++; }
+        GGML_LOG_INFO("moe-host: slot %d: gate experts by node: %d %d %d\n", n, c[0], c[1], c[2]);
+    }
     g_slots.n.store(n + 1, std::memory_order_release);
     return n;
 }

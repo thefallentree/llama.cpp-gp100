@@ -50,3 +50,8 @@ void ggml_cuda_moe_host_free(ggml_backend_cuda_context & ctx);
 // triple's first node and its down projection, so the GPU computes it while the host threads compute the cold
 // experts instead of waiting for them.
 void ggml_cuda_moe_host_reorder(ggml_cgraph * cgraph);
+
+// GGML_CUDA_MOE_HOST_NUMA_POOLS=1 (ggml-cuda.cu): the NUMA node of a device's cold experts and pool, -1 when off; and the
+// memory policy around an allocation that is to land on a node
+int  ggml_cuda_host_numa_node_of_device(int device);
+void ggml_cuda_host_numa_bind_node(bool on, int node);

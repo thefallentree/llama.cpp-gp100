@@ -1728,8 +1728,9 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
 #include <unistd.h>
 // GGML_CUDA_HOST_NUMA=<node>: the pinned host buffers (the cold experts) on that NUMA node, where the process may
 // run on several (MPOL_BIND around the allocation; pinned pages are placed when they are allocated)
-static void ggml_cuda_host_numa_bind(const bool on) {
-    static const int node = getenv("GGML_CUDA_HOST_NUMA") != nullptr ? atoi(getenv("GGML_CUDA_HOST_NUMA")) : -1;
+static void ggml_cuda_host_numa_bind(const bool on, const int node_override = -1) {
+    static const int node_env = getenv("GGML_CUDA_HOST_NUMA") != nullptr ? atoi(getenv("GGML_CUDA_HOST_NUMA")) : -1;
+    const int node = node_override >= 0 ? node_override : node_env;
     if (node < 0 || node >= 64) {
         return;
     }
@@ -1742,8 +1743,44 @@ static void ggml_cuda_host_numa_bind(const bool on) {
     }
 }
 #else
-static void ggml_cuda_host_numa_bind(const bool) {}
+static void ggml_cuda_host_numa_bind(const bool, const int = -1) {}
 #endif
+
+// GGML_CUDA_MOE_HOST_NUMA_POOLS=1: one host-tier pool per socket. The cold experts of a device's layers are pinned on the
+// NUMA node GGML_CUDA_MOE_HOST_NUMA_NODES (comma list indexed by device ordinal, default 0,1) and the device's pool
+// (GGML_CUDA_MOE_HOST_POOL_CPUS, moe-host-cpu.cpp) runs on that node's CPUs, so that no host thread reads over UPI.
+static bool ggml_cuda_host_numa_pools() {
+    static const bool on = getenv("GGML_CUDA_MOE_HOST_NUMA_POOLS") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_NUMA_POOLS")) != 0;
+    return on;
+}
+
+int ggml_cuda_host_numa_node_of_device(const int device) {
+    if (!ggml_cuda_host_numa_pools()) {
+        return -1;
+    }
+    static const std::vector<int> nodes = [] {
+        std::vector<int> v;
+        const char * e = getenv("GGML_CUDA_MOE_HOST_NUMA_NODES");
+        for (const char * p = e != nullptr ? e : "0,1"; *p != 0;) {
+            char * end = nullptr;
+            const long c = strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            v.push_back((int) c);
+            p = *end == ',' ? end + 1 : end;
+        }
+        if (v.empty()) {
+            v = { 0, 1 };
+        }
+        return v;
+    }();
+    return nodes[(size_t) device % nodes.size()];
+}
+
+void ggml_cuda_host_numa_bind_node(const bool on, const int node) {
+    ggml_cuda_host_numa_bind(on, node);
+}
 
 #if defined(__linux__)
 // GGML_CUDA_HOST_HUGE=1: a large pinned buffer as a registered anonymous mapping of transparent 2 MB pages instead
@@ -1751,7 +1788,7 @@ static void ggml_cuda_host_numa_bind(const bool) {}
 // before cudaHostRegister pins them). Measured for the cold experts on the P100 box: the host tier's jobs take the
 // same 45 us per pair on 2 MB pages as on 4 KB ones (its kernel is instruction-bound, not TLB- or
 // prefetch-bound), so this is off by default.
-static void * ggml_cuda_host_malloc_huge(const size_t size) {
+static void * ggml_cuda_host_malloc_huge(const size_t size, const int node) {
     static const bool huge = getenv("GGML_CUDA_HOST_HUGE") != nullptr && atoi(getenv("GGML_CUDA_HOST_HUGE")) != 0;
     const size_t align = (size_t) 2 << 20;
     if (!huge || size < (size_t) 64 << 20) {
@@ -1771,7 +1808,7 @@ static void * ggml_cuda_host_malloc_huge(const size_t size) {
         munmap(p + len, (char *) base + len + align - (p + len));
     }
     madvise(p, len, MADV_HUGEPAGE);
-    ggml_cuda_host_numa_bind(true);
+    ggml_cuda_host_numa_bind(true, node);
     // touch every page from a few threads: the first touch allocates it under the policy (9 GB per device here)
     {
         const size_t n_threads = 4;
@@ -1802,19 +1839,19 @@ static void * ggml_cuda_host_malloc_huge(const size_t size) {
     return p;
 }
 #else
-static void * ggml_cuda_host_malloc_huge(size_t) { return nullptr; }
+static void * ggml_cuda_host_malloc_huge(size_t, int) { return nullptr; }
 #endif
 
-static void * ggml_cuda_host_malloc(size_t size) {
+static void * ggml_cuda_host_malloc(size_t size, const int node) {
     if (ggml_cuda_pinned_memory_disabled()) {
         return nullptr;
     }
 
-    void * ptr = ggml_cuda_host_malloc_huge(size);
+    void * ptr = ggml_cuda_host_malloc_huge(size, node);
     if (ptr != nullptr) {
         return ptr;
     }
-    ggml_cuda_host_numa_bind(true);
+    ggml_cuda_host_numa_bind(true, node);
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     ggml_cuda_host_numa_bind(false);
     if (err != cudaSuccess) {
@@ -1829,7 +1866,8 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size);
+    // a per-node buffer type (ggml_backend_cuda_host_buffer_type_node) carries its NUMA node + 1 in the context
+    void * ptr = ggml_cuda_host_malloc(size, (int) ((intptr_t) buft->context) - 1);
 
     if (ptr == nullptr) {
         // fallback to cpu buffer
@@ -7689,9 +7727,28 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
     return ggml_backend_cuda_buffer_type(ctx->device);
 }
 
+// with GGML_CUDA_MOE_HOST_NUMA_POOLS=1 the host buffer type of a device allocates on that device's NUMA node
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type_node(int node) {
+    constexpr int max_nodes = 8;
+    static std::mutex mtx;
+    static ggml_backend_buffer_type types[max_nodes];
+    static bool init[max_nodes] = { false };
+    if (node < 0 || node >= max_nodes) {
+        return ggml_backend_cuda_host_buffer_type();
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!init[node]) {
+        types[node]         = *ggml_backend_cuda_host_buffer_type();
+        types[node].context = (void *) (intptr_t) (node + 1);
+        init[node]          = true;
+    }
+    return &types[node];
+}
+
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    GGML_UNUSED(dev);
-    return ggml_backend_cuda_host_buffer_type();
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+    const int node = ggml_cuda_host_numa_node_of_device(ctx->device);
+    return node >= 0 ? ggml_backend_cuda_host_buffer_type_node(node) : ggml_backend_cuda_host_buffer_type();
 }
 
 // TODO: move these functions here

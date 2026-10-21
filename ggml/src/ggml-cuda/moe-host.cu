@@ -498,7 +498,15 @@ static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n
 
     ggml_cuda_set_device(ctx.device);
     mh_mailbox * mb = nullptr;
-    if (cudaHostAlloc((void **) &mb, size, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+    const int numa_node = ggml_cuda_host_numa_node_of_device(ctx.device);
+    if (numa_node >= 0) {
+        ggml_cuda_host_numa_bind_node(true, numa_node);
+    }
+    const cudaError_t mb_err = cudaHostAlloc((void **) &mb, size, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (numa_node >= 0) {
+        ggml_cuda_host_numa_bind_node(false, numa_node);
+    }
+    if (mb_err != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_WARN("%s: no pinned mailbox (%.1f MiB), cold experts stay on the GPU\n", __func__, size/1048576.0);
         return false;
@@ -508,7 +516,7 @@ static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n
     CUDA_CHECK(cudaMalloc((void **) &ctx.moe_host_dstate, (MH_DSTATE_PAIR + (size_t) cap_pairs)*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(ctx.moe_host_dstate, 0, (MH_DSTATE_PAIR + (size_t) cap_pairs)*sizeof(uint32_t)));
     ctx.moe_host_mb = mb;
-    mh_pool_attach(g_mh_mailboxes.fetch_add(1), mb, ggml_cuda_info().device_count);
+    mh_pool_attach(g_mh_mailboxes.fetch_add(1), mb, ggml_cuda_info().device_count, numa_node >= 0 ? ctx.device : -1);
     return true;
 }
 

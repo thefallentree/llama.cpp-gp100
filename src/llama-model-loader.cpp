@@ -1412,6 +1412,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // an override to the CUDA host buffer type ("-ot _exps_cold=CUDA_Host" resolves the name to one device's type): the
+        // cold experts still go to their own layer's device's type, which differs per NUMA node with
+        // GGML_CUDA_MOE_HOST_NUMA_POOLS=1 and is the same type otherwise
+        if (buft && !buft_list->empty() && tn.str().find("_exps_cold") != std::string::npos) {
+            ggml_backend_dev_t dev = buft_list->front().first;
+            ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (host_buft != nullptr && host_buft != buft && strcmp(ggml_backend_buft_name(host_buft), ggml_backend_buft_name(buft)) == 0) {
+                buft = host_buft;
+            }
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {

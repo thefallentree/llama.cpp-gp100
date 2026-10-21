@@ -1848,6 +1848,81 @@ static void * ggml_cuda_host_malloc_huge(const size_t size, const int node) {
 static void * ggml_cuda_host_malloc_huge(size_t, int) { return nullptr; }
 #endif
 
+#if defined(__linux__)
+// GGML_CUDA_MOE_HOST_STRIPE=<bytes>: a large pinned buffer (the cold experts) as a registered anonymous mapping whose
+// stripes of that many bytes alternate over the NUMA nodes GGML_CUDA_MOE_HOST_STRIPE_NODES (default 0,1): the pages of a
+// stripe are first touched under that node's policy before cudaHostRegister pins them. With the stripe at the size of
+// one expert (2752512 for GLM-5.3-Flash's Q2_K: the tensors are packed back to back) an expert is wholly on one node,
+// and the host tier's NUMA split (GGML_CUDA_MOE_HOST_NUMA_SPLIT=1, moe-host-cpu.cpp) lets each socket's threads read
+// their own node's experts, so both memory controllers work on one layer's job.
+static void * ggml_cuda_host_malloc_striped(const size_t size) {
+    static const size_t stripe = [] {
+        const char * e = getenv("GGML_CUDA_MOE_HOST_STRIPE");
+        return e != nullptr ? (size_t) strtoull(e, nullptr, 10)/4096*4096 : (size_t) 0;
+    }();
+    if (stripe == 0 || size < (size_t) 64 << 20) {
+        return nullptr;
+    }
+    static const std::vector<int> nodes = [] {
+        std::vector<int> v;
+        const char * e = getenv("GGML_CUDA_MOE_HOST_STRIPE_NODES");
+        for (const char * p = e != nullptr ? e : "0,1"; *p != 0;) {
+            char * end = nullptr;
+            const long c = strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            if (c >= 0 && c < 64) {
+                v.push_back((int) c);
+            }
+            p = *end == ',' ? end + 1 : end;
+        }
+        if (v.empty()) {
+            v = { 0, 1 };
+        }
+        return v;
+    }();
+    const size_t len = (size + 4095)/4096*4096;
+    char * p = (char *) mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        return nullptr;
+    }
+    const size_t n_stripes = (len + stripe - 1)/stripe;
+    const size_t n_threads = 8;
+    std::vector<std::thread> workers;
+    for (size_t t = 0; t < n_threads; ++t) {
+        workers.emplace_back([=] {
+            const size_t a = n_stripes*t/n_threads, b = n_stripes*(t + 1)/n_threads;
+            for (size_t i = a; i < b; ++i) {
+                const unsigned long mask = 1ul << nodes[i % nodes.size()];
+                if (syscall(SYS_set_mempolicy, 1 /* MPOL_PREFERRED */, &mask, 64) != 0) {
+                    GGML_LOG_WARN("%s: set_mempolicy failed\n", __func__);
+                }
+                const size_t o1 = std::min(len, (i + 1)*stripe);
+                for (size_t o = i*stripe; o < o1; o += 4096) {
+                    p[o] = 0;
+                }
+            }
+        });
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+    const cudaError_t err = cudaHostRegister(p, len, cudaHostRegisterDefault);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: cudaHostRegister of %.1f GB failed (%s), falling back to cudaMallocHost\n", __func__, len/1e9, cudaGetErrorString(err));
+        munmap(p, len);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_huge_mtx);
+    ggml_cuda_host_huge[p] = len;
+    return p;
+}
+#else
+static void * ggml_cuda_host_malloc_striped(size_t) { return nullptr; }
+#endif
+
 static void * ggml_cuda_host_malloc(size_t size, const int node) {
     if (ggml_cuda_pinned_memory_disabled()) {
         return nullptr;
@@ -1855,6 +1930,9 @@ static void * ggml_cuda_host_malloc(size_t size, const int node) {
 
     void * ptr = ggml_cuda_host_malloc_huge(size, node);
     if (ptr != nullptr) {
+        return ptr;
+    }
+    if ((ptr = ggml_cuda_host_malloc_striped(size)) != nullptr) {
         return ptr;
     }
     ggml_cuda_host_numa_bind(true, node);

@@ -685,6 +685,13 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+    if (ncols_dst == 1 && ids && !shared_expert && ids[channel_dst] < 0) {
+        // expert parallelism: a negative id is an expert of another node, its output row is zero (the block is uniform)
+        if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
@@ -965,6 +972,13 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
+    if (!shared_expert && ids[channel_dst + token_idx * ids_stride] < 0) {
+        // expert parallelism: a negative id is an expert of another node, its output row is zero (a warp works alone here)
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 

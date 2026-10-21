@@ -2532,8 +2532,8 @@ fn_moe_up(const char * __restrict__ wg, const char * __restrict__ wu, const int6
         route[c].e = e;
         route[c].w = weights[t*sw1 + c % n_used];
     }
-    if (e >= n_hot) {
-        return;
+    if (e < 0 || e >= n_hot) {
+        return;   // cold (the host tier's), or a negative id (expert parallelism: another node's expert): no pair here
     }
     half2 a[32];
     Q::load_act(X + (int64_t) t*xstride + k*32, a);
@@ -2612,7 +2612,7 @@ fn_moe_down(const char * __restrict__ wd, const int64_t nb1, const int64_t nb2,
     if (s < n_used) {
         rt = route[c];
     }
-    if (rt.e < n_hot) {
+    if (rt.e >= 0 && rt.e < n_hot) {
         half2 a[32];
         Q::load_act(Xh + (int64_t) c*(TPR*32) + k*32, a);
         const float  ws = rt.w*xsh[c];

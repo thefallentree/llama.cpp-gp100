@@ -5704,6 +5704,45 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// MUL_MAT_ID with negative expert ids (expert parallelism: -1 = an expert owned by another node): such a pair is skipped and its
+// output row is zero. The first row is all -1 (when there are several), the second has none, the others about a third.
+struct test_mul_mat_id_neg : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",neg=1"; }
+    static void init_ids(ggml_context * ctx, int n_mats) {
+        std::default_random_engine rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i < n_mats ? i : -1;   // no repeated expert in a row (an ids view with a padded row has more entries than experts)
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    if (ggml_nrows(t) > 2 && r == 0) {
+                        data[i] = -1;
+                    } else if (!(ggml_nrows(t) > 2 && r == 1) && rng() % 3 == 0) {
+                        data[i] = -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        init_ids(ctx, n_mats);
+    }
+    void reinit_perf_iter(ggml_context * ctx) override { init_ids(ctx, n_mats); }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11527,6 +11566,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {1, 3, 8}) {
         test_cases.emplace_back(new test_mul_mat_id_chain(GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 3, 16, 6, n, 1024, 768));
         test_cases.emplace_back(new test_mul_mat_id_chain(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 2, 16, 6, n, 768, 1024));
+    }
+
+    // negative ids (expert parallelism): the pair is skipped and its row is zero. Decode batches, the batch widths of the
+    // mat-vec / MMQ / MMF / sorted paths, broadcast and per-slot activations, an ids view with a padded row
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int n : {1, 3, 8, 9, 33}) {
+            for (bool bc : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_neg(type_a, GGML_TYPE_F32, 16, 6, bc, 512, n, 2304));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id_neg(type_a, GGML_TYPE_F32, 16, 6, true, 512, 5, 1024, 1.0f, 544, true));
+        test_cases.emplace_back(new test_mul_mat_id_neg(type_a, GGML_TYPE_F32, 8, 8, false, 256, 4, 512));
     }
 
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]

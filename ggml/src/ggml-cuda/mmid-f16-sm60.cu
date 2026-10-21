@@ -278,6 +278,14 @@ mmid16_q2_0_vec(
     if (skip_cold && e >= n_hot) {
         return;
     }
+    if (e < 0) {
+        // expert parallelism: an expert of another node, its output row is zero
+        const int row0 = blockIdx.x*MMID16V_ROWS + threadIdx.y*MMID16V_RW;
+        if (threadIdx.x < MMID16V_RW) {
+            dst[(int64_t) c*stride_dst + row0 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
 
     const half2 * xr   = xh + (int64_t) r*nkb*32;
     const float * xsr  = xs + (int64_t) r*nkb;

@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/mmid-kq-sm60.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/cold-kq.cuh"
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/moe-host-cpu.h"
@@ -2936,6 +2937,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
             } else {
                 ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
+                ggml_cuda_mmid_zero_neg_rows(ids, dst, ctx.stream());
             }
             return;
         }
@@ -2945,9 +2947,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
         GGML_ASSERT(ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst) && "cold experts need the sm_60 Q2_0 MUL_MAT_ID kernels");
         if (ggml_cuda_cold_prefetch_run(ctx, dst)) {
+            ggml_cuda_mmid_zero_neg_rows(ids, dst, ctx.stream());
             return;
         }
         ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+        ggml_cuda_mmid_zero_neg_rows(ids, dst, ctx.stream());
         return;
     }
 
@@ -2998,18 +3002,23 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
             }
         }
 
+        // the sorted kernels below write the rows of the pairs they compute only: a negative id (expert parallelism: an
+        // expert of another node) is no pair, its row is zeroed here
         if (ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst)) {
             ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+            ggml_cuda_mmid_zero_neg_rows(ids, dst, ctx.stream());
             return;
         }
 
         if (!ctx.mmid_no_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            ggml_cuda_mmid_zero_neg_rows(ids, dst, ctx.stream());
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            ggml_cuda_mmid_zero_neg_rows(ids, dst, ctx.stream());
             return;
         }
     }
@@ -3078,7 +3087,7 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
     for (int64_t i12 = 0; i12 < ne12; ++i12) {
         for (int64_t iex = 0; iex < n_expert_used; ++iex) {
             const int32_t e = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-            n_pairs += e < skip_from ? 1 : 0;
+            n_pairs += e >= 0 && e < skip_from ? 1 : 0;   // a negative id (expert parallelism: another node's expert) is no pair
         }
     }
     std::fill(ids_from_sorted_host.begin(), ids_from_sorted_host.end(), (int32_t) n_pairs);
@@ -3086,10 +3095,10 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                if (expert_to_use >= skip_from) {
-                    continue;
+                if (expert_to_use < 0 || expert_to_use >= skip_from) {
+                    continue;   // its row is the zero row past the computed ones
                 }
-                assert(expert_to_use >= 0 && expert_to_use < ne02_all);
+                assert(expert_to_use < ne02_all);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);

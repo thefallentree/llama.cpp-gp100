@@ -2,7 +2,9 @@
 //  (a) on one node, and (b) expert-parallel: the experts split over 3 shards (shard 0 local, shards 1-2 on ggml-rpc servers
 //      started in this process), each shard computing only its own experts (the other pairs carry id -1 = skipped) and
 //      returning its [n_embd, T] partial sum; the head adds the partials.
-// Prints the NMSE of (b) against (a). usage: ep-moe-test [-T tokens] [-e experts] [-k used] [-p partition 0:mod 1:blocks 2:skewed]
+// Prints the NMSE of (b) against (a). usage: ep-moe-test [-T tokens] [-e experts] [-k used] [-p partition 0:mod 1:blocks 2:skewed] [-g device]
+// -g N: everything (reference, shard 0, the servers' shards) runs on CUDA device N instead of the CPU (needs a build with GGML_USE_CUDA;
+// the shards then exercise the CUDA MUL_MAT_ID paths with id -1 pairs).
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -49,7 +51,9 @@ static void quant_fill(ggml_tensor * t, std::mt19937 & rng, float scale) { // ra
     std::vector<float> f(row * rows);
     for (auto & v : f) v = nd(rng);
     ggml_quantize_init(t->type);
-    ggml_quantize_chunk(t->type, f.data(), t->data, 0, rows, row, nullptr);
+    std::vector<char> q(ggml_nbytes(t));
+    ggml_quantize_chunk(t->type, f.data(), q.data(), 0, rows, row, nullptr);
+    ggml_backend_tensor_set(t, q.data(), 0, q.size());
 }
 
 static double nmse(const std::vector<float> & a, const std::vector<float> & ref) {
@@ -59,16 +63,29 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & ref)
 }
 
 int main(int argc, char ** argv) {
-    int T = 6, n_exp = 24, n_used = 6, part = 0;
+    int T = 6, n_exp = 24, n_used = 6, part = 0, gpu = -1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-T") T = atoi(argv[++i]); else if (a == "-e") n_exp = atoi(argv[++i]);
         else if (a == "-k") n_used = atoi(argv[++i]); else if (a == "-p") part = atoi(argv[++i]);
+        else if (a == "-g") gpu = atoi(argv[++i]);
     }
     const int N_SH = 3;
     std::mt19937 rng(1234);
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, 4);
+    ggml_backend_load_all();
+    ggml_backend_dev_t main_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (gpu >= 0) {
+        main_dev = nullptr;
+        for (size_t i = 0, n = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU && (int) n++ == gpu) { main_dev = d; }
+        }
+        if (!main_dev) { fprintf(stderr, "no GPU device %d\n", gpu); return 2; }
+        printf("device: %s\n", ggml_backend_dev_name(main_dev));
+    }
+    ggml_backend_t be = gpu >= 0 ? ggml_backend_dev_init(main_dev, nullptr) : cpu;   // the compute backend of the reference and of shard 0
 
     // owner of each expert and its slot in the owner's tensor
     std::vector<int> owner(n_exp), slot(n_exp), cnt(N_SH, 0);
@@ -84,7 +101,7 @@ int main(int argc, char ** argv) {
     ggml_tensor * gate = ggml_new_tensor_3d(cw, GGML_TYPE_Q2_K, N_EMBD, N_FF, n_exp);
     ggml_tensor * up   = ggml_new_tensor_3d(cw, GGML_TYPE_Q2_K, N_EMBD, N_FF, n_exp);
     ggml_tensor * down = ggml_new_tensor_3d(cw, GGML_TYPE_Q3_K, N_FF, N_EMBD, n_exp);
-    ggml_backend_buffer_t bw = ggml_backend_alloc_ctx_tensors(cw, cpu);
+    ggml_backend_buffer_t bw = ggml_backend_alloc_ctx_tensors(cw, be);
     { std::normal_distribution<float> nd(0, 1); std::vector<float> r(N_EMBD * n_exp); for (auto & v : r) v = nd(rng); ggml_backend_tensor_set(router, r.data(), 0, ggml_nbytes(router)); }
     quant_fill(gate, rng, 0.05f); quant_fill(up, rng, 0.05f); quant_fill(down, rng, 0.05f);
 
@@ -110,9 +127,9 @@ int main(int argc, char ** argv) {
         ggml_set_output(idsc); ggml_set_output(w); ggml_set_output(y);
         ggml_cgraph * gf = ggml_new_graph_custom(c, 1024, false);
         ggml_build_forward_expand(gf, y); ggml_build_forward_expand(gf, idsc); ggml_build_forward_expand(gf, w);
-        ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors(c, cpu);
+        ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors(c, be);
         ggml_backend_tensor_set(x, xh.data(), 0, ggml_nbytes(x));
-        ggml_backend_graph_compute(cpu, gf);
+        ggml_backend_graph_compute(be, gf);
         ggml_backend_tensor_get(y, yref.data(), 0, ggml_nbytes(y));
         ggml_backend_tensor_get(idsc, ids_h.data(), 0, ggml_nbytes(idsc));
         ggml_backend_tensor_get(w, w_h.data(), 0, ggml_nbytes(w));
@@ -120,7 +137,7 @@ int main(int argc, char ** argv) {
     }
 
     // (b) EP: start the servers (shards 1, 2), build the shards
-    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_dev_t cpu_dev = main_dev;   // the servers compute on the same kind of device
     const char * eps[N_SH] = { nullptr, "127.0.0.1:50311", "127.0.0.1:50312" };
     for (int k = 1; k < N_SH; k++) {
         std::string ep = eps[k];
@@ -134,7 +151,7 @@ int main(int argc, char ** argv) {
     std::vector<char> tmp;
     for (int k = 0; k < N_SH; k++) {
         shard & s = sh[k];
-        s.be = k == 0 ? cpu : ggml_backend_rpc_init(eps[k], 0);
+        s.be = k == 0 ? be : ggml_backend_rpc_init(eps[k], 0);
         if (!s.be) { fprintf(stderr, "no backend for shard %d\n", k); return 2; }
         s.c = ggml_init(ip);
         const int nk = std::max(cnt[k], 1);

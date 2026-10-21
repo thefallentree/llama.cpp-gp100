@@ -53,6 +53,14 @@ static __global__ void mul_mat_vec_f(
         dst += token_idx*stride_col_dst;
     }
 
+    if (ids && channel_x < 0) {
+        // expert parallelism: a negative id is an expert of another node, its output row is zero (the block is uniform)
+        if (tid < ncols_dst) {
+            dst[tid*stride_col_dst + row] = 0.0f;
+        }
+        return;
+    }
+
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;

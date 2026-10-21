@@ -48,7 +48,8 @@ static __global__ void mm_ids_helper(
         for (int it = 0; it < n_tokens; ++it) {
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
-                const int expert_used = ids[it*si1 + iex];
+                int expert_used = ids[it*si1 + iex];
+                expert_used = expert_used < 0 ? INT_MAX : expert_used; // a negative id (an expert of another node) is no pair
                 nex_prev += expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
@@ -72,8 +73,9 @@ static __global__ void mm_ids_helper(
             const int it = it0 + threadIdx.x / neu_padded;
 
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+            int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
+            expert_used = expert_used < 0 ? INT_MAX : expert_used; // a negative id (an expert of another node) is no pair
             const int iex_used = expert_used == expert ? iex : -1;
             nex_prev += expert_used < expert;
 
@@ -111,6 +113,27 @@ static __global__ void mm_ids_helper(
             ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
         } else {
             ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
+        }
+    }
+
+    if (write_inverse && expert == 0) {
+        // the slots of negative ids have no compact row: they point at the last one, which no pair uses then
+        // (with a negative id there are fewer compact rows than slots), so the scatter quantizers stay in bounds
+        for (int i = threadIdx.x; i < n_tokens*n_expert_used; i += warp_size) {
+            const int it  = i / n_expert_used;
+            const int iex = i % n_expert_used;
+            if (ids[it*si1 + iex] < 0) {
+                ids_src1[i] = n_tokens*n_expert_used - 1;
+            }
+        }
+    }
+
+    if (!write_inverse && expert == static_cast<int>(gridDim.x) - 1) {
+        // with negative ids (expert parallelism) fewer compact rows than slots exist: the others point at row 0 / slot 0,
+        // for the kernels that run over every slot (the quantizers) and read the rows' ids
+        for (int i = nex_prev + it_compact + threadIdx.x; i < n_tokens*n_expert_used; i += warp_size) {
+            ids_src1[i] = 0;
+            ids_dst[i]  = 0;
         }
     }
 
@@ -176,4 +199,27 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
+}
+
+// Expert parallelism: a pair whose id is negative (an expert owned by another node) is no pair; its output row is zero.
+// For the kernels that write only the rows of the pairs they compute (the sorted ones: MMQ, MMF, the sm_60 GEMM).
+static __global__ void k_mmid_zero_neg_rows(const int32_t * __restrict__ ids, float * __restrict__ dst, const int64_t si1,
+        const int ne0, const int64_t s1, const int64_t s2) {
+    const int s = blockIdx.x, t = blockIdx.y;
+    if (ids[t*si1 + s] >= 0) {
+        return;
+    }
+    float * w = dst + t*s2 + s*s1;
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+        w[i] = 0.0f;
+    }
+}
+
+void ggml_cuda_mmid_zero_neg_rows(const ggml_tensor * ids, ggml_tensor * dst, cudaStream_t stream) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[1] % sizeof(float) == 0 && dst->nb[2] % sizeof(float) == 0);
+    k_mmid_zero_neg_rows<<<dim3(ids->ne[0], ids->ne[1]), 256, 0, stream>>>(
+        (const int32_t *) ids->data, (float *) dst->data, ids->nb[1]/sizeof(int32_t), (int) dst->ne[0],
+        dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
 }

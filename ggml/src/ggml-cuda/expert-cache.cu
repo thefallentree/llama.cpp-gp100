@@ -119,6 +119,9 @@ static __global__ void ec_remap(int32_t * ids, const int si1, const int n_used, 
     }
     int32_t * p = ids + (i / n_used)*si1 + i % n_used;
     const int e = *p;
+    if (e < 0) {
+        return;   // expert parallelism: an expert of another node (id -1), no pair here: not counted, left alone
+    }
     if ((unsigned int) e >= EC_MAX_EXPERTS - 1) {
         // not an expert id (a stale or torn ids tensor): counted in the row's last slot, which no expert uses, and left alone
         atomicAdd(counts + EC_MAX_EXPERTS - 1, 1u);

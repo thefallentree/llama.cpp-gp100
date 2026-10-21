@@ -242,12 +242,17 @@ KQ_DEV bool kq_vec_lane(const char * __restrict__ w, const char * __restrict__ x
     t = c / n_used;
     s = c % n_used;
     const int e = ids[t*si1 + s];
-    if (e < 0 || e >= n_hot) {
+    if (e >= n_hot) {
         return false;
     }
     const int r    = t*ne11 + s % ne11;
     const int part = lane & 3;
     row0 = bx*KQ_ROWS + warp*8 + (lane >> 2);
+    if (e < 0) {
+        // expert parallelism: an expert of another node, its output row is zero
+        sum = 0.0f;
+        return true;
+    }
     const int row = row0 < ne01 ? row0 : ne01 - 1; // rows past the end read the last row and do not store
     const char * wr = w + (int64_t) e*nb02 + (int64_t) row*nb01;
     const char * xr = x + (int64_t) r*nsb*KQ_REC_BYTES;

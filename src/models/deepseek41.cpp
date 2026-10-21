@@ -1107,6 +1107,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         }
 
         std::vector<llm_ep_shard> ep_shards;
+        std::vector<ggml_tensor *> ep_remote;   // the partial sums of the other nodes, added after the shared expert
         if (pmodel.ep) {
             const int K = pmodel.ep->n_nodes;
             ep_shards.resize(K);
@@ -1134,7 +1135,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il,
                 nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1e-5f,
-                pmodel.ep ? &ep_shards : nullptr);
+                pmodel.ep ? &ep_shards : nullptr, &ep_remote);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
@@ -1145,6 +1146,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cb(ffn_shexp, "ffn_shexp", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        for (ggml_tensor * part : ep_remote) {
+            cur = ggml_add(ctx0, cur, part);
+        }
         cb(cur, "ffn_out", il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);

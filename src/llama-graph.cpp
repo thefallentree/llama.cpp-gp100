@@ -2246,7 +2246,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
                float   post_exp_norm_eps,
-const std::vector<llm_ep_shard> * ep_shards) const {
+const std::vector<llm_ep_shard> * ep_shards,
+std::vector<ggml_tensor *> * ep_remote) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2270,7 +2271,8 @@ const std::vector<llm_ep_shard> * ep_shards) const {
         selected_experts_in,
         post_exp_norm,
         post_exp_norm_eps,
-        ep_shards
+        ep_shards,
+        ep_remote
     );
 }
 
@@ -2301,7 +2303,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
                float   post_exp_norm_eps,
-const std::vector<llm_ep_shard> * ep_shards) const {
+const std::vector<llm_ep_shard> * ep_shards,
+std::vector<ggml_tensor *> * ep_remote) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2668,17 +2671,40 @@ const std::vector<llm_ep_shard> * ep_shards) const {
                 "expert parallelism: plain separate gate/up/down experts only");
     ggml_tensor * ids_flat = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
     ids_flat = ggml_reshape_1d(ctx0, ids_flat, ggml_nelements(ids_flat));   // GET_ROWS takes one table for all the ids
-    ggml_tensor * moe_out = nullptr;
+    // every node's ids first (they are tiny and run here), then the nodes from the last to the first: the scheduler runs the splits in
+    // graph order and waits for this device's stream before it copies a split's inputs, so the remote nodes' inputs must not
+    // queue behind this node's own experts - which then run while the remote nodes compute
+    std::vector<ggml_tensor *> ids_node(ep_shards->size());
     for (size_t k = 0; k < ep_shards->size(); ++k) {
-        const llm_ep_shard & sh = (*ep_shards)[k];
         // this node's slot of each selected expert, or -1: the node skips the pair (its output row is zero)
-        ggml_tensor * ids_k = ggml_get_rows(ctx0, sh.tab, ids_flat);   // [1, n_expert_used*n_tokens]
+        ggml_tensor * ids_k = ggml_get_rows(ctx0, (*ep_shards)[k].tab, ids_flat);   // [1, n_expert_used*n_tokens]
         ids_k = ggml_reshape_2d(ctx0, ids_k, selected_experts->ne[0], selected_experts->ne[1]);
         cb(ids_k, "ffn_moe_ep_ids", il);
-        ggml_tensor * part = build_experts(cur, ids_k, sh.up, sh.gate, sh.down, nullptr);
+        ggml_build_forward_expand(gf, ids_k);
+        ids_node[k] = ids_k;
+    }
+    // the partial sums of the nodes 1.. go to ep_remote when the caller adds them last (after the work that needs no remote result,
+    // such as the shared expert); else they are added here, node 0's first
+    ggml_tensor * moe_out = nullptr;
+    std::vector<ggml_tensor *> remote;
+    for (size_t i = ep_shards->size(); i-- > 0; ) {
+        const llm_ep_shard & sh = (*ep_shards)[i];
+        ggml_tensor * part = build_experts(cur, ids_node[i], sh.up, sh.gate, sh.down, nullptr);
         cb(part, "ffn_moe_ep_part", il);
-        moe_out = moe_out == nullptr ? part : ggml_add(ctx0, moe_out, part);
-        ggml_build_forward_expand(gf, moe_out);
+        if (i == 0) {
+            moe_out = part;
+        } else {
+            remote.push_back(part);
+            ggml_build_forward_expand(gf, part);
+        }
+    }
+    if (ep_remote != nullptr) {
+        ep_remote->insert(ep_remote->end(), remote.begin(), remote.end());
+    } else {
+        for (ggml_tensor * part : remote) {
+            moe_out = ggml_add(ctx0, moe_out, part);
+            ggml_build_forward_expand(gf, moe_out);
+        }
     }
     cb(moe_out, "ffn_moe_out", il);
     return moe_out;

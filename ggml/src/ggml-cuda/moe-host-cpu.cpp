@@ -1301,6 +1301,7 @@ struct pool {
     bool                              nsplit = false;
     std::vector<int>                  qgu[MH_NODES], qdn[MH_NODES];
     struct alignas(64) counter { std::atomic<int> v { 0 }; };
+    std::atomic<int64_t>              st_own { 0 }, st_steal { 0 };   // chunks taken from the thread's own node's queue / the other's
     counter                           qcnt_gu[MH_NODES], qcnt_dn[MH_NODES];
     alignas(64) std::atomic<int>      bar_count { 0 };
     alignas(64) std::atomic<uint32_t> bar_gen { 0 };
@@ -1509,6 +1510,9 @@ struct pool {
                 if (cnt.load(std::memory_order_relaxed) < (int) q.size()) {
                     const int j = cnt.fetch_add(1, std::memory_order_relaxed);
                     if (j < (int) q.size()) {
+                        if (stat_every > 0) {
+                            (k == my ? st_own : st_steal).fetch_add(1, std::memory_order_relaxed);
+                        }
                         return q[j];
                     }
                 }
@@ -2042,7 +2046,7 @@ int mh_pool_register(const mh_slot_desc & d) {
         g_slot_nodes[n].down = expert_nodes(d.down, d.down_nb2, d.n_cold);
         int c[8] = {};
         for (const int8_t v : g_slot_nodes[n].gate) { c[v & 7]++; }
-        GGML_LOG_INFO("moe-host: slot %d: gate experts by node: %d %d %d\n", n, c[0], c[1], c[2]);
+        GGML_LOG_WARN("moe-host: slot %d: gate experts by node: %d %d %d\n", n, c[0], c[1], c[2]);
     }
     g_slots.n.store(n + 1, std::memory_order_release);
     return n;

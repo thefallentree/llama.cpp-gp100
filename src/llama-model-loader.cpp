@@ -478,7 +478,8 @@ namespace GGUFMeta {
             struct GGUFMeta::ArrayInfo arr_info =
                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
 
-            if (n != arr_info.length) {
+            // LLAMA_PARTIAL_LAYERS=1: a model cut to its first layers (block_count overridden): the per-layer arrays keep their length
+            if (n != arr_info.length && !(n < arr_info.length && getenv("LLAMA_PARTIAL_LAYERS") != nullptr)) {
                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
             }
 
@@ -1516,6 +1517,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // the engine's cold expert tensors (the part of a hot/cold split that stays in host memory) follow their
         // layer's device: the pinned host memory next to a local GPU (CUDA_Host), the pinned memory on the server of
         // an RPC device, so that the device computing the layer can reach them; an explicit override still wins
+        if (!buft && tn.str().find("_exps_cold.ep") != std::string::npos) {
+            // an expert-parallel node's cold experts live in the pinned memory of THAT node: never follow the layer's device
+            throw std::runtime_error(format("expert parallelism: place %s with -ot on its node (e.g. -ot '_exps_cold\\.ep1\\.=RPC0[host:port]_Host')", tn.str().c_str()));
+        }
         if (!buft && tn.str().find("_exps_cold") != std::string::npos && !buft_list->empty()) {
             ggml_backend_dev_t dev = buft_list->front().first;
             ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;

@@ -165,6 +165,47 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                 ep->table(il, k, ep_tab.data() + ((size_t) il*ep->n_nodes + k)*n_expert);
             }
         }
+        // hot/cold on the other nodes: LLAMA_EP_HOT=h1,h2,.. = the hot experts per layer of node 1, 2, ..: the first h of the node's
+        // shard (its most popular) stay in the node's VRAM, the rest is the cold tensor (pinned memory on the node, the node's host tier
+        // computes it); 0 / absent: the whole shard in VRAM. LLAMA_EXPERT_SPARE slots are added to both parts as on the head.
+        ep_hot.assign(ep->n_nodes, 0);
+        if (const char * h = getenv("LLAMA_EP_HOT"); h != nullptr && *h != '\0') {
+            std::string spec = h;
+            size_t pos = 0;
+            for (int k = 1; k < ep->n_nodes && pos <= spec.size(); ++k) {
+                size_t end = spec.find(',', pos);
+                if (end == std::string::npos) {
+                    end = spec.size();
+                }
+                ep_hot[k] = std::max(0, atoi(spec.substr(pos, end - pos).c_str()));
+                pos = end + 1;
+            }
+        }
+        const int64_t n_spare_ep = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
+        for (int il = 0; il < n_layer; ++il) {
+            for (int k = 1; k < ep->n_nodes; ++k) {
+                if (ep_hot[k] <= 0 || ep_hot[k] >= ep->n_local(il, k)) {
+                    continue;
+                }
+                static const llm_tensor pairs_ep[3][2] = {
+                    { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
+                    { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
+                    { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
+                };
+                for (const auto & pair : pairs_ep) {
+                    const std::string hot  = tn(pair[0], ep_sfx[k].c_str(), il).str();
+                    const std::string cold = tn(pair[1], ep_sfx[k].c_str(), il).str();
+                    if (!ml.split_single(hot, cold, ep_hot[k], 2)) {
+                        throw std::runtime_error(format("LLAMA_EP_HOT: cannot cut the experts of node %d, layer %d at %" PRId64, k, il, ep_hot[k]));
+                    }
+                    if (n_spare_ep > 0) {
+                        ml.pad_dim(hot,  2, n_spare_ep);
+                        ml.pad_dim(cold, 2, n_spare_ep);
+                    }
+                }
+            }
+        }
+        ep_spare = n_spare_ep;
         LLAMA_LOG_WARN("%s: expert parallelism over %d nodes: this node keeps %.1f experts per layer of %" PRId64 "\n", __func__,
                 ep->n_nodes, (double) std::accumulate(n_exp_layer.begin(), n_exp_layer.end(), (int64_t) 0)/n_layer, (int64_t) n_expert);
     }
@@ -316,9 +357,20 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         for (int k = 1; ep != nullptr && k < ep->n_nodes; ++k) {
             const int64_t n_k = ep->n_local(i, k);
             ep_tensors & et = ep_layers[i][k - 1];
-            et.gate = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_k}, 0);
-            et.down = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, ep_sfx[k].c_str(), i), {n_ff_exp, n_embd,   n_k}, 0);
-            et.up   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_k}, 0);
+            const int64_t nh = ep_hot[k] > 0 && ep_hot[k] < n_k ? ep_hot[k] : 0;
+            const int64_t ns = nh > 0 ? ep_spare : 0;
+            const int64_t n_hot_k = nh > 0 ? nh + ns : n_k;
+            et.gate = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_hot_k}, 0);
+            et.down = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, ep_sfx[k].c_str(), i), {n_ff_exp, n_embd,   n_hot_k}, 0);
+            et.up   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_hot_k}, 0);
+            if (nh > 0) {
+                et.gate_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_k - nh + ns}, 0);
+                et.down_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, ep_sfx[k].c_str(), i), {n_ff_exp, n_embd,   n_k - nh + ns}, 0);
+                et.up_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   ep_sfx[k].c_str(), i), {n_embd,   n_ff_exp, n_k - nh + ns}, 0);
+                exps_cold[et.gate] = et.gate_cold;
+                exps_cold[et.down] = et.down_cold;
+                exps_cold[et.up]   = et.up_cold;
+            }
         }
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);

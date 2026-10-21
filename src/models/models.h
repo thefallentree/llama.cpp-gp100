@@ -1519,9 +1519,15 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         ggml_tensor * gate = nullptr;
         ggml_tensor * up   = nullptr;
         ggml_tensor * down = nullptr;
+        // the cold part of the node's shard (LLAMA_EP_HOT): pinned memory on the node, next to the hot tensors (-ot ..._exps_cold.epK=RPC<i>[host:port]_Host)
+        ggml_tensor * gate_cold = nullptr;
+        ggml_tensor * up_cold   = nullptr;
+        ggml_tensor * down_cold = nullptr;
     };
     std::shared_ptr<llama_ep_partition> ep;
     std::vector<std::vector<ep_tensors>> ep_layers;
+    std::vector<int64_t> ep_hot;   // [node]: hot experts per layer of the node's shard (0: all in VRAM)
+    int64_t ep_spare = 0;
     std::vector<int32_t> ep_tab;
 
     struct graph : public llama_model_deepseek4::graph {

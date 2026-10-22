@@ -1062,12 +1062,19 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         const size_t min_size = ggml_nbytes(tensor);
 
         // Cache key for calls to read the alloc_size.
-        // We deliberately exclude src tensor dimensions from the key because:
-        // 1. For CPU backends, alloc_size = ggml_nbytes(output) regardless of src shapes
-        // 2. For GPU backends, the reservation graph uses max dimensions, so the
-        //    cached value from reservation is always >= any subsequent request
-        // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
-        //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
+        // The alloc_size of an op that may expand is a function of its sources, not of its output alone: a
+        // FLASH_ATTN_EXT converts K and V to f16 in room that follows its output, sized by K->ne[1], and layers of
+        // one graph share the output shape while their K lengths differ (DeepSeek V4: raw-only, compressed and
+        // top-k layers; the K length also grows with the context). A key of the output alone returned the size of
+        // whichever layer or context asked first, the compute buffer was too small for the later ones and the
+        // conversion wrote past its end ("illegal memory access" in FLASH_ATTN_EXT after a few thousand tokens of
+        // context). So the key holds the type, shape and strides of every source.
+        // A cache miss is one round trip to the server; the cache is per process and the shapes of a model repeat.
+        struct alloc_size_src_key {
+            uint32_t type;
+            uint32_t ne[GGML_MAX_DIMS];
+            uint64_t nb[GGML_MAX_DIMS];
+        };
         struct alloc_size_cache_key {
             uint32_t device;
             uint32_t type;
@@ -1075,6 +1082,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
             uint32_t ne[GGML_MAX_DIMS];
             uint64_t nb[GGML_MAX_DIMS];
+            alloc_size_src_key src[GGML_MAX_SRC];
         };
 
         alloc_size_cache_key key = {};
@@ -1085,6 +1093,17 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             key.ne[i] = (uint32_t)tensor->ne[i];
             key.nb[i] = (uint64_t)tensor->nb[i];
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * src = tensor->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+            key.src[j].type = src->type;
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                key.src[j].ne[i] = (uint32_t)src->ne[i];
+                key.src[j].nb[i] = (uint64_t)src->nb[i];
+            }
         }
 
         uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));

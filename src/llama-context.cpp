@@ -1981,10 +1981,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
                 gf_res_prev_active = nullptr;
 
+                // the graph was built for the slot's scheduler: its callbacks (graph_get_cb, the MoE cache) assigned tensors to
+                // backends there, and the main scheduler knows none of it. Computing that graph on the main scheduler ended in
+                // "cannot copy tensors with different layouts" in a split input copy (an OOM of the slot's buffers on the draft
+                // card, DeepSeek V4.1 + DSpark). So it is built again for the main scheduler, as in the last resort below
+                res = get_gf_res_prev();
+                res->reset();
+
                 ggml_backend_sched_reset(sch);
                 ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
 
-                allocated = ggml_backend_sched_alloc_graph(sch, gf);
+                gf = model.build_graph(graph_params(res, ubatch, mctx, gtype, sch));
+                allocated = gf != nullptr && ggml_backend_sched_alloc_graph(sch, gf);
             }
         }
 

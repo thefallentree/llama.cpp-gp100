@@ -6790,6 +6790,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (err_node != cudaSuccess) {
                         GGML_LOG_ERROR("%s: dev%d: node %s (%s) of a graph of %d nodes: %s\n", __func__, cuda_ctx->device, node->name,
                                 ggml_op_name(node->op), cgraph->n_nodes, cudaGetErrorString(err_node));
+                        {
+                            // the shapes of the faulting node and its inputs: the fault is data- or shape-dependent
+                            const auto desc = [](const ggml_tensor * t) {
+                                char b[256];
+                                snprintf(b, sizeof(b), "%s %s ne[%lld,%lld,%lld,%lld] nb[%zu,%zu,%zu,%zu] data %p", t->name, ggml_type_name(t->type),
+                                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                                        t->nb[0], t->nb[1], t->nb[2], t->nb[3], t->data);
+                                return std::string(b);
+                            };
+                            GGML_LOG_ERROR("  dst %s\n", desc(node).c_str());
+                            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                                if (node->src[j] != nullptr) {
+                                    GGML_LOG_ERROR("  src[%d] %s\n", j, desc(node->src[j]).c_str());
+                                }
+                            }
+                        }
                     }
                     CUDA_CHECK(err_node);
                     ggml_cuda_node_time_add(cuda_ctx->device, node, (double) (ggml_time_us() - t_node));

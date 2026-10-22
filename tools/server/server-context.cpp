@@ -3,6 +3,7 @@
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
+#include "server-ckpt-spread.h"
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
@@ -2721,12 +2722,33 @@ private:
             }
 
             auto victim = slot.prompt.checkpoints.end();
-            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
-                if (it == keep) {
-                    continue;
+
+            if (params_base.checkpoint_spread) {
+                // spread policy: drop the checkpoint whose removal leaves the smallest gap for its distance from the
+                // newest, never the root, the restore point kept above or the checkpoint added below
+                std::vector<int64_t> n_tokens;
+                n_tokens.reserve(slot.prompt.checkpoints.size());
+                int i_keep = -1;
+                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                    if (it == keep) {
+                        i_keep = (int) n_tokens.size();
+                    }
+                    n_tokens.push_back(it->n_tokens);
                 }
-                if (victim == slot.prompt.checkpoints.end() || it->n_tokens < victim->n_tokens) {
-                    victim = it;
+                const int i_victim = server_ckpt_spread_victim(n_tokens, i_keep, slot.prompt.n_tokens() - n_tokens_cur);
+                if (i_victim >= 0) {
+                    victim = std::next(slot.prompt.checkpoints.begin(), i_victim);
+                }
+            }
+
+            if (victim == slot.prompt.checkpoints.end()) {
+                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                    if (it == keep) {
+                        continue;
+                    }
+                    if (victim == slot.prompt.checkpoints.end() || it->n_tokens < victim->n_tokens) {
+                        victim = it;
+                    }
                 }
             }
             if (victim == slot.prompt.checkpoints.end()) {

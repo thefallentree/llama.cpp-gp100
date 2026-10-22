@@ -538,13 +538,19 @@ struct case_spec_rounds : ctx_test {
             llama_pos pos = (llama_pos) n_prompt; // the true token at pos is the next one to decode, the way the server's sampled token is
 
             for (uint32_t r = 0; pos + (llama_pos) n_draft_max < (llama_pos) n_total; ++r) {
-                const uint32_t k = n_draft_max - (r % 4 == 3 ? 3 : 0); // a plain decode now and then
-                const uint32_t a = (r*5 + n_prompt) % (k + 1);         // accepted drafts
+                // a plain decode now and then, and a window padded to the full width (launch-ahead of the server, with a draft
+                // shorter than n_draft_max): the padding rows leave with the rejected ones in one removal
+                const uint32_t pad = r % 4 == 1 ? 1 : 0;
+                const uint32_t k   = n_draft_max - (r % 4 == 3 ? 3 : 0) - pad;
+                const uint32_t a   = (r*5 + n_prompt) % (k + 1); // accepted drafts
 
                 std::vector<row_t> rows = { { tok(pos), pos, true } };
                 for (uint32_t i = 1; i <= k; ++i) {
                     const llama_token t = i <= a ? tok(pos + (llama_pos) i) : (llama_token) ((tok(pos + (llama_pos) i) + i) % n_vocab);
                     rows.push_back({ t, pos + (llama_pos) i, true });
+                }
+                for (uint32_t i = k + 1; i <= k + pad; ++i) {
+                    rows.push_back({ rows.back().tok, pos + (llama_pos) i, true });
                 }
                 CTX_REQUIRE(decode_rows(rows), "verify decode failed, n_prompt " + std::to_string(n_prompt) + ", round " + std::to_string(r));
 
@@ -558,10 +564,10 @@ struct case_spec_rounds : ctx_test {
                             " (n_prompt " + std::to_string(n_prompt) + ", round " + std::to_string(r) + ")");
                 }
 
-                if (a < k) {
+                if (a < k + pad) {
                     for (llama_context * ctx : { ctx_spec.get(), ctx_bs.get() }) {
                         CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + (llama_pos) a + 1, -1),
-                                "the rollback of " + std::to_string(k - a) + " tokens was refused");
+                                "the rollback of " + std::to_string(k + pad - a) + " tokens was refused");
                     }
                     n_rolled++;
                 }
@@ -850,13 +856,19 @@ struct case_spec_requests : ctx_test {
             llama_pos pos = (llama_pos) n_prompt;
 
             for (uint32_t r = 0; pos + (llama_pos) n_draft_max < (llama_pos) n_total; ++r) {
-                const uint32_t k = n_draft_max - (r % 4 == 3 ? 3 : 0); // a plain decode now and then
-                const uint32_t a = (r*5 + n_prompt) % (k + 1);         // accepted drafts
+                // a plain decode now and then, and a window padded to the full width (launch-ahead of the server, with a draft
+                // shorter than n_draft_max): the padding rows leave with the rejected ones in one removal
+                const uint32_t pad = r % 4 == 1 ? 1 : 0;
+                const uint32_t k   = n_draft_max - (r % 4 == 3 ? 3 : 0) - pad;
+                const uint32_t a   = (r*5 + n_prompt) % (k + 1); // accepted drafts
 
                 std::vector<row_t> rows = { { tok(pos), pos, true } };
                 for (uint32_t i = 1; i <= k; ++i) {
                     const llama_token t = i <= a ? tok(pos + (llama_pos) i) : (llama_token) ((tok(pos + (llama_pos) i) + i) % n_vocab);
                     rows.push_back({ t, pos + (llama_pos) i, true });
+                }
+                for (uint32_t i = k + 1; i <= k + pad; ++i) {
+                    rows.push_back({ rows.back().tok, pos + (llama_pos) i, true });
                 }
                 if (!decode_rows(rows)) {
                     return "round " + std::to_string(r) + " did not decode";

@@ -1632,7 +1632,7 @@ done:
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d (n_rs_seq=%u, pos_max=%d)\n", seq_id, p0, p1, llama_n_rs_seq(ctx), llama_memory_seq_pos_max(mem, seq_id)).c_str());
     }
 }
 

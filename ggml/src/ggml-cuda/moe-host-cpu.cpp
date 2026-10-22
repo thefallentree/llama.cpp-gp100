@@ -1268,6 +1268,10 @@ struct pool {
     mh_mailbox *         jm = nullptr;
     int                  n_groups = 0;
     std::vector<group>   groups;         // the cold experts of the job
+    int tail_rank = 0, tail_max_tok = 16;   // GGML_CUDA_MOE_HOST_TAIL_SKIP=R (0 off), ..._TAIL_MAX_TOK
+    int64_t stat_skipped = 0;
+    std::vector<int>     tail_min;
+    std::vector<char>    pair_skip;
     std::vector<int>     pair_of;        // pairs grouped by expert: pair index p (into the mailbox y)
     std::vector<int>     tok_of;         // ... and its token
     std::vector<int>     grp_of_exp;     // scratch: expert -> group
@@ -1696,9 +1700,32 @@ struct pool {
                 return;
             }
         }
+        // GGML_CUDA_MOE_HOST_TAIL_SKIP=R (changes the output; after Strata's route tail skip): a cold expert that EVERY token of this
+        // window routes at rank >= R (rank = position in the token's top-k, best first = slot k of pair t*n_used + k) is neither
+        // computed nor copied: its pair rows are zeroed, so its weighted contribution drops. No renormalisation (the other
+        // experts keep the weights the router gave them), as in Strata. Windows wider than tail_max_tok (prompts) are untouched.
+        int n_skip = 0;
+        const bool tail_on = tail_rank > 0 && m->n_tokens <= tail_max_tok;
+        if (tail_on) {
+            tail_min.assign((size_t) max_c + 1, 1 << 20);
+            for (int p = 0; p < n_pairs; ++p) {
+                tail_min[pexp[p]] = std::min(tail_min[pexp[p]], (int) pidx[p] % n_used);
+            }
+            pair_skip.assign(n_pairs, 0);
+            for (int p = 0; p < n_pairs; ++p) {
+                if (tail_min[pexp[p]] >= tail_rank) {
+                    pair_skip[p] = 1;
+                    n_skip++;
+                    memset(mh_y(m) + (size_t) p*js->n_embd, 0, (size_t) js->n_embd*sizeof(float));
+                }
+            }
+        }
         grp_of_exp.assign((size_t) max_c + 1, -1);
         groups.clear();
         for (int p = 0; p < n_pairs; ++p) {
+            if (tail_on && pair_skip[p]) {
+                continue;
+            }
             int & gi = grp_of_exp[pexp[p]];
             if (gi < 0) {
                 gi = (int) groups.size();
@@ -1715,6 +1742,9 @@ struct pool {
         pair_of.resize(n_pairs);
         tok_of.resize(n_pairs);
         for (int p = 0; p < n_pairs; ++p) {
+            if (tail_on && pair_skip[p]) {
+                continue;
+            }
             group & g = groups[grp_of_exp[pexp[p]]];
             pair_of[g.first + g.n] = p;
             tok_of [g.first + g.n] = pidx[p]/n_used;
@@ -1807,16 +1837,17 @@ struct pool {
             stat_work_us  += std::chrono::duration<double, std::micro>(t_work - t_start).count();
             stat_p1_us    += (t_p1_ns.load() - std::chrono::duration_cast<std::chrono::nanoseconds>(t_start.time_since_epoch()).count())/1e3;
             stat_pairs    += n_pairs;
+            stat_skipped  += n_skip;
             stat_groups   += n_groups;
             if (++stat_jobs == stat_every) {
-                fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs, %.2f experts per job, %s kernels\n",
+                fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs (%.2f skipped by the tail rule), %.2f experts per job, %s kernels\n",
                               id, (long long) stat_jobs, stat_us/stat_jobs, stat_quant_us/stat_jobs, stat_p1_us/stat_jobs, stat_work_us/stat_jobs,
-                              (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs, jmode == 2 ? "k" : "old");
+                              (double) stat_pairs/stat_jobs, (double) stat_skipped/stat_jobs, (double) stat_groups/stat_jobs, jmode == 2 ? "k" : "old");
                 if (nsplit) {
                     fprintf(stderr, "moe-host: pool %d: NUMA split: %lld chunks from the thread's own node, %lld from the other\n", id,
                             (long long) st_own.exchange(0), (long long) st_steal.exchange(0));
                 }
-                stat_jobs = stat_pairs = stat_groups = 0;
+                stat_jobs = stat_pairs = stat_groups = stat_skipped = 0;
                 stat_us = stat_quant_us = stat_p1_us = stat_work_us = 0.0;
             }
         }
@@ -1877,6 +1908,11 @@ struct pool {
         id = pool_id;
         pick_kernels(dot2, quant, dot2k, dot2k3, quantn, isa);
         stat_every = getenv("GGML_CUDA_MOE_HOST_STATS") ? atoll(getenv("GGML_CUDA_MOE_HOST_STATS")) : 0;
+        tail_rank    = getenv("GGML_CUDA_MOE_HOST_TAIL_SKIP") ? std::max(0, atoi(getenv("GGML_CUDA_MOE_HOST_TAIL_SKIP"))) : 0;
+        tail_max_tok = getenv("GGML_CUDA_MOE_HOST_TAIL_MAX_TOK") ? atoi(getenv("GGML_CUDA_MOE_HOST_TAIL_MAX_TOK")) : 16;
+        if (tail_rank > 0 && id == 0) {
+            fprintf(stderr, "moe-host: route tail skip ON: cold experts that every token of a window of <= %d tokens ranks >= %d are skipped\n", tail_max_tok, tail_rank);
+        }
         const char * env = getenv("GGML_CUDA_MOE_HOST_THREADS");
         const int hw = (int) std::thread::hardware_concurrency();
         const int total = env != nullptr ? atoi(env) : std::max(1, std::min(16, hw - 4));

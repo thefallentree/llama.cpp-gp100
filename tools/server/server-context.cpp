@@ -3884,10 +3884,13 @@ private:
                 others |= slot.is_processing() && &slot != drafting[0];
             });
             // (a target checkpoint after the draft would read the context while its window waits: not with those)
+            // (the padding rows of a window must stay within the rollback depth of a recurrent memory)
+            const int32_t n_rows_ahead = 1 + std::min(drafting[0]->get_n_draft_max(), common_speculative_n_max(spec.get()));
             if (spec_ahead.enabled && drafting.size() == 1 && generating.size() == 1 && !others && drafting[0]->inp_embd.empty() &&
-                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                    (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_rows_ahead - 1 <= (int32_t) llama_n_rs_seq(ctx_tgt))) {
                 server_slot * slot   = drafting[0];
-                const int32_t n_rows = 1 + std::min(slot->get_n_draft_max(), common_speculative_n_max(spec.get()));
+                const int32_t n_rows = n_rows_ahead;
                 common_speculative_set_launch_hook(spec.get(), [this, slot, n_rows]() {
                     auto & b = spec_ahead.batch;
                     b.clear();
@@ -4730,9 +4733,14 @@ private:
                     llama_synchronize(ctx_tgt);
                 }
             });
-            if (ret == 0 && n_view < spec_ahead.n_rows) {
+            if (ret == 0 && n_view == 1 && n_view < spec_ahead.n_rows) {
+                // no draft: nothing verifies these rows, so they leave the memory now
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), spec_ahead.slot->id, spec_ahead.pos0 + n_view, -1);
             }
+            // with a draft the padding rows stay until the accept step of post_decode, whose seq_rm [pos_next, end) removes them
+            // together with the rejected rows: a recurrent memory selects one rollback snapshot per decode, so a second
+            // partial removal before the next decode (padding first, then the rejected tail) is refused
+
             if (ret != 0) {
                 SRV_ERR("llama_decode_commit failed, ret = %d\n", ret);
                 throw std::runtime_error("the prepared decode failed");

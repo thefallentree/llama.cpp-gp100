@@ -1734,6 +1734,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-spread"},
+        "when the checkpoint list is full, evict the checkpoint whose removal leaves the smallest gap for its distance from the newest\n"
+        "(kept points thin out geometrically back from the end, so a client rewriting its history N tokens back re-reads about N tokens)\n"
+        "(default: evict the oldest, except the restore point with the lowest pos_min)",
+        [](common_params & params) {
+            params.checkpoint_spread = true;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_SPREAD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

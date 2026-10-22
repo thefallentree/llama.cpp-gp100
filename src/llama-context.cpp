@@ -1927,49 +1927,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         bool allocated = ggml_backend_sched_alloc_graph(sch, gf);
         FN_PROF_ADD(allocated ? "pu.alloc(ok)" : "pu.alloc(fail)", t_al);
 
+        // ggml_backend_sched_alloc_graph reserves the buffers it lacks by itself, so a failure here is an out of memory
+        // (the draft card of DeepSeek V4.1 + DSpark holds ~300 MB free at the HOT=52 split). A graph that went through
+        // the scheduler once is not scheduled again (the split rewrites its sources, and the tensor-backend assignments
+        // of the build live in the scheduler's hash), so every attempt below builds it again, after a reset.
+        const auto rebuild = [&](ggml_backend_sched_t s, llm_graph_result * r) -> ggml_cgraph * {
+            r->reset();
+            ggml_backend_sched_reset(s);
+            ggml_backend_sched_set_eval_callback(s, cparams.cb_eval, cparams.cb_eval_user_data);
+            return model.build_graph(graph_params(r, ubatch, mctx, gtype, s));
+        };
+
         if (!allocated && use_slot) {
-            // the slot's compute buffers are not large enough for this graph yet (first use or a larger shape):
-            // reserve them for this graph and try again
-            ggml_backend_sched_reset(sch);
-
-            FN_PROF_T(t_rs);
-            const bool reserved = ggml_backend_sched_reserve(sch, gf);
-            FN_PROF_ADD("pu.reserve", t_rs);
-            if (reserved) {
-                ggml_backend_sched_reset(sch);
-                ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
-
-                FN_PROF_T(t_al2);
-                allocated = ggml_backend_sched_alloc_graph(sch, gf);
-                FN_PROF_ADD("pu.alloc(2)", t_al2);
+            // sibling slots may still hold the previous turn's decode graphs.
+            // free those first, then build this graph again on its slot
+            bool freed_sibling = false;
+            for (int i = 0; i < (int) gf_slots.size(); ++i) {
+                if (i == slot || !gf_slots[i].valid) {
+                    continue;
+                }
+                gf_slots_recreate_one(gf_slots[i]);
+                freed_sibling = true;
+            }
+            if (freed_sibling) {
+                LLAMA_LOG_WARN("%s: released sibling graph slots after alloc failure, retrying slot %d\n", __func__, slot);
+                gf = rebuild(sch, res);
+                allocated = gf != nullptr && ggml_backend_sched_alloc_graph(sch, gf);
             }
 
             if (!allocated) {
-                // sibling slots may still hold the previous turn's decode graphs.
-                // free those first, then retry reserve on this slot.
-                bool freed_sibling = false;
-                for (int i = 0; i < (int) gf_slots.size(); ++i) {
-                    if (i == slot || !gf_slots[i].valid) {
-                        continue;
-                    }
-                    gf_slots_recreate_one(gf_slots[i]);
-                    freed_sibling = true;
-                }
-                if (freed_sibling) {
-                    LLAMA_LOG_INFO("%s: released sibling graph slots after alloc failure, retrying slot %d\n", __func__, slot);
-                    ggml_backend_sched_reset(sch);
-                    if (ggml_backend_sched_reserve(sch, gf)) {
-                        ggml_backend_sched_reset(sch);
-                        ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
-                        allocated = ggml_backend_sched_alloc_graph(sch, gf);
-                    }
-                }
-            }
-
-            if (!allocated) {
-                // fall back to the main scheduler. reserving there can move the tensors of the previous graph, so it
+                // fall back to the main scheduler. allocating there can move the tensors of the previous graph, so it
                 // cannot be reused afterwards
-                LLAMA_LOG_DEBUG("%s: graph slot %d cannot hold this graph, using the main scheduler\n", __func__, slot);
+                LLAMA_LOG_WARN("%s: graph slot %d cannot hold this graph, using the main scheduler\n", __func__, slot);
 
                 sch = sched.get();
                 gf_slot_cur = -1;
@@ -1981,17 +1970,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
                 gf_res_prev_active = nullptr;
 
-                // the graph was built for the slot's scheduler: its callbacks (graph_get_cb, the MoE cache) assigned tensors to
-                // backends there, and the main scheduler knows none of it. Computing that graph on the main scheduler ended in
-                // "cannot copy tensors with different layouts" in a split input copy (an OOM of the slot's buffers on the draft
-                // card, DeepSeek V4.1 + DSpark). So it is built again for the main scheduler, as in the last resort below
                 res = get_gf_res_prev();
-                res->reset();
-
-                ggml_backend_sched_reset(sch);
-                ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
-
-                gf = model.build_graph(graph_params(res, ubatch, mctx, gtype, sch));
+                gf  = rebuild(sch, res);
                 allocated = gf != nullptr && ggml_backend_sched_alloc_graph(sch, gf);
             }
         }
@@ -2006,21 +1986,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             sch = sched.get();
             gf_slot_cur = -1;
             res = get_gf_res_prev();
-            res->reset();
-            ggml_backend_sched_reset(sch);
-            ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
-            gf = model.build_graph(graph_params(res, ubatch, mctx, gtype, sch));
+            gf  = rebuild(sch, res);
             allocated = gf != nullptr && ggml_backend_sched_alloc_graph(sch, gf);
-            if (gf != nullptr && !allocated && ggml_backend_sched_reserve(sch, gf)) {
-                ggml_backend_sched_reset(sch);
-                ggml_backend_sched_set_eval_callback(sch, cparams.cb_eval, cparams.cb_eval_user_data);
-                allocated = ggml_backend_sched_alloc_graph(sch, gf);
-            }
             if (allocated) {
                 LLAMA_LOG_WARN("%s: allocated the graph after dropping every cached graph\n", __func__);
             }
         }
-
         if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;

@@ -276,6 +276,7 @@ set_tests_properties(test-llama-context PROPERTIES
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
+llama_build_and_test(test-ckpt-spread.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)

@@ -142,6 +142,62 @@ static __device__ __forceinline__ half2 mmid16_h2(const uint32_t v) {
     return *((const half2 *) &v);
 }
 
+// Q4_0 (the MTP layer's experts, resident): 32-value blocks of 18 B (half d + 16 nibble bytes: element j = low
+// nibble of byte j, j + 16 = high nibble), two blocks per 64-value k-block. Word w (0..7) of a k-block = block w/4,
+// bytes 4(w%4)..+3, decoded to 4 half2 pairs t0 = (e, e+2) low nibbles of bytes 0/2, t1 = (e+16, e+18) high nibbles
+// of bytes 0/2, t2 = (e+1, e+3), t3 = (e+17, e+19) with e = 32(w/4) + 4(w%4); activation pair 4w + t holds the same
+// elements (mmid16_convert_act_q4). Bench: runs/fn-m2/qpf/bench/mmid_bench.cu (q4 argument).
+static __device__ __forceinline__ void mmid16_decode_q4_0(const uint32_t q, half2 * h) {
+    const uint32_t q4  = q >> 4;
+    const uint32_t q8  = q >> 8;
+    const uint32_t q12 = q >> 12;
+    uint32_t t[4];
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[0]) : "r"(q),   "n"(0x000f000f), "n"(0x64006400));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[1]) : "r"(q4),  "n"(0x000f000f), "n"(0x64006400));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[2]) : "r"(q8),  "n"(0x000f000f), "n"(0x64006400));
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t[3]) : "r"(q12), "n"(0x000f000f), "n"(0x64006400));
+    const half2 m = __float2half2_rn(1032.0f); // 1024 + 8: code n -> n - 8
+    h[0] = __hsub2(mmid16_h2(t[0]), m);
+    h[1] = __hsub2(mmid16_h2(t[1]), m);
+    h[2] = __hsub2(mmid16_h2(t[2]), m);
+    h[3] = __hsub2(mmid16_h2(t[3]), m);
+}
+
+// one compact slot per block, one 64-value k-block per warp; even lane l pairs with lane l+1: A = (2l, 2l+2) and
+// B = (2l+1, 2l+3); with 2l = 32b + 16h + 4m: A is pair t = h of word 4b + m, B is pair t = 2 + h
+static __global__ void mmid16_convert_act_q4(
+        const float * __restrict__ src1, const int32_t * __restrict__ ids_src1, half2 * __restrict__ xh,
+        float * __restrict__ xs, const int64_t stride_row, const int nkb) {
+    const int     c    = blockIdx.x;
+    const float * x    = src1 + (int64_t) ids_src1[c]*stride_row;
+    const int     lane = threadIdx.x % 32;
+    const int     wid  = threadIdx.x / 32;
+    const int     nw   = blockDim.x / 32;
+    for (int kb = wid; kb < nkb; kb += nw) {
+        const float2 v = ((const float2 *) (x + kb*64))[lane];
+        float amax = fmaxf(fabsf(v.x), fabsf(v.y));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+        }
+        const float    s   = amax > 0.0f ? amax : 1.0f;
+        const float    id  = 1.0f/s;
+        const uint32_t own = mmid16_u32(make_half2(__float2half(v.x*id), __float2half(v.y*id)));
+        const uint32_t nbr = __shfl_down_sync(0xffffffff, own, 1);
+        if ((lane & 1) == 0) {
+            const int b = lane / 16, h = (lane / 8) & 1, m = (lane / 2) & 3;
+            const int w = 4*b + m;
+            uint32_t * o = (uint32_t *) (xh + ((int64_t) c*nkb + kb)*32);
+            o[4*w + h]     = __byte_perm(own, nbr, 0x5410); // (own.x, nbr.x)
+            o[4*w + 2 + h] = __byte_perm(own, nbr, 0x7632); // (own.y, nbr.y)
+        }
+        if (lane == 0) {
+            xs[(int64_t) c*nkb + kb] = s;
+        }
+    }
+}
+
+
 // 16 Q2_0 codes (one 32-bit word) -> 8 half2 holding c - 1, pair j = elements (j, j + 8)
 static __device__ __forceinline__ void mmid16_decode_q2_0(const uint32_t q, half2 * h) {
     const uint32_t qs = q >> 8;
@@ -475,6 +531,149 @@ mmid16_q2_0_gemm_p(
 #endif // FP16_AVAILABLE
 }
 
+// The Q4_0 variant of the pipelined tile: 8 words and two scales per row per k-block, one half2 accumulator per
+// 32-value block (GGML_CUDA_MMID16_Q4TILE selects the instantiation).
+template <int NT, int RPT, int NJ, int MINB = mmid16_tile_cfg<NT, RPT, NJ>::MINB>
+static __global__ void __launch_bounds__(NT, MINB)
+mmid16_q4_0_gemm_p(
+        const char * __restrict__ w, const half2 * __restrict__ xh, const float * __restrict__ xs,
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
+        const int32_t * __restrict__ tile_expert, const int32_t * __restrict__ tile_col0,
+        float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02, const int64_t stride_dst,
+        const int e_lo, const int e_hi) {
+#if defined(FP16_AVAILABLE)
+    using C = mmid16_tile_cfg<NT, RPT, NJ>;
+    constexpr int TM = C::TM, RG = C::RG, TX = C::TX, TN = C::TN, XI = C::XI;
+    constexpr int WI = TM*8/NT; // 8 words per row per k-block
+    static_assert(TM*8 % NT == 0, "weight words per thread");
+
+    const int e = tile_expert[blockIdx.y];
+    if (e < 0 || e < e_lo || e >= e_hi) {
+        return;
+    }
+    const int c0   = tile_col0[blockIdx.y];
+    const int cend = expert_bounds[e + 1];
+    const int row0 = blockIdx.x*TM;
+
+    __shared__ __align__(16) uint32_t ws [TM][MMID16_LDS];
+    __shared__ __align__(16) uint32_t xsm[TN][MMID16_LDS];
+    __shared__ float wd [2][TM];
+    __shared__ float xsc[TN];
+
+    const int tid = threadIdx.x;
+    const int tx  = tid % TX;
+    const int ty  = tid / TX;
+    const char * wexp = w + (int64_t) e*nb02;
+
+    float acc[RPT][NJ];
+#pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+    uint32_t rq[WI];
+    float    rd[WI];
+    uint4    rx[XI];
+    float    rxs = 0.0f;
+
+#define MMID16_LOADQ4(kb) do { \
+        _Pragma("unroll") for (int i = 0; i < WI; ++i) { \
+            const int lr = (i*NT + tid) / 8; const int lw = (i*NT + tid) % 8; \
+            const char * blk = wexp + (int64_t) (row0 + lr)*nb01 + (int64_t) (kb)*36 + (lw/4)*18; \
+            const uint16_t * q16 = (const uint16_t *) (blk + 2 + 4*(lw%4)); \
+            rq[i] = (uint32_t) q16[0] | ((uint32_t) q16[1] << 16); \
+            rd[i] = __half2float(*((const half *) blk)); \
+        } \
+        _Pragma("unroll") for (int i = 0; i < XI; ++i) { \
+            const int idx = i*NT + tid; const int col = idx / 8; const int part = idx % 8; const int c = c0 + col; \
+            rx[i] = make_uint4(0, 0, 0, 0); \
+            if (idx < TN*8 && c < cend) { rx[i] = ((const uint4 *) (xh + ((int64_t) c*nkb + (kb))*32))[part]; } \
+        } \
+        if (tid < TN) { const int c = c0 + tid; rxs = c < cend ? xs[(int64_t) c*nkb + (kb)] : 0.0f; } \
+    } while (0)
+#define MMID16_STOREQ4() do { \
+        _Pragma("unroll") for (int i = 0; i < WI; ++i) { \
+            const int lr = (i*NT + tid) / 8; const int lw = (i*NT + tid) % 8; \
+            half2 h[4]; mmid16_decode_q4_0(rq[i], h); \
+            *((uint4 *) &ws[lr][4*lw]) = make_uint4(mmid16_u32(h[0]), mmid16_u32(h[1]), mmid16_u32(h[2]), mmid16_u32(h[3])); \
+            if ((lw & 3) == 0) { wd[lw/4][lr] = rd[i]; } \
+        } \
+        _Pragma("unroll") for (int i = 0; i < XI; ++i) { \
+            const int idx = i*NT + tid; const int col = idx / 8; const int part = idx % 8; \
+            if (idx < TN*8) { *((uint4 *) &xsm[col][4*part]) = rx[i]; } \
+        } \
+        if (tid < TN) { xsc[tid] = rxs; } \
+    } while (0)
+
+    MMID16_LOADQ4(0);
+    for (int kb = 0; kb < nkb; ++kb) {
+        MMID16_STOREQ4();
+        __syncthreads();
+        if (kb + 1 < nkb) {
+            MMID16_LOADQ4(kb + 1);
+        }
+        half2 hacc0[RPT][NJ];
+        half2 hacc1[RPT][NJ];
+#pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                hacc0[i][j] = make_half2(0.0f, 0.0f);
+                hacc1[i][j] = make_half2(0.0f, 0.0f);
+            }
+        }
+#define MMID16_Q4_HALF(HACC, P0) do { \
+        _Pragma("unroll") for (int p4 = P0; p4 < P0 + 4; ++p4) { \
+            uint4 wv[RPT]; uint4 xv[NJ]; \
+            _Pragma("unroll") for (int i = 0; i < RPT; ++i) { wv[i] = *((const uint4 *) &ws[ty + RG*i][4*p4]); } \
+            _Pragma("unroll") for (int j = 0; j < NJ; ++j) { xv[j] = *((const uint4 *) &xsm[tx + TX*j][4*p4]); } \
+            _Pragma("unroll") for (int i = 0; i < RPT; ++i) { \
+                _Pragma("unroll") for (int j = 0; j < NJ; ++j) { \
+                    HACC[i][j] = __hfma2(mmid16_h2(wv[i].x), mmid16_h2(xv[j].x), HACC[i][j]); \
+                    HACC[i][j] = __hfma2(mmid16_h2(wv[i].y), mmid16_h2(xv[j].y), HACC[i][j]); \
+                    HACC[i][j] = __hfma2(mmid16_h2(wv[i].z), mmid16_h2(xv[j].z), HACC[i][j]); \
+                    HACC[i][j] = __hfma2(mmid16_h2(wv[i].w), mmid16_h2(xv[j].w), HACC[i][j]); \
+                } \
+            } \
+        } \
+    } while (0)
+        MMID16_Q4_HALF(hacc0, 0);
+        MMID16_Q4_HALF(hacc1, 4);
+#undef MMID16_Q4_HALF
+#pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+            const float d0 = wd[0][ty + RG*i];
+            const float d1 = wd[1][ty + RG*i];
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                acc[i][j] += xsc[tx + TX*j]*(d0*__half2float(__hadd(__low2half(hacc0[i][j]), __high2half(hacc0[i][j])))
+                                           + d1*__half2float(__hadd(__low2half(hacc1[i][j]), __high2half(hacc1[i][j]))));
+            }
+        }
+        __syncthreads();
+    }
+#undef MMID16_LOADQ4
+#undef MMID16_STOREQ4
+
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        const int c = c0 + tx + TX*j;
+        if (c < cend) {
+            float * d = dst + (int64_t) ids_dst[c]*stride_dst + row0;
+#pragma unroll
+            for (int i = 0; i < RPT; ++i) {
+                d[ty + RG*i] = acc[i][j];
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(w, xh, xs, ids_dst, expert_bounds, tile_expert, tile_col0, dst, nkb, nb01, nb02, stride_dst, e_lo, e_hi);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
 // Mat-vec for up to MMVQ_MAX_BATCH_SIZE tokens: one token slot per blockIdx.y, MMID16V_RW rows per warp.
 // A lane owns one 16-weight word of a block at a time for all rows of its warp, so the activation load is
 // shared by the rows and every row adds independent loads in flight (the kernel is latency bound otherwise).
@@ -613,7 +812,9 @@ bool ggml_cuda_mmid_f16_sm60_supported(
     if (!enabled || ids == nullptr) {
         return false;
     }
-    if (src0->type != GGML_TYPE_Q2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    // GGML_CUDA_SM60_MMID_Q4=0: the Q4_0 experts (the MTP layer's, all resident) stay on MMQ
+    static const bool q4 = getenv("GGML_CUDA_SM60_MMID_Q4") == nullptr || atoi(getenv("GGML_CUDA_SM60_MMID_Q4")) != 0;
+    if ((src0->type != GGML_TYPE_Q2_0 && !(q4 && src0->type == GGML_TYPE_Q4_0)) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -622,6 +823,9 @@ bool ggml_cuda_mmid_f16_sm60_supported(
     }
     int n_cold = 0;
     ggml_cuda_mmid_cold(dst, nullptr, &n_cold);
+    if (src0->type == GGML_TYPE_Q4_0 && n_cold > 0) {
+        return false; // the cold staging and the mat-vec are Q2_0 only
+    }
     if (src0->ne[0] % 64 != 0 || src0->ne[1] % MMID16_TM != 0 || src0->ne[2] + n_cold > 1024 || src0->ne[3] != 1) {
         return false;
     }
@@ -656,6 +860,7 @@ struct mmid16_gemm_plan {
     bool    mixed  = false; // wide tiles on the full 64-slot groups of every expert, narrow tiles on the remainders
     bool    narrow128 = false; // the narrow tiles with 128 threads
     bool    tile16 = false; // the pipelined 16-slot tiles (mmid16_q2_0_gemm_p<64, 4, 4>)
+    int     q4     = 0;     // Q4_0 experts: 1 + the GGML_CUDA_MMID16_Q4TILE instantiation (0 = Q2_0)
     const half2 * xh_ptr = nullptr; // the converted activations: the pool allocation above or the context's cache
     const float * xs_ptr = nullptr;
     dim3    grid;
@@ -686,6 +891,11 @@ static void mmid16_gemm_setup(
     const int     nkb      = ne00/64;
 
     p.src0 = src0; p.dst = dst; p.n_hot = n_hot; p.n_cold = n_cold; p.ne02 = ne02; p.nkb = nkb;
+    // GGML_CUDA_MMID16_Q4TILE: 0 = 64x16 tiles of 2 warps (4x4 per thread, 4 blocks per SM), 1 = 64x16 of 4 warps
+    // (4x2), 2 = 64x32 of 4 warps (4x4, 3 blocks per SM)
+    static const int q4tile = getenv("GGML_CUDA_MMID16_Q4TILE") != nullptr ? atoi(getenv("GGML_CUDA_MMID16_Q4TILE")) : 0;
+    p.q4 = src0->type == GGML_TYPE_Q4_0 ? 1 + q4tile : 0;
+    GGML_ASSERT(p.q4 == 0 || n_cold == 0);
 
     p.ids_src1.alloc(n_assign);
     p.ids_dst.alloc(n_assign);
@@ -716,7 +926,10 @@ static void mmid16_gemm_setup(
     static const bool share    = getenv("GGML_CUDA_MMID16_SHARE") == nullptr || atoi(getenv("GGML_CUDA_MMID16_SHARE")) != 0;
     static const int  conv_env = getenv("GGML_CUDA_MMID16_CONV") != nullptr ? atoi(getenv("GGML_CUDA_MMID16_CONV")) : 2;
     const auto convert = [&](half2 * xh, float * xs) {
-        if (conv_env == 1) {
+        if (p.q4) {
+            mmid16_convert_act_q4<<<n_assign, 128, 0, stream>>>(
+                (const float *) src1->data, p.ids_src1.get(), xh, xs, src1->nb[1]/sizeof(float), nkb);
+        } else if (conv_env == 1) {
             mmid16_convert_act_v1<<<n_assign, nkb <= 32 ? 32 : 64, 0, stream>>>(
                 (const float *) src1->data, p.ids_src1.get(), xh, xs, src1->nb[1]/sizeof(float), nkb);
         } else {
@@ -727,7 +940,7 @@ static void mmid16_gemm_setup(
     if (share) {
         const size_t  xh_size = (size_t) n_assign*nkb*32*sizeof(half2);
         const size_t  total   = xh_size + (size_t) n_assign*nkb*sizeof(float);
-        const int64_t key     = (n_assign << 20) ^ ((int64_t) nkb << 8) ^ ((int64_t) src1->nb[1] << 32) ^ (int64_t) ids->nb[1];
+        const int64_t key     = (n_assign << 20) ^ ((int64_t) nkb << 8) ^ ((int64_t) src1->nb[1] << 32) ^ (int64_t) ids->nb[1] ^ ((int64_t) p.q4 << 60);
         const bool hit = ctx.mmid16_pcache_mem != nullptr && ctx.mmid16_pcache_src1 == src1 && ctx.mmid16_pcache_data == src1->data &&
                          ctx.mmid16_pcache_ids == ids->data && ctx.mmid16_pcache_key == key;
         if (!hit) {
@@ -765,6 +978,9 @@ static void mmid16_gemm_setup(
     p.narrow128 = narrow128;
     p.tile16    = !mixed && tile_env == 16 && n_assign < 48*ne02;
     p.narrow    = !mixed && !p.tile16 && n_assign < 48*ne02;
+    if (p.q4) {
+        p.mixed = false; p.narrow = p.q4 == 3; p.tile16 = p.q4 != 3; p.narrow128 = false;
+    }
     const int     tn     = p.tile16 ? 16 : p.narrow ? 32 : 64;
     const int64_t t_max  = (n_assign + tn - 1)/tn + ne02;
     GGML_ASSERT(t_max <= 65535);
@@ -807,7 +1023,26 @@ static void mmid16_gemm_launch(
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * src0 = p.src0;
     ggml_tensor *       dst  = p.dst;
-    if (p.mixed) {
+    if (p.q4) {
+        switch (p.q4) {
+            case 2:
+                mmid16_q4_0_gemm_p<128, 4, 2><<<p.grid, 128, 0, stream>>>(
+                    (const char *) src0->data, p.xh_ptr, p.xs_ptr, p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
+                    (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), e_lo, e_hi);
+                break;
+            case 3:
+                mmid16_q4_0_gemm_p<128, 4, 4, 3><<<p.grid, 128, 0, stream>>>(
+                    (const char *) src0->data, p.xh_ptr, p.xs_ptr, p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
+                    (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), e_lo, e_hi);
+                break;
+            default:
+                mmid16_q4_0_gemm_p<64, 4, 4, 4><<<p.grid, 64, 0, stream>>>(
+                    (const char *) src0->data, p.xh_ptr, p.xs_ptr, p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
+                    (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), e_lo, e_hi);
+                break;
+        }
+        GGML_UNUSED(w_cold); GGML_UNUSED(cold_base);
+    } else if (p.mixed) {
         mmid16_q2_0_gemm<4><<<p.grid, MMID16_THREADS, 0, stream>>>(
             (const char *) src0->data, p.xh_ptr, p.xs_ptr, p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
             (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
@@ -851,7 +1086,7 @@ void ggml_cuda_mmid_f16_sm60(
 bool ggml_cuda_mmid_vec_f16_sm60_supported(
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     static const bool enabled = getenv("GGML_CUDA_SM60_MMID_VEC_F16") == nullptr || atoi(getenv("GGML_CUDA_SM60_MMID_VEC_F16")) != 0;
-    if (!enabled || !ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst)) {
+    if (!enabled || src0->type != GGML_TYPE_Q2_0 || !ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst)) {
         return false;
     }
     return src0->ne[1] % MMID16V_ROWS == 0 && src1->nb[2] % 16 == 0;

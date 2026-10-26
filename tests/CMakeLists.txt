@@ -316,6 +316,8 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+# the ordering of an async copy between two devices against the destination's queued work (needs two devices, else skipped)
+llama_build(test-backend-copy-order.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

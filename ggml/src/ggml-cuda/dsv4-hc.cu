@@ -100,6 +100,49 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
+// blockIdx.y = token: no 64-bit division per element (the 1-D kernel below spent its time on them: 0.22 ms per
+// call at 1536 tokens for 16 MB of output)
+template <bool gated>
+static __global__ void dsv4_hc_pre_f32_2d(
+        const float * x,
+        const float * weights,
+        float * dst,
+        int64_t n_embd,
+        int64_t hc,
+        int64_t sx0,
+        int64_t sx1,
+        int64_t sx2,
+        int64_t sw0,
+        int64_t sw1,
+        int64_t sw2,
+        int64_t sd0,
+        int64_t sd1,
+        float   scale) {
+    ggml_cuda_pdl_lc();
+    const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t it = blockIdx.y;
+
+    if (i0 >= n_embd) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float sum = 0.0f;
+    for (int64_t ih = 0; ih < hc; ++ih) {
+        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+        float wv;
+        if constexpr (gated) {
+            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+        } else {
+            wv = weights[ih*sw0 + it*sw1];
+        }
+        sum += xv * wv;
+    }
+
+    dst[i0*sd0 + it*sd1] = scale * sum;
+}
+
 template <bool gated>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
@@ -143,6 +186,61 @@ static __global__ void dsv4_hc_pre_f32(
     }
 
     dst[i0*sd0 + it*sd1] = scale * sum;
+}
+
+// blockIdx.y = destination stream, blockIdx.z = token: no 64-bit divisions per element (the 1-D kernel below spent
+// ~280 instructions per element on three of them and ran at 146 GB/s: 0.97 ms per call at 1536 tokens, 4.6% of
+// a prompt ubatch)
+template <bool has_comb, bool gated>
+static __global__ void dsv4_hc_post_f32_3d(
+        const float * x,
+        const float * residual,
+        const float * post,
+        const float * comb,
+        float * dst,
+        int64_t n_embd,
+        int64_t hc,
+        int64_t sx0,
+        int64_t sx1,
+        int64_t sr0,
+        int64_t sr1,
+        int64_t sr2,
+        int64_t sp0,
+        int64_t sp1,
+        int64_t sc0,
+        int64_t sc1,
+        int64_t sc2,
+        int64_t sd0,
+        int64_t sd1,
+        int64_t sd2,
+        float gate_scale_in,
+        float gate_scale_out) {
+    ggml_cuda_pdl_lc();
+    const int64_t i0   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t idst = blockIdx.y;
+    const int64_t it   = blockIdx.z;
+
+    if (i0 >= n_embd) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float p = post[idst*sp0 + it*sp1];
+    if constexpr (gated) {
+        p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
+    }
+
+    float sum = x[i0*sx0 + it*sx1] * p;
+    if constexpr (has_comb) {
+        for (int64_t isrc = 0; isrc < hc; ++isrc) {
+            sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+        }
+    } else {
+        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
+    }
+
+    dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
 // gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
@@ -265,6 +363,20 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     const int block_size = 256;
+    if (n_tokens <= 65535) {
+        const dim3 block_dims(block_size, 1, 1);
+        const dim3 grid_dims((n_embd + block_size - 1) / block_size, n_tokens, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+        auto kernel = gated ? dsv4_hc_pre_f32_2d<true> : dsv4_hc_pre_f32_2d<false>;
+        ggml_cuda_kernel_launch(kernel, launch_params,
+                (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+                n_embd, hc,
+                nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+                nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+                nbd0 / sizeof(float), nbd1 / sizeof(float),
+                scale);
+        return;
+    }
     const int64_t nr = n_embd * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
@@ -313,6 +425,24 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t hc       = residual->ne[1];
 
     const int block_size = 256;
+    if (n_tokens <= 65535 && hc <= 65535) {
+        const dim3 block_dims(block_size, 1, 1);
+        const dim3 grid_dims((n_embd + block_size - 1) / block_size, hc, n_tokens);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+        auto kernel = comb ? (gated ? dsv4_hc_post_f32_3d<true,  true> : dsv4_hc_post_f32_3d<true,  false>)
+                           : (gated ? dsv4_hc_post_f32_3d<false, true> : dsv4_hc_post_f32_3d<false, false>);
+        ggml_cuda_kernel_launch(kernel, launch_params,
+                (const float *) x->data, (const float *) residual->data,
+                (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
+                n_embd, hc,
+                nbx0 / sizeof(float), nbx1 / sizeof(float),
+                nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
+                nbp0 / sizeof(float), nbp1 / sizeof(float),
+                nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+                nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+                gate_in, gate_out);
+        return;
+    }
     const int64_t nr = n_embd * hc * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);

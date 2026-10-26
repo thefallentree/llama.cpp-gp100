@@ -533,15 +533,32 @@ bool ggml_cuda_moe_host_active(const ggml_backend_cuda_context & ctx, const ggml
     return t.ids != nullptr && node->src[2] == t.ids && (node == t.up || node == t.gate || node == t.down);
 }
 
+// the weight type code of the host kernels (moe-host-cpu.h)
+static int mh_wtype(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q2_K:    return MH_W_Q2K;
+        case GGML_TYPE_Q3_K:    return MH_W_Q3K;
+        case GGML_TYPE_Q4_0:    return MH_W_Q40;
+        case GGML_TYPE_IQ2_XXS: return MH_W_IQ2XXS;
+        case GGML_TYPE_IQ2_S:   return MH_W_IQ2S;
+        case GGML_TYPE_IQ3_XXS: return MH_W_IQ3XXS;
+        case GGML_TYPE_IQ3_S:   return MH_W_IQ3S;
+        case GGML_TYPE_IQ1_S:   return MH_W_IQ1S;
+        case GGML_TYPE_Q4_K:    return MH_W_Q4K;
+        case GGML_TYPE_IQ2_XS:  return MH_W_IQ2XS;
+        default:                return MH_W_Q2_0;
+    }
+}
+
 static bool mh_is_cold_q2(const ggml_tensor * n) {
     if (n->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_mmid_cold(n) ||
-        (n->src[0]->type != GGML_TYPE_Q2_0 && n->src[0]->type != GGML_TYPE_Q2_K && n->src[0]->type != GGML_TYPE_Q3_K &&
-         n->src[0]->type != GGML_TYPE_Q4_0) ||
+        (n->src[0]->type != GGML_TYPE_Q2_0 && !ggml_cuda_moe_host_ktype(n->src[0]->type)) ||
         n->src[1]->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32) {
         return false;
     }
-    if (n->src[0]->type == GGML_TYPE_Q2_K || n->src[0]->type == GGML_TYPE_Q3_K || n->src[0]->type == GGML_TYPE_Q4_0) {
-        // glm5-next (Q4_0: its NextN block): the hot pairs run the generic mul_mat_id (mmvq Q2_K), the cold ones the host's Q2_K kernels
+    if (ggml_cuda_moe_host_ktype(n->src[0]->type)) {
+        // glm5-next (Q4_0: its NextN block; the i-quants: Project Maya's files): the hot pairs run the generic mul_mat_id (mmvq,
+        // the sm_60 kernels for Q2_K / Q3_K), the cold ones the host's k kernels
         // (GGML_CUDA_MMID_ALLGPU=1: the whole layer on the GPU instead, a correctness bisect)
         static const bool allgpu = getenv("GGML_CUDA_MMID_ALLGPU") != nullptr && atoi(getenv("GGML_CUDA_MMID_ALLGPU")) != 0;
         return !allgpu;
@@ -712,10 +729,9 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     d.n_ff     = (int) n_ff;
     d.n_cold   = 0;
     ggml_cuda_mmid_cold(up, nullptr, &d.n_cold);
-    d.wtype    = up->src[0]->type == GGML_TYPE_Q2_K ? 1 : up->src[0]->type == GGML_TYPE_Q4_0 ? 3 : 0;
-    d.wtype_down = down->src[0]->type == GGML_TYPE_Q3_K ? 2 : down->src[0]->type == GGML_TYPE_Q4_0 ? 3 : d.wtype;
-    GGML_ASSERT((d.wtype == 1 || d.wtype_down != 2) && "a Q3_K down needs Q2_K gate/up (natural-order activations)");
-    GGML_ASSERT((d.wtype == 3) == (d.wtype_down == 3) && "Q4_0 experts need Q4_0 gate/up/down");
+    d.wtype      = mh_wtype(up->src[0]->type);
+    d.wtype_down = mh_wtype(down->src[0]->type);
+    GGML_ASSERT((d.wtype == MH_W_Q2_0) == (d.wtype_down == MH_W_Q2_0) && "gate/up and down of a layer are Q2_0 together, or types of the k kernels");
     GGML_ASSERT(gate->src[0]->type == up->src[0]->type && "gate and up of a layer share one type");
     d.clamp    = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
 

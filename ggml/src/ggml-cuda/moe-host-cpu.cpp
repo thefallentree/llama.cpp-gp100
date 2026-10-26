@@ -7,6 +7,11 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 
+// the i-quant grids and sign tables of the IQ cold-expert kernels (moe-host-iq.inc)
+#define GGML_COMMON_DECL_CPP
+#define GGML_COMMON_IMPL_CPP
+#include "ggml-common.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1037,6 +1042,8 @@ static void kdot_q40_avx2(const uint8_t * const * w, const kact_block * a, int n
         out[r] = kh256(acc[r]) - cor[r];
     }
 }
+
+#include "moe-host-iq.inc"
 #endif // MH_X86
 
 typedef void (*kdot_fn)(const uint8_t * const *, const kact_block *, int, float *);
@@ -1105,7 +1112,7 @@ static void pick_kernels(dot2_fn & dot2, quant_fn & quant, dot2k_fn & dot2k, dot
 }
 
 // the k kernels (2 rows) and activation converters: AVX-512 where the old kernels are, AVX2 below; false: the old path only
-static bool pick_kkernels(kdot_fn & q2, kdot_fn & q3, kdot_fn & q4, kfrom_fn & from, kquant_fn & quant, const char *& name) {
+static bool pick_kkernels(kdot_fn * kd, kfrom_fn & from, kquant_fn & quant, const char *& name) {
 #if MH_X86
     const char * force = getenv("GGML_CUDA_MOE_HOST_ISA");
     __builtin_cpu_init();
@@ -1116,18 +1123,32 @@ static bool pick_kkernels(kdot_fn & q2, kdot_fn & q3, kdot_fn & q4, kfrom_fn & f
     }
     from  = kact_from_act_sse;
     quant = kact_quantize_avx2;
-    q2    = kdot_q2k_avx2<2>;
-    q3    = kdot_q3k_avx2<2>;
-    q4    = kdot_q40_avx2<2>;
+    kd[MH_W_Q2K]    = kdot_q2k_avx2<2>;
+    kd[MH_W_Q3K]    = kdot_q3k_avx2<2>;
+    kd[MH_W_Q40]    = kdot_q40_avx2<2>;
+    kd[MH_W_IQ2XXS] = kdot_iq2xxs_avx2<2>;
+    kd[MH_W_IQ2S]   = kdot_iq2s_avx2<2>;
+    kd[MH_W_IQ3XXS] = kdot_iq3xxs_avx2<2>;
+    kd[MH_W_IQ3S]   = kdot_iq3s_avx2<2>;
+    kd[MH_W_IQ1S]   = kdot_iq1s_avx2<2>;
+    kd[MH_W_Q4K]    = kdot_q4k_avx2<2>;
+    kd[MH_W_IQ2XS]  = kdot_iq2xs_avx2<2>;
     name  = "AVX2";
     if (has512 && !(force != nullptr && strcmp(force, "avx2") == 0)) {
-        q2   = kdot_q2k_avx512<2>;
-        q3   = kdot_q3k_avx512<2>;
+        kd[MH_W_Q2K] = kdot_q2k_avx512<2>;
+        kd[MH_W_Q3K] = kdot_q3k_avx512<2>;
+        if (getenv("GGML_CUDA_MOE_HOST_IQ_ISA") == nullptr || strcmp(getenv("GGML_CUDA_MOE_HOST_IQ_ISA"), "avx2") != 0) {
+            kd[MH_W_IQ2XXS] = kdot_iq2xxs_avx512<2>;
+            kd[MH_W_IQ2S]   = kdot_iq2s_avx512<2>;
+            kd[MH_W_IQ3XXS] = kdot_iq3xxs_avx512<2>;
+            kd[MH_W_IQ3S]   = kdot_iq3s_avx512<2>;
+            kd[MH_W_IQ1S]   = kdot_iq1s_avx512<2>;
+        }
         name = "AVX-512";
     }
     return true;
 #else
-    (void) q2; (void) q3; (void) q4; (void) from; (void) quant; (void) name;
+    (void) kd; (void) from; (void) quant; (void) name;
     return false;
 #endif
 }
@@ -1280,9 +1301,7 @@ struct pool {
     // the k kernels (GGML_CUDA_MOE_HOST_KERNEL=old turns them off): Q2_K gate/up with a Q2_K or Q3_K down, blocks of 256
     bool         knew     = false;
     int          jmode    = 0;           // this job: 0 old kernels, 2 k kernels
-    kdot_fn      kd_q2k   = nullptr;     // 2 rows
-    kdot_fn      kd_q3k   = nullptr;
-    kdot_fn      kd_q40   = nullptr;     // Q4_0 gate/up/down (wtype 3)
+    kdot_fn      kd_w[MH_NW] = {};       // 2 rows, by weight type (MH_W_*)
     kfrom_fn     kfrom    = nullptr;
     kquant_fn    kquant   = nullptr;
     const char * kisa     = nullptr;
@@ -1493,8 +1512,8 @@ struct pool {
         const int ch3 = s.n_embd % CH3k == 0 ? CH3k : 32;
         const int rb3 = s.n_embd/ch3;
         const int n3  = n_groups*rb3;
-        const kdot_fn kdn = s.wtype_down == 3 ? kd_q40 : s.wtype_down == 2 ? kd_q3k : kd_q2k;
-        const kdot_fn kdg = s.wtype == 3 ? kd_q40 : kd_q2k;
+        const kdot_fn kdn = kd_w[s.wtype_down];
+        const kdot_fn kdg = kd_w[s.wtype];
         float * hbase = (float *) (((uintptr_t) h.data() + 63) & ~(uintptr_t) 63);   // 64-byte lines: chunks of 16 rows own whole lines
         const bool split = nsplit;
         const int  my    = std::min(thread_node(), MH_NODES - 1);
@@ -1657,9 +1676,11 @@ struct pool {
         }
         js = &g_slots.tab[slot];
         jm = m;
-        jmode = knew && ((js->wtype == 1 && (js->wtype_down == 1 || js->wtype_down == 2)) || (js->wtype == 3 && js->wtype_down == 3)) &&
-                js->n_embd % 256 == 0 && js->n_ff % 256 == 0 ? 2 : 0;
-        GGML_ASSERT((js->wtype != 3 || jmode == 2) && "Q4_0 cold experts need the k kernels (GGML_CUDA_MOE_HOST_KERNEL, AVX2)");
+        jmode = knew && js->wtype >= MH_W_Q2K && js->wtype < MH_NW && js->wtype_down >= MH_W_Q2K && js->wtype_down < MH_NW &&
+                kd_w[js->wtype] != nullptr && kd_w[js->wtype_down] != nullptr && js->n_embd % 256 == 0 && js->n_ff % 256 == 0 ? 2 : 0;
+        // the old kernels know Q2_0 and Q2_K gate/up with a Q2_K / Q3_K down
+        GGML_ASSERT((jmode == 2 || js->wtype == MH_W_Q2_0 || (js->wtype == MH_W_Q2K && (js->wtype_down == MH_W_Q2K || js->wtype_down == MH_W_Q3K))) &&
+                    "Q3_K / Q4_0 / i-quant cold experts need the k kernels (GGML_CUDA_MOE_HOST_KERNEL, AVX2, n_embd and n_ff multiples of 256)");
         const int n_used  = m->n_used;
         const int n_pairs = std::min<int>(m->n_pairs, m->cap_pairs);
         const int nb_f    = js->n_ff/QK;
@@ -1925,7 +1946,7 @@ struct pool {
         // GGML_CUDA_MOE_HOST_KERNEL=old: the previous kernels and job loop for every layer (an A/B switch)
         {
             const char * ke = getenv("GGML_CUDA_MOE_HOST_KERNEL");
-            knew = (ke == nullptr || strcmp(ke, "old") != 0) && pick_kkernels(kd_q2k, kd_q3k, kd_q40, kfrom, kquant, kisa);
+            knew = (ke == nullptr || strcmp(ke, "old") != 0) && pick_kkernels(kd_w, kfrom, kquant, kisa);
             if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH3")) {
                 const int v = atoi(e);
                 if (v >= 2 && v % 2 == 0) {
@@ -1975,7 +1996,7 @@ struct pool {
         }
 #endif
         GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s; %s%s)\n", __func__, pool_id, n_pools, n_threads, isa,
-                      knew ? "Q2_K/Q3_K layers on the k kernels: " : "old kernels", knew ? kisa : "");
+                      knew ? "Q2_K / Q3_K / Q4_0 / Q4_K / i-quant layers on the k kernels: " : "old kernels", knew ? kisa : "");
     }
 
     ~pool() {

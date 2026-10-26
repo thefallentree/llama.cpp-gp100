@@ -3,6 +3,7 @@
 #include "cold-kq.cuh"
 #include "mmid-f16-sm60.cuh"
 #include "mmvq.cuh"
+#include "moe-host.cuh"
 
 #include <algorithm>
 #include <cinttypes>
@@ -14,7 +15,7 @@ bool ggml_cuda_cold_kq_enabled() {
 
 bool ggml_cuda_cold_kq_node(const ggml_tensor * node) {
     return node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(node) && node->ne[2] > MMVQ_MAX_BATCH_SIZE &&
-           (node->src[0]->type == GGML_TYPE_Q2_K || node->src[0]->type == GGML_TYPE_Q3_K);
+           ggml_cuda_moe_host_ktype(node->src[0]->type) && node->src[0]->type != GGML_TYPE_Q4_0;
 }
 
 static size_t cold_kq_budget() {

@@ -228,6 +228,93 @@ KQ_DEV float kq_q3k_lane(const char * __restrict__ row, const int nsb, const int
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Q6_K: super-block 210 bytes (2-byte aligned) = ql[128] (low nibbles), qh[64] (2 high bits), scales[16] (int8), half d
+// weight y = 128n + 32j + l (l = 0..31): q = nibble (j >> 1) of ql[64n + 32(j & 1) + l] | (bits 2j, 2j + 1 of qh[32n + l]) << 4,
+// value d*sc[8n + 2j + l/16]*(q - 32). For the record's sub-block (n, k = j, h = l >> 4) the fields sit at bit 4(k >> 1) (nibble)
+// and 2k (high bits): the odd planes shift the nibble up by 2 so that every plane's product carries 2^-9, as in Q2_K.
+
+// c0, c1: the part's 4 ql words of the chunks 0 (planes 0, 2) and 1 (planes 1, 3), g: its 4 qh words, s0, s1: the 8 scale bytes of
+// the half n, dbits: d, sel: 0x6420 + 0x1111*h gathers the scale bytes h, h + 2, h + 4, h + 6 (planes 0..3)
+KQ_DEV float kq_q6k_chunk(const uint32_t (&c0)[4], const uint32_t (&c1)[4], const uint32_t (&g)[4], const uint32_t s0, const uint32_t s1,
+        const uint32_t dbits, const uint4 (&xa)[8], const uint2 xx, const uint32_t sel) {
+    const half2 f16 = kq_h2(0x4C004C00u); // 16
+    half2 acc[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc[k] = kq_h2(0u);
+    }
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const uint32_t w0 = c0[a], w1 = c1[a], gw = g[a];
+        const uint32_t w0s = w0 >> 8, w1s = w1 >> 8, gs = gw >> 8;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int      sh = 2*(k & 1);
+            const uint32_t mq = ((k & 2) ? 0x00F000F0u : 0x000F000Fu) << sh;
+            const uint32_t mh = 0x00030003u << (2*k);
+            const uint32_t cw = (k & 1) ? w1 : w0;
+            const uint32_t cs = (k & 1) ? w1s : w0s;
+            const uint4    xv = xa[2*k + (a >> 1)];
+            const uint32_t xe = (a & 1) ? xv.z : xv.x;
+            const uint32_t xo = (a & 1) ? xv.w : xv.y;
+            const half2 we = __hfma2(kq_h2(gw & mh), f16, kq_h2((cw << sh) & mq));
+            const half2 wo = __hfma2(kq_h2(gs & mh), f16, kq_h2((cs << sh) & mq));
+            acc[k] = __hfma2(we, kq_h2(xe), acc[k]);
+            acc[k] = __hfma2(wo, kq_h2(xo), acc[k]);
+        }
+    }
+    // the int8 scales of the planes 0..3 in bytes 0..3; biased by 128 into the mantissa of 1024 + v, the bias taken off in half2:
+    // (sc0, sc2) and (sc1, sc3) as exact half2 integers
+    const uint32_t v4   = __byte_perm(s0, s1, sel) ^ 0x80808080u;
+    const half2 b1152 = kq_h2(0x64806480u); // 1024 + 128
+    const half2 sc02  = __hsub2(kq_h2(__byte_perm(v4, 0x64646464u, 0x5250)), b1152);
+    const half2 sc13  = __hsub2(kq_h2(__byte_perm(v4, 0x64646464u, 0x5351)), b1152);
+
+    const half2 P = __hfma2(kq_fold2(acc[0], acc[2]), sc02, __hmul2(kq_fold2(acc[1], acc[3]), sc13));
+    const half2 M = __hfma2(kq_h2(xx.x), sc02, __hmul2(kq_h2(xx.y), sc13));
+    const float2 pm = __half22float2(__hadd2(kq_h2(__byte_perm(kq_u32(P), kq_u32(M), 0x5410)), kq_h2(__byte_perm(kq_u32(P), kq_u32(M), 0x7632))));
+    const float2 df = __half22float2(kq_h2(dbits));
+    return df.x*fmaf((float) (1 << KQ_SCALE_SHIFT), pm.x, -32.0f*pm.y);
+}
+
+// part p of every super-block of one row; row points at the row's first block (2-byte aligned), x at the converted row
+KQ_DEV float kq_q6k_lane(const char * __restrict__ row, const int nsb, const int part, const char * __restrict__ x) {
+    const int      n   = part >> 1;
+    const int      h   = part & 1;
+    const uint32_t sel = 0x6420u + 0x1111u*(uint32_t) h;
+    const char *   blk = row;
+    const char *   rec = x;
+    float sum = 0.0f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint32_t mis = (uint32_t) (uintptr_t) blk & 3; // the block starts 0 or 2 bytes into an aligned word
+        const uint32_t * pb = (const uint32_t *) (blk - mis);
+        const uint32_t   sh = 8*mis;
+
+        uint32_t c0[4], c1[4], g[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            c0[i] = __funnelshift_r(pb[16*n + 4*h + i],     pb[16*n + 4*h + i + 1],     sh);
+            c1[i] = __funnelshift_r(pb[16*n + 4*h + 8 + i], pb[16*n + 4*h + 8 + i + 1], sh);
+            g[i]  = __funnelshift_r(pb[32 + 8*n + 4*h + i], pb[32 + 8*n + 4*h + i + 1], sh);
+        }
+        const uint32_t s0 = __funnelshift_r(pb[48 + 2*n], pb[49 + 2*n], sh);
+        const uint32_t s1 = __funnelshift_r(pb[49 + 2*n], pb[49 + 2*n + (sh >> 4)], sh); // the word 52 only belongs to the block for sh = 16
+        const uint32_t dbits = (uint32_t) *((const uint16_t *) (blk + 208));
+
+        uint4 xa[8];
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            xa[q] = ((const uint4 *) rec)[q*4 + part];
+        }
+        const uint4 xp = ((const uint4 *) (rec + 512))[part];
+        sum = fmaf(__uint_as_float(xp.z), kq_q6k_chunk(c0, c1, g, s0, s1, dbits, xa, make_uint2(xp.x, xp.y), sel), sum);
+        blk += 210;
+        rec += KQ_REC_BYTES;
+    }
+    return sum;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // the mat-vec: a block is (rows, slot c = t*n_used + s) with KQ_NWARPS warps of 8 rows (4 lanes per row)
 
 #define KQ_NWARPS 4
@@ -261,9 +348,9 @@ KQ_DEV bool kq_vec_lane(const char * __restrict__ w, const char * __restrict__ x
 // index, so the blocks that read the same weights run together (one DRAM read, the rest hit L2). The converted rows are in the order
 // (i2, i1): the row of a column is i02*ncols + c.
 
-// The work of one lane: its part of row row0 of dst[., i1, i2]
-template <bool q3>
-KQ_DEV float kq_mm_lane(const char * __restrict__ w, const char * __restrict__ x, const int c, const int tile, const int i02,
+// The work of one lane: its part of row row0 of dst[., i1, i2]. kqt: 0 = Q2_K, 1 = Q3_K, 2 = Q6_K
+template <int kqt>
+KQ_DEV float kq_mm_lane_t(const char * __restrict__ w, const char * __restrict__ x, const int c, const int tile, const int i02,
         const int warp, const int lane, const int nsb, const int ne01, const int64_t nb01, const int64_t nb02, const int ne11, const int r2,
         int & i1, int & i2, int & row0) {
     const int i2r = r2 > 1 ? c / ne11 : 0;
@@ -273,5 +360,12 @@ KQ_DEV float kq_mm_lane(const char * __restrict__ w, const char * __restrict__ x
     const int row = row0 < ne01 ? row0 : ne01 - 1; // rows past the end read the last row and do not store
     const char * wr = w + (int64_t) i02*nb02 + (int64_t) row*nb01;
     const char * xr = x + (int64_t) (i2*ne11 + i1)*nsb*KQ_REC_BYTES;
-    return q3 ? kq_q3k_lane(wr, nsb, lane & 3, xr) : kq_q2k_lane(wr, nsb, lane & 3, xr);
+    return kqt == 1 ? kq_q3k_lane(wr, nsb, lane & 3, xr) : kqt == 2 ? kq_q6k_lane(wr, nsb, lane & 3, xr) : kq_q2k_lane(wr, nsb, lane & 3, xr);
+}
+
+template <bool q3>
+KQ_DEV float kq_mm_lane(const char * __restrict__ w, const char * __restrict__ x, const int c, const int tile, const int i02,
+        const int warp, const int lane, const int nsb, const int ne01, const int64_t nb01, const int64_t nb02, const int ne11, const int r2,
+        int & i1, int & i2, int & row0) {
+    return kq_mm_lane_t<q3 ? 1 : 0>(w, x, c, tile, i02, warp, lane, nsb, ne01, nb01, nb02, ne11, r2, i1, i2, row0);
 }

@@ -226,8 +226,8 @@ mm_kq_vec(
         const int64_t nb01, const int64_t nb02, const int ne11, const int r2, const int64_t dst_nb1, const int64_t dst_nb2) {
 #if defined(FP16_AVAILABLE)
     int i1, i2, row0;
-    float sum = kq_mm_lane<type == GGML_TYPE_Q3_K>(w, x, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.y, threadIdx.x, nsb, ne01, nb01, nb02,
-            ne11, r2, i1, i2, row0);
+    float sum = kq_mm_lane_t<type == GGML_TYPE_Q3_K ? 1 : type == GGML_TYPE_Q6_K ? 2 : 0>(w, x, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.y,
+            threadIdx.x, nsb, ne01, nb01, nb02, ne11, r2, i1, i2, row0);
     sum += __shfl_xor_sync(0xffffffff, sum, 1);
     sum += __shfl_xor_sync(0xffffffff, sum, 2);
     if ((threadIdx.x & 3) == 0 && row0 < ne01) {
@@ -247,7 +247,8 @@ bool ggml_cuda_mm_vec_kq_sm60_supported(const ggml_tensor * src0, const ggml_ten
     if (!enabled) {
         return false;
     }
-    if ((src0->type != GGML_TYPE_Q2_K && src0->type != GGML_TYPE_Q3_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if ((src0->type != GGML_TYPE_Q2_K && src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q6_K) || src1->type != GGML_TYPE_F32 ||
+            dst->type != GGML_TYPE_F32) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -265,7 +266,7 @@ bool ggml_cuda_mm_vec_kq_sm60_supported(const ggml_tensor * src0, const ggml_ten
     if (src0->ne[0] % 256 != 0 || src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1] || dst->ne[1] != src1->ne[1] || dst->ne[2] != src1->ne[2]) {
         return false;
     }
-    // the weights are read in 4-byte words (Q2_K, block 84 bytes) or 2-byte aligned and realigned (Q3_K, block 110 bytes)
+    // the weights are read in 4-byte words (Q2_K, block 84 bytes) or 2-byte aligned and realigned (Q3_K 110 bytes, Q6_K 210 bytes)
     const size_t align = src0->type == GGML_TYPE_Q2_K ? 4 : 2;
     if (src0->nb[0] != ggml_type_size(src0->type) || src0->nb[1] % align != 0 || src0->nb[2] % align != 0 ||
             (uintptr_t) src0->data % align != 0) {
@@ -323,6 +324,10 @@ void ggml_cuda_mm_vec_kq_sm60(ggml_backend_cuda_context & ctx, const ggml_tensor
     const dim3 block(WARP_SIZE, KQ_NWARPS, 1);
     if (src0->type == GGML_TYPE_Q2_K) {
         mm_kq_vec<GGML_TYPE_Q2_K><<<grid, block, 0, stream>>>(
+            (const char *) src0->data, x.get(), (float *) dst->data, nsb, (int) ne01, src0->nb[1], src0->nb[2], (int) ne11, r2,
+            dst->nb[1], dst->nb[2]);
+    } else if (src0->type == GGML_TYPE_Q6_K) {
+        mm_kq_vec<GGML_TYPE_Q6_K><<<grid, block, 0, stream>>>(
             (const char *) src0->data, x.get(), (float *) dst->data, nsb, (int) ne01, src0->nb[1], src0->nb[2], (int) ne11, r2,
             dst->nb[1], dst->nb[2]);
     } else {

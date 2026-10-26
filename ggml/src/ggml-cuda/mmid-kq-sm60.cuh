@@ -21,7 +21,7 @@ bool ggml_cuda_mmid_vec_kq_sm60_last_hit();
 const char * ggml_cuda_mmid_kq_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int nsb, bool & hit);
 
 // The same kernels for plain MUL_MAT (src1 F32 with up to MMVQ_MAX_BATCH_SIZE columns; src0 [k, m] or [k, m, g] with src1 [k, n, g*r]): the
-// attention and dense Q2_K / Q3_K weights. The activations are converted per op (no cache).
+// attention and dense Q2_K / Q3_K / Q6_K weights (Q6_K: Project Maya's trunks). The activations are converted per op (no cache).
 // GGML_CUDA_MM_KQ_SM60=0 turns it off, GGML_CUDA_MM_KQ_SM60_MAXN=n limits it to batches of up to n columns,
 // GGML_CUDA_MM_KQ_SM60_STATS=n logs the first n dispatches (then totals per 1000).
 bool ggml_cuda_mm_vec_kq_sm60_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);

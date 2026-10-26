@@ -882,10 +882,10 @@ struct case_spec_requests : ctx_test {
                     }
                 }
 
-                if (a < k) {
+                if (a < k + pad) { // the padding rows leave with the rejected ones (as in case_spec_rounds)
                     for (llama_context * ctx : ctxs) {
                         if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + (llama_pos) a + 1, -1)) {
-                            return "the rollback of " + std::to_string(k - a) + " tokens was refused in round " + std::to_string(r);
+                            return "the rollback of " + std::to_string(k + pad - a) + " tokens was refused in round " + std::to_string(r);
                         }
                     }
                 }

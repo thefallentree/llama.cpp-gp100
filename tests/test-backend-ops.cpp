@@ -11824,9 +11824,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // prompts, and a whole MoE FFN over several layers (gate and up share their converted activations, down does not)
     for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         for (int n : {1, 5, 8}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 2304, 1.0f, 0, true));
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, false, 512, n, 1024, 1.0f, 544, true));
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 5120, 1.0f, 544, false));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 2304, 0, true));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, false, 512, n, 1024, 544, true));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 5120, 544, false));
             for (int mode : {0, 1, 2}) {
                 test_cases.emplace_back(new test_mul_mat_id_act(mode, type_a, GGML_TYPE_F32, 16, 6, true,  512, n, 5120));
                 test_cases.emplace_back(new test_mul_mat_id_act(mode, type_a, GGML_TYPE_F32, 16, 6, false, 512, n, 2304));

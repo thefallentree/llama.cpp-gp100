@@ -9543,10 +9543,11 @@ struct test_flash_attn_sel : public test_case {
     const int64_t kv;    // cache rows
     const int64_t nsel;  // selected rows per token
     const bool    dead;  // some selected rows out of range
-    const ggml_type type_kv;
+    const ggml_type type_kv; // the keys
+    const ggml_type type_v;  // the values (f16/f16, q8_0/q8_0, q8_0/q4_0, q4_0/q4_0 on CUDA)
 
     std::string vars() override {
-        return VARS_TO_STR8(hs, nh, nhk, nt, kv, nsel, dead, type_kv);
+        return VARS_TO_STR9(hs, nh, nhk, nt, kv, nsel, dead, type_kv, type_v);
     }
 
     double max_nmse_err() override {
@@ -9559,8 +9560,9 @@ struct test_flash_attn_sel : public test_case {
     }
 
     test_flash_attn_sel(int64_t hs = 256, int64_t nh = 12, int64_t nhk = 1, int64_t nt = 4, int64_t kv = 1024, int64_t nsel = 259, bool dead = true,
-                        ggml_type type_kv = GGML_TYPE_F16)
-        : hs(hs), nh(nh), nhk(nhk), nt(nt), kv(kv), nsel(nsel), dead(dead), type_kv(type_kv) {}
+                        ggml_type type_kv = GGML_TYPE_F16, ggml_type type_v = GGML_TYPE_COUNT)
+        : hs(hs), nh(nh), nhk(nhk), nt(nt), kv(kv), nsel(nsel), dead(dead), type_kv(type_kv),
+          type_v(type_v == GGML_TYPE_COUNT ? type_kv : type_v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nt);
@@ -9569,7 +9571,7 @@ struct test_flash_attn_sel : public test_case {
         // the cache: [hs, nhk, kv] rows of all kv heads, viewed by head
         ggml_tensor * k = ggml_new_tensor_3d(ctx, type_kv, hs, nhk, kv);
         ggml_set_name(k, "k");
-        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_kv, hs, nhk, kv);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_v, hs, nhk, kv);
         ggml_set_name(v, "v");
 
         ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nsel, nt);
@@ -12926,6 +12928,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 4096, 2051, true, GGML_TYPE_Q8_0));
     }
     test_cases.emplace_back(new test_flash_attn_sel(256, 24, 2, 3, 1024,  259, false, GGML_TYPE_Q8_0));
+    // q4_0 values under q8_0 keys, and q4_0 keys and values (the 500K-context caches)
+    for (int64_t nt : { 1, 8, 100 }) {
+        test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 4096, 2051, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_sel(256, 12, 1, nt, 4096, 2051, true, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    }
+    test_cases.emplace_back(new test_flash_attn_sel(256, 24, 2, 3, 1024,  259, false, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_sel(256, 24, 2, 3, 1024,  259, false, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
 
     return test_cases;
 }

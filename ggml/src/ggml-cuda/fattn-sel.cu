@@ -46,7 +46,37 @@ static __device__ __forceinline__ void fattn_sel_row32_q8(const char * row, cons
     }
 }
 
-// 8 values of a row at 8*lane (one uint4 of f16 pairs): f16, or a quarter of a q8_0 block
+// one q4_0 block (18 bytes, 2-byte aligned: the scale, then 16 bytes of nibbles; value i < 16 is the low nibble
+// of byte i, value i + 16 the high nibble of byte i, both minus 8)
+static __device__ __forceinline__ void fattn_sel_row32_q4(const char * row, const int w, float4 (&v)[8]) {
+    const unsigned short * p = (const unsigned short *) (row + 18*w);
+    const float d = __half2float(__ushort_as_half(p[0]));
+    unsigned short q[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        q[i] = p[1 + i];
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        // bytes 4i .. 4i + 3: values 4i .. 4i + 3 (low nibbles) and 16 + 4i .. 16 + 4i + 3 (high nibbles)
+        const int b0 = q[2*i] & 0xFF, b1 = q[2*i] >> 8, b2 = q[2*i + 1] & 0xFF, b3 = q[2*i + 1] >> 8;
+        v[i]     = make_float4(d*(float) ((b0 & 0xF) - 8), d*(float) ((b1 & 0xF) - 8), d*(float) ((b2 & 0xF) - 8), d*(float) ((b3 & 0xF) - 8));
+        v[4 + i] = make_float4(d*(float) ((b0 >> 4) - 8),  d*(float) ((b1 >> 4) - 8),  d*(float) ((b2 >> 4) - 8),  d*(float) ((b3 >> 4) - 8));
+    }
+}
+
+template <int T>
+static __device__ __forceinline__ void fattn_sel_row32(const char * row, const int w, float4 (&v)[8]) {
+    if (T == FATTN_SEL_T_Q8) {
+        fattn_sel_row32_q8(row, w, v);
+    } else if (T == FATTN_SEL_T_Q4) {
+        fattn_sel_row32_q4(row, w, v);
+    } else {
+        fattn_sel_row32_f16(row, w, v);
+    }
+}
+
+// 8 values of a row at 8*lane (one uint4 of f16 pairs): f16, or a quarter of a q8_0 / q4_0 block
 static __device__ __forceinline__ void fattn_sel_row8_f16(const char * row, const int lane, float4 & v0, float4 & v1) {
     const uint4  u  = *(const uint4 *) (row + 16*lane);
     const float2 a0 = __half22float2(fattn_sel_h2((int) u.x));
@@ -68,8 +98,35 @@ static __device__ __forceinline__ void fattn_sel_row8_q8(const char * row, const
                      d*(float) (int) (signed char) (q3 & 0xFF), d*(float) (int) (signed char) (q3 >> 8));
 }
 
-// block (token, chunk block): heads h0 .. h0 + NH - 1 of one kv head over the chunks [cb*cpb, (cb + 1)*cpb)
-template <int NH, bool Q8>
+// a quarter of a q4_0 block: values 8r .. 8r + 7 of block lane/4 (r = lane % 4) are the low (r < 2) or high
+// (r >= 2) nibbles of bytes 8*(r % 2) .. 8*(r % 2) + 7
+static __device__ __forceinline__ void fattn_sel_row8_q4(const char * row, const int lane, float4 & v0, float4 & v1) {
+    const unsigned short * p = (const unsigned short *) (row + 18*(lane/4));
+    const float d  = __half2float(__ushort_as_half(p[0]));
+    const int   r  = lane % 4;
+    const int   sh = (r >> 1)*4;
+    const unsigned short * q = p + 1 + 4*(r & 1);
+    const unsigned short q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+    v0 = make_float4(d*(float) ((((q0 & 0xFF) >> sh) & 0xF) - 8), d*(float) ((((q0 >> 8) >> sh) & 0xF) - 8),
+                     d*(float) ((((q1 & 0xFF) >> sh) & 0xF) - 8), d*(float) ((((q1 >> 8) >> sh) & 0xF) - 8));
+    v1 = make_float4(d*(float) ((((q2 & 0xFF) >> sh) & 0xF) - 8), d*(float) ((((q2 >> 8) >> sh) & 0xF) - 8),
+                     d*(float) ((((q3 & 0xFF) >> sh) & 0xF) - 8), d*(float) ((((q3 >> 8) >> sh) & 0xF) - 8));
+}
+
+template <int T>
+static __device__ __forceinline__ void fattn_sel_row8(const char * row, const int lane, float4 & v0, float4 & v1) {
+    if (T == FATTN_SEL_T_Q8) {
+        fattn_sel_row8_q8(row, lane, v0, v1);
+    } else if (T == FATTN_SEL_T_Q4) {
+        fattn_sel_row8_q4(row, lane, v0, v1);
+    } else {
+        fattn_sel_row8_f16(row, lane, v0, v1);
+    }
+}
+
+// block (token, chunk block): heads h0 .. h0 + NH - 1 of one kv head over the chunks [cb*cpb, (cb + 1)*cpb);
+// KT / VT: the FATTN_SEL_T_* of the key and value rows
+template <int NH, int KT, int VT>
 static __global__ void __launch_bounds__(FATTN_SEL_NW*WARP_SIZE, 2)
 fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
     constexpr int D  = FATTN_SEL_D;
@@ -128,11 +185,7 @@ fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
             cell = cell >= 0 && cell < a.n_kv ? cell : -1;
             const char * kr = K + (int64_t) (cell >= 0 ? cell : 0)*a.sk;
             float4 kv[8];
-            if (Q8) {
-                fattn_sel_row32_q8(kr, warp, kv);
-            } else {
-                fattn_sel_row32_f16(kr, warp, kv);
-            }
+            fattn_sel_row32<KT>(kr, warp, kv);
             if (warp == 0 && c < C) {
                 s_cell[c] = cell >= 0 ? cell : 0; // a dead slot reads row 0 with the weight 0
                 s_mk[c]   = cell >= 0 ? 0.0f : -INFINITY;
@@ -227,11 +280,7 @@ fattn_sel(const ggml_cuda_fattn_sel_args a, const int h0) {
             for (int b = 0; b < 4; ++b) {
                 const int    c  = c0 + b*(NW/2);
                 const char * vr = V + (int64_t) s_cell[c < n_c ? c : 0]*a.sv;
-                if (Q8) {
-                    fattn_sel_row8_q8(vr, lane, v0[b], v1[b]);
-                } else {
-                    fattn_sel_row8_f16(vr, lane, v0[b], v1[b]);
-                }
+                fattn_sel_row8<VT>(vr, lane, v0[b], v1[b]);
             }
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
@@ -317,7 +366,7 @@ void ggml_cuda_fattn_sel_plan(ggml_cuda_fattn_sel_args & a, const int nt) {
     a.n_cb = (n_chunk + a.cpb - 1)/a.cpb;
 }
 
-template <bool Q8>
+template <int KT, int VT>
 static void fattn_sel_launch_t(const ggml_cuda_fattn_sel_args & a, const int nt, cudaStream_t stream) {
     const dim3 grid((unsigned) nt, (unsigned) a.n_cb, 1);
     // the head groups of a block share one kv head
@@ -325,16 +374,16 @@ static void fattn_sel_launch_t(const ggml_cuda_fattn_sel_args & a, const int nt,
         for (int h0 = hk0; h0 < hk0 + a.gqa; ) {
             const int nh = hk0 + a.gqa - h0;
             if (nh >= 16) {
-                fattn_sel<16, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<16, KT, VT><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 16;
             } else if (nh >= 12) {
-                fattn_sel<12, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<12, KT, VT><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 12;
             } else if (nh >= 8) {
-                fattn_sel<8, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<8, KT, VT><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 8;
             } else {
-                fattn_sel<4, Q8><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
+                fattn_sel<4, KT, VT><<<grid, FATTN_SEL_NW*WARP_SIZE, 0, stream>>>(a, h0);
                 h0 += 4;
             }
         }
@@ -343,10 +392,16 @@ static void fattn_sel_launch_t(const ggml_cuda_fattn_sel_args & a, const int nt,
 
 void ggml_cuda_fattn_sel_launch(const ggml_cuda_fattn_sel_args & a, const int nt, cudaStream_t stream) {
     GGML_ASSERT(a.n_cb == 1 || a.part != nullptr);
-    if (a.q8) {
-        fattn_sel_launch_t<true>(a, nt, stream);
+    if (a.kt == FATTN_SEL_T_Q8 && a.vt == FATTN_SEL_T_Q8) {
+        fattn_sel_launch_t<FATTN_SEL_T_Q8, FATTN_SEL_T_Q8>(a, nt, stream);
+    } else if (a.kt == FATTN_SEL_T_Q8 && a.vt == FATTN_SEL_T_Q4) {
+        fattn_sel_launch_t<FATTN_SEL_T_Q8, FATTN_SEL_T_Q4>(a, nt, stream);
+    } else if (a.kt == FATTN_SEL_T_Q4 && a.vt == FATTN_SEL_T_Q4) {
+        fattn_sel_launch_t<FATTN_SEL_T_Q4, FATTN_SEL_T_Q4>(a, nt, stream);
+    } else if (a.kt == FATTN_SEL_T_F16 && a.vt == FATTN_SEL_T_F16) {
+        fattn_sel_launch_t<FATTN_SEL_T_F16, FATTN_SEL_T_F16>(a, nt, stream);
     } else {
-        fattn_sel_launch_t<false>(a, nt, stream);
+        GGML_ABORT("fattn_sel: unsupported key/value types %d/%d", a.kt, a.vt);
     }
     if (a.n_cb > 1) {
         fattn_sel_join<<<dim3((unsigned) a.n_head, (unsigned) nt, 1), FATTN_SEL_D, 0, stream>>>(a);
@@ -361,15 +416,16 @@ bool ggml_cuda_flash_attn_sel_supported(const ggml_tensor * op) {
     const int64_t n_head    = q->ne[1];
     const int64_t n_head_kv = k->ne[2];
     const int64_t gqa       = n_head/n_head_kv;
-    const bool    f16       = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
-    const bool    q8        = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
-    // f16 rows are read 16 bytes at a time, q8_0 rows 2 bytes at a time
-    const size_t  al        = f16 ? 16 : 2;
-    return q->type == GGML_TYPE_F32 && (f16 || q8) && sel->type == GGML_TYPE_I32 &&
+    const int     kt        = fattn_sel_type_code(k->type);
+    const int     vt        = fattn_sel_type_code(v->type);
+    // f16 rows are read 16 bytes at a time, q8_0 and q4_0 rows 2 bytes at a time
+    const size_t  alk       = kt == FATTN_SEL_T_F16 ? 16 : 2;
+    const size_t  alv       = vt == FATTN_SEL_T_F16 ? 16 : 2;
+    return q->type == GGML_TYPE_F32 && fattn_sel_types_ok(kt, vt) && sel->type == GGML_TYPE_I32 &&
            op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
            q->ne[0] == FATTN_SEL_D && q->nb[0] == sizeof(float) && q->nb[1] % 16 == 0 && q->nb[2] % 16 == 0 &&
-           k->nb[0] == ggml_type_size(k->type) && k->nb[1] % al == 0 && k->nb[2] % al == 0 &&
-           v->nb[0] == ggml_type_size(v->type) && v->nb[1] % al == 0 && v->nb[2] % al == 0 &&
+           k->nb[0] == ggml_type_size(k->type) && k->nb[1] % alk == 0 && k->nb[2] % alk == 0 &&
+           v->nb[0] == ggml_type_size(v->type) && v->nb[1] % alv == 0 && v->nb[2] % alv == 0 &&
            sel->nb[0] == sizeof(int32_t) && sel->ne[0] <= FATTN_SEL_MAX_SEL &&
            n_head % 4 == 0 && gqa % 4 == 0 && k->ne[1] < INT32_MAX;
 }
@@ -380,9 +436,11 @@ void ggml_cuda_flash_attn_sel(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * v   = dst->src[2];
     const ggml_tensor * sel = dst->src[3];
     GGML_ASSERT(ggml_cuda_flash_attn_sel_supported(dst));
-    const bool   q8 = k->type == GGML_TYPE_Q8_0;
-    const size_t al = q8 ? 2 : 16;
-    GGML_ASSERT(((uintptr_t) q->data & 0xF) == 0 && ((uintptr_t) k->data % al) == 0 && ((uintptr_t) v->data % al) == 0 &&
+    const int    kt  = fattn_sel_type_code(k->type);
+    const int    vt  = fattn_sel_type_code(v->type);
+    const size_t alk = kt == FATTN_SEL_T_F16 ? 16 : 2;
+    const size_t alv = vt == FATTN_SEL_T_F16 ? 16 : 2;
+    GGML_ASSERT(((uintptr_t) q->data & 0xF) == 0 && ((uintptr_t) k->data % alk) == 0 && ((uintptr_t) v->data % alv) == 0 &&
                 ((uintptr_t) dst->data & 0xF) == 0);
 
     const int nt = (int) q->ne[2];
@@ -394,7 +452,8 @@ void ggml_cuda_flash_attn_sel(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     a.V      = (const char *) v->data;
     a.out    = (float *) dst->data;
     a.part   = nullptr;
-    a.q8     = q8;
+    a.kt     = kt;
+    a.vt     = vt;
     a.s_sel  = (int) (sel->nb[1]/sizeof(int32_t));
     a.sq_t   = (int) (q->nb[2]/sizeof(float));
     a.sq_h   = (int) (q->nb[1]/sizeof(float));

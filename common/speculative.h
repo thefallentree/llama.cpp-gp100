@@ -28,6 +28,12 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
+// DSpark: how many of the n leading drafts of a block to keep. conf[i * stride] is the confidence of draft i. The block
+// ends at the first draft whose own confidence is below p_min (0: no floor) or where the running product of the
+// confidences, this draft's included, drops below p_cum (0: no cut): a long window whose later drafts are likely to be
+// rejected is not verified whole. The cut only shortens the block, the kept drafts are the same tokens.
+size_t common_speculative_dspark_keep(const float * conf, size_t stride, size_t n, float p_min, float p_cum);
+
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 

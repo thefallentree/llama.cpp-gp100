@@ -1129,18 +1129,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             throw std::runtime_error("DFlash draft has no mask token");
         }
 
-        if (is_dspark && this->params.p_min > 0.0f) {
+        if (is_dspark && (this->params.p_min > 0.0f || this->params.p_cum > 0.0f)) {
             char buf[16] = {};
             const bool has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
             if (!has_conf) {
-                throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
+                throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0 and --spec-draft-p-cum 0");
             }
         }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, p_cum=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.p_cum);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
 
@@ -1473,15 +1473,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = (params.p_min > 0.0f || params.p_cum > 0.0f) ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                // the floor on each draft and the cut on the running product (p_cum) end the block
+                const int32_t i_draft_end = conf
+                    ? i_draft_beg + (int32_t) common_speculative_dspark_keep(conf + (size_t) (beg + i_draft_beg) * n_embd_dec,
+                            (size_t) n_embd_dec, (size_t) (n_block_tokens - i_draft_beg), params.p_min, params.p_cum)
+                    : n_block_tokens;
+                for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
                     const int32_t idx = beg + i;
-
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
-                        break;
-                    }
 
                     if (!spec_row_finite(ctx_dft, idx)) {
                         // the first reports, then every 64th
@@ -2995,6 +2996,23 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
         result |= (1u << configs[i]);
     }
     return result;
+}
+
+size_t common_speculative_dspark_keep(const float * conf, size_t stride, size_t n, float p_min, float p_cum) {
+    float cum = 1.0f;
+    size_t keep = 0;
+    while (keep < n) {
+        const float c = conf[keep * stride];
+        if (p_min > 0.0f && c < p_min) {
+            break;
+        }
+        cum *= c;
+        if (p_cum > 0.0f && cum < p_cum) {
+            break;
+        }
+        ++keep;
+    }
+    return keep;
 }
 
 int32_t common_speculative_n_max(const common_params_speculative * spec) {

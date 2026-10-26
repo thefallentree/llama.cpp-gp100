@@ -331,6 +331,7 @@ struct common_params_speculative_draft {
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+    float p_cum   = 0.0f; // DSpark: stop the block where the product of the draft confidences drops below this (0: off)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

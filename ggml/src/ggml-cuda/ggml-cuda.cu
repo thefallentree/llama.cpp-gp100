@@ -308,6 +308,252 @@ static void ggml_cuda_node_time_print(int device) {
     m.clear();
 }
 
+// temporary: GGML_CUDA_CHECK_FINITE=N waits after every node (not in a captured graph) and scans its float output for
+// NaN; the first N nodes with a NaN are reported with the stats of their inputs (NaN / inf counts, max |x|), which names
+// the op that produced the NaN and tells an overflowed input (inf) from a kernel's own NaN. Debugging only, slow.
+static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer);
+static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft);
+
+static int ggml_cuda_check_finite_limit() {
+    static const int n = getenv("GGML_CUDA_CHECK_FINITE") != nullptr ? atoi(getenv("GGML_CUDA_CHECK_FINITE")) : 0;
+    return n;
+}
+
+// GGML_CUDA_CHECK_FINITE_END=1: the scan runs once after the whole graph instead of after every node (one wait where the
+// scheduler waits anyway, so the timing between the kernels stays as it is: for a NaN that a wait after every node hides)
+static bool ggml_cuda_check_finite_at_end() {
+    static const bool on = getenv("GGML_CUDA_CHECK_FINITE_END") != nullptr && atoi(getenv("GGML_CUDA_CHECK_FINITE_END")) != 0;
+    return on;
+}
+
+// =2: only the wait after the graph (no scan, no allocation); =3: only a 16-byte cudaMalloc at the first graph (the scan's
+// stats buffer), no wait, no scan: which of the end scan's side effects changes a result
+static int ggml_cuda_check_finite_end_mode() {
+    static const int m = getenv("GGML_CUDA_CHECK_FINITE_END") != nullptr ? atoi(getenv("GGML_CUDA_CHECK_FINITE_END")) : 0;
+    return m;
+}
+
+static __global__ void k_check_finite(const char * __restrict__ data, const int type,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const int64_t nb0, const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t n, int * __restrict__ n_nan, int * __restrict__ n_inf, int * __restrict__ amax_bits) {
+    int   nnan = 0;
+    int   ninf = 0;
+    float amax = 0.0f;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t i0 = i % ne0;
+        int64_t t = i / ne0;
+        const int64_t i1 = t % ne1;
+        t /= ne1;
+        const int64_t i2 = t % ne2;
+        const int64_t i3 = t / ne2;
+        const char * p = data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3;
+        float v;
+        if (type == GGML_TYPE_F32) {
+            v = *(const float *) p;
+        } else if (type == GGML_TYPE_F16) {
+            v = __half2float(*(const half *) p);
+        } else {
+            v = __bfloat162float(*(const nv_bfloat16 *) p);
+        }
+        if (isnan(v)) {
+            nnan++;
+        } else if (isinf(v)) {
+            ninf++;
+        } else {
+            amax = fmaxf(amax, fabsf(v));
+        }
+    }
+    nnan = warp_reduce_sum(nnan);
+    ninf = warp_reduce_sum(ninf);
+    amax = warp_reduce_max(amax);
+    if (threadIdx.x % WARP_SIZE == 0) {
+        atomicAdd(n_nan, nnan);
+        atomicAdd(n_inf, ninf);
+        atomicMax(amax_bits, __float_as_int(amax));   // non-negative floats order as ints
+    }
+}
+
+struct ggml_cuda_finite_stats {
+    bool    checked = false;
+    int64_t n_nan = 0;
+    int64_t n_inf = 0;   // -inf is legitimate in masks and masked scores: only a NaN triggers a report
+    float   amax = 0.0f;
+};
+
+static ggml_cuda_finite_stats ggml_cuda_tensor_finite_stats(const ggml_tensor * t, cudaStream_t stream) {
+    ggml_cuda_finite_stats s;
+    if (t == nullptr || t->data == nullptr || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
+        return s;
+    }
+    if (t->buffer == nullptr || (!ggml_backend_buffer_is_cuda(t->buffer) && !ggml_backend_buft_is_cuda_host(t->buffer->buft))) {
+        return s;
+    }
+    static int * dev_stats[GGML_CUDA_MAX_DEVICES] = { nullptr };
+    const int device = ggml_cuda_get_device();
+    if (dev_stats[device] == nullptr) {
+        CUDA_CHECK(cudaMalloc(&dev_stats[device], 3*sizeof(int)));
+    }
+    const int64_t n = ggml_nelements(t);
+    if (n == 0) {
+        return s;
+    }
+    CUDA_CHECK(cudaMemsetAsync(dev_stats[device], 0, 3*sizeof(int), stream));
+    const int blocks = (int) std::min<int64_t>((n + 255)/256, 4096);
+    k_check_finite<<<blocks, 256, 0, stream>>>((const char *) t->data, t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t->nb[0], t->nb[1], t->nb[2], t->nb[3], n, dev_stats[device], dev_stats[device] + 1, dev_stats[device] + 2);
+    int host[3];
+    CUDA_CHECK(cudaMemcpyAsync(host, dev_stats[device], 3*sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    s.checked = true;
+    s.n_nan = host[0];
+    s.n_inf = host[1];
+    memcpy(&s.amax, &host[2], sizeof(float));
+    return s;
+}
+
+// GGML_CUDA_CHECK_FINITE_SNAP=1: no wait after the nodes; each node's output is copied on the stream into a scratch arena
+// (an ordered copy, the timing between the kernels stays), and the copies are scanned once after the graph. The first
+// NaN node named this way is the real one, which the per-node wait (that hides a race) and the end scan (that sees
+// buffers reused by later nodes) cannot give.
+static bool ggml_cuda_check_finite_snap() {
+    static const bool on = getenv("GGML_CUDA_CHECK_FINITE_SNAP") != nullptr && atoi(getenv("GGML_CUDA_CHECK_FINITE_SNAP")) != 0;
+    return on;
+}
+
+struct ggml_cuda_finite_snap {
+    const ggml_tensor * node;
+    int                 index;
+    char *              copy;
+};
+
+struct ggml_cuda_finite_snap_arena {
+    char *  base  = nullptr;
+    size_t  size  = 0;
+    size_t  used  = 0;
+    bool    full  = false;
+    std::vector<ggml_cuda_finite_snap> snaps;
+};
+
+static ggml_cuda_finite_snap_arena & ggml_cuda_finite_arena(int device) {
+    static ggml_cuda_finite_snap_arena arenas[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_finite_snap_arena & a = arenas[device];
+    if (a.base == nullptr) {
+        const size_t mb = getenv("GGML_CUDA_CHECK_FINITE_SNAP_MB") != nullptr ? (size_t) atoi(getenv("GGML_CUDA_CHECK_FINITE_SNAP_MB")) : 1024;
+        a.size = mb*1024*1024;
+        ggml_cuda_set_device(device);
+        if (atoi(getenv("GGML_CUDA_CHECK_FINITE_SNAP")) == 2) {
+            // pinned host memory (read by the scan over PCIe): the device's own allocations stay where they are
+            CUDA_CHECK(cudaMallocHost((void **) &a.base, a.size));
+        } else {
+            CUDA_CHECK(cudaMalloc((void **) &a.base, a.size));
+        }
+    }
+    return a;
+}
+
+static void ggml_cuda_check_finite_snap_node(ggml_backend_cuda_context & ctx, const ggml_tensor * node, int node_index) {
+    if (node->data == nullptr || (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_BF16)) {
+        return;
+    }
+    ggml_cuda_finite_snap_arena & a = ggml_cuda_finite_arena(ctx.device);
+    const size_t bytes = (ggml_nbytes(node) + 255) & ~(size_t) 255;
+    if (a.used + bytes > a.size) {
+        a.full = true;
+        return;
+    }
+    char * copy = a.base + a.used;
+    a.used += bytes;
+    CUDA_CHECK(cudaMemcpyAsync(copy, node->data, ggml_nbytes(node), cudaMemcpyDeviceToDevice, ctx.stream()));
+    a.snaps.push_back({ node, node_index, copy });
+}
+
+static void ggml_cuda_check_finite_node(ggml_backend_cuda_context & ctx, const ggml_tensor * node, int graph_nodes, int node_index);
+
+static void ggml_cuda_check_finite_snap_scan(ggml_backend_cuda_context & ctx, int graph_nodes) {
+    static std::atomic<int> reported{0};
+    ggml_cuda_finite_snap_arena & a = ggml_cuda_finite_arena(ctx.device);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    const auto stats_of = [&](const ggml_tensor * t) {
+        // the snapshot of t if it was taken (its value when its node was done), else its buffer as it is now
+        for (const auto & sn : a.snaps) {
+            if (sn.node == t) {
+                ggml_tensor tmp = *t;
+                tmp.data = sn.copy;
+                return std::make_pair(ggml_cuda_tensor_finite_stats(&tmp, ctx.stream()), true);
+            }
+        }
+        return std::make_pair(ggml_cuda_tensor_finite_stats(t, ctx.stream()), false);
+    };
+    const auto desc = [](const ggml_tensor * t, const ggml_cuda_finite_stats & fs, bool snap) {
+        char b[512];
+        snprintf(b, sizeof(b), "%s (%s%s%s) %s ne[%lld,%lld,%lld,%lld] nb[%zu,%zu,%zu,%zu] nan %lld inf %lld amax %g%s%s",
+                t->name, ggml_op_name(t->op), t->op == GGML_OP_UNARY ? " " : "", t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : "",
+                ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                t->nb[0], t->nb[1], t->nb[2], t->nb[3], (long long) fs.n_nan, (long long) fs.n_inf, fs.amax, fs.checked ? "" : " (not checked)",
+                snap ? " [snapshot]" : " [live]");
+        return std::string(b);
+    };
+    for (const auto & sn : a.snaps) {
+        if (reported.load() >= ggml_cuda_check_finite_limit()) {
+            break;
+        }
+        ggml_tensor tmp = *sn.node;
+        tmp.data = sn.copy;
+        const ggml_cuda_finite_stats st = ggml_cuda_tensor_finite_stats(&tmp, ctx.stream());
+        if (!st.checked || st.n_nan == 0) {
+            continue;
+        }
+        reported.fetch_add(1);
+        GGML_LOG_ERROR("check-finite-snap dev%d: node %d/%d: %s\n", ctx.device, sn.index, graph_nodes, desc(sn.node, st, true).c_str());
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * src = sn.node->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+            const auto ss = stats_of(src);
+            GGML_LOG_ERROR("  src[%d] %s buffer %s\n", j, desc(src, ss.first, ss.second).c_str(), src->buffer != nullptr ? ggml_backend_buffer_name(src->buffer) : "none");
+        }
+    }
+    if (a.full) {
+        GGML_LOG_WARN("check-finite-snap dev%d: the arena of %zu MB was full, later nodes of the graph were not snapshotted\n", ctx.device, a.size/1024/1024);
+    }
+    a.snaps.clear();
+    a.used = 0;
+    a.full = false;
+}
+
+static void ggml_cuda_check_finite_node(ggml_backend_cuda_context & ctx, const ggml_tensor * node, int graph_nodes, int node_index) {
+    static std::atomic<int> reported{0};
+    if (reported.load() >= ggml_cuda_check_finite_limit()) {
+        return;
+    }
+    const ggml_cuda_finite_stats st = ggml_cuda_tensor_finite_stats(node, ctx.stream());
+    if (!st.checked || st.n_nan == 0) {
+        return;
+    }
+    if (reported.fetch_add(1) >= ggml_cuda_check_finite_limit()) {
+        return;
+    }
+    const auto desc = [](const ggml_tensor * t, const ggml_cuda_finite_stats & fs) {
+        char b[512];
+        snprintf(b, sizeof(b), "%s (%s%s%s) %s ne[%lld,%lld,%lld,%lld] nb[%zu,%zu,%zu,%zu] nan %lld inf %lld amax %g%s",
+                t->name, ggml_op_name(t->op), t->op == GGML_OP_UNARY ? " " : "", t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : "",
+                ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                t->nb[0], t->nb[1], t->nb[2], t->nb[3], (long long) fs.n_nan, (long long) fs.n_inf, fs.amax, fs.checked ? "" : " (not checked)");
+        return std::string(b);
+    };
+    GGML_LOG_ERROR("check-finite dev%d: node %d/%d: %s\n", ctx.device, node_index, graph_nodes, desc(node, st).c_str());
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const ggml_tensor * src = node->src[j];
+        if (src == nullptr) {
+            continue;
+        }
+        const ggml_cuda_finite_stats ss = ggml_cuda_tensor_finite_stats(src, ctx.stream());
+        GGML_LOG_ERROR("  src[%d] %s buffer %s\n", j, desc(src, ss).c_str(), src->buffer != nullptr ? ggml_backend_buffer_name(src->buffer) : "none");
+    }
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -6877,6 +7123,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (ggml_cuda_check_finite_limit() > 0 && !ggml_cuda_capturing && !cuda_ctx->window_active) {
+                        if (ggml_cuda_check_finite_snap()) {
+                            ggml_cuda_check_finite_snap_node(*cuda_ctx, cgraph->nodes[i + nodes_to_skip], i + nodes_to_skip);
+                        } else if (!ggml_cuda_check_finite_at_end()) {
+                            ggml_cuda_check_finite_node(*cuda_ctx, cgraph->nodes[i + nodes_to_skip], cgraph->n_nodes, i + nodes_to_skip);
+                        }
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -6933,6 +7186,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (moe_host) {
                     ggml_cuda_moe_host_end(*cuda_ctx, node);
                 }
+                if (ggml_cuda_check_finite_limit() > 0 && !ggml_cuda_capturing && !cuda_ctx->window_active) {
+                    if (ggml_cuda_check_finite_snap()) {
+                        ggml_cuda_check_finite_snap_node(*cuda_ctx, node, i);
+                    } else if (!ggml_cuda_check_finite_at_end()) {
+                        ggml_cuda_check_finite_node(*cuda_ctx, node, cgraph->n_nodes, i);
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -6941,6 +7201,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
         ggml_cuda_cold_prefetch_finish(*cuda_ctx);
+
+        if (ggml_cuda_check_finite_limit() > 0 && ggml_cuda_check_finite_snap() && !ggml_cuda_capturing && !cuda_ctx->window_active) {
+            ggml_cuda_check_finite_snap_scan(*cuda_ctx, cgraph->n_nodes);
+        }
+        if (ggml_cuda_check_finite_limit() > 0 && ggml_cuda_check_finite_at_end() && !ggml_cuda_check_finite_snap() && !ggml_cuda_capturing && !cuda_ctx->window_active) {
+            // the first nodes with a NaN, in graph order (an output the allocator reused by now is not seen)
+            const int mode = ggml_cuda_check_finite_end_mode();
+            if (mode == 3) {
+                static void * probe[GGML_CUDA_MAX_DEVICES] = { nullptr };
+                if (probe[cuda_ctx->device] == nullptr) {
+                    CUDA_CHECK(cudaMalloc(&probe[cuda_ctx->device], 16));
+                }
+            } else {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            }
+            for (int i = 0; mode == 1 && i < cgraph->n_nodes; i++) {
+                if (!ggml_cuda_is_view_or_noop(cgraph->nodes[i])) {
+                    ggml_cuda_check_finite_node(*cuda_ctx, cgraph->nodes[i], cgraph->n_nodes, i);
+                }
+            }
+        }
 
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture

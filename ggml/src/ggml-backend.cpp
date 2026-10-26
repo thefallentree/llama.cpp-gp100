@@ -1829,6 +1829,17 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+    // temporary: GGML_SCHED_COPY_DEBUG=N prints the first N input copies: which backend is waited for, which buffer is read
+    {
+        static int left = getenv("GGML_SCHED_COPY_DEBUG") != NULL ? atoi(getenv("GGML_SCHED_COPY_DEBUG")) : 0;
+        if (left > 0) {
+            left--;
+            GGML_LOG_WARN("sched-copy: %s (%s) backend %s buffer %s -> split backend %s buffer %s\n", input->name, ggml_op_name(input->op),
+                    input_backend != NULL ? ggml_backend_name(input_backend) : "none", input->buffer != NULL ? ggml_backend_buffer_name(input->buffer) : "none",
+                    ggml_backend_name(split_backend), input_cpy->buffer != NULL ? ggml_backend_buffer_name(input_cpy->buffer) : "none");
+        }
+    }
+
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {

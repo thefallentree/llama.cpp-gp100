@@ -11701,6 +11701,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
 
+    // prompt-size batched products with quantized 3D weights (MLA attn_k_b [256,512,64] and attn_v_b [512,256,64] of
+    // GLM-5.3-Flash / DeepSeek, 512 tokens): the dequantize + cuBLAS path with its fp16 compute on Pascal
+    for (ggml_type type_a : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 512, 256, {64, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 512, 512, {64, 1}, {1, 1}));
+    }
+
     // SIMD K boundaries, including tails shorter than one vector.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int k : {1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 48}) {

@@ -305,6 +305,9 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
+    // scratch of seq_rm: the cells of the sequence in the removed range
+    std::vector<uint32_t> seq_rm_hits;
+
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 

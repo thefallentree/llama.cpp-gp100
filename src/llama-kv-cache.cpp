@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "fn-prof.h"
 
 #include <algorithm>
 #include <cassert>
@@ -61,6 +62,8 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 //
 // llama_kv_cache
 //
+
+FN_PROF_DECL("kv");
 
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
@@ -434,16 +437,36 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
+        // the sequence's cells in [p0, p1) come from its ordered (pos, cell) set: a rejected draft token or the
+        // draft context's rows (every round) cost a few set steps, not a walk over the 262144 cells of a long
+        // context (~0.6 ms per cache, twice per context). LLAMA_KV_SEQ_RM_SCAN=1 keeps the walk.
+        static const bool scan_all = getenv("LLAMA_KV_SEQ_RM_SCAN") != nullptr && atoi(getenv("LLAMA_KV_SEQ_RM_SCAN")) != 0;
+        FN_PROF_T(t_rm0);
+        if (!scan_all) {
+            const auto & sp = cells.seq_pos_get(seq_id);
+            seq_rm_hits.clear();
+            for (auto it = sp.lower_bound({ p0, 0u }); it != sp.end() && it->first < p1; ++it) {
+                seq_rm_hits.push_back(it->second);
             }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+            for (const uint32_t i : seq_rm_hits) {
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    new_head = std::min(new_head, i);
                 }
             }
+            FN_PROF_ADD("kv.seq_rm(set)", t_rm0);
+        } else {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
+
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
+                }
+            }
+            FN_PROF_ADD("kv.seq_rm(scan)", t_rm0);
         }
 
         // If we freed up a slot, set head to it so searching can start there.

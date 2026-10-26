@@ -195,25 +195,27 @@ MH_IQ_AVX2 static void kdot_iq3s_avx2(const uint8_t * const * w, const kact_bloc
 }
 
 // IQ1_S: the grid is ternary (-1, 0, 1) and the group has a shift delta = +-1/8 on every weight: the grid plus one is unsigned
-// for vpmaddubsw, and the one (with the delta) leaves as (1 - delta)*scale*(sum of the group's activations)
+// for vpmaddubsw, and the one (with the delta) leaves as (1 - delta)*scale*(sum of the group's activations), computed for the 8
+// groups of a block at once (a branch on the delta sign mispredicts half the time)
 template <int NR>
 MH_IQ_AVX2 static void kdot_iq1s_avx2(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
     const __m128i qsh = _mm_setr_epi32(0, 3, 6, 9);
     const __m128i m7  = _mm_set1_epi32(7);
     const __m256i one = _mm256_set1_epi8(1);
-    __m256 acc[NR];
-    float  cor[NR];
+    const __m256 fd1  = _mm256_set1_ps(2.0f*IQ1S_DELTA), fd0 = _mm256_set1_ps(1.0f - IQ1S_DELTA);
+    __m256 acc[NR], cor[NR];
     for (int r = 0; r < NR; ++r) {
         acc[r] = _mm256_setzero_ps();
-        cor[r] = 0.0f;
+        cor[r] = _mm256_setzero_ps();
     }
     for (int k = 0; k < nsb; ++k) {
         const kact_block & ab = a[k];
+        // the groups' activation sums times their scales
+        const __m256 asb = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_load_si256((const __m256i *) ab.bs), _mm256_set1_epi16(1))), _mm256_load_ps(ab.asg));
         for (int r = 0; r < NR; ++r) {
             const uint8_t * p  = w[r] + (size_t) k*50;
             const uint8_t * qs = p + 2, * qhp = p + 34;
             __m256 sb = _mm256_setzero_ps();
-            float  cb = 0.0f;
 #pragma GCC unroll 8
             for (int g = 0; g < 8; ++g) {
                 const __m256i y   = _mm256_load_si256((const __m256i *) (ab.q + MH_IQ_YOFF(g)));
@@ -224,15 +226,17 @@ MH_IQ_AVX2 static void kdot_iq1s_avx2(const uint8_t * const * w, const kact_bloc
                 const int   ls = 2*((qh >> 12) & 7) + 1;
                 const __m256i pr = _mm256_madd_epi16(_mm256_maddubs_epi16(grid, y), _mm256_set1_epi16((short) ls));
                 sb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pr), _mm256_broadcast_ss(ab.asg + g), sb);
-                cb += ab.asg[g]*(float) ls*((qh & 0x8000 ? 1.0f + IQ1S_DELTA : 1.0f - IQ1S_DELTA))*(float) (ab.bs[2*g] + ab.bs[2*g + 1]);
             }
-            const float d = _cvtsh_ss(iq_ld16(p));
-            acc[r] = _mm256_fmadd_ps(sb, _mm256_set1_ps(d), acc[r]);
-            cor[r] += cb*d;
+            const __m256i qhv = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) qhp));
+            const __m256  lsf = _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(qhv, 12), _mm256_set1_epi32(7)), 1), _mm256_set1_epi32(1)));
+            const __m256  fv  = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_srli_epi32(qhv, 15)), fd1, fd0);
+            const __m256  d   = _mm256_set1_ps(_cvtsh_ss(iq_ld16(p)));
+            acc[r] = _mm256_fmadd_ps(sb, d, acc[r]);
+            cor[r] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_mul_ps(lsf, fv), asb), d, cor[r]);
         }
     }
     for (int r = 0; r < NR; ++r) {
-        out[r] = kh256(acc[r]) - cor[r];
+        out[r] = kh256(acc[r]) - kh256(cor[r]);
     }
 }
 
@@ -387,19 +391,20 @@ MH_IQ_AVX512 static void kdot_iq1s_avx512(const uint8_t * const * w, const kact_
     const __m256i qsh = _mm256_setr_epi32(0, 3, 6, 9, 0, 3, 6, 9);
     const __m256i m7  = _mm256_set1_epi32(7);
     const __m512i one = _mm512_set1_epi8(1);
+    const __m256 fd1  = _mm256_set1_ps(2.0f*IQ1S_DELTA), fd0 = _mm256_set1_ps(1.0f - IQ1S_DELTA);
     __m512 acc[NR];
-    float  cor[NR];
+    __m256 cor[NR];
     for (int r = 0; r < NR; ++r) {
         acc[r] = _mm512_setzero_ps();
-        cor[r] = 0.0f;
+        cor[r] = _mm256_setzero_ps();
     }
     for (int k = 0; k < nsb; ++k) {
         const kact_block & ab = a[k];
+        const __m256 asb = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_load_si256((const __m256i *) ab.bs), _mm256_set1_epi16(1))), _mm256_load_ps(ab.asg));
         for (int r = 0; r < NR; ++r) {
             const uint8_t * p  = w[r] + (size_t) k*50;
             const uint8_t * qs = p + 2, * qhp = p + 34;
             __m512 sb = _mm512_setzero_ps();
-            float  cb = 0.0f;
 #pragma GCC unroll 4
             for (int j = 0; j < 4; ++j) {
                 const int ga = j, gb = j + 4;
@@ -411,16 +416,99 @@ MH_IQ_AVX512 static void kdot_iq1s_avx512(const uint8_t * const * w, const kact_
                 const __m512i pr = _mm512_madd_epi16(_mm512_maddubs_epi16(grid, _mm512_load_si512((const void *) (ab.q + 64*j))),
                                                      iq_cat(_mm256_set1_epi16((short) la), _mm256_set1_epi16((short) lb)));
                 sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(pr), iq_asg2(ab.asg, ga, gb), sb);
-                cb += ab.asg[ga]*(float) la*((qa & 0x8000 ? 1.0f + IQ1S_DELTA : 1.0f - IQ1S_DELTA))*(float) (ab.bs[2*ga] + ab.bs[2*ga + 1]) +
-                      ab.asg[gb]*(float) lb*((qb & 0x8000 ? 1.0f + IQ1S_DELTA : 1.0f - IQ1S_DELTA))*(float) (ab.bs[2*gb] + ab.bs[2*gb + 1]);
             }
-            const float d = _cvtsh_ss(iq_ld16(p));
+            const __m256i qhv = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) qhp));
+            const __m256  lsf = _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(qhv, 12), m7), 1), _mm256_set1_epi32(1)));
+            const __m256  fv  = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_srli_epi32(qhv, 15)), fd1, fd0);
+            const float   d   = _cvtsh_ss(iq_ld16(p));
             acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(d), acc[r]);
-            cor[r] += cb*d;
+            cor[r] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_mul_ps(lsf, fv), asb), _mm256_set1_ps(d), cor[r]);
         }
     }
     for (int r = 0; r < NR; ++r) {
-        out[r] = _mm512_reduce_add_ps(acc[r]) - cor[r];
+        out[r] = _mm512_reduce_add_ps(acc[r]) - kh256(cor[r]);
+    }
+}
+
+// ======================================================= IQ2_XS and Q4_K (AVX2 only: an AVX-512 machine runs them on these)
+//   IQ2_XS  74 bytes: d, qs[32] u16 (9-bit grid index, 7-bit sign index above), scales[8] (two nibbles per group)   w = d*0.125*(2s+1)*grid*sign
+//   Q4_K   144 bytes: d, dmin, scales[12] (8 x 6-bit scale + 8 x 6-bit min), qs[128] (group 2j: low nibbles, 2j + 1: high nibbles of 32 bytes)
+
+template <int NR>
+MH_IQ_AVX2 static void kdot_iq2xs_avx2(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const iq_sign_tabs & T = iq_tabs();
+    const __m128i m511 = _mm_set1_epi32(511);
+    __m256 acc[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p  = w[r] + (size_t) k*74;
+            const uint8_t * qs = p + 2, * sc = p + 66;
+            __m256 sb = _mm256_setzero_ps();
+#pragma GCC unroll 8
+            for (int g = 0; g < 8; ++g) {
+                const __m256i y   = _mm256_load_si256((const __m256i *) (ab.q + MH_IQ_YOFF(g)));
+                const __m128i c   = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *) (qs + 8*g)));
+                const __m256i grid = _mm256_i32gather_epi64((const long long *) iq2xs_grid, _mm_and_si128(c, m511), 8);
+                const __m128i si  = _mm_srli_epi32(c, 9);
+                const __m256i sg  = _mm256_set_epi64x((long long) T.s7[_mm_extract_epi32(si, 3)], (long long) T.s7[_mm_extract_epi32(si, 2)],
+                                                      (long long) T.s7[_mm_extract_epi32(si, 1)], (long long) T.s7[_mm_cvtsi128_si32(si)]);
+                const __m256i scl = _mm256_set_m128i(_mm_set1_epi16((short) (2*(sc[g] >> 4) + 1)), _mm_set1_epi16((short) (2*(sc[g] & 15) + 1)));
+                sb = iq_acc_avx2(sb, grid, sg, y, scl, ab.asg + g);
+            }
+            acc[r] = _mm256_fmadd_ps(sb, _mm256_set1_ps(_cvtsh_ss(iq_ld16(p))*0.125f), acc[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = kh256(acc[r]);
+    }
+}
+
+template <int NR>
+MH_IQ_AVX2 static void kdot_q4k_avx2(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m256i m4 = _mm256_set1_epi8(0x0f);
+    __m256 acc[NR];
+    float  cor[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm256_setzero_ps();
+        cor[r] = 0.0f;
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p = w[r] + (size_t) k*144;
+            const float d = _cvtsh_ss(iq_ld16(p)), dmin = _cvtsh_ss(iq_ld16(p + 2));
+            const uint8_t * q = p + 4;
+            int scl[8], mn[8];
+            for (int j = 0; j < 4; ++j) {
+                scl[j] = q[j] & 63;
+                mn[j]  = q[j + 4] & 63;
+                scl[j + 4] = (q[j + 8] & 15) | ((q[j] >> 6) << 4);
+                mn[j + 4]  = (q[j + 8] >> 4) | ((q[j + 4] >> 6) << 4);
+            }
+            __m256 sb = _mm256_setzero_ps();
+            float  cm = 0.0f;
+#pragma GCC unroll 4
+            for (int j = 0; j < 4; ++j) {
+                const __m256i qv = _mm256_loadu_si256((const __m256i *) (p + 16 + 32*j));
+                const int ga = 2*j, gb = 2*j + 1;
+                const __m256i ya = _mm256_load_si256((const __m256i *) (ab.q + MH_IQ_YOFF(ga)));
+                const __m256i yb = _mm256_load_si256((const __m256i *) (ab.q + MH_IQ_YOFF(gb)));
+                const __m256i pa = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(qv, m4), ya), _mm256_set1_epi16((short) scl[ga]));
+                const __m256i pb = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(qv, 4), m4), yb), _mm256_set1_epi16((short) scl[gb]));
+                sb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pa), _mm256_broadcast_ss(ab.asg + ga), sb);
+                sb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pb), _mm256_broadcast_ss(ab.asg + gb), sb);
+                cm += (float) mn[ga]*ab.asg[ga]*(float) (ab.bs[2*ga] + ab.bs[2*ga + 1]) + (float) mn[gb]*ab.asg[gb]*(float) (ab.bs[2*gb] + ab.bs[2*gb + 1]);
+            }
+            acc[r] = _mm256_fmadd_ps(sb, _mm256_set1_ps(d), acc[r]);
+            cor[r] += cm*dmin;
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = kh256(acc[r]) - cor[r];
     }
 }
 

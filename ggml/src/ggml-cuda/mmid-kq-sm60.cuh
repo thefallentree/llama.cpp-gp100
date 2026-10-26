@@ -27,3 +27,6 @@ const char * ggml_cuda_mmid_kq_rows(ggml_backend_cuda_context & ctx, const ggml_
 bool ggml_cuda_mm_vec_kq_sm60_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 
 void ggml_cuda_mm_vec_kq_sm60(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Q6_K MUL_MAT with one warp per row (mm-q6k-sm60.cu): x = the converted rows of src1, ne11*r2 <= MMVQ_MAX_BATCH_SIZE columns
+void ggml_cuda_mm_q6k_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * x);

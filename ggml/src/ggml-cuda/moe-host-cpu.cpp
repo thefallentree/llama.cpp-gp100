@@ -1310,6 +1310,8 @@ struct pool {
     kdec_fn      kdec_w[MH_NW] = {};
     kdotdec_fn   kdot_dec = nullptr;
     int          dec_min  = 2;
+    int          dec_tok  = 4;           // ... and only in jobs of >= dec_tok tokens (GGML_CUDA_MOE_HOST_IQ_DEC_TOK): decode steps keep the plain kernels
+    bool         dec_job  = false;       // this job decodes rows
     int          CH3k     = 64;          // down rows per chunk of the k path
     std::vector<kact_block> xk;          // the input rows in k format, [n_tokens][n_embd/256]
     std::vector<kact_block> hk;          // the swiglu outputs, [n_pairs][n_ff/256]
@@ -1555,7 +1557,7 @@ struct pool {
                 const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
                 const int * gp = pair_of.data() + g.first;
                 const int * gt = tok_of.data()  + g.first;
-                const bool dec = dec_min > 0 && g.n >= dec_min && kdec_w[s.wtype] != nullptr;
+                const bool dec = dec_job && g.n >= dec_min && kdec_w[s.wtype] != nullptr;
                 if (dec) {
                     if (ks.dec.size() < (size_t) 2*ch1*nsb_e) {
                         ks.dec.resize((size_t) 2*ch1*nsb_e);
@@ -1622,7 +1624,7 @@ struct pool {
             }
             MH_TR({ const int64_t t = tns(); T.wait += t - t_prev; t_prev = t; })
             const int * gp = pair_of.data() + g.first;
-            const bool decdn = dec_min > 0 && g.n >= dec_min && kdec_w[s.wtype_down] != nullptr;
+            const bool decdn = dec_job && g.n >= dec_min && kdec_w[s.wtype_down] != nullptr;
             if (decdn) {
                 if (ks.dec.size() < (size_t) ch3*nsb_f) {
                     ks.dec.resize((size_t) ch3*nsb_f);
@@ -1724,6 +1726,7 @@ struct pool {
         const int n_used  = m->n_used;
         const int n_pairs = std::min<int>(m->n_pairs, m->cap_pairs);
         const int nb_f    = js->n_ff/QK;
+        dec_job = dec_min > 0 && kdot_dec != nullptr && m->n_tokens >= dec_tok;
         const int32_t * pidx = mh_pair_idx(m);
         const int32_t * pexp = mh_pair_exp(m);
 
@@ -1998,6 +2001,9 @@ struct pool {
             if (const char * e = getenv("GGML_CUDA_MOE_HOST_IQ_DEC")) {
                 dec_min = std::max(0, atoi(e));
             }
+            if (const char * e = getenv("GGML_CUDA_MOE_HOST_IQ_DEC_TOK")) {
+                dec_tok = std::max(1, atoi(e));
+            }
             if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH3")) {
                 const int v = atoi(e);
                 if (v >= 2 && v % 2 == 0) {
@@ -2048,7 +2054,7 @@ struct pool {
 #endif
         GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s; %s%s%s)\n", __func__, pool_id, n_pools, n_threads, isa,
                       knew ? "Q2_K / Q3_K / Q4_0 / Q4_K / i-quant layers on the k kernels: " : "old kernels", knew ? kisa : "",
-                      kdot_dec != nullptr && dec_min > 0 ? ", i-quant rows decoded once for experts with several tokens" : "");
+                      kdot_dec != nullptr && dec_min > 0 ? ", i-quant rows decoded once for experts with several tokens in prompt jobs" : "");
     }
 
     ~pool() {

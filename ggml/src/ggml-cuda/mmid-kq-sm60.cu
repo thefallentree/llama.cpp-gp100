@@ -322,6 +322,12 @@ void ggml_cuda_mm_vec_kq_sm60(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const dim3 grid(ne11*r2, (ne01 + KQ_ROWS - 1)/KQ_ROWS, ne02);
     const dim3 block(WARP_SIZE, KQ_NWARPS, 1);
+    // Q6_K: the warp-per-row kernel (mm-q6k-sm60.cu) for up to MMVQ_MAX_BATCH_SIZE columns (GGML_CUDA_MM_Q6K_WARP=0: the lane kernel)
+    static const bool q6_warp = getenv("GGML_CUDA_MM_Q6K_WARP") == nullptr || atoi(getenv("GGML_CUDA_MM_Q6K_WARP")) != 0;
+    if (src0->type == GGML_TYPE_Q6_K && q6_warp && ne11*r2 <= MMVQ_MAX_BATCH_SIZE) {
+        ggml_cuda_mm_q6k_vec(ctx, src0, src1, dst, x.get());
+        return;
+    }
     if (src0->type == GGML_TYPE_Q2_K) {
         mm_kq_vec<GGML_TYPE_Q2_K><<<grid, block, 0, stream>>>(
             (const char *) src0->data, x.get(), (float *) dst->data, nsb, (int) ne01, src0->nb[1], src0->nb[2], (int) ne11, r2,

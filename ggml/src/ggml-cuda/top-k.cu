@@ -213,6 +213,119 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
+// The same radix select as one launch for a few long rows (a decode window's indexer: 3-8 rows of up to 128K pool
+// scores, k = 512): the 11 launches above cost ~5-8 us each on a P100 while the data (3 x 64K floats) sits in L2.
+// Every block keeps the row's running prefix; the per-pass histograms are merged through global atomics and a
+// software grid barrier (all blocks resident: the caller checks the occupancy), then every block scans the row's
+// 256 bins itself. The work buffer (barrier counter, 4 x 256 bins and 2 gather counters per row) is zeroed by a memset.
+#define CUDA_TOP_K_FUSED_BLOCK 256
+#define CUDA_TOP_K_FUSED_ROW_INTS (4*256 + 32)
+
+static __device__ __forceinline__ void top_k_fused_grid_sync(unsigned int * bar, const unsigned int target) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(bar, 1u);
+        volatile unsigned int * vb = bar;
+        while (*vb < target) {
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+static __global__ void __launch_bounds__(CUDA_TOP_K_FUSED_BLOCK)
+top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * __restrict__ work,
+                  const int ncols, const int k, const int blocks_per_row) {
+    constexpr int BS = CUDA_TOP_K_FUSED_BLOCK;
+    const int row = blockIdx.x / blocks_per_row;
+    const int rb  = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    unsigned int * bar = (unsigned int *) work;
+    int *          rw  = work + 32 + row*CUDA_TOP_K_FUSED_ROW_INTS;
+    const float *  row_src = src + (size_t) row*ncols;
+    int *          row_dst = dst + (size_t) row*k;
+    const unsigned int nblocks = gridDim.x;
+    __shared__ int      hist[256];
+    __shared__ uint32_t s_prefix;
+    __shared__ int      s_rank;
+
+    uint32_t prefix = 0;
+    uint32_t pmask  = 0;
+    int      rank   = k;
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8*pass;
+        hist[tid] = 0;
+        __syncthreads();
+        for (int col = rb*BS + tid; col < ncols; col += blocks_per_row*BS) {
+            const uint32_t key = top_k_float_to_ordered(row_src[col]);
+            if ((key & pmask) == prefix) {
+                atomicAdd(&hist[(key >> shift) & 255], 1);
+            }
+        }
+        __syncthreads();
+        if (hist[tid] != 0) {
+            atomicAdd(&rw[pass*256 + tid], hist[tid]);
+        }
+        top_k_fused_grid_sync(bar, (unsigned int) (pass + 1)*nblocks);
+        // the row's bins of this pass (through L2: other blocks' atomics), the bin at which the rank is reached
+        hist[tid] = __ldcg(&rw[pass*256 + tid]);
+        __syncthreads();
+        if (tid == 0) {
+            int r   = rank;
+            int bin = 255;
+            while (bin > 0 && hist[bin] < r) {
+                r -= hist[bin--];
+            }
+            s_prefix = prefix | ((uint32_t) bin << shift);
+            s_rank   = r;
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        rank   = s_rank;
+        pmask |= 255u << shift;
+    }
+    // the gather: the keys above the k-th in any order, then the first rank of those equal to it
+    for (int col = rb*BS + tid; col < ncols; col += blocks_per_row*BS) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key > prefix) {
+            const int pos = atomicAdd(&rw[4*256], 1);
+            row_dst[pos] = col;
+        } else if (key == prefix) {
+            const int pos = atomicAdd(&rw[4*256 + 1], 1);
+            if (pos < rank) {
+                row_dst[k - rank + pos] = col;
+            }
+        }
+    }
+}
+
+static bool top_k_radix_fused_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int nrows, const int k, cudaStream_t stream) {
+    static const bool enabled = getenv("GGML_CUDA_TOP_K_FUSED") == nullptr || atoi(getenv("GGML_CUDA_TOP_K_FUSED")) != 0;
+    if (!enabled || nrows < 1 || nrows > 8 || ncols < 32768 || ncols > (1 << 20)) {
+        return false;
+    }
+    // every block of the grid must be resident at once for the barrier
+    const int device = ggml_cuda_get_device();
+    static int max_resident[GGML_CUDA_MAX_DEVICES] = { 0 };
+    if (max_resident[device] == 0) {
+        int per_sm = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, top_k_radix_fused, CUDA_TOP_K_FUSED_BLOCK, 0));
+        max_resident[device] = std::max(1, per_sm*ggml_cuda_info().devices[device].nsm);
+    }
+    const int blocks_per_row = std::min({ 64, (ncols + 1023)/1024, max_resident[device]/nrows });
+    if (blocks_per_row < 1) {
+        return false;
+    }
+    const size_t n_work = 32 + (size_t) nrows*CUDA_TOP_K_FUSED_ROW_INTS;
+    ggml_cuda_pool_alloc<int> work_alloc(pool, n_work);
+    int * work = work_alloc.get();
+    CUDA_CHECK(cudaMemsetAsync(work, 0, n_work*sizeof(int), stream));
+    top_k_radix_fused<<<blocks_per_row*nrows, CUDA_TOP_K_FUSED_BLOCK, 0, stream>>>(src, dst, work, ncols, k, blocks_per_row);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // Partial selection for small k.  Where cub::DeviceTopK (CCCL >= 3.2) is unavailable, the
 // caller below falls back to fully sorting the row and taking the first k -- but obtaining k
 // elements does not require a sort.
@@ -699,6 +812,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // rows and k = 512, 64 / 77 us (grid) against 49 / 173 us (one block) at 16K / 64K columns
     static const int64_t grid_min = getenv("GGML_CUDA_TOP_K_GRID") != nullptr ? atoll(getenv("GGML_CUDA_TOP_K_GRID")) : 32768;
     if (grid_min > 0 && ncols >= grid_min && ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX && k > CUDA_TOP_K_MAX_K && k < ncols) {
+        // a few long rows: the same select as one launch (GGML_CUDA_TOP_K_FUSED=0 keeps the dozen launches)
+        if (top_k_radix_fused_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
+            return;
+        }
         top_k_radix_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
         return;
     }

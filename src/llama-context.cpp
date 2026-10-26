@@ -347,8 +347,14 @@ llama_context::llama_context(
     cparams.auto_fhc           = true;
 
     // only the indexer models build this mask, skip the probe for the others
+    // (qwen4exp selects its cells with GGML_OP_FLASH_ATTN_SEL and never builds the mask: no probe, no extra reserve)
     cparams.fused_top_k_mask = true;
-    cparams.auto_ftkm        = hparams.indexer_top_k > 0;
+    cparams.auto_ftkm        = hparams.indexer_top_k > 0 && model.arch != LLM_ARCH_QWEN4EXP;
+    // LLAMA_FUSED_TOP_K_MASK=0 builds the mask from the unfused ops, as before the op existed
+    if (const char * env = getenv("LLAMA_FUSED_TOP_K_MASK"); env != nullptr && atoi(env) == 0) {
+        cparams.fused_top_k_mask = false;
+        cparams.auto_ftkm        = false;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;

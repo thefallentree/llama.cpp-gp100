@@ -1510,7 +1510,8 @@ struct ggml_backend_cuda_context {
     bool mmid_cold_stage = false; // ... and copies the cold experts it reads to VRAM first (cold-kq.cuh)
     int device;
     std::string name;
-    cudaEvent_t copy_event = nullptr;
+    cudaEvent_t copy_event    = nullptr;
+    cudaEvent_t copy_in_event = nullptr; // the position of this context's stream before a copy from another backend lands in its buffers
 
     ggml_cuda_cold_prefetch cold_pf;
     ggml_cuda_cold_kq       cold_kq;

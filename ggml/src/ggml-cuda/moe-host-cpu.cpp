@@ -1305,6 +1305,11 @@ struct pool {
     kfrom_fn     kfrom    = nullptr;
     kquant_fn    kquant   = nullptr;
     const char * kisa     = nullptr;
+    // i-quant rows decoded once per chunk when an expert has >= dec_min tokens in the job (prompt batches): the gathers
+    // and sign/scale prep are shared by the tokens (GGML_CUDA_MOE_HOST_IQ_DEC=n, 0 = off; AVX-512 only)
+    kdec_fn      kdec_w[MH_NW] = {};
+    kdotdec_fn   kdot_dec = nullptr;
+    int          dec_min  = 2;
     int          CH3k     = 64;          // down rows per chunk of the k path
     std::vector<kact_block> xk;          // the input rows in k format, [n_tokens][n_embd/256]
     std::vector<kact_block> hk;          // the swiglu outputs, [n_pairs][n_ff/256]
@@ -1492,6 +1497,8 @@ struct pool {
     struct kscratch {
         std::vector<kact_block> x;         // the input row of token x_tok
         std::vector<kact_block> h;         // the quantized swiglu row of pair h_pair
+        std::vector<kdec_block> dec;       // the decoded i-quant rows of the current chunk (gate/up interleaved, or down)
+        std::vector<float>      decd;      // their block scales
         uint32_t x_job = 0, h_job = 0;
         int      x_tok = -1, h_pair = -1;
     };
@@ -1548,6 +1555,17 @@ struct pool {
                 const uint8_t * up   = s.up   + (size_t) g.c*s.up_nb2;
                 const int * gp = pair_of.data() + g.first;
                 const int * gt = tok_of.data()  + g.first;
+                const bool dec = dec_min > 0 && g.n >= dec_min && kdec_w[s.wtype] != nullptr;
+                if (dec) {
+                    if (ks.dec.size() < (size_t) 2*ch1*nsb_e) {
+                        ks.dec.resize((size_t) 2*ch1*nsb_e);
+                        ks.decd.resize((size_t) 2*ch1*nsb_e);
+                    }
+                    for (int rr = 0; rr < ch1; ++rr) {
+                        kdec_w[s.wtype](gate + (size_t) (r0 + rr)*s.gate_nb1, nsb_e, ks.dec.data() + (size_t) 2*rr*nsb_e,       ks.decd.data() + (size_t) 2*rr*nsb_e);
+                        kdec_w[s.wtype](up   + (size_t) (r0 + rr)*s.up_nb1,   nsb_e, ks.dec.data() + (size_t) (2*rr + 1)*nsb_e, ks.decd.data() + (size_t) (2*rr + 1)*nsb_e);
+                    }
+                }
                 float hl[64];
                 for (int i = 0; i < g.n; ++i) {
                     if (ks.x_job != job || ks.x_tok != gt[i]) {
@@ -1559,9 +1577,15 @@ struct pool {
                         ks.x_tok = gt[i];
                     }
                     for (int r = r0; r < r0 + ch1; ++r) {
-                        const uint8_t * pw[2] = { gate + (size_t) r*s.gate_nb1, up + (size_t) r*s.up_nb1 };
                         float v[2];
-                        kdg(pw, ks.x.data(), nsb_e, v);
+                        if (dec) {
+                            const kdec_block * pw[2] = { ks.dec.data() + (size_t) 2*(r - r0)*nsb_e, ks.dec.data() + (size_t) (2*(r - r0) + 1)*nsb_e };
+                            const float *      pd[2] = { ks.decd.data() + (size_t) 2*(r - r0)*nsb_e, ks.decd.data() + (size_t) (2*(r - r0) + 1)*nsb_e };
+                            kdot_dec(pw, pd, ks.x.data(), nsb_e, v);
+                        } else {
+                            const uint8_t * pw[2] = { gate + (size_t) r*s.gate_nb1, up + (size_t) r*s.up_nb1 };
+                            kdg(pw, ks.x.data(), nsb_e, v);
+                        }
                         float vg = v[0], vu = v[1];
                         if (s.clamp > 0.0f) {   // swiglu_clamp(limit): silu(min(g, limit)) * clamp(u, -limit, limit)
                             vg = std::min(vg, s.clamp);
@@ -1598,6 +1622,16 @@ struct pool {
             }
             MH_TR({ const int64_t t = tns(); T.wait += t - t_prev; t_prev = t; })
             const int * gp = pair_of.data() + g.first;
+            const bool decdn = dec_min > 0 && g.n >= dec_min && kdec_w[s.wtype_down] != nullptr;
+            if (decdn) {
+                if (ks.dec.size() < (size_t) ch3*nsb_f) {
+                    ks.dec.resize((size_t) ch3*nsb_f);
+                    ks.decd.resize((size_t) ch3*nsb_f);
+                }
+                for (int rr = 0; rr < ch3; ++rr) {
+                    kdec_w[s.wtype_down](down + (size_t) (r0 + rr)*s.down_nb1, nsb_f, ks.dec.data() + (size_t) rr*nsb_f, ks.decd.data() + (size_t) rr*nsb_f);
+                }
+            }
             for (int i = 0; i < g.n; ++i) {
                 const int p = gp[i];
                 if (ks.h_job != job || ks.h_pair != p) {
@@ -1610,9 +1644,15 @@ struct pool {
                 }
                 float * y = jy + (size_t) p*s.n_embd;
                 for (int r = r0; r < r0 + ch3; r += 2) {
-                    const uint8_t * pw[2] = { down + (size_t) (r + 0)*s.down_nb1, down + (size_t) (r + 1)*s.down_nb1 };
                     float v[2];
-                    kdn(pw, ks.h.data(), nsb_f, v);
+                    if (decdn) {
+                        const kdec_block * pw[2] = { ks.dec.data() + (size_t) (r - r0)*nsb_f, ks.dec.data() + (size_t) (r - r0 + 1)*nsb_f };
+                        const float *      pd[2] = { ks.decd.data() + (size_t) (r - r0)*nsb_f, ks.decd.data() + (size_t) (r - r0 + 1)*nsb_f };
+                        kdot_dec(pw, pd, ks.h.data(), nsb_f, v);
+                    } else {
+                        const uint8_t * pw[2] = { down + (size_t) (r + 0)*s.down_nb1, down + (size_t) (r + 1)*s.down_nb1 };
+                        kdn(pw, ks.h.data(), nsb_f, v);
+                    }
                     y[r + 0] = v[0];
                     y[r + 1] = v[1];
                 }
@@ -1947,6 +1987,17 @@ struct pool {
         {
             const char * ke = getenv("GGML_CUDA_MOE_HOST_KERNEL");
             knew = (ke == nullptr || strcmp(ke, "old") != 0) && pick_kkernels(kd_w, kfrom, kquant, kisa);
+#if MH_X86
+            if (knew && kd_w[MH_W_IQ2S] == kdot_iq2s_avx512<2>) {
+                kdec_w[MH_W_IQ2S]   = kdec_iq2s_avx512;
+                kdec_w[MH_W_IQ3XXS] = kdec_iq3xxs_avx512;
+                kdec_w[MH_W_IQ3S]   = kdec_iq3s_avx512;
+                kdot_dec            = kdot_dec_avx512<2>;
+            }
+#endif
+            if (const char * e = getenv("GGML_CUDA_MOE_HOST_IQ_DEC")) {
+                dec_min = std::max(0, atoi(e));
+            }
             if (const char * e = getenv("GGML_CUDA_MOE_HOST_CH3")) {
                 const int v = atoi(e);
                 if (v >= 2 && v % 2 == 0) {
@@ -1995,8 +2046,9 @@ struct pool {
             g_pinned_cpus.push_back(cpu);
         }
 #endif
-        GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s; %s%s)\n", __func__, pool_id, n_pools, n_threads, isa,
-                      knew ? "Q2_K / Q3_K / Q4_0 / Q4_K / i-quant layers on the k kernels: " : "old kernels", knew ? kisa : "");
+        GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s; %s%s%s)\n", __func__, pool_id, n_pools, n_threads, isa,
+                      knew ? "Q2_K / Q3_K / Q4_0 / Q4_K / i-quant layers on the k kernels: " : "old kernels", knew ? kisa : "",
+                      kdot_dec != nullptr && dec_min > 0 ? ", i-quant rows decoded once for experts with several tokens" : "");
     }
 
     ~pool() {

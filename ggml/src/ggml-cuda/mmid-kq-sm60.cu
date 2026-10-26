@@ -247,7 +247,10 @@ bool ggml_cuda_mm_vec_kq_sm60_supported(const ggml_tensor * src0, const ggml_ten
     if (!enabled) {
         return false;
     }
-    if ((src0->type != GGML_TYPE_Q2_K && src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q6_K) || src1->type != GGML_TYPE_F32 ||
+    // Q6_K: opt-in (GGML_CUDA_MM_Q6K_SM60=1). The generic mmvq is at 168 / 189 / 248 us for 4096 x 14336 at n = 1 / 2 / 3 on a P100
+    // (Q8_0's HFMA2 path: 143 / 163 / 169), the lane kernel at 186 / 288 / 403 and the warp kernel at 260 / 412 / 600: neither pays.
+    static const bool q6 = getenv("GGML_CUDA_MM_Q6K_SM60") != nullptr && atoi(getenv("GGML_CUDA_MM_Q6K_SM60")) != 0;
+    if ((src0->type != GGML_TYPE_Q2_K && src0->type != GGML_TYPE_Q3_K && (src0->type != GGML_TYPE_Q6_K || !q6)) || src1->type != GGML_TYPE_F32 ||
             dst->type != GGML_TYPE_F32) {
         return false;
     }

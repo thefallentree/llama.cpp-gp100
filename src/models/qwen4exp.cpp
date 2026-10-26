@@ -1122,7 +1122,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, nt]
 
         idx_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, idx_f, 1.0f, (float) -n_kv), live), 1.0f, (float) n_kv);
-        ggml_build_forward_expand(gf, idx_f);
+        // not expanded here: the node order of the unchunked graph stays the one the attention's expansion gives
         idx_all = idx_all == nullptr ? idx_f : ggml_concat(ctx0, idx_all, idx_f, 1);
     }
     const int64_t n_sel = idx_all->ne[0];

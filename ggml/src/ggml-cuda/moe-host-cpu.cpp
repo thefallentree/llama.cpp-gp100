@@ -1996,7 +1996,7 @@ struct pool {
         }
 #endif
         GGML_LOG_INFO("%s: pool %d of %d: %d host threads compute the cold experts (%s; %s%s)\n", __func__, pool_id, n_pools, n_threads, isa,
-                      knew ? "Q2_K/Q3_K layers on the k kernels: " : "old kernels", knew ? kisa : "");
+                      knew ? "Q2_K / Q3_K / Q4_0 / Q4_K / i-quant layers on the k kernels: " : "old kernels", knew ? kisa : "");
     }
 
     ~pool() {

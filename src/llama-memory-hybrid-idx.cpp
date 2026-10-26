@@ -1,5 +1,7 @@
 #include "llama-memory-hybrid-idx.h"
 
+#include <cstring>
+
 #include "fn-prof.h"
 FN_PROF_DECL("mem");
 
@@ -74,10 +76,16 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
-        // the indexer keys stay f16 whatever the attention cache's type: their kernels (the pooling, the decode
-        // window's scoring) read f16 rows, and they are a small part of the cache
+        // the indexer keys are f16 whatever the attention cache's type (the glm5-next kernels read f16 rows);
+        // LLAMA_IDX_CACHE_TYPE=q8_0 halves them for a k-pool indexer whose raw rows are only ever pooled
+        // (qwen4exp: 768 MiB per card at a 262144 context, mirrored on every device; the pooled table stays f16)
+        static const ggml_type type_idx = [] {
+            const char * e = getenv("LLAMA_IDX_CACHE_TYPE");
+            return e != nullptr && strcmp(e, "q8_0") == 0 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        }();
+        GGML_ASSERT(type_idx == GGML_TYPE_F16 || (model.hparams.indexer_kpool > 0 && hparams_idx.n_embd_head_k_full % 32 == 0));
         return new llama_kv_cache(
-            model, hparams_idx, GGML_TYPE_F16, GGML_TYPE_F16, v_trans, offload, unified,
+            model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()),
@@ -925,7 +933,10 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const auto & lay = mem->kpool_layout_get();
 
     const uint32_t n_tokens = ubatch->n_tokens;
-    const uint32_t n_pool   = (uint32_t) pool_mask->ne[0];
+    // the mask as {lo, hi} slot ranges per token (I32 [2, n_tokens]) carries no pool count: the graph scores
+    // kpool_pad(n_slot_used) slots, as get_n_kpool() told it
+    const bool     mask_range = pool_mask->type == GGML_TYPE_I32;
+    const uint32_t n_pool   = mask_range ? kpool_pad(st.n_slot_used) : (uint32_t) pool_mask->ne[0];
     const uint32_t n_new    = st.n_new;
     // the graph always pools at least one entry, padded to a stable bound, see kpool_build_state
     const uint32_t n_new_g  = st.n_new_g;
@@ -936,6 +947,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_cells == nullptr || pool_cells->ne[0] == (int64_t) n_pool);
     GGML_ASSERT(pool_mask->ne[1] == (int64_t) n_tokens);
+    GGML_ASSERT(!mask_range || (pool_mask->ne[0] == 2 && sel_mask == nullptr));
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs == nullptr || (pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool));
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
@@ -1123,7 +1135,22 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (mask_range) {
+        int32_t * r = (int32_t *) pool_mask->data;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id s  = ubatch->seq_id[i][0];
+            const llama_pos    p  = ubatch->pos[i];
+            const auto &       sq = lay.seqs[s];
+            const uint32_t p0 = seq_slot0[s];
+            const uint32_t np = (uint32_t) sq.pools.size();
+            const uint32_t nv = by_order ? std::min(np, (uint32_t) ((rank[i] + 1)/kpool)) :
+                (uint32_t) (std::upper_bound(sq.pools.begin(), sq.pools.end(), p,
+                    [&](llama_pos pos, uint32_t j) { return pos < sq.cells[j + kpool - 1].first; }) - sq.pools.begin());
+            GGML_ASSERT(p0 + nv <= n_pool);
+            r[2*i + 0] = (int32_t) p0;
+            r[2*i + 1] = (int32_t) (p0 + nv);
+        }
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);

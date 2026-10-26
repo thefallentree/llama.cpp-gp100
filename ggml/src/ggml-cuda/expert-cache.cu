@@ -98,6 +98,7 @@ struct ec_device {
     int          n_used      = 0; // experts per token, from the routing
     int          last_prompt_tokens = 0; // tokens of the last update if it was a prompt ubatch
     bool         prompt_pending     = false; // a prompt ubatch's exchanges were deferred to the next decode update
+    uint64_t     prompt_updates     = 0;     // prompt ubatch updates seen (GGML_CUDA_EXPERT_CACHE_PROMPT_EVERY)
     uint64_t     n_pairs     = 0;
     uint64_t     n_pairs_cold = 0;
     std::vector<uint64_t> row_pairs, row_cold; // per layer (GGML_CUDA_EXPERT_CACHE_STATS)
@@ -598,10 +599,18 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     // defers it to the first decode update after the prompt: a 200K prompt is 130 ubatches that each route to every
     // expert, and the exchanges after each of them (hundreds of MB over PCIe, graphs re-captured on the new
     // permutation) stalled the host ~320 ms per update, 4.3% of a 16K prefill (nsys trace a2, 2026-10-26)
-    static const bool prompt_swaps = getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS") != nullptr && atoi(getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS")) != 0;
+    // GGML_CUDA_EXPERT_CACHE_PROMPT_EVERY=n (default 8): the exchanges run after every n-th prompt ubatch, so the
+    // cache still follows a long prompt's routing (with spare slots an update exchanges at most 4 experts per
+    // layer: deferring everything to the decode made the decode after a 200K prompt 15% slower while it caught up,
+    // gate run g5) at an eighth of the stall cost; 1 = after every prompt ubatch (qp8)
+    static const int  prompt_every = getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_EVERY") != nullptr ? std::max(1, atoi(getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_EVERY"))) : 8;
+    static const bool prompt_swaps = getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS")) != 0 : prompt_every == 1;
     if (prompt && !prompt_swaps) {
-        d.prompt_pending = true;
-        return;
+        d.prompt_updates++;
+        if (d.prompt_updates % prompt_every != 0) {
+            d.prompt_pending = true;
+            return;
+        }
     }
     const size_t budget = prompt || d.prompt_pending ? (size_t) EC_MAX_SWAPS : (size_t) std::max(0, n_swaps_max);
     d.prompt_pending = false;

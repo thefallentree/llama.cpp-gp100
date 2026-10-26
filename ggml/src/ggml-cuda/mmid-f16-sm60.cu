@@ -64,13 +64,24 @@ static __global__ void mmid16_convert_rows(
 }
 
 // One block: exclusive scan of the per-expert tile counts, then a tile -> (expert, first slot) table.
-template <int TN>
+// MODE 0: ceil(count/TN) tiles per expert; MODE 1: only the full groups of TN slots (count/TN tiles); MODE 2: the
+// remainder after full groups of 2*TN slots, in tiles of TN (the mixed launch: wide tiles on the full groups, narrow
+// tiles on the remainder; the kernel bounds every tile by the expert's last slot)
+template <int TN, int MODE = 0>
 static __global__ void mmid16_tiles(
         const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_expert,
         int32_t * __restrict__ tile_col0, const int n_experts) {
     __shared__ int scan[1024];
-    const int e  = threadIdx.x;
-    const int nt = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + TN - 1)/TN : 0;
+    const int e   = threadIdx.x;
+    const int cnt = e < n_experts ? expert_bounds[e + 1] - expert_bounds[e] : 0;
+    int nt  = (cnt + TN - 1)/TN;
+    int off = 0;
+    if (MODE == 1) {
+        nt = cnt/TN;
+    } else if (MODE == 2) {
+        off = (cnt/(2*TN))*(2*TN);
+        nt  = (cnt - off + TN - 1)/TN;
+    }
     scan[e] = nt;
     __syncthreads();
     for (int off = 1; off < (int) blockDim.x; off <<= 1) {
@@ -82,7 +93,7 @@ static __global__ void mmid16_tiles(
     const int start = scan[e] - nt;
     for (int i = 0; i < nt; ++i) {
         tile_expert[start + i] = e;
-        tile_col0[start + i]   = expert_bounds[e] + i*TN;
+        tile_col0[start + i]   = expert_bounds[e] + off + i*TN;
     }
 }
 
@@ -427,6 +438,7 @@ struct mmid16_gemm_plan {
     ggml_cuda_pool_alloc<half2>   xh;
     ggml_cuda_pool_alloc<float>   xs;
     ggml_cuda_pool_alloc<int32_t> tile_expert, tile_col0;
+    ggml_cuda_pool_alloc<int32_t> tile_expert2, tile_col02; // the mixed launch's remainder tiles (narrow)
     const ggml_tensor * src0 = nullptr;
     ggml_tensor *       dst  = nullptr;
     const char * w_cold = nullptr;
@@ -435,11 +447,14 @@ struct mmid16_gemm_plan {
     int64_t ne02   = 0;
     int     nkb    = 0;
     bool    narrow = false;
+    bool    mixed  = false; // wide tiles on the full 64-slot groups of every expert, narrow tiles on the remainders
     dim3    grid;
+    dim3    grid2;
 
     mmid16_gemm_plan(ggml_backend_cuda_context & ctx) :
         ids_src1(ctx.pool()), ids_dst(ctx.pool()), bounds(ctx.pool()), stage(ctx.pool()),
-        xh(ctx.pool()), xs(ctx.pool()), tile_expert(ctx.pool()), tile_col0(ctx.pool()) {}
+        xh(ctx.pool()), xs(ctx.pool()), tile_expert(ctx.pool()), tile_col0(ctx.pool()),
+        tile_expert2(ctx.pool()), tile_col02(ctx.pool()) {}
 };
 
 static void mmid16_gemm_setup(
@@ -490,8 +505,11 @@ static void mmid16_gemm_setup(
     mmid16_convert_act<<<n_assign, nkb <= 32 ? 32 : 64, 0, stream>>>(
         (const float *) src1->data, p.ids_src1.get(), p.xh.get(), p.xs.get(), src1->nb[1]/sizeof(float), nkb);
 
-    // narrow tiles when experts see few slots each
-    p.narrow = n_assign < 48*ne02;
+    // GGML_CUDA_MMID16_MIXED=1: every expert's full groups of 64 slots take wide tiles (NJ=4: more HFMA2 per shared
+    // load), the remainder narrow ones; else one tile width for the op: narrow when experts see few slots each
+    static const bool mixed = getenv("GGML_CUDA_MMID16_MIXED") != nullptr && atoi(getenv("GGML_CUDA_MMID16_MIXED")) != 0;
+    p.mixed  = mixed;
+    p.narrow = !mixed && n_assign < 48*ne02;
     const int     tn     = p.narrow ? 32 : 64;
     const int64_t t_max  = (n_assign + tn - 1)/tn + ne02;
     GGML_ASSERT(t_max <= 65535);
@@ -505,7 +523,16 @@ static void mmid16_gemm_setup(
         nthr *= 2;
     }
     p.grid = dim3(ne01/MMID16_TM, t_max, 1);
-    if (p.narrow) {
+    if (mixed) {
+        // wide tiles: at most n_assign/64 of them; narrow remainder tiles: at most 2 per expert
+        const int64_t t_max2 = 2*ne02;
+        p.tile_expert2.alloc(t_max2);
+        p.tile_col02.alloc(t_max2);
+        CUDA_CHECK(cudaMemsetAsync(p.tile_expert2.get(), 0xFF, t_max2*sizeof(int32_t), stream));
+        p.grid2 = dim3(ne01/MMID16_TM, t_max2, 1);
+        mmid16_tiles<64, 1><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(),  p.tile_col0.get(),  ne02);
+        mmid16_tiles<32, 2><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(), ne02);
+    } else if (p.narrow) {
         mmid16_tiles<32><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02);
     } else {
         mmid16_tiles<64><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02);
@@ -520,7 +547,14 @@ static void mmid16_gemm_launch(
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * src0 = p.src0;
     ggml_tensor *       dst  = p.dst;
-    if (p.narrow) {
+    if (p.mixed) {
+        mmid16_q2_0_gemm<4><<<p.grid, MMID16_THREADS, 0, stream>>>(
+            (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
+            (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
+        mmid16_q2_0_gemm<2><<<p.grid2, MMID16_THREADS, 0, stream>>>(
+            (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(),
+            (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
+    } else if (p.narrow) {
         mmid16_q2_0_gemm<2><<<p.grid, MMID16_THREADS, 0, stream>>>(
             (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
             (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);

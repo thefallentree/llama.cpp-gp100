@@ -129,13 +129,13 @@ mmid16_q2_0_gemm(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
         const int32_t * __restrict__ tile_expert, const int32_t * __restrict__ tile_col0,
         float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02, const int64_t stride_dst,
-        const char * __restrict__ w_cold, const int n_hot) {
+        const char * __restrict__ w_cold, const int n_hot, const int e_lo, const int e_hi, const int cold_base) {
 #if defined(FP16_AVAILABLE)
     constexpr int TN = 16*NJ;
 
     const int e = tile_expert[blockIdx.y];
-    if (e < 0 || (e >= n_hot && w_cold == nullptr)) {
-        return; // no tile, or a cold expert the host computes (moe-host.cuh)
+    if (e < 0 || e < e_lo || e >= e_hi || (e >= n_hot && w_cold == nullptr)) {
+        return; // no tile, an expert outside this launch's range, or a cold expert the host computes (moe-host.cuh)
     }
     const int c0   = tile_col0[blockIdx.y];
     const int cend = expert_bounds[e + 1];
@@ -152,7 +152,7 @@ mmid16_q2_0_gemm(
 
     const int lr = tid / 4; // weight row loaded by this thread
     const int lq = tid % 4; // 16-value group loaded by this thread
-    const char * wexp = e < n_hot ? w + (int64_t) e*nb02 : w_cold + (int64_t) (e - n_hot)*nb02;
+    const char * wexp = e < n_hot ? w + (int64_t) e*nb02 : w_cold + (int64_t) (e - cold_base)*nb02;
     const char * wrow = wexp + (int64_t) (row0 + lr)*nb01;
 
     float acc[4][NJ];
@@ -253,7 +253,7 @@ mmid16_q2_0_gemm(
         }
     }
 #else
-    GGML_UNUSED_VARS(w, xh, xs, ids_dst, expert_bounds, tile_expert, tile_col0, dst, nkb, nb01, nb02, stride_dst, w_cold, n_hot);
+    GGML_UNUSED_VARS(w, xh, xs, ids_dst, expert_bounds, tile_expert, tile_col0, dst, nkb, nb01, nb02, stride_dst, w_cold, n_hot, e_lo, e_hi, cold_base);
     NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
 }
@@ -418,9 +418,33 @@ bool ggml_cuda_mmid_f16_sm60_supported(
     return true;
 }
 
-void ggml_cuda_mmid_f16_sm60(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-        ggml_tensor * dst, const bool skip_cold, const char * cold_vram) {
+// The per-op setup of the GEMM (sorted ids, converted activations, the tile table), then one or more launches over
+// expert ranges: the whole op at once, or a range per staged piece of the cold experts (the prefetch below).
+struct mmid16_gemm_plan {
+    // declared in allocation order: the pool wants its allocations released in reverse order (members are destroyed last first)
+    ggml_cuda_pool_alloc<int32_t> ids_src1, ids_dst, bounds;
+    ggml_cuda_pool_alloc<char>    stage;
+    ggml_cuda_pool_alloc<half2>   xh;
+    ggml_cuda_pool_alloc<float>   xs;
+    ggml_cuda_pool_alloc<int32_t> tile_expert, tile_col0;
+    const ggml_tensor * src0 = nullptr;
+    ggml_tensor *       dst  = nullptr;
+    const char * w_cold = nullptr;
+    int     n_hot  = 0;
+    int     n_cold = 0;
+    int64_t ne02   = 0;
+    int     nkb    = 0;
+    bool    narrow = false;
+    dim3    grid;
+
+    mmid16_gemm_plan(ggml_backend_cuda_context & ctx) :
+        ids_src1(ctx.pool()), ids_dst(ctx.pool()), bounds(ctx.pool()), stage(ctx.pool()),
+        xh(ctx.pool()), xs(ctx.pool()), tile_expert(ctx.pool()), tile_col0(ctx.pool()) {}
+};
+
+static void mmid16_gemm_setup(
+        ggml_backend_cuda_context & ctx, mmid16_gemm_plan & p, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const bool skip_cold, const char * cold_vram) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t ne00     = src0->ne[0];
@@ -436,16 +460,17 @@ void ggml_cuda_mmid_f16_sm60(
     const int64_t n_assign = ne12*n_used;
     const int     nkb      = ne00/64;
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
-    ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
-    ggml_cuda_pool_alloc<int32_t> bounds  (ctx.pool(), ne02 + 1);
+    p.src0 = src0; p.dst = dst; p.n_hot = n_hot; p.n_cold = n_cold; p.ne02 = ne02; p.nkb = nkb;
+
+    p.ids_src1.alloc(n_assign);
+    p.ids_dst.alloc(n_assign);
+    p.bounds.alloc(ne02 + 1);
 
     const int si1  = ids->nb[1]/sizeof(int32_t);
     const int sis1 = src1->nb[2]/src1->nb[1];
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, p.ids_src1.get(), p.ids_dst.get(), p.bounds.get(),
         ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
 
-    ggml_cuda_pool_alloc<char> stage(ctx.pool());
     if (n_cold > 0 && skip_cold) {
         w_cold = nullptr; // the GEMM skips the cold experts' tiles
     } else if (n_cold > 0 && cold_vram != nullptr) {
@@ -453,44 +478,66 @@ void ggml_cuda_mmid_f16_sm60(
     } else if (n_cold > 0) {
         GGML_ASSERT(src0->nb[2] % 16 == 0);
         const int64_t n16 = src0->nb[2]/16;
-        stage.alloc((size_t) n_cold*src0->nb[2]);
+        p.stage.alloc((size_t) n_cold*src0->nb[2]);
         mmid16_stage_cold_experts<<<dim3(16, n_cold, 1), 256, 0, stream>>>(
-            bounds.get(), n_hot, (const uint4 *) w_cold, n16, (uint4 *) stage.get());
-        w_cold = stage.get();
+            p.bounds.get(), n_hot, (const uint4 *) w_cold, n16, (uint4 *) p.stage.get());
+        w_cold = p.stage.get();
     }
+    p.w_cold = w_cold;
 
-    ggml_cuda_pool_alloc<half2> xh(ctx.pool(), n_assign*nkb*32);
-    ggml_cuda_pool_alloc<float> xs(ctx.pool(), n_assign*nkb);
+    p.xh.alloc(n_assign*nkb*32);
+    p.xs.alloc(n_assign*nkb);
     mmid16_convert_act<<<n_assign, nkb <= 32 ? 32 : 64, 0, stream>>>(
-        (const float *) src1->data, ids_src1.get(), xh.get(), xs.get(), src1->nb[1]/sizeof(float), nkb);
+        (const float *) src1->data, p.ids_src1.get(), p.xh.get(), p.xs.get(), src1->nb[1]/sizeof(float), nkb);
 
     // narrow tiles when experts see few slots each
-    const bool    narrow = n_assign < 48*ne02;
-    const int     tn     = narrow ? 32 : 64;
+    p.narrow = n_assign < 48*ne02;
+    const int     tn     = p.narrow ? 32 : 64;
     const int64_t t_max  = (n_assign + tn - 1)/tn + ne02;
     GGML_ASSERT(t_max <= 65535);
 
-    ggml_cuda_pool_alloc<int32_t> tile_expert(ctx.pool(), t_max);
-    ggml_cuda_pool_alloc<int32_t> tile_col0  (ctx.pool(), t_max);
-    CUDA_CHECK(cudaMemsetAsync(tile_expert.get(), 0xFF, t_max*sizeof(int32_t), stream));
+    p.tile_expert.alloc(t_max);
+    p.tile_col0.alloc(t_max);
+    CUDA_CHECK(cudaMemsetAsync(p.tile_expert.get(), 0xFF, t_max*sizeof(int32_t), stream));
 
     int nthr = 32;
     while (nthr < ne02) {
         nthr *= 2;
     }
-    const dim3 grid(ne01/MMID16_TM, t_max, 1);
-    if (narrow) {
-        mmid16_tiles<32><<<1, nthr, 0, stream>>>(bounds.get(), tile_expert.get(), tile_col0.get(), ne02);
-        mmid16_q2_0_gemm<2><<<grid, MMID16_THREADS, 0, stream>>>(
-            (const char *) src0->data, xh.get(), xs.get(), ids_dst.get(), bounds.get(), tile_expert.get(), tile_col0.get(),
-            (float *) dst->data, nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, n_hot);
+    p.grid = dim3(ne01/MMID16_TM, t_max, 1);
+    if (p.narrow) {
+        mmid16_tiles<32><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02);
     } else {
-        mmid16_tiles<64><<<1, nthr, 0, stream>>>(bounds.get(), tile_expert.get(), tile_col0.get(), ne02);
-        mmid16_q2_0_gemm<4><<<grid, MMID16_THREADS, 0, stream>>>(
-            (const char *) src0->data, xh.get(), xs.get(), ids_dst.get(), bounds.get(), tile_expert.get(), tile_col0.get(),
-            (float *) dst->data, nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, n_hot);
+        mmid16_tiles<64><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// the tiles of experts [e_lo, e_hi); cold expert e is read at w_cold + (e - cold_base)*nb02
+static void mmid16_gemm_launch(
+        ggml_backend_cuda_context & ctx, mmid16_gemm_plan & p, const int e_lo, const int e_hi,
+        const char * w_cold, const int cold_base) {
+    cudaStream_t stream = ctx.stream();
+    const ggml_tensor * src0 = p.src0;
+    ggml_tensor *       dst  = p.dst;
+    if (p.narrow) {
+        mmid16_q2_0_gemm<2><<<p.grid, MMID16_THREADS, 0, stream>>>(
+            (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
+            (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
+    } else {
+        mmid16_q2_0_gemm<4><<<p.grid, MMID16_THREADS, 0, stream>>>(
+            (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
+            (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mmid_f16_sm60(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, const bool skip_cold, const char * cold_vram) {
+    mmid16_gemm_plan p(ctx);
+    mmid16_gemm_setup(ctx, p, src0, src1, ids, dst, skip_cold, cold_vram);
+    mmid16_gemm_launch(ctx, p, 0, (int) p.ne02, p.w_cold, p.n_hot);
 }
 
 bool ggml_cuda_mmid_vec_f16_sm60_supported(
@@ -580,17 +627,36 @@ static size_t cold_bytes(const ggml_tensor * node) {
     return (size_t) n_cold*node->src[0]->nb[2];
 }
 
-static void cold_issue(ggml_cuda_cold_prefetch & pf, const int k, const bool wait_freed = true) {
-    if (k >= (int) pf.ops.size()) {
+// GGML_CUDA_COLD_PREFETCH_PIECE_MB=n: an op's cold experts are staged in pieces of up to n MiB (two piece buffers
+// instead of two op-sized ones: 2 x 63 MiB per card at 272 cold experts of a 2560 x 640 Q2_0 slice); 0 = whole ops
+static size_t cold_piece_bytes() {
+    static const size_t bytes = [] {
+        const char * e = getenv("GGML_CUDA_COLD_PREFETCH_PIECE_MB");
+        return (size_t) std::max(0, e != nullptr ? atoi(e) : 0)*1048576;
+    }();
+    return bytes;
+}
+
+static size_t piece_bytes(const ggml_cuda_cold_prefetch & pf, const int s) {
+    const ggml_cuda_cold_prefetch::piece & pc = pf.pieces[s];
+    return (size_t) (pc.e1 - pc.e0)*pf.ops[pc.op]->src[0]->nb[2];
+}
+
+// copy piece s into buffer s % 2
+static void cold_issue(ggml_cuda_cold_prefetch & pf, const int s, const bool wait_freed = true) {
+    if (s >= (int) pf.pieces.size()) {
         return;
     }
-    const int b = k % 2;
+    const ggml_cuda_cold_prefetch::piece & pc = pf.pieces[s];
+    const ggml_tensor * op = pf.ops[pc.op];
+    const int b = s % 2;
     const char * host = nullptr;
-    ggml_cuda_mmid_cold(pf.ops[k], &host, nullptr);
+    ggml_cuda_mmid_cold(op, &host, nullptr);
+    host += (size_t) (pc.e0 - op->src[0]->ne[2])*op->src[0]->nb[2];
     if (wait_freed) {
         CUDA_CHECK(cudaStreamWaitEvent(pf.copy, pf.freed[b], 0));
     }
-    CUDA_CHECK(cudaMemcpyAsync(pf.buf[b], host, cold_bytes(pf.ops[k]), cudaMemcpyHostToDevice, pf.copy));
+    CUDA_CHECK(cudaMemcpyAsync(pf.buf[b], host, piece_bytes(pf, s), cudaMemcpyHostToDevice, pf.copy));
     CUDA_CHECK(cudaEventRecord(pf.ready[b], pf.copy));
 }
 
@@ -599,7 +665,10 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
     pf.active  = false;
     pf.started = false;
     pf.next    = 0;
+    pf.pnext   = 0;
     pf.ops.clear();
+    pf.pieces.clear();
+    pf.op_piece0.clear();
     if (!ggml_cuda_cold_prefetch_enabled() || ggml_cuda_moe_host_takes_prompts()) {
         return false;
     }
@@ -608,8 +677,24 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
         const ggml_tensor * n = cgraph->nodes[i];
         if (ggml_cuda_mmid_cold_prompt(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
             ggml_cuda_mmid_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)) {
+            const int op = (int) pf.ops.size();
             pf.ops.push_back(n);
-            need = std::max(need, cold_bytes(n));
+            pf.op_piece0.push_back((int) pf.pieces.size());
+            int n_cold = 0;
+            ggml_cuda_mmid_cold(n, nullptr, &n_cold);
+            const int    n_hot  = (int) n->src[0]->ne[2];
+            const size_t bytes  = cold_bytes(n);
+            const size_t pbytes = cold_piece_bytes();
+            const int    np     = pbytes > 0 && bytes > pbytes ? (int) ((bytes + pbytes - 1)/pbytes) : 1;
+            const int    per    = (n_cold + np - 1)/np;
+            for (int e0 = n_hot; e0 < n_hot + n_cold || e0 == n_hot; e0 += std::max(per, 1)) {
+                const int e1 = std::min(e0 + std::max(per, 1), n_hot + n_cold);
+                pf.pieces.push_back({ op, e0, e1 });
+                need = std::max(need, (size_t) (e1 - e0)*n->src[0]->nb[2]);
+                if (n_cold == 0) {
+                    break;
+                }
+            }
         }
     }
     if (pf.ops.empty()) {
@@ -647,10 +732,18 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
                     }
                 }
                 pf.ops.clear();
+                pf.pieces.clear();
+                pf.op_piece0.clear();
                 return false;
             }
         }
         pf.cap = need;
+        static bool once = false;
+        if (!once) {
+            once = true;
+            GGML_LOG_WARN("%s: dev%d cold-expert prefetch buffers 2 x %.1f MiB (%d ops, %d pieces)\n", __func__, ctx.device,
+                          need/1048576.0, (int) pf.ops.size(), (int) pf.pieces.size());
+        }
     }
     pf.active = true;
     return true;
@@ -693,18 +786,26 @@ bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (j == (int) pf.ops.size()) {
         return false;
     }
-    for (; pf.next < j; pf.next++) {
-        // an op that was not computed: its buffer is free once its copy is done
-        CUDA_CHECK(cudaEventRecord(pf.freed[pf.next % 2], pf.copy));
-        cold_issue(pf, pf.next + 2);
+    const int s_end = j + 1 < (int) pf.ops.size() ? pf.op_piece0[j + 1] : (int) pf.pieces.size();
+    for (; pf.pnext < pf.op_piece0[j]; pf.pnext++) {
+        // a piece of an op that was not computed: its buffer is free once its copy is done
+        CUDA_CHECK(cudaEventRecord(pf.freed[pf.pnext % 2], pf.copy));
+        cold_issue(pf, pf.pnext + 2);
     }
-    const int    b      = pf.next % 2;
     cudaStream_t stream = ctx.stream();
-    CUDA_CHECK(cudaStreamWaitEvent(stream, pf.ready[b], 0));
-    ggml_cuda_mmid_f16_sm60(ctx, dst->src[0], dst->src[1], dst->src[2], dst, /*skip_cold =*/ false, pf.buf[b]);
-    CUDA_CHECK(cudaEventRecord(pf.freed[b], stream));
-    cold_issue(pf, pf.next + 2);
-    pf.next++;
+    mmid16_gemm_plan p(ctx);
+    mmid16_gemm_setup(ctx, p, dst->src[0], dst->src[1], dst->src[2], dst, /*skip_cold =*/ false, /*cold_vram =*/ nullptr);
+    for (; pf.pnext < s_end; pf.pnext++) {
+        const int s = pf.pnext;
+        const int b = s % 2;
+        const ggml_cuda_cold_prefetch::piece & pc = pf.pieces[s];
+        CUDA_CHECK(cudaStreamWaitEvent(stream, pf.ready[b], 0));
+        // the first piece's launch takes the hot experts too
+        mmid16_gemm_launch(ctx, p, s == pf.op_piece0[j] ? 0 : pc.e0, pc.e1, pf.buf[b], pc.e0);
+        CUDA_CHECK(cudaEventRecord(pf.freed[b], stream));
+        cold_issue(pf, s + 2);
+    }
+    pf.next = j + 1;
     return true;
 }
 

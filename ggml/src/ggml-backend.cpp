@@ -21,6 +21,10 @@ FN_PROF_DECL("sched");
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <errno.h>
+#endif
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
@@ -2725,6 +2729,21 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
         return NULL;
     }
+
+#if defined(__linux__)
+    // a large table in host memory (per-layer token embeddings of tens of GB, read a few random rows per decode
+    // window) pays a TLB miss per row on 4 KiB pages: ask for transparent huge pages before the loader touches
+    // it (THP 'madvise' mode needs the advice; GGML_CPU_HUGEPAGE=0 turns it off)
+    static const bool hugepage = getenv("GGML_CPU_HUGEPAGE") == NULL || atoi(getenv("GGML_CPU_HUGEPAGE")) != 0;
+    if (hugepage && size >= 64u*1024*1024) {
+        const size_t huge = 2u*1024*1024;
+        const uintptr_t beg = ((uintptr_t) data + huge - 1) & ~(uintptr_t) (huge - 1);
+        const uintptr_t end = ((uintptr_t) data + size) & ~(uintptr_t) (huge - 1);
+        if (end > beg && madvise((void *) beg, end - beg, MADV_HUGEPAGE) != 0) {
+            GGML_LOG_WARN("%s: madvise(MADV_HUGEPAGE) on a %zu-byte buffer failed: %s\n", __func__, size, strerror(errno));
+        }
+    }
+#endif
 
     return ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
 }

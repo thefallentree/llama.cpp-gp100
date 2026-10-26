@@ -2,6 +2,62 @@
 #include "llama-memory-hybrid-idx.h"
 #include <cinttypes>
 #include <cstdlib>
+#include <fstream>
+#include <map>
+#include <sstream>
+
+// LLAMA_EXPERT_ORDER=FILE.json: {"3": [old expert ids in the new order], ...} (runs/fn-m2/glm_order.json, the file
+// fn_permute_inplace.py rewrites a file with): a layer's experts are loaded in that order instead (slot j takes expert
+// order[j]), so a stock file gets the hot-first order at load. Only this shape is read: quoted integer keys, arrays of integers.
+static std::map<int, std::vector<int64_t>> read_expert_order(const std::string & path, const int64_t n_expert) {
+    std::ifstream f(path);
+    if (!f) {
+        throw std::runtime_error(format("LLAMA_EXPERT_ORDER: cannot read '%s'", path.c_str()));
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string text = ss.str();
+    std::map<int, std::vector<int64_t>> orders;
+    size_t pos = 0;
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        const size_t end = text.find('"', pos + 1);
+        if (end == std::string::npos) {
+            break;
+        }
+        const std::string key = text.substr(pos + 1, end - pos - 1);
+        pos = end + 1;
+        if (key.empty() || key.find_first_not_of("0123456789") != std::string::npos) {
+            continue;
+        }
+        const size_t open = text.find('[', pos);
+        const size_t close = open == std::string::npos ? std::string::npos : text.find(']', open);
+        if (close == std::string::npos) {
+            throw std::runtime_error(format("LLAMA_EXPERT_ORDER: layer %s: no array", key.c_str()));
+        }
+        std::vector<int64_t> order;
+        std::vector<bool> seen(n_expert, false);
+        std::string item;
+        std::stringstream items(text.substr(open + 1, close - open - 1));
+        while (std::getline(items, item, ',')) {
+            const size_t b = item.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) {
+                continue;
+            }
+            const int64_t e = atoll(item.c_str() + b);
+            if (e < 0 || e >= n_expert || seen[e]) {
+                throw std::runtime_error(format("LLAMA_EXPERT_ORDER: layer %s: expert %" PRId64 " out of range or repeated", key.c_str(), e));
+            }
+            seen[e] = true;
+            order.push_back(e);
+        }
+        if ((int64_t) order.size() != n_expert) {
+            throw std::runtime_error(format("LLAMA_EXPERT_ORDER: layer %s: %zu experts of %" PRId64, key.c_str(), order.size(), n_expert));
+        }
+        orders[atoi(key.c_str())] = std::move(order);
+        pos = close + 1;
+    }
+    return orders;
+}
 
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
@@ -126,23 +182,52 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
                 { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
                 { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
             };
+            std::map<int, std::vector<int64_t>> orders;
+            if (getenv("LLAMA_EXPERT_ORDER") != nullptr) {
+                orders = read_expert_order(getenv("LLAMA_EXPERT_ORDER"), n_expert);
+            }
             int64_t total = 0;
             int n_padded = 0;
+            int n_ordered = 0;
             for (int il = (int) hparams.n_layer_dense_lead; il < n_layer_all; ++il) {
                 if (n_hot_layer[il] == 0) {
                     continue;
                 }
                 total += n_hot_layer[il];
+                const auto it_order = orders.find(il);
+                const std::vector<int64_t> * order = it_order != orders.end() ? &it_order->second : nullptr;
                 for (const auto & pair : pairs) {
                     const std::string hot  = tn(pair[0], "weight", il).str();
                     const std::string cold = tn(pair[1], "weight", il).str();
-                    if (!ml.resplit(hot, cold, n_hot_layer[il], 2) && !ml.split_single(hot, cold, n_hot_layer[il], 2)) {
-                        throw std::runtime_error(format("LLAMA_EXPERT_HOT: cannot cut the experts of layer %d at %" PRId64, il, n_hot_layer[il]));
+                    bool was_pair = true;
+                    if (!ml.resplit(hot, cold, n_hot_layer[il], 2)) {
+                        was_pair = false;
+                        if (!ml.split_single(hot, cold, n_hot_layer[il], 2)) {
+                            throw std::runtime_error(format("LLAMA_EXPERT_HOT: cannot cut the experts of layer %d at %" PRId64, il, n_hot_layer[il]));
+                        }
+                    }
+                    if (order) {
+                        // a file that already holds the pair was permuted when it was written: the order applies to one array
+                        if (was_pair || !ml.gather_axis(hot, 2, *order) || !ml.gather_axis(cold, 2, *order)) {
+                            throw std::runtime_error(format("LLAMA_EXPERT_ORDER: cannot order the experts of %s", hot.c_str()));
+                        }
                     }
                     if (n_spare > 0 && il < n_layer) {   // the NextN block's hot set is fixed: no spare slots
                         n_padded += ml.pad_dim(hot,  2, n_spare) ? 1 : 0;
                         n_padded += ml.pad_dim(cold, 2, n_spare) ? 1 : 0;
                     }
+                }
+                if (order) {
+                    // the router's rows and the routing bias follow the experts
+                    const std::string router = tn(LLM_TENSOR_FFN_GATE_INP, "weight", il).str();
+                    const std::string bias   = tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", il).str();
+                    if (!ml.gather_axis(router, 1, *order)) {
+                        throw std::runtime_error(format("LLAMA_EXPERT_ORDER: cannot order the rows of %s", router.c_str()));
+                    }
+                    if (ml.get_tensor_meta(bias.c_str()) != nullptr && !ml.gather_axis(bias, 0, *order)) {
+                        throw std::runtime_error(format("LLAMA_EXPERT_ORDER: cannot order %s", bias.c_str()));
+                    }
+                    n_ordered++;
                 }
             }
             if (n_padded == 0) {
@@ -150,6 +235,10 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             }
             LLAMA_LOG_INFO("%s: %.1f hot experts per layer on average of %" PRId64 " (file: %u), %" PRId64 " spare slots per side\n", __func__,
                     (double) total/(n_layer - hparams.n_layer_dense_lead), (int64_t) n_expert, hparams.n_expert_hot, n_spare);
+            if (!orders.empty()) {
+                LLAMA_LOG_WARN("%s: expert order from %s: %d layers loaded in the hot-first order (%zu layers in the file)\n", __func__,
+                        getenv("LLAMA_EXPERT_ORDER"), n_ordered, orders.size());
+            }
         }
     }
 

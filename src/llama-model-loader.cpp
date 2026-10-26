@@ -969,10 +969,48 @@ bool llama_model_loader::split_single(const std::string & first, const std::stri
         ta->nb[d] = ta->nb[d - 1]*ta->ne[d - 1];
     }
     llama_tensor_weight b = a;
-    b.tensor = tb;
-    b.offs   = a.offs + (size_t) n_first*slice;
+    b.tensor   = tb;
+    b.offs     = a.offs + (size_t) n_first*slice;
+    b.base_idx = a.base_idx + n_first;
     weights_map.emplace(second, b);
     n_tensors++;   // done_getting_tensors counts the synthesized tensor like one of the file's
+    return true;
+}
+
+bool llama_model_loader::gather_axis(const std::string & name, const int axis, const std::vector<int64_t> & order) {
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end() || axis < 0 || axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    llama_tensor_weight & w = it->second;
+    const ggml_tensor * t = w.tensor;
+    if (!w.slice_offs.empty() || (axis == 0 && ggml_blck_size(t->type) != 1) || n_bytes_file.find(name) != n_bytes_file.end()) {
+        return false;
+    }
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] != 1) {
+            return false;
+        }
+    }
+    if (use_mmap) {
+        throw std::runtime_error(format("%s: the expert order of '%s' needs the file read without mmap (-lm none)", __func__, name.c_str()));
+    }
+    const size_t  slice = t->nb[axis];
+    const int64_t n     = t->ne[axis];
+    const int64_t n_all = (int64_t) order.size();
+    if (w.base_idx + n > n_all || slice == 0) {
+        return false;
+    }
+    std::vector<size_t> offs(n);
+    for (int64_t j = 0; j < n; ++j) {
+        const int64_t src = order[w.base_idx + j];
+        if (src < 0 || src >= n_all) {
+            return false;
+        }
+        offs[j] = w.base_offs + (size_t) src*slice;
+    }
+    w.slice_offs  = std::move(offs);
+    w.slice_bytes = slice;
     return true;
 }
 
@@ -1867,6 +1905,31 @@ bool llama_model_loader::load_all_data(
         }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
+
+        if (!weight->slice_offs.empty()) {
+            // gather_axis: the slices of the file in the tensor's order (never mapped: gather_axis refuses mmap)
+            GGML_ASSERT(!from_mapping);
+            GGML_ASSERT(n_size == weight->slice_offs.size()*weight->slice_bytes);
+            const auto & file = files.at(weight->idx);
+            const bool  host  = ggml_backend_buffer_is_host(cur->buffer);
+            std::vector<no_init<uint8_t>> read_buf(host ? 0 : n_size);
+            uint8_t * dst = host ? (uint8_t *) cur->data : (uint8_t *) read_buf.data();
+            for (size_t j = 0; j < weight->slice_offs.size(); ++j) {
+                file->seek(weight->slice_offs[j], SEEK_SET);
+                file->read_raw(dst + j*weight->slice_bytes, weight->slice_bytes);
+            }
+            if (!host) {
+                ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+            }
+            if (check_tensors && !ggml_validate_row_data(cur->type, dst, n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            size_done += n_size;
+            if (n_size < ggml_nbytes(cur)) {
+                size_done += ggml_nbytes(cur) - n_size;
+            }
+            continue;
+        }
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);

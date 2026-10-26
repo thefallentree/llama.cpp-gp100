@@ -35,6 +35,16 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        // the array of the file this tensor is a part of (split_single): its data offset and the index of this
+        // tensor's first slice in it, so that gather_axis can address any slice of the array
+        size_t  base_offs = 0;
+        int64_t base_idx  = 0;
+
+        // gather_axis: the tensor's data is these slices of the file (absolute offsets, slice_bytes each), in this
+        // order, instead of the contiguous bytes at offs
+        std::vector<size_t> slice_offs;
+        size_t              slice_bytes = 0;
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -45,6 +55,7 @@ struct llama_model_loader {
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
+            base_offs = offs;
         }
     };
 
@@ -240,6 +251,13 @@ struct llama_model_loader {
     // changed, if `first` is not in the file, `second` already is, or the cut is not inside the array.
     bool split_single(const std::string & first, const std::string & second, int64_t n_first, int axis);
     ggml_context_ptr ctx_synth; // metas of the tensors split_single synthesizes
+
+    // Loads a tensor's slices along `axis` from the file in another order: slot j of the tensor takes slice
+    // order[base_idx + j] of the file's array (the whole array, or the one split_single cut it from), so a MoE layer's
+    // experts come hot first at load without rewriting the file (fn_permute_inplace.py does the same in place).
+    // Call it after split_single / resplit and before pad_dim and the tensor's creation. Needs -lm none (no mmap).
+    // False, and nothing changed, if the tensor is not in the file or `order` does not cover its slots.
+    bool gather_axis(const std::string & name, int axis, const std::vector<int64_t> & order);
 
     // the bytes the file holds for a tensor padded with pad_dim (ggml_nbytes otherwise)
     std::map<std::string, size_t> n_bytes_file;

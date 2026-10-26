@@ -16,6 +16,10 @@ void ggml_cuda_mmid_vec_kq_sm60(ggml_backend_cuda_context & ctx, const ggml_tens
 // whether the last ggml_cuda_mmid_vec_kq_sm60 of the calling thread took its converted rows from the cache
 bool ggml_cuda_mmid_vec_kq_sm60_last_hit();
 
+// the converted rows (KQ records) of src1 (ne00 = 256*nsb), from the gate/up cache when it holds them (hit) or converted now;
+// shared with the IQ mat-vec (mmid-iq-sm60.cu)
+const char * ggml_cuda_mmid_kq_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int nsb, bool & hit);
+
 // The same kernels for plain MUL_MAT (src1 F32 with up to MMVQ_MAX_BATCH_SIZE columns; src0 [k, m] or [k, m, g] with src1 [k, n, g*r]): the
 // attention and dense Q2_K / Q3_K weights. The activations are converted per op (no cache).
 // GGML_CUDA_MM_KQ_SM60=0 turns it off, GGML_CUDA_MM_KQ_SM60_MAXN=n limits it to batches of up to n columns,

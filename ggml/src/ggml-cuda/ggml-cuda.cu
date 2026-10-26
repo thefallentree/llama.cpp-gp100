@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq-f16-sm60.cuh"
 #include "ggml-cuda/mmid-f16-sm60.cuh"
 #include "ggml-cuda/mmid-kq-sm60.cuh"
+#include "ggml-cuda/mmid-iq-sm60.cuh"
 #include "ggml-cuda/cold-kq.cuh"
 #include "ggml-cuda/moe-host.cuh"
 #include "ggml-cuda/moe-host-cpu.h"
@@ -3301,6 +3302,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                                            ggml_cuda_mmid_vec_kq_sm60_last_hit() ? "sm60 kernel, cache hit" : "sm60 kernel, converted");
                 return;
             }
+            if (!ggml_cuda_mmid_allgpu() && ggml_cuda_mmid_vec_iq_sm60_supported(src0, src1, ids, dst)) {
+                ggml_cuda_mmid_vec_iq_sm60(ctx, src0, src1, ids, dst);
+                ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ true,
+                                           ggml_cuda_mmid_vec_iq_sm60_last_hit() ? "sm60 iq kernel, cache hit" : "sm60 iq kernel, converted");
+                return;
+            }
             ggml_cuda_mmid_hot_generic(ctx, dst, gpu_cold);
             return;
         }
@@ -3332,9 +3339,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 
+    if (ggml_cuda_mmid_vec_iq_sm60_supported(src0, src1, ids, dst)) {
+        ggml_cuda_mmid_vec_iq_sm60(ctx, src0, src1, ids, dst);
+        ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ false,
+                                   ggml_cuda_mmid_vec_iq_sm60_last_hit() ? "sm60 iq kernel, cache hit" : "sm60 iq kernel, converted");
+        return;
+    }
+
     ggml_cuda_mul_mat_id_generic(ctx, dst);
-    if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K) {
-        // the same oracle on the generic path, to compare the two numerics (GGML_CUDA_MMID_KQ_SM60=0)
+    if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
+            src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S) {
+        // the same oracle on the generic path, to compare the two numerics (GGML_CUDA_MMID_KQ_SM60=0, GGML_CUDA_MMID_IQ_SM60=0)
         ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ false, "generic");
     }
 }

@@ -151,18 +151,13 @@ static void mmid_kq_log(const ggml_tensor * src0, const ggml_tensor * src1, cons
     }
 }
 
-void ggml_cuda_mmid_vec_kq_sm60(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+const char * ggml_cuda_mmid_kq_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int nsb, bool & hit) {
     cudaStream_t stream = ctx.stream();
 
-    const int64_t ne01   = src0->ne[1];
-    const int64_t ne11   = src1->ne[1];
-    const int64_t ne12   = src1->ne[2];
-    const int     n_used = ids->ne[0];
-    const int     nsb    = src0->ne[0]/256;
-    const int     si1    = ids->nb[1]/sizeof(int32_t);
-    const int64_t s11    = src1->nb[1]/sizeof(float);
-    const int64_t s12    = src1->nb[2]/sizeof(float);
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t s11  = src1->nb[1]/sizeof(float);
+    const int64_t s12  = src1->nb[2]/sizeof(float);
 
     // gate and up read the same src1 back to back: the converted rows are kept for the second op (see mmid16_cache in common.cuh)
     const int64_t nrows1  = ne11*ne12;
@@ -171,10 +166,8 @@ void ggml_cuda_mmid_vec_kq_sm60(
 
     // GGML_CUDA_MMID_KQ_SM60_NOCACHE=1: every op converts its own rows (a bisect against the sharing)
     static const bool nocache = getenv("GGML_CUDA_MMID_KQ_SM60_NOCACHE") != nullptr && atoi(getenv("GGML_CUDA_MMID_KQ_SM60_NOCACHE")) != 0;
-    const bool hit = !nocache && ctx.mmid16_cache_mem != nullptr && ctx.mmid16_cache_src1 == src1 &&
-                     ctx.mmid16_cache_data == src1->data && ctx.mmid16_cache_key == key;
-    g_last_hit = hit;
-    mmid_kq_log(src0, src1, ids, dst, nsb, hit);
+    hit = !nocache && ctx.mmid16_cache_mem != nullptr && ctx.mmid16_cache_src1 == src1 &&
+          ctx.mmid16_cache_data == src1->data && ctx.mmid16_cache_key == key;
     if (!hit) {
         if (total > ctx.mmid16_cache_cap) {
             ctx.retire_mem(ctx.mmid16_cache_mem, ctx.mmid16_cache_cap);
@@ -190,7 +183,24 @@ void ggml_cuda_mmid_vec_kq_sm60(
         ctx.mmid16_cache_data = src1->data;
         ctx.mmid16_cache_key  = key;
     }
-    const char * x = ctx.mmid16_cache_mem;
+    return ctx.mmid16_cache_mem;
+}
+
+void ggml_cuda_mmid_vec_kq_sm60(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne01   = src0->ne[1];
+    const int64_t ne11   = src1->ne[1];
+    const int64_t ne12   = src1->ne[2];
+    const int     n_used = ids->ne[0];
+    const int     nsb    = src0->ne[0]/256;
+    const int     si1    = ids->nb[1]/sizeof(int32_t);
+
+    bool hit = false;
+    const char * x = ggml_cuda_mmid_kq_rows(ctx, src1, nsb, hit);
+    g_last_hit = hit;
+    mmid_kq_log(src0, src1, ids, dst, nsb, hit);
 
     const dim3 grid((ne01 + KQ_ROWS - 1)/KQ_ROWS, ne12*n_used, 1);
     const dim3 block(WARP_SIZE, KQ_NWARPS, 1);

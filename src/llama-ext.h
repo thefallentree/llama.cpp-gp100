@@ -157,6 +157,17 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// DeepSeek-V4.1 exact long-prompt layer skip. Tells the context that the prompt of seq_id ends at pos_end (the position
+// after its last token): a ubatch of that sequence that has no output and lies wholly before pos_end minus the returned
+// number of rows only runs the layers up to the last compressed-stream source (and of that one only what it publishes
+// for the later rows), which leaves the logits of the prompt's last row and the state the decode reads as the full
+// work leaves them (see llama_model_deepseek41::graph). Only active with LLAMA_DSV41_LAYER_SKIP=1 (2: also with a
+// drafter's layer-input taps past the source, which then read zeros for the skipped rows).
+// Returns the number of rows before pos_end that run in full, 0 when the model or the env does not skip (the call then
+// clears seq_id). A negative pos_end clears the setting. Set it before every batch of a prompt and clear it after, a
+// ubatch of a sequence whose setting is stale would be skipped.
+LLAMA_API int32_t llama_set_prompt_end(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_end);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

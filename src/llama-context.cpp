@@ -1562,6 +1562,69 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+// LLAMA_DSV41_LAYER_SKIP: 0 off (default), 1 on, 2 on and a drafter's layer-input taps past the last stream source read
+// zeros for the skipped rows (1 does not skip while such a tap is requested)
+static int dsv41_layer_skip_mode() {
+    const char * env = getenv("LLAMA_DSV41_LAYER_SKIP");
+    return env != nullptr ? atoi(env) : 0;
+}
+
+int32_t llama_context::set_prompt_end(llama_seq_id seq_id, llama_pos pos_end) {
+    const auto & hp = model.hparams;
+
+    if (pos_end < 0 || dsv41_layer_skip_mode() == 0 || hp.dsv41_skip_src < 0 || hp.dsv41_skip_tail == 0) {
+        prompt_end.erase(seq_id);
+        return 0;
+    }
+
+    prompt_end[seq_id] = pos_end;
+
+    // LLAMA_DSV41_SKIP_TAIL=N: a different tail, for the tests that show a tail that is too short is seen
+    const char * tail_env = getenv("LLAMA_DSV41_SKIP_TAIL");
+    prompt_tail = tail_env != nullptr ? (uint32_t) std::max(atoi(tail_env), 0) : hp.dsv41_skip_tail;
+
+    return (int32_t) prompt_tail;
+}
+
+bool llama_context::prompt_skip_for(const llama_ubatch & ubatch, uint32_t n_out, llm_graph_type gtype) const {
+    const auto & hp = model.hparams;
+
+    // a ubatch that outputs anything, the draft and encoder graphs and the pooled embeddings run in full
+    if (prompt_end.empty() || n_out != 0 || gtype != LLM_GRAPH_TYPE_DEFAULT || hp.dsv41_skip_src < 0) {
+        return false;
+    }
+    if (cparams.embeddings || cparams.embeddings_nextn) {
+        return false;
+    }
+    if (ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 || ubatch.pos == nullptr || ubatch.output == nullptr) {
+        return false;
+    }
+
+    if (dsv41_layer_skip_mode() < 2) {
+        for (size_t il = (size_t) hp.dsv41_skip_src + 1; il < cparams.embeddings_layer_inp.size(); ++il) {
+            if (cparams.embeddings_layer_inp[il]) {
+                return false;
+            }
+        }
+    }
+
+    const auto it = prompt_end.find(ubatch.seq_id_unq[0]);
+    if (it == prompt_end.end() || it->second < (llama_pos) prompt_tail) {
+        return false;
+    }
+
+    // the rows from the cut on, and the ubatch the cut falls in, run every layer
+    const llama_pos cut = it->second - (llama_pos) prompt_tail;
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.output[i] != 0 || ubatch.seq_id[i][0] != ubatch.seq_id_unq[0] || ubatch.pos[i] >= cut) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2576,6 +2639,13 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+
+            // the prompt of a sequence is read once a ubatch of it outputs: its end is no longer a cut for what follows
+            if (n_outputs_new > 0 && !prompt_end.empty()) {
+                for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+                    prompt_end.erase(ubatch.seq_id_unq[i]);
+                }
+            }
         }
 
         ggml_status status;
@@ -3469,6 +3539,7 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(sched),
         /*.res         =*/ res,
     };
+    params.prompt_skip    = prompt_skip_for(ubatch, n_outputs, gtype);
     params.chain.in       = draft_chain.cur_in;
     params.chain.out      = draft_chain.cur_out;
     params.chain.tok      = draft_chain.tok;
@@ -5031,6 +5102,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+int32_t llama_set_prompt_end(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_end) {
+    return ctx->set_prompt_end(seq_id, pos_end);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

@@ -121,6 +121,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    int32_t set_prompt_end(llama_seq_id seq_id, llama_pos pos_end);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -271,6 +272,14 @@ public:
 
 private:
     llm_graph_result * get_gf_res_prev();
+
+    // DeepSeek-V4.1 exact long-prompt layer skip: whether a ubatch lies wholly before the rows the layers after the last
+    // stream source need their own work for (llama_set_prompt_end)
+    bool prompt_skip_for(const llama_ubatch & ubatch, uint32_t n_outputs, llm_graph_type gtype) const;
+
+    // the end of the prompt being read, per sequence
+    std::map<llama_seq_id, llama_pos> prompt_end;
+    uint32_t prompt_tail = 0; // the rows before the end that run in full, as of the last llama_set_prompt_end
 
     llm_graph_params graph_params(
                         llm_graph_result * res,

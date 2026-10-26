@@ -1470,6 +1470,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             type = gguf_get_tensor_type(metadata, tid);
         }
 
+        // a virtual model of the tests leaves out the optional tensors that start like an entry of test.absent_tensors
+        if (flags & TENSOR_NOT_REQUIRED) {
+            const int64_t kid = gguf_find_key(metadata, "test.absent_tensors");
+            if (kid >= 0) {
+                const std::string name = tn.str();
+                for (size_t i = 0; i < gguf_get_arr_n(metadata, kid); ++i) {
+                    if (name.rfind(gguf_get_arr_str(metadata, kid, i), 0) == 0) {
+                        return nullptr;
+                    }
+                }
+            }
+        }
+
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {
             for (size_t dim = 0; dim < ne.size(); dim++) {

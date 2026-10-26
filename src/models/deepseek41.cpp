@@ -349,6 +349,32 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         hparams.dsv41_topk_source[i]      = last_index_source;
     }
 
+    // The exact long-prompt layer skip needs a last stream source with layers after it (see the graph constructor): the
+    // layers after it must not publish anything themselves
+    hparams.dsv41_skip_src  = -1;
+    hparams.dsv41_skip_tail = 0;
+    {
+        int32_t src = -1;
+        for (int i = 0; i < n_layer; ++i) {
+            if (hparams.dsv41_is_kv_source(i) || hparams.dsv41_owns_index_k(i)) {
+                src = i;
+            }
+        }
+        if (src >= 0 && src < n_layer - 1 && hparams.n_swa > 0) {
+            hparams.dsv41_skip_src  = src;
+            hparams.dsv41_skip_tail = (uint32_t) (n_layer - src)*(hparams.n_swa - 1) + hparams.n_swa;
+        }
+        // WARN: the server log drops the loader's INFO lines
+        if (getenv("LLAMA_DSV41_LAYER_SKIP") != nullptr && atoi(getenv("LLAMA_DSV41_LAYER_SKIP")) != 0) {
+            if (hparams.dsv41_skip_src >= 0) {
+                LLAMA_LOG_WARN("%s: long-prompt layer skip: last stream source is layer %d of %d, the layers after it run in full on the last %u rows of a prompt only\n",
+                        __func__, hparams.dsv41_skip_src, (int) n_layer, hparams.dsv41_skip_tail);
+            } else {
+                LLAMA_LOG_WARN("%s: long-prompt layer skip: no layer after the last stream source (layer %d), nothing to skip\n", __func__, src);
+            }
+        }
+    }
+
     // a compressor with no gate only makes sense where there is nothing to pool
     for (int i = 0; i < n_layer; ++i) {
         if (hparams.dsv41_is_kv_source(i) && !layers[i].attn_comp_wgate && hparams.dsv4_compress_ratios[i] != 1) {
@@ -717,7 +743,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) {
+        int il,
+        bool kv_only) {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
 
@@ -863,6 +890,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                     ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
     }
 
+    if (kv_only) {
+        // the layer's published streams (compressed KV, index keys, compressor state) are written, nothing of its
+        // attention is: see the layer skip in the graph constructor
+        return nullptr;
+    }
+
     // an index source picks the positions; the layers in between attend to the same ones
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
 
@@ -955,9 +988,45 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * cur;
 
+    // Exact long-prompt layer skip (LLAMA_DSV41_LAYER_SKIP=1, llama_set_prompt_end). Why it is exact:
+    //
+    // Let S be the last layer that publishes a shared stream (the compressed KV, the index keys): layer 20 of the
+    // released model, which has 40 layers. A layer after S reads what came before the current token only through
+    //  (a) the compressed KV and the index keys that S published, which are computed from the hidden state entering S,
+    //      so they need no layer after S, and
+    //  (b) its own raw sliding window of n_swa rows (the token and the n_swa - 1 before it), whose K/V it computes
+    //      from the output of the layer before it on those rows.
+    // (b) is the only way a row of a layer after S depends on other rows' work in the layers after S.
+    //
+    // A prompt has to leave behind the logits of its last row N - 1 and the state the decode reads: the streams of every
+    // row, which (a) gives, and the raw rings of the layers from S on, which hold the last n_swa rows. Walk back from
+    // the last layer: its K/V on the rows [N - n_swa, N) come from the output of the layer before it on those rows; that
+    // layer's output on a row reads the n_swa - 1 rows below it of the layer before it, and so on: the output of layer
+    // S + j has to be right from row N - n_swa - (n_layer - 2 - S - j)(n_swa - 1). A ubatch that skips S's attention
+    // does not write S's raw K/V either, so the first full row c is wrong at S (it reads cells that were not written),
+    // and the wrong rows grow by n_swa - 1 per layer: S + j is wrong up to c + (j + 1)(n_swa - 1) - 1. Equating the two
+    // (j = n_layer - 2 - S) gives c <= N - T with T = (n_layer - 1 - S)(n_swa - 1) + n_swa, 2,541 for 40, 20 and 128.
+    // The tail used is one window more, as Maya's and Strata's is, to stay clear of an off-by-one in the window:
+    //     dsv41_skip_tail = (n_layer - S)(n_swa - 1) + n_swa    (2,668)
+    // (the tests measure the bound on a small model: the logits are bit-identical down to the tight tail and differ
+    // below it). Rows from N - dsv41_skip_tail on run in full, and a ubatch that lies wholly before them runs layers
+    // 0 .. S - 1 and, of S, only what publishes the streams (the hyper-connection pre-norm, the compressor latent and
+    // its carried state, the index keys, the compressed KV): no attention, no router, no experts of S, nothing after S,
+    // no logits. The ubatch the cut falls in and every later one run all layers. The raw K/V cells of layers S and
+    // later that the skipped rows would have written keep their old contents; only rows whose output nothing reads
+    // (the first rows of the first full ubatch, whose window reaches into the skipped rows) see them.
+    //
+    // So the logits of the last row and the rings the decode reads are what the full work gives, up to the rounding of
+    // a differently shaped batch (the rows that matter run the same graph). Strata measured KL 0.00029 against the
+    // full work after a 4,200 token prompt, Maya 1.5e-4 on the last row. What the skip does not cover: whatever
+    // reads the hidden state of a skipped row after S (a drafter's layer-input taps read zeros there), and a context
+    // checkpoint or a prompt cache entry taken inside the skipped rows (their rings past S are stale; the server
+    // keeps checkpoints out of that range).
+    const bool skip = prompt_skip && hparams.dsv41_skip_src >= 0;
+
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = skip ? nullptr : build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
@@ -985,6 +1054,27 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         if (pmodel.engram_index(il) >= 0) {
             inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
             cb(inpL, "engram_out", il);
+        }
+
+        if (skip && il == hparams.dsv41_skip_src) {
+            // the last stream source of a skipped ubatch: only what it publishes for the rows after this one
+            cur = build_hc_pre(inpL, pre_mix, il);
+            cb(cur, "hc_attn_pre", il);
+
+            cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
+
+            build_attention_v41(model, inp_dsv4, cur, inp_pos, il, /*kv_only =*/ true);
+
+            // a layer input tap past this point has no rows to give
+            for (size_t t = il + 1; t < cparams.embeddings_layer_inp.size(); ++t) {
+                if (cparams.embeddings_layer_inp[t]) {
+                    res->t_layer_inp[t] = ggml_scale(ctx0, dsv41_hc_mean(ctx0, inpL), 0.0f);
+                    cb(res->t_layer_inp[t], "layer_inp", (int) t);
+                    ggml_build_forward_expand(gf, res->t_layer_inp[t]);
+                }
+            }
+            return;
         }
 
         ggml_tensor * residual = inpL;

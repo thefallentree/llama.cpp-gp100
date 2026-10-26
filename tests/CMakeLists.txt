@@ -173,6 +173,7 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/cases-kv.cpp
     llama-context/cases-rs.cpp
     llama-context/cases-spec.cpp
+    llama-context/cases-dsv41.cpp
     llama-context/test-case.cpp
     llama-context/test-log.cpp
     llama-context/test-runner.cpp
@@ -277,6 +278,7 @@ llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-ckpt-spread.cpp  LABEL behavior)
+llama_build_and_test(test-spec-dspark-cum.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)

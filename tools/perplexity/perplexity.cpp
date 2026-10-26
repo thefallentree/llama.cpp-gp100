@@ -3,6 +3,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_prompt_end
 
 #include <algorithm>
 #include <array>
@@ -549,6 +550,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        // DeepSeek-V4.1 layer skip (LLAMA_DSV41_LAYER_SKIP=1): the first half of a chunk is a prompt whose rows output nothing
+        for (int seq = 0; seq < n_seq_batch; seq++) {
+            llama_set_prompt_end(ctx, seq, first);
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -1781,6 +1787,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        // DeepSeek-V4.1 layer skip (LLAMA_DSV41_LAYER_SKIP=1): the first half of a chunk is a prompt whose rows output nothing
+        for (int seq = 0; seq < n_seq_batch; seq++) {
+            llama_set_prompt_end(ctx, seq, first);
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;

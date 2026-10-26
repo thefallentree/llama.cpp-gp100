@@ -362,6 +362,12 @@ struct llama_hparams {
     bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
     bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
 
+    // Exact long-prompt layer skip (see llama_model_deepseek41::graph): the last layer that publishes a shared
+    // stream (compressed KV, index keys), or -1 when the layers after it cannot be skipped, and how many rows
+    // before the end of a prompt the layers after it need their own work for
+    int32_t  dsv41_skip_src  = -1;
+    uint32_t dsv41_skip_tail = 0;
+
     uint32_t ple_ngram_size      = 0;
     uint32_t ple_heads_per_ngram = 0;
     uint32_t ple_conv_kernel     = 0;

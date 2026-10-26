@@ -6486,9 +6486,11 @@ struct ggml_tensor * ggml_lightning_indexer(
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    // the mask: F16 [n_kv, n_tokens] added to the scores, or I32 [2, n_tokens] ranges (the keys [lo, hi) of a
+    // token are visible, the rest get -INFINITY): the second form replaces a 6 B x n_kv x n_tokens tensor
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(   mask->ne[0] == (mask->type == GGML_TYPE_I32 ? 2 : k->ne[2]));
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);

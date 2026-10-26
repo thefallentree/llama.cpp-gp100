@@ -2044,14 +2044,36 @@ static __global__ void fn_qsa_cells(const fn_qsa_cells_args a, const int nt, int
 // The pooled indexer keys of a QSA attention layer (qwen4exp build_qsa_sel), one block:
 //   the raw keys of the new tokens go to their cache rows, then the mean over the kpool member rows of each block
 //   to re-pool is taken from the cache.
+// The cache rows are f16, or q8_0 (Q8: blocks of 32 as block_q8_0, a thread quantizes one block of a token).
+template <bool Q8>
 static __global__ void fn_qsa_pool(const float * __restrict__ k_raw, const int64_t sk_t, const int d, const int nt,
-                                   const int64_t * __restrict__ k_idxs, half * cache, const int64_t s_cell,
+                                   const int64_t * __restrict__ k_idxs, char * cache, const int64_t s_cell,
                                    const int32_t * __restrict__ pool_idx, const int kpool, const int n_new, const float scale,
                                    float * __restrict__ out, const int64_t so) {
-    for (int e = threadIdx.x; e < nt*d; e += blockDim.x) {
-        const int t = e/d;
-        const int c = e - t*d;
-        cache[k_idxs[t]*s_cell + c] = __float2half(k_raw[t*sk_t + c]);
+    if constexpr (Q8) {
+        const int nb = d/QK8_0;
+        for (int e = threadIdx.x; e < nt*nb; e += blockDim.x) {
+            const int t = e/nb;
+            const int b = e - t*nb;
+            const float * x = k_raw + t*sk_t + b*QK8_0;
+            float amax = 0.0f;
+            for (int i = 0; i < QK8_0; ++i) {
+                amax = fmaxf(amax, fabsf(x[i]));
+            }
+            const float dq = amax/127.0f;
+            const float id = dq != 0.0f ? 1.0f/dq : 0.0f;
+            block_q8_0 * blk = (block_q8_0 *) (cache + k_idxs[t]*s_cell) + b;
+            blk->d = __float2half(dq);
+            for (int i = 0; i < QK8_0; ++i) {
+                blk->qs[i] = (int8_t) __float2int_rn(x[i]*id);
+            }
+        }
+    } else {
+        for (int e = threadIdx.x; e < nt*d; e += blockDim.x) {
+            const int t = e/d;
+            const int c = e - t*d;
+            ((half *) (cache + k_idxs[t]*s_cell))[c] = __float2half(k_raw[t*sk_t + c]);
+        }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < n_new*d; e += blockDim.x) {
@@ -2059,7 +2081,13 @@ static __global__ void fn_qsa_pool(const float * __restrict__ k_raw, const int64
         const int c = e - j*d;
         float acc = 0.0f;
         for (int m = 0; m < kpool; ++m) {
-            acc += __half2float(cache[(int64_t) pool_idx[j*kpool + m]*s_cell + c]);
+            const char * row = cache + (int64_t) pool_idx[j*kpool + m]*s_cell;
+            if constexpr (Q8) {
+                const block_q8_0 * blk = (const block_q8_0 *) row + c/QK8_0;
+                acc += __half2float(blk->d)*(float) blk->qs[c - (c/QK8_0)*QK8_0];
+            } else {
+                acc += __half2float(((const half *) row)[c]);
+            }
         }
         out[j*so + c] = acc*scale;
     }
@@ -3509,9 +3537,11 @@ int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     if (!ok) {
         fn_decline("qsa_pool: wiring", i);
     }
+    const bool q8 = cache->type == GGML_TYPE_Q8_0;
     ok = ok && k_raw->type == GGML_TYPE_F32 && k_cur->nb[0] == sizeof(float) && d <= 256 && nt >= 1 && nt <= FN_MAX_T &&
-         k_idxs->type == GGML_TYPE_I64 && ggml_nelements(k_idxs) == nt && cache->type == GGML_TYPE_F16 &&
-         cache->nb[0] == sizeof(half) && keys->ne[0] == d && keys->nb[1] == cache->nb[1] &&
+         k_idxs->type == GGML_TYPE_I64 && ggml_nelements(k_idxs) == nt &&
+         ((cache->type == GGML_TYPE_F16 && cache->nb[0] == sizeof(half)) || (q8 && d % QK8_0 == 0 && cache->nb[1] == (size_t) d/QK8_0*sizeof(block_q8_0))) &&
+         keys->ne[0] == d && keys->nb[1] == cache->nb[1] &&
          pool_idx->type == GGML_TYPE_I32 && ggml_nelements(pool_idx) == kpool*n_new && ggml_is_contiguous(pool_idx) &&
          get_rows->type == GGML_TYPE_F32 && get_rows->ne[0] == d && get_rows->ne[1] == kpool*n_new &&
          out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && out->ne[0] == d && out->ne[1] == n_new && n_new <= 64;
@@ -3529,10 +3559,17 @@ int ggml_cuda_fn_qsa_pool(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         }
         return 0;
     }
-    fn_qsa_pool<<<1, 256, 0, ctx.stream()>>>(
-        (const float *) k_cur->data, k_cur->nb[1]/sizeof(float), (int) d, (int) nt, (const int64_t *) k_idxs->data,
-        (half *) cache->data, cache->nb[1]/sizeof(half), (const int32_t *) pool_idx->data, (int) kpool, (int) n_new,
-        ggml_get_op_params_f32(out, 0), (float *) out->data, out->nb[1]/sizeof(float));
+    if (q8) {
+        fn_qsa_pool<true><<<1, 256, 0, ctx.stream()>>>(
+            (const float *) k_cur->data, k_cur->nb[1]/sizeof(float), (int) d, (int) nt, (const int64_t *) k_idxs->data,
+            (char *) cache->data, cache->nb[1], (const int32_t *) pool_idx->data, (int) kpool, (int) n_new,
+            ggml_get_op_params_f32(out, 0), (float *) out->data, out->nb[1]/sizeof(float));
+    } else {
+        fn_qsa_pool<false><<<1, 256, 0, ctx.stream()>>>(
+            (const float *) k_cur->data, k_cur->nb[1]/sizeof(float), (int) d, (int) nt, (const int64_t *) k_idxs->data,
+            (char *) cache->data, cache->nb[1], (const int32_t *) pool_idx->data, (int) kpool, (int) n_new,
+            ggml_get_op_params_f32(out, 0), (float *) out->data, out->nb[1]/sizeof(float));
+    }
     CUDA_CHECK(cudaGetLastError());
     return n_ops - 1;
 }

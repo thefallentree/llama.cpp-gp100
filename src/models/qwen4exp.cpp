@@ -857,7 +857,7 @@ public:
         bool res = true;
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
-        res &= pool_mask->ne[0]  == mctx->get_n_kpool();
+        res &= n_pool            == mctx->get_n_kpool();
         res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // the scatter mask shape follows n_kv
@@ -868,7 +868,7 @@ public:
     }
 
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens], or I32 [2, n_tokens]: the visible slots [lo, hi) of each token
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_rows = nullptr; // I32 [kpool*n_new]    the same as the rows of a gather: reshaping an input
@@ -880,6 +880,7 @@ public:
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
+    uint32_t n_pool = 0; // slots the indexer scores (kpool_pad of the slots in use)
     uint32_t n_new = 0; // padded to a stable bound, never below 1
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
@@ -894,8 +895,14 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
+    // a token sees one contiguous run of its sequence's pool slots, so the mask is two ints per token; the F16
+    // [n_pool, n_tokens] rows (192 MiB per 1536-token ubatch at a 262144 context, filled and uploaded per window)
+    // stay as LLAMA_QSA_MASK_RANGE=0
+    static const bool mask_range = getenv("LLAMA_QSA_MASK_RANGE") == nullptr || atoi(getenv("LLAMA_QSA_MASK_RANGE")) != 0;
+
+    inp->n_pool     = n_pool;
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    inp->pool_mask  = mask_range ? ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens) : ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
@@ -944,7 +951,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     const int64_t idx_dim = hparams.indexer_head_size;
     const int64_t n_idx_h = hparams.indexer_n_head;
     const int64_t kpool   = inp_kpool->kpool;
-    const int64_t n_pool  = inp_kpool->pool_mask->ne[0];
+    const int64_t n_pool  = inp_kpool->n_pool;
     const int64_t n_new   = inp_kpool->n_new;
 
     GGML_ASSERT(hparams.dsv4_compress_ratios[il] == kpool);
@@ -1019,7 +1026,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         // token slices of contiguous tensors are contiguous views
         ggml_tensor * q_c    = whole ? q : ggml_view_3d(ctx0, q, idx_dim, n_idx_h, nt, q->nb[1], q->nb[2], t0*q->nb[2]);
         ggml_tensor * mask_c = whole ? inp_kpool->pool_mask :
-            ggml_view_2d(ctx0, inp_kpool->pool_mask, n_pool, nt, inp_kpool->pool_mask->nb[1], t0*inp_kpool->pool_mask->nb[1]);
+            ggml_view_2d(ctx0, inp_kpool->pool_mask, inp_kpool->pool_mask->ne[0], nt, inp_kpool->pool_mask->nb[1], t0*inp_kpool->pool_mask->nb[1]);
         ggml_tensor * tail_f = whole ? tail_f_all :
             ggml_view_2d(ctx0, tail_f_all, kpool - 1, nt, tail_f_all->nb[1], t0*tail_f_all->nb[1]);
         ggml_tensor * live_tail = whole ? live_tail_all :

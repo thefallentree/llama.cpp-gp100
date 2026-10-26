@@ -9226,9 +9226,10 @@ struct test_lightning_indexer : public test_case {
     const int64_t nm; // ne[3] of mask
 
     const ggml_type type_K;
+    const bool      range; // the mask as I32 {lo, hi} ranges per token instead of F16 rows
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, type_K, range);
     }
 
     double max_nmse_err() override {
@@ -9240,8 +9241,8 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16, bool range = false)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), range(range) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -9256,7 +9257,7 @@ struct test_lightning_indexer : public test_case {
         ggml_set_param(w);
         ggml_set_name(w, "w");
 
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
+        ggml_tensor * m = range ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, nm) : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
         ggml_set_param(m);
         ggml_set_name(m, "m");
 
@@ -9268,7 +9269,17 @@ struct test_lightning_indexer : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "m") == 0 && range) {
+                // visible ranges [lo, hi): a prefix of the keys for most tokens, some empty and some full
+                std::vector<int32_t> r(2*nb*nm);
+                for (int64_t i = 0; i < nb*nm; ++i) {
+                    const int64_t hi = (i % 5 == 0) ? kv : (i % 7 == 0) ? 0 : (int64_t) ((i*37 + 11) % (kv + 1));
+                    const int64_t lo = (i % 3 == 0) ? 0 : std::min<int64_t>(hi, (int64_t) ((i*13) % (kv + 1)));
+                    r[2*i + 0] = (int32_t) lo;
+                    r[2*i + 1] = (int32_t) hi;
+                }
+                ggml_backend_tensor_set(t, r.data(), 0, r.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
             } else {
                 init_tensor_uniform(t);
@@ -12553,10 +12564,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // decode windows of a 4-head indexer (lane-per-key kernel)
+    // decode windows of a 4-head indexer (lane-per-key kernel), with F16 mask rows and with {lo, hi} ranges
     for (int bs : { 1, 2, 3, 5, 8 }) {
         for (int kv : { 200, 16384 }) {
             test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F16, true));
+        }
+    }
+    // the range mask on the tile (prompt), vec and 64-head kernels
+    for (int bs : { 24, 512 }) {
+        for (int nh : { 4, 32, 64 }) {
+            for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, nh, 1000, bs, 1, 1, type_K, true));
+            }
         }
     }
 

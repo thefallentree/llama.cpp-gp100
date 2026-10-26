@@ -34,6 +34,24 @@ void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgr
 // whether batches above MMVQ_MAX_BATCH_SIZE tokens go to the host too (opt-in)
 bool ggml_cuda_moe_host_takes_prompts();
 
+// The weight types whose cold experts the host tier computes with its k kernels (moe-host-cpu.cpp, moe-host-iq.inc): Q2_K /
+// Q3_K (glm5-next, deepseek41), Q4_0 (glm5-next's NextN block), and the i-quants of Project Maya's files.
+static inline bool ggml_cuda_moe_host_ktype(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Does node belong to the open host triple?
 bool ggml_cuda_moe_host_active(const ggml_backend_cuda_context & ctx, const ggml_tensor * node);
 

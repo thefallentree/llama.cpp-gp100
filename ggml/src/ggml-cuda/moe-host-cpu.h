@@ -75,7 +75,24 @@ inline size_t mh_mailbox_layout(mh_mailbox * m, int cap_tok, int cap_pairs, int 
     return off;
 }
 
-// One hot/cold MoE layer: the cold Q2_0 experts in host memory.
+// The weight types of a slot's gate/up (wtype) and down (wtype_down) tensors. 0 is the GPU's own Q2_0 blocks of 64 (the old
+// kernels); the others run the k kernels (any gate/up and down combination of 1..8, wtype 1 with a down of 1 or 2 also on
+// the old kernels): Q2_K / Q3_K super-blocks (glm5-next, deepseek41), Q4_0 (glm5-next's NextN block), the i-quants of Project
+// Maya's files (IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S for GLM; IQ1_S, IQ2_XXS for DeepSeek).
+enum {
+    MH_W_Q2_0   = 0,
+    MH_W_Q2K    = 1,
+    MH_W_Q3K    = 2,
+    MH_W_Q40    = 3,
+    MH_W_IQ2XXS = 4,
+    MH_W_IQ2S   = 5,
+    MH_W_IQ3XXS = 6,
+    MH_W_IQ3S   = 7,
+    MH_W_IQ1S   = 8,
+    MH_NW       = 9,
+};
+
+// One hot/cold MoE layer: the cold experts in host memory.
 struct mh_slot_desc {
     const uint8_t * up;
     const uint8_t * gate;
@@ -86,8 +103,8 @@ struct mh_slot_desc {
     int    n_embd;
     int    n_ff;
     int    n_cold;     // experts in the cold tensors (a pair's expert index is < n_cold)
-    int    wtype;      // gate/up: 0: Q2_0 blocks of 64, 1: Q2_K super-blocks of 256 (glm5-next, deepseek41), 3: Q4_0 blocks of 32 (glm5-next's NextN block)
-    int    wtype_down; // down: as wtype, or 2: Q3_K super-blocks (deepseek41's Q2_K files keep the down at Q3_K)
+    int    wtype;      // gate/up: MH_W_*
+    int    wtype_down; // down: MH_W_*
     float  clamp;      // > 0: swiglu_clamp(limit) between gate/up and down instead of swiglu
 };
 

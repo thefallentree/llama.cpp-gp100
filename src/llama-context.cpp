@@ -18,6 +18,7 @@ static int     fn_prof_n_window[2] = { 0, 0 };
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3324,6 +3325,29 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    // LLAMA_GRAPH_DUMP_BIG=n: the n largest tensors of a reserved graph (what sizes a compute buffer; a prompt ubatch's
+    // superlinear growth with n_tokens shows here)
+    if (gf != nullptr) {
+        static const int n_big = getenv("LLAMA_GRAPH_DUMP_BIG") != nullptr ? atoi(getenv("LLAMA_GRAPH_DUMP_BIG")) : 0;
+        if (n_big > 0) {
+            std::vector<std::pair<size_t, const ggml_tensor *>> big;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(gf, i);
+                if (t->view_src == nullptr) {
+                    big.push_back({ ggml_nbytes(t), t });
+                }
+            }
+            std::sort(big.begin(), big.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+            LLAMA_LOG_WARN("%s: reserve graph n_tokens = %u, %d nodes, the %d largest non-view tensors:\n", __func__, n_tokens, ggml_graph_n_nodes(gf), n_big);
+            for (int i = 0; i < (int) big.size() && i < n_big; ++i) {
+                const ggml_tensor * t = big[i].second;
+                LLAMA_LOG_WARN("%s:   %9.1f MiB  %-14s %-28s [%lld, %lld, %lld, %lld] %s\n", __func__, big[i].first/1048576.0,
+                        ggml_op_name(t->op), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        ggml_type_name(t->type));
+            }
+        }
+    }
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {

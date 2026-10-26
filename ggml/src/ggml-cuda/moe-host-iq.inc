@@ -242,6 +242,9 @@ MH_IQ_AVX2 static void kdot_iq1s_avx2(const uint8_t * const * w, const kact_bloc
 
 // ======================================================= AVX-512 (two groups of 64 per step: the groups j and j + 4 of
 // a k block share a 64-byte vector of activations; signs by mask registers; the gathers take both groups' indices)
+//
+// What a group needs besides the lookups (sign masks, scales, the high index bits) is computed for the 8 groups of a block at
+// once as vectors and handed to the pair steps by one permute each: scalar code for it was two thirds of the instructions.
 
 #define MH_IQ_AVX512 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,f16c,fma")))
 
@@ -250,15 +253,56 @@ MH_IQ_AVX512 static inline __m512i iq_cat(__m256i lo, __m256i hi) {
     return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
 }
 
-MH_IQ_AVX512 static inline __m512 iq_asg2(const float * asg, int a, int b) {
-    return _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(asg[a])), _mm256_set1_ps(asg[b]), 1);
-}
-
-// acc += (grid . (y negated where the mask has a bit)) * scale (16 int32 lanes: group a in 0..7, group b in 8..15) * asg
+// acc += (grid . (y negated where the mask has a bit)) * scale (32 int16: group a in 0..15, group b in 16..31) * asg
 MH_IQ_AVX512 static inline __m512 iq_acc512(__m512 sb, __m512i grid, __mmask64 m, __m512i y, __m512i sc, __m512 as) {
     const __m512i ys = _mm512_mask_sub_epi8(y, m, _mm512_setzero_si512(), y);
     const __m512i pr = _mm512_madd_epi16(_mm512_maddubs_epi16(grid, ys), sc);
     return _mm512_fmadd_ps(_mm512_cvtepi32_ps(pr), as, sb);
+}
+
+// per k block, shared by the rows: the 4 vectors of activations (groups j and j + 4) and their float scales
+struct iq_act512 {
+    __m512i y[4];
+    __m512  as[4];
+};
+
+MH_IQ_AVX512 static inline void iq_load_act512(const kact_block & ab, iq_act512 & a) {
+    for (int j = 0; j < 4; ++j) {
+        a.y[j]  = _mm512_load_si512((const void *) (ab.q + 64*j));
+        a.as[j] = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(ab.asg[j])), _mm256_set1_ps(ab.asg[j + 4]), 1);
+    }
+}
+
+// vpermw indexes of a pair step: 32 words = [word a0 x8, word a1 x8, word b0 x8, word b1 x8] of a vector of per-group scales
+MH_IQ_AVX512 static inline __m512i iq_wperm(int a0, int a1, int b0, int b1) {
+    short idx[32];
+    for (int i = 0; i < 8; ++i) {
+        idx[i]      = (short) a0;
+        idx[8 + i]  = (short) a1;
+        idx[16 + i] = (short) b0;
+        idx[24 + i] = (short) b1;
+    }
+    return _mm512_loadu_si512((const void *) idx);
+}
+
+// the sign masks of the 8 groups of IQ2_XXS / IQ3_XXS from their words (4 x 7-bit sign index each, bits 0..27): one 32-bit mask
+// per group (ksigns_iq2xs of each index, the parity bit from a nibble lookup)
+MH_IQ_AVX512 static inline __m256i iq_masks7_vec(__m256i a1) {
+    const __m256i m127 = _mm256_set1_epi32(127), m15 = _mm256_set1_epi8(15);
+    const __m256i par  = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0));
+    __m256i out = _mm256_setzero_si256();
+#pragma GCC unroll 4
+    for (int l = 0; l < 4; ++l) {
+        const __m256i s = _mm256_and_si256(_mm256_srli_epi32(a1, 7*l), m127);
+        const __m256i x = _mm256_and_si256(_mm256_xor_si256(s, _mm256_srli_epi32(s, 4)), m15);
+        out = _mm256_or_si256(out, _mm256_slli_epi32(_mm256_or_si256(s, _mm256_shuffle_epi8(par, x)), 8*l));
+    }
+    return out;
+}
+
+// 8 dwords [m0 .. m7] -> 4 qwords [m_j | m_{j+4} << 32]
+MH_IQ_AVX512 static inline __m256i iq_pairq(__m256i v) {
+    return _mm256_permutevar8x32_epi32(v, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
 }
 
 template <int NR>
@@ -267,21 +311,25 @@ MH_IQ_AVX512 static void kdot_iq2xxs_avx512(const uint8_t * const * w, const kac
     for (int r = 0; r < NR; ++r) {
         acc[r] = _mm512_setzero_ps();
     }
+    const __m512i wps[4] = { iq_wperm(0, 0, 4, 4), iq_wperm(1, 1, 5, 5), iq_wperm(2, 2, 6, 6), iq_wperm(3, 3, 7, 7) };
     for (int k = 0; k < nsb; ++k) {
-        const kact_block & ab = a[k];
+        iq_act512 A;
+        iq_load_act512(a[k], A);
         for (int r = 0; r < NR; ++r) {
             const uint8_t * p = w[r] + (size_t) k*66;
-            const uint8_t * q = p + 2;
+            const __m512i v   = _mm512_loadu_si512((const void *) (p + 2));       // 8 groups x (4 grid bytes, u32 signs + scale)
+            const __m256i a1  = _mm512_cvtepi64_epi32(_mm512_srli_epi64(v, 32));
+            alignas(32) uint64_t mq[4], iq[4];
+            _mm256_store_si256((__m256i *) mq, iq_pairq(iq_masks7_vec(a1)));
+            _mm256_store_si256((__m256i *) iq, iq_pairq(_mm512_cvtepi64_epi32(v)));
+            const __m128i ls = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(_mm256_castsi256_si128(_mm256_srli_epi32(a1, 28)), _mm256_extracti128_si256(_mm256_srli_epi32(a1, 28), 1)), 1), _mm_set1_epi16(1));
+            const __m512i ls512 = _mm512_castsi128_si512(ls);
             __m512 sb = _mm512_setzero_ps();
 #pragma GCC unroll 4
             for (int j = 0; j < 4; ++j) {
-                const uint32_t ia = iq_ld32(q + 8*j), aa = iq_ld32(q + 8*j + 4);
-                const uint32_t ib = iq_ld32(q + 8*(j + 4)), ab1 = iq_ld32(q + 8*(j + 4) + 4);
-                const __m256i idx = _mm256_cvtepu8_epi32(_mm_unpacklo_epi32(_mm_cvtsi32_si128((int) ia), _mm_cvtsi32_si128((int) ib)));
+                const __m256i idx  = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long) iq[j]));
                 const __m512i grid = _mm512_i32gather_epi64(idx, (const void *) iq2xxs_grid, 8);
-                const __mmask64 m = (__mmask64) iq_mask7(aa) | (__mmask64) iq_mask7(ab1) << 32;
-                const __m512i sc = iq_cat(_mm256_set1_epi16((short) (2*(aa >> 28) + 1)), _mm256_set1_epi16((short) (2*(ab1 >> 28) + 1)));
-                sb = iq_acc512(sb, grid, m, _mm512_load_si512((const void *) (ab.q + 64*j)), sc, iq_asg2(ab.asg, j, j + 4));
+                sb = iq_acc512(sb, grid, (__mmask64) mq[j], A.y[j], _mm512_permutexvar_epi16(wps[j], ls512), A.as[j]);
             }
             acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(_cvtsh_ss(iq_ld16(p))*0.125f), acc[r]);
         }
@@ -299,22 +347,29 @@ MH_IQ_AVX512 static void kdot_iq2s_avx512(const uint8_t * const * w, const kact_
     for (int r = 0; r < NR; ++r) {
         acc[r] = _mm512_setzero_ps();
     }
+    // the scale words of group g: [lo nibble x8, hi nibble x8] = words 2g, 2g + 1 of the interleaved nibbles, 8 lanes each
+    const __m512i wps[4] = { iq_wperm(0, 1, 8, 9), iq_wperm(2, 3, 10, 11), iq_wperm(4, 5, 12, 13), iq_wperm(6, 7, 14, 15) };
     for (int k = 0; k < nsb; ++k) {
-        const kact_block & ab = a[k];
+        iq_act512 A;
+        iq_load_act512(a[k], A);
         for (int r = 0; r < NR; ++r) {
             const uint8_t * p  = w[r] + (size_t) k*82;
             const uint8_t * qs = p + 2, * sg = p + 34, * qh = p + 66, * sc = p + 74;
+            const __m128i s8   = _mm_loadl_epi64((const __m128i *) sc);
+            const __m128i nib  = _mm_unpacklo_epi8(_mm_and_si128(s8, _mm_set1_epi8(15)), _mm_and_si128(_mm_srli_epi16(s8, 4), _mm_set1_epi8(15)));   // 16 bytes: g0 lo, g0 hi, g1 lo ...
+            const __m256i ls16 = _mm256_add_epi16(_mm256_slli_epi16(_mm256_cvtepu8_epi16(nib), 1), _mm256_set1_epi16(1));
+            const __m512i ls512 = _mm512_castsi256_si512(ls16);
+            const __m256i qhv  = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) qh));
             __m512 sb = _mm512_setzero_ps();
 #pragma GCC unroll 4
             for (int j = 0; j < 4; ++j) {
                 const int ga = j, gb = j + 4;
-                const __m256i hi  = _mm256_and_si256(_mm256_sllv_epi32(_mm256_inserti128_si256(_mm256_set1_epi32(qh[ga]), _mm_set1_epi32(qh[gb]), 1), qsh), m3);
+                const __m256i qpair = _mm256_permutevar8x32_epi32(qhv, _mm256_setr_epi32(ga, ga, ga, ga, gb, gb, gb, gb));
+                const __m256i hi  = _mm256_and_si256(_mm256_sllv_epi32(qpair, qsh), m3);
                 const __m256i idx = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_unpacklo_epi32(_mm_cvtsi32_si128((int) iq_ld32(qs + 4*ga)), _mm_cvtsi32_si128((int) iq_ld32(qs + 4*gb)))), hi);
                 const __m512i grid = _mm512_i32gather_epi64(idx, (const void *) iq2s_grid, 8);
                 const __mmask64 m = (__mmask64) iq_ld32(sg + 4*ga) | (__mmask64) iq_ld32(sg + 4*gb) << 32;
-                const __m256i sa = _mm256_set_m128i(_mm_set1_epi16((short) (2*(sc[ga] >> 4) + 1)), _mm_set1_epi16((short) (2*(sc[ga] & 15) + 1)));
-                const __m256i sbv = _mm256_set_m128i(_mm_set1_epi16((short) (2*(sc[gb] >> 4) + 1)), _mm_set1_epi16((short) (2*(sc[gb] & 15) + 1)));
-                sb = iq_acc512(sb, grid, m, _mm512_load_si512((const void *) (ab.q + 64*j)), iq_cat(sa, sbv), iq_asg2(ab.asg, ga, gb));
+                sb = iq_acc512(sb, grid, m, A.y[j], _mm512_permutexvar_epi16(wps[j], ls512), A.as[j]);
             }
             acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(_cvtsh_ss(iq_ld16(p))*0.125f), acc[r]);
         }
@@ -330,20 +385,25 @@ MH_IQ_AVX512 static void kdot_iq3xxs_avx512(const uint8_t * const * w, const kac
     for (int r = 0; r < NR; ++r) {
         acc[r] = _mm512_setzero_ps();
     }
+    const __m512i wps[4] = { iq_wperm(0, 0, 4, 4), iq_wperm(1, 1, 5, 5), iq_wperm(2, 2, 6, 6), iq_wperm(3, 3, 7, 7) };
     for (int k = 0; k < nsb; ++k) {
-        const kact_block & ab = a[k];
+        iq_act512 A;
+        iq_load_act512(a[k], A);
         for (int r = 0; r < NR; ++r) {
             const uint8_t * p  = w[r] + (size_t) k*98;
-            const uint8_t * qs = p + 2, * gas = p + 66;
+            const uint8_t * qs = p + 2;
+            const __m256i a1   = _mm256_loadu_si256((const __m256i *) (p + 66));
+            alignas(32) uint64_t mq[4];
+            _mm256_store_si256((__m256i *) mq, iq_pairq(iq_masks7_vec(a1)));
+            const __m256i l28  = _mm256_srli_epi32(a1, 28);
+            const __m128i ls   = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(_mm256_castsi256_si128(l28), _mm256_extracti128_si256(l28, 1)), 1), _mm_set1_epi16(1));
+            const __m512i ls512 = _mm512_castsi128_si512(ls);
             __m512 sb = _mm512_setzero_ps();
 #pragma GCC unroll 4
             for (int j = 0; j < 4; ++j) {
-                const uint32_t aa = iq_ld32(gas + 4*j), ab1 = iq_ld32(gas + 4*(j + 4));
                 const __m128i i16 = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *) (qs + 8*j)), _mm_loadl_epi64((const __m128i *) (qs + 8*(j + 4))));
                 const __m512i grid = _mm512_i32gather_epi32(_mm512_cvtepu8_epi32(i16), (const void *) iq3xxs_grid, 4);
-                const __mmask64 m = (__mmask64) iq_mask7(aa) | (__mmask64) iq_mask7(ab1) << 32;
-                const __m512i sc = iq_cat(_mm256_set1_epi16((short) (2*(aa >> 28) + 1)), _mm256_set1_epi16((short) (2*(ab1 >> 28) + 1)));
-                sb = iq_acc512(sb, grid, m, _mm512_load_si512((const void *) (ab.q + 64*j)), sc, iq_asg2(ab.asg, j, j + 4));
+                sb = iq_acc512(sb, grid, (__mmask64) mq[j], A.y[j], _mm512_permutexvar_epi16(wps[j], ls512), A.as[j]);
             }
             acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(_cvtsh_ss(iq_ld16(p))*0.25f), acc[r]);
         }
@@ -361,22 +421,30 @@ MH_IQ_AVX512 static void kdot_iq3s_avx512(const uint8_t * const * w, const kact_
     for (int r = 0; r < NR; ++r) {
         acc[r] = _mm512_setzero_ps();
     }
+    const __m512i wps[4] = { iq_wperm(0, 0, 4, 4), iq_wperm(1, 1, 5, 5), iq_wperm(2, 2, 6, 6), iq_wperm(3, 3, 7, 7) };
+    const __m512i qperm[4] = {
+        _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4), _mm512_setr_epi32(1, 1, 1, 1, 1, 1, 1, 1, 5, 5, 5, 5, 5, 5, 5, 5),
+        _mm512_setr_epi32(2, 2, 2, 2, 2, 2, 2, 2, 6, 6, 6, 6, 6, 6, 6, 6), _mm512_setr_epi32(3, 3, 3, 3, 3, 3, 3, 3, 7, 7, 7, 7, 7, 7, 7, 7) };
     for (int k = 0; k < nsb; ++k) {
-        const kact_block & ab = a[k];
+        iq_act512 A;
+        iq_load_act512(a[k], A);
         for (int r = 0; r < NR; ++r) {
             const uint8_t * p  = w[r] + (size_t) k*110;
             const uint8_t * qs = p + 2, * qh = p + 66, * sg = p + 74, * sc = p + 106;
+            const __m128i s4   = _mm_cvtsi32_si128((int) iq_ld32(sc));
+            const __m128i nib  = _mm_unpacklo_epi8(_mm_and_si128(s4, _mm_set1_epi8(15)), _mm_and_si128(_mm_srli_epi16(s4, 4), _mm_set1_epi8(15)));   // groups 0..7
+            const __m128i ls   = _mm_add_epi16(_mm_slli_epi16(_mm_cvtepu8_epi16(nib), 1), _mm_set1_epi16(1));
+            const __m512i ls512 = _mm512_castsi128_si512(ls);
+            const __m512i qhv  = _mm512_castsi256_si512(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) qh)));
             __m512 sb = _mm512_setzero_ps();
 #pragma GCC unroll 4
             for (int j = 0; j < 4; ++j) {
                 const int ga = j, gb = j + 4;
-                const __m512i hi  = _mm512_and_si512(_mm512_sllv_epi32(iq_cat(_mm256_set1_epi32(qh[ga]), _mm256_set1_epi32(qh[gb])), qsh), m1);
+                const __m512i hi  = _mm512_and_si512(_mm512_sllv_epi32(_mm512_permutexvar_epi32(qperm[j], qhv), qsh), m1);
                 const __m128i i16 = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *) (qs + 8*ga)), _mm_loadl_epi64((const __m128i *) (qs + 8*gb)));
                 const __m512i grid = _mm512_i32gather_epi32(_mm512_or_si512(_mm512_cvtepu8_epi32(i16), hi), (const void *) iq3s_grid, 4);
                 const __mmask64 m = (__mmask64) iq_ld32(sg + 4*ga) | (__mmask64) iq_ld32(sg + 4*gb) << 32;
-                const int la = 2*((sc[ga >> 1] >> (4*(ga & 1))) & 15) + 1, lb = 2*((sc[gb >> 1] >> (4*(gb & 1))) & 15) + 1;
-                sb = iq_acc512(sb, grid, m, _mm512_load_si512((const void *) (ab.q + 64*j)),
-                               iq_cat(_mm256_set1_epi16((short) la), _mm256_set1_epi16((short) lb)), iq_asg2(ab.asg, ga, gb));
+                sb = iq_acc512(sb, grid, m, A.y[j], _mm512_permutexvar_epi16(wps[j], ls512), A.as[j]);
             }
             acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(_cvtsh_ss(iq_ld16(p))), acc[r]);
         }
@@ -392,6 +460,7 @@ MH_IQ_AVX512 static void kdot_iq1s_avx512(const uint8_t * const * w, const kact_
     const __m256i m7  = _mm256_set1_epi32(7);
     const __m512i one = _mm512_set1_epi8(1);
     const __m256 fd1  = _mm256_set1_ps(2.0f*IQ1S_DELTA), fd0 = _mm256_set1_ps(1.0f - IQ1S_DELTA);
+    const __m512i wps[4] = { iq_wperm(0, 0, 4, 4), iq_wperm(1, 1, 5, 5), iq_wperm(2, 2, 6, 6), iq_wperm(3, 3, 7, 7) };
     __m512 acc[NR];
     __m256 cor[NR];
     for (int r = 0; r < NR; ++r) {
@@ -400,25 +469,28 @@ MH_IQ_AVX512 static void kdot_iq1s_avx512(const uint8_t * const * w, const kact_
     }
     for (int k = 0; k < nsb; ++k) {
         const kact_block & ab = a[k];
+        iq_act512 A;
+        iq_load_act512(ab, A);
         const __m256 asb = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_load_si256((const __m256i *) ab.bs), _mm256_set1_epi16(1))), _mm256_load_ps(ab.asg));
         for (int r = 0; r < NR; ++r) {
             const uint8_t * p  = w[r] + (size_t) k*50;
             const uint8_t * qs = p + 2, * qhp = p + 34;
+            const __m256i qhv = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) qhp));
+            const __m256i l3  = _mm256_and_si256(_mm256_srli_epi32(qhv, 12), m7);
+            const __m128i ls  = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(_mm256_castsi256_si128(l3), _mm256_extracti128_si256(l3, 1)), 1), _mm_set1_epi16(1));
+            const __m512i ls512 = _mm512_castsi128_si512(ls);
             __m512 sb = _mm512_setzero_ps();
 #pragma GCC unroll 4
             for (int j = 0; j < 4; ++j) {
                 const int ga = j, gb = j + 4;
-                const uint32_t qa = iq_ld16(qhp + 2*ga), qb = iq_ld16(qhp + 2*gb);
-                const __m256i hi  = _mm256_slli_epi32(_mm256_and_si256(_mm256_srlv_epi32(_mm256_inserti128_si256(_mm256_set1_epi32((int) qa), _mm_set1_epi32((int) qb), 1), qsh), m7), 8);
+                const __m256i qpair = _mm256_permutevar8x32_epi32(qhv, _mm256_setr_epi32(ga, ga, ga, ga, gb, gb, gb, gb));
+                const __m256i hi  = _mm256_slli_epi32(_mm256_and_si256(_mm256_srlv_epi32(qpair, qsh), m7), 8);
                 const __m256i idx = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_unpacklo_epi32(_mm_cvtsi32_si128((int) iq_ld32(qs + 4*ga)), _mm_cvtsi32_si128((int) iq_ld32(qs + 4*gb)))), hi);
                 const __m512i grid = _mm512_add_epi8(_mm512_i32gather_epi64(idx, (const void *) iq1s_grid, 8), one);
-                const int la = 2*((qa >> 12) & 7) + 1, lb = 2*((qb >> 12) & 7) + 1;
-                const __m512i pr = _mm512_madd_epi16(_mm512_maddubs_epi16(grid, _mm512_load_si512((const void *) (ab.q + 64*j))),
-                                                     iq_cat(_mm256_set1_epi16((short) la), _mm256_set1_epi16((short) lb)));
-                sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(pr), iq_asg2(ab.asg, ga, gb), sb);
+                const __m512i pr = _mm512_madd_epi16(_mm512_maddubs_epi16(grid, A.y[j]), _mm512_permutexvar_epi16(wps[j], ls512));
+                sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(pr), A.as[j], sb);
             }
-            const __m256i qhv = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) qhp));
-            const __m256  lsf = _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(qhv, 12), m7), 1), _mm256_set1_epi32(1)));
+            const __m256  lsf = _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_slli_epi32(l3, 1), _mm256_set1_epi32(1)));
             const __m256  fv  = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_srli_epi32(qhv, 15)), fd1, fd0);
             const float   d   = _cvtsh_ss(iq_ld16(p));
             acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(d), acc[r]);

@@ -132,9 +132,11 @@ static __device__ __forceinline__ void mmid16_decode_q2_0(const uint32_t q, half
     h[7] = __hsub2(mmid16_h2(t[7]), m3);
 }
 
-// NJ token slots per thread, so a tile is 64 weight rows x 16*NJ slots.
-template <int NJ>
-static __global__ void __launch_bounds__(MMID16_THREADS, 2)
+// NT threads as 16 row groups of 4 rows x NT/16 slot groups of NJ slots: a tile is 64 weight rows x (NT/16)*NJ slots.
+// (256, 2) = 32 slots, (256, 4) = 64, (128, 4) = 32 slots with 4 x 4 outputs per thread: 8 LDS.128 per 64 HFMA2 instead
+// of 6 per 32 (the kernel is shared-memory bound)
+template <int NJ, int NT = MMID16_THREADS>
+static __global__ void __launch_bounds__(NT, 512/NT)
 mmid16_q2_0_gemm(
         const char * __restrict__ w, const half2 * __restrict__ xh, const float * __restrict__ xs,
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
@@ -142,7 +144,8 @@ mmid16_q2_0_gemm(
         float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02, const int64_t stride_dst,
         const char * __restrict__ w_cold, const int n_hot, const int e_lo, const int e_hi, const int cold_base) {
 #if defined(FP16_AVAILABLE)
-    constexpr int TN = 16*NJ;
+    constexpr int TX = NT/16;  // slot groups
+    constexpr int TN = TX*NJ;  // slots per tile
 
     const int e = tile_expert[blockIdx.y];
     if (e < 0 || e < e_lo || e >= e_hi || (e >= n_hot && w_cold == nullptr)) {
@@ -158,13 +161,10 @@ mmid16_q2_0_gemm(
     __shared__ float xsc[TN];
 
     const int tid = threadIdx.x;
-    const int tx  = tid % 16;
-    const int ty  = tid / 16;
+    const int tx  = tid % TX;
+    const int ty  = tid / TX;
 
-    const int lr = tid / 4; // weight row loaded by this thread
-    const int lq = tid % 4; // 16-value group loaded by this thread
     const char * wexp = e < n_hot ? w + (int64_t) e*nb02 : w_cold + (int64_t) (e - cold_base)*nb02;
-    const char * wrow = wexp + (int64_t) (row0 + lr)*nb01;
 
     float acc[4][NJ];
 #pragma unroll
@@ -176,9 +176,12 @@ mmid16_q2_0_gemm(
     }
 
     for (int kb = 0; kb < nkb; ++kb) {
-        {
+#pragma unroll
+        for (int w0 = 0; w0 < MMID16_TM*4; w0 += NT) {
+            const int lr = (w0 + tid) / 4; // weight row loaded by this thread
+            const int lq = (w0 + tid) % 4; // 16-value group loaded by this thread
             // block_q2_0 is 18 bytes, so the codes are only 2-byte aligned
-            const char *     blk = wrow + (int64_t) kb*18;
+            const char *     blk = wexp + (int64_t) (row0 + lr)*nb01 + (int64_t) kb*18;
             const uint16_t * q16 = (const uint16_t *) (blk + 2 + 4*lq);
             const uint32_t   q   = (uint32_t) q16[0] | ((uint32_t) q16[1] << 16);
 
@@ -193,16 +196,18 @@ mmid16_q2_0_gemm(
             }
         }
 #pragma unroll
-        for (int i0 = 0; i0 < TN*8; i0 += MMID16_THREADS) {
+        for (int i0 = 0; i0 < TN*8; i0 += NT) {
             const int i    = i0 + tid;
             const int col  = i / 8;
             const int part = i % 8;
             const int c    = c0 + col;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (c < cend) {
+            if (i < TN*8 && c < cend) {
                 v = ((const uint4 *) (xh + ((int64_t) c*nkb + kb)*32))[part];
             }
-            *((uint4 *) &xsm[col][4*part]) = v;
+            if (i < TN*8) {
+                *((uint4 *) &xsm[col][4*part]) = v;
+            }
         }
         if (tid < TN) {
             const int c = c0 + tid;
@@ -228,7 +233,7 @@ mmid16_q2_0_gemm(
             }
 #pragma unroll
             for (int j = 0; j < NJ; ++j) {
-                xv[j] = *((const uint4 *) &xsm[tx + 16*j][4*p4]);
+                xv[j] = *((const uint4 *) &xsm[tx + TX*j][4*p4]);
             }
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -246,7 +251,7 @@ mmid16_q2_0_gemm(
             const float dw = wd[ty + 16*i];
 #pragma unroll
             for (int j = 0; j < NJ; ++j) {
-                acc[i][j] += dw*xsc[tx + 16*j]*__half2float(__hadd(__low2half(hacc[i][j]), __high2half(hacc[i][j])));
+                acc[i][j] += dw*xsc[tx + TX*j]*__half2float(__hadd(__low2half(hacc[i][j]), __high2half(hacc[i][j])));
             }
         }
         __syncthreads();
@@ -254,7 +259,7 @@ mmid16_q2_0_gemm(
 
 #pragma unroll
     for (int j = 0; j < NJ; ++j) {
-        const int c = c0 + tx + 16*j;
+        const int c = c0 + tx + TX*j;
         if (c < cend) {
             float * d = dst + (int64_t) ids_dst[c]*stride_dst + row0;
 #pragma unroll
@@ -448,6 +453,7 @@ struct mmid16_gemm_plan {
     int     nkb    = 0;
     bool    narrow = false;
     bool    mixed  = false; // wide tiles on the full 64-slot groups of every expert, narrow tiles on the remainders
+    bool    narrow128 = false; // the narrow tiles with 128 threads
     dim3    grid;
     dim3    grid2;
 
@@ -508,7 +514,10 @@ static void mmid16_gemm_setup(
     // GGML_CUDA_MMID16_MIXED=1: every expert's full groups of 64 slots take wide tiles (NJ=4: more HFMA2 per shared
     // load), the remainder narrow ones; else one tile width for the op: narrow when experts see few slots each
     static const bool mixed = getenv("GGML_CUDA_MMID16_MIXED") != nullptr && atoi(getenv("GGML_CUDA_MMID16_MIXED")) != 0;
-    p.mixed  = mixed;
+    // GGML_CUDA_MMID16_NARROW128=1: the narrow (32-slot) tiles with 128 threads of 4 x 4 outputs
+    static const bool narrow128 = getenv("GGML_CUDA_MMID16_NARROW128") != nullptr && atoi(getenv("GGML_CUDA_MMID16_NARROW128")) != 0;
+    p.mixed     = mixed;
+    p.narrow128 = narrow128;
     p.narrow = !mixed && n_assign < 48*ne02;
     const int     tn     = p.narrow ? 32 : 64;
     const int64_t t_max  = (n_assign + tn - 1)/tn + ne02;
@@ -551,8 +560,18 @@ static void mmid16_gemm_launch(
         mmid16_q2_0_gemm<4><<<p.grid, MMID16_THREADS, 0, stream>>>(
             (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
             (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
-        mmid16_q2_0_gemm<2><<<p.grid2, MMID16_THREADS, 0, stream>>>(
-            (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(),
+        if (p.narrow128) {
+            mmid16_q2_0_gemm<4, 128><<<p.grid2, 128, 0, stream>>>(
+                (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(),
+                (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
+        } else {
+            mmid16_q2_0_gemm<2><<<p.grid2, MMID16_THREADS, 0, stream>>>(
+                (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(),
+                (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
+        }
+    } else if (p.narrow && p.narrow128) {
+        mmid16_q2_0_gemm<4, 128><<<p.grid, 128, 0, stream>>>(
+            (const char *) src0->data, p.xh.get(), p.xs.get(), p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(),
             (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base);
     } else if (p.narrow) {
         mmid16_q2_0_gemm<2><<<p.grid, MMID16_THREADS, 0, stream>>>(

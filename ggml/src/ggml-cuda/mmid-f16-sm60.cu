@@ -920,10 +920,12 @@ static void mmid16_gemm_setup(
     }
     p.w_cold = w_cold;
 
-    // The converted activations: gate and up read the same src1 with the same ids, so the conversion is kept in the
-    // context (cleared at every graph start, like the mat-vec's) and the second op hits it. GGML_CUDA_MMID16_SHARE=0
-    // converts per op from the pool; GGML_CUDA_MMID16_CONV=1 takes the old strided conversion kernel.
-    static const bool share    = getenv("GGML_CUDA_MMID16_SHARE") == nullptr || atoi(getenv("GGML_CUDA_MMID16_SHARE")) != 0;
+    // The converted activations: per op from the pool. GGML_CUDA_MMID16_SHARE=1 keeps them in the context instead
+    // (cleared at every graph start, like the mat-vec's) so that up hits gate's conversion: off by default since
+    // qp12, the buffer is a cudaMalloc outside the pool (81 MiB at 1536 tokens, +27 MiB for the MTP experts) for
+    // ~0.6 ms per layer, and the gate run at -ub 1536 ran out of VRAM with it (qp8 itself ends a 200K prompt +
+    // restore at 16.2 of 16.4 GB). GGML_CUDA_MMID16_CONV=1 takes the old strided conversion kernel.
+    static const bool share    = getenv("GGML_CUDA_MMID16_SHARE") != nullptr && atoi(getenv("GGML_CUDA_MMID16_SHARE")) != 0;
     static const int  conv_env = getenv("GGML_CUDA_MMID16_CONV") != nullptr ? atoi(getenv("GGML_CUDA_MMID16_CONV")) : 2;
     const auto convert = [&](half2 * xh, float * xs) {
         if (p.q4) {

@@ -3020,6 +3020,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // GGML_CUDA_SM60_DENSE_MMQ=<rows>: on sm_60 the prompt-batch products of quantized dense weights with up to <rows>
+    // output rows take MMQ (emulated dp4a) instead of dequant + cuBLAS, whose HGEMM runs the skinny hyper-connection
+    // shapes (10240 -> 320) at ~3 TFLOPS. An A/B switch; 0 = off.
+    {
+        static const int64_t mmq_rows = getenv("GGML_CUDA_SM60_DENSE_MMQ") != nullptr ? atoll(getenv("GGML_CUDA_SM60_DENSE_MMQ")) : 0;
+        if (mmq_rows > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_DP4A && ne11 > 4*MMVQ_MAX_BATCH_SIZE &&
+                ne01 <= mmq_rows && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0) && ggml_is_contiguous(src0) &&
+                ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 1)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+    }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 

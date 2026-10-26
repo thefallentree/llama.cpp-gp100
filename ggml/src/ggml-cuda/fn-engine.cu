@@ -3624,7 +3624,8 @@ int ggml_cuda_fn_qsa_attn(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     a.V      = (const char *) v->data;
     a.out    = (float *) out->data;
     a.part   = nullptr;
-    a.q8     = k->type == GGML_TYPE_Q8_0;
+    a.kt     = fattn_sel_type_code(k->type);
+    a.vt     = fattn_sel_type_code(v->type);
     a.s_sel  = (int) n_sel;
     a.sq_t   = (int) (q->nb[2]/sizeof(float));
     a.sq_h   = (int) (q->nb[1]/sizeof(float));

@@ -79,6 +79,7 @@ using ctx_test_ptr = std::unique_ptr<const ctx_test>;
 std::vector<ctx_test_ptr> make_kv_cases();  // cases-kv.cpp
 std::vector<ctx_test_ptr> make_rs_cases();  // cases-rs.cpp
 std::vector<ctx_test_ptr> make_spec_cases(); // cases-spec.cpp
+std::vector<ctx_test_ptr> make_dsv41_cases(); // cases-dsv41.cpp
 
 // all cases, in table order
 const std::vector<ctx_test_ptr> & test_cases();

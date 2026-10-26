@@ -18,6 +18,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_prompt_end
 
 #include <algorithm>
 #include <cstddef>
@@ -254,6 +255,10 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
+
+    // DeepSeek-V4.1 exact long-prompt layer skip (LLAMA_DSV41_LAYER_SKIP): the end position handed to
+    // llama_set_prompt_end for this prompt, -1 when the prompt is read in full
+    llama_pos prompt_skip_end = -1;
 
     // speculative decoding
     common_speculative * spec;
@@ -4041,6 +4046,23 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // DeepSeek-V4.1 exact long-prompt layer skip: the layers past the last stream source only need their
+                        // work on the last rows of a prompt. The end handed over is n_ubatch + 8 rows before the real one, so
+                        // that the checkpoints at 4 and 4 + n_ubatch before the end still hold exact rings (see the
+                        // graph of llama_model_deepseek41). A prompt with less than a window of 1024 rows to save is read in full
+                        slot.prompt_skip_end = -1;
+                        if (!slot.task->tokens.has_mtmd) {
+                            const llama_pos end = slot.task->n_tokens() - (n_ubatch + 8);
+                            const int32_t  tail = llama_set_prompt_end(ctx_tgt, slot.id, end);
+                            if (tail > 0 && end - n_past >= tail + 1024) {
+                                slot.prompt_skip_end = end;
+                                SLT_INF(slot, "layer skip: the layers past the last stream source run on the last %d rows of %d, the %d rows from %d are skipped\n",
+                                        tail, slot.task->n_tokens(), end - tail - n_past, n_past);
+                            } else {
+                                llama_set_prompt_end(ctx_tgt, slot.id, -1);
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4063,6 +4085,11 @@ private:
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
+
+                    // the setting of the context is cleared once a ubatch outputs, and by a request that is not skipped
+                    if (slot.prompt_skip_end >= 0) {
+                        llama_set_prompt_end(ctx_tgt, slot.id, slot.prompt_skip_end);
+                    }
 
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
@@ -4288,6 +4315,11 @@ private:
 
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
+
+                    // the rings of the layers past the last stream source are only right in the last window of a skipped prompt
+                    if (do_checkpoint && slot.prompt_skip_end >= 0 && n_tokens_start < slot.prompt_skip_end - llama_model_n_swa(model_tgt)) {
+                        do_checkpoint = false;
+                    }
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (

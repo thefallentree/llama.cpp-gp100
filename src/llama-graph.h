@@ -884,6 +884,10 @@ struct llm_graph_params {
         ggml_tensor * off      = nullptr; // F32 [n_dev]: the first row of every shard
     } chain;
 
+    // DeepSeek-V4.1 exact long-prompt layer skip (llama_set_prompt_end): this ubatch only feeds the shared streams of
+    // the layers up to the last stream source, the layers after it are not built
+    bool prompt_skip = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -925,6 +929,10 @@ struct llm_graph_params {
         }
 
         if (chain.in != other.chain.in || chain.out != other.chain.out) {
+            return false;
+        }
+
+        if (prompt_skip != other.prompt_skip) {
             return false;
         }
 
@@ -1115,6 +1123,7 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const bool    prompt_skip; // llm_graph_params::prompt_skip
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

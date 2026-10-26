@@ -172,6 +172,7 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/cases-kv.cpp
     llama-context/cases-rs.cpp
     llama-context/cases-spec.cpp
+    llama-context/cases-dsv41.cpp
     llama-context/test-case.cpp
     llama-context/test-log.cpp
     llama-context/test-runner.cpp
@@ -257,6 +258,7 @@ endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-ckpt-spread.cpp)
+llama_build_and_test(test-spec-dspark-cum.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)

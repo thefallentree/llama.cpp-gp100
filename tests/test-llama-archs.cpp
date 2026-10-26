@@ -196,7 +196,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd  = 512;
         n_head  = 8;
         n_ff    = 1024;
-        n_layer = 4;
+        n_layer = arch == LLM_ARCH_DEEPSEEK41 ? 8 : 4; // V4.1: stream sources 2 and 4, readers after them (below)
     } else if (arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_LAGUNA) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
@@ -461,7 +461,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     if (is_dsv4) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,          uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,            uint32_t(32));
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,             std::vector<uint32_t>({0, 0, 4, 128}));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,             arch == LLM_ARCH_DEEPSEEK41
+                ? std::vector<uint32_t>({0, 0, 4, 4, 128, 128, 128, 128}) : std::vector<uint32_t>({0, 0, 4, 128}));
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,     160000.0f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,                uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,  uint32_t(2));
@@ -473,6 +474,18 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     }
 
     if (arch == LLM_ARCH_DEEPSEEK41) {
+        // The stream roles of the released model in small: layers 2 and 4 publish a compressed stream and index keys,
+        // 3 reads layer 2's, 5 reads layer 4's, 6 picks its own rows from layer 4's keys (an index source that is no
+        // key owner), 7 reads 6's picks. A virtual model has every optional tensor, so the others are left out here.
+        const char * absent[] = {
+            "blk.0.attn_compressor", "blk.0.indexer.", "blk.1.attn_compressor", "blk.1.indexer.",
+            "blk.3.attn_compressor", "blk.3.indexer.",
+            "blk.5.attn_compressor", "blk.5.indexer.",
+            "blk.6.attn_compressor", "blk.6.indexer.attn_k", "blk.6.indexer.k_norm",
+            "blk.7.attn_compressor", "blk.7.indexer.",
+        };
+        gguf_set_arr_str(ret.get(), "test.absent_tensors", absent, sizeof(absent)/sizeof(absent[0]));
+
         // engram on two layers, 3-grams over 2 heads: the table rows are the primes of its buckets one after the other
         constexpr uint32_t n_eg_layers = 2;
         constexpr uint32_t n_gram      = 3;

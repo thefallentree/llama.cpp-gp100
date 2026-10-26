@@ -1558,7 +1558,8 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il);
+                int il,
+                bool kv_only = false);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

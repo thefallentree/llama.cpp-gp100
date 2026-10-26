@@ -1482,6 +1482,12 @@ struct ggml_cuda_cold_prefetch {
     int          next     = 0;            // the next of them to compute
     bool         active   = false;        // buffers ready for this graph's ops
     bool         started  = false;        // the first copies are issued
+    // the ops' cold experts in staged ranges [e0, e1) (absolute expert ids), in order: one piece per op unless
+    // GGML_CUDA_COLD_PREFETCH_PIECE_MB splits them; piece s is copied into buf[s % 2]
+    struct piece { int op; int e0; int e1; };
+    std::vector<piece> pieces;
+    std::vector<int>   op_piece0;         // the first piece of each op
+    int          pnext    = 0;            // the next piece to compute
 };
 
 // prompt batches of a Q2_K / Q3_K hot/cold layer: the cold experts an op touches are copied to a VRAM staging buffer on a

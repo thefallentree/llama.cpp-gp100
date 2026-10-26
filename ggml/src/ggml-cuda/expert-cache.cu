@@ -97,6 +97,7 @@ struct ec_device {
     uint64_t     n_swaps     = 0;
     int          n_used      = 0; // experts per token, from the routing
     int          last_prompt_tokens = 0; // tokens of the last update if it was a prompt ubatch
+    bool         prompt_pending     = false; // a prompt ubatch's exchanges were deferred to the next decode update
     uint64_t     n_pairs     = 0;
     uint64_t     n_pairs_cold = 0;
     std::vector<uint64_t> row_pairs, row_cold; // per layer (GGML_CUDA_EXPERT_CACHE_STATS)
@@ -592,8 +593,18 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
             pairs_last = d.n_pairs; cold_last = d.n_pairs_cold; swaps_last = d.n_swaps;
         }
     }
-    // after a prompt every cold expert it routed to comes in; in a decode the best of the last window
-    const size_t budget = prompt ? (size_t) EC_MAX_SWAPS : (size_t) std::max(0, n_swaps_max);
+    // after a prompt every cold expert it routed to comes in; in a decode the best of the last window.
+    // GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS=1 does that after every prompt ubatch (the behaviour up to qp8); the default
+    // defers it to the first decode update after the prompt: a 200K prompt is 130 ubatches that each route to every
+    // expert, and the exchanges after each of them (hundreds of MB over PCIe, graphs re-captured on the new
+    // permutation) stalled the host ~320 ms per update, 4.3% of a 16K prefill (nsys trace a2, 2026-10-26)
+    static const bool prompt_swaps = getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS") != nullptr && atoi(getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS")) != 0;
+    if (prompt && !prompt_swaps) {
+        d.prompt_pending = true;
+        return;
+    }
+    const size_t budget = prompt || d.prompt_pending ? (size_t) EC_MAX_SWAPS : (size_t) std::max(0, n_swaps_max);
+    d.prompt_pending = false;
     if (swaps.size() > budget) {
         std::partial_sort(swaps.begin(), swaps.begin() + budget, swaps.end(), [](const swap & a, const swap & b) { return a.gain > b.gain; });
         swaps.resize(budget);

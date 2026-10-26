@@ -1551,6 +1551,14 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * mmid16_cache_src1 = nullptr;
     const void *        mmid16_cache_data = nullptr;
     int64_t             mmid16_cache_key  = -1;
+    // the same for the prompt GEMM (activations in the expert-sorted slot order, so the ids are part of the key):
+    // gate and up convert the same src1 with the same ids, down has its own
+    char *              mmid16_pcache_mem  = nullptr;
+    size_t              mmid16_pcache_cap  = 0;
+    const ggml_tensor * mmid16_pcache_src1 = nullptr;
+    const void *        mmid16_pcache_data = nullptr;
+    const void *        mmid16_pcache_ids  = nullptr;
+    int64_t             mmid16_pcache_key  = -1;
 
     // sm_60 fused engine (fn-engine.cuh): the fp16 activations of the vectors that mat-vecs read, by tensor. The keys
     // are tensor pointers, so they are cleared at the top of every graph compute (of every window when the graph is
@@ -1679,9 +1687,13 @@ struct ggml_backend_cuda_context {
     }
 
     void mmid16_cache_clear() {
-        mmid16_cache_src1 = nullptr;
-        mmid16_cache_data = nullptr;
-        mmid16_cache_key  = -1;
+        mmid16_cache_src1  = nullptr;
+        mmid16_cache_data  = nullptr;
+        mmid16_cache_key   = -1;
+        mmid16_pcache_src1 = nullptr;
+        mmid16_pcache_data = nullptr;
+        mmid16_pcache_ids  = nullptr;
+        mmid16_pcache_key  = -1;
     }
     void mmid16_cache_free() {
         if (mmid16_cache_mem != nullptr) {
@@ -1689,6 +1701,11 @@ struct ggml_backend_cuda_context {
             mmid16_cache_mem = nullptr;
         }
         mmid16_cache_cap = 0;
+        if (mmid16_pcache_mem != nullptr) {
+            cudaFree(mmid16_pcache_mem);
+            mmid16_pcache_mem = nullptr;
+        }
+        mmid16_pcache_cap = 0;
         mmid16_cache_clear();
     }
 

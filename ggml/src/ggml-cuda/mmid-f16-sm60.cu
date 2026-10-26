@@ -495,7 +495,7 @@ static void mmid16_gemm_setup(
     if (n_cold > 0 && skip_cold) {
         w_cold = nullptr; // the GEMM skips the cold experts' tiles
     } else if (n_cold > 0 && cold_vram != nullptr) {
-        w_cold = cold_vram;
+        w_cold = cold_vram; // staged by the caller (the prefetch below hands a buffer per launch: MMID16_COLD_BY_LAUNCH)
     } else if (n_cold > 0) {
         GGML_ASSERT(src0->nb[2] % 16 == 0);
         const int64_t n16 = src0->nb[2]/16;
@@ -548,6 +548,9 @@ static void mmid16_gemm_setup(
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// a non-null cold_vram for mmid16_gemm_setup that means "the launches bring their own staged cold experts"
+#define MMID16_COLD_BY_LAUNCH ((const char *) 1)
 
 // the tiles of experts [e_lo, e_hi); cold expert e is read at w_cold + (e - cold_base)*nb02
 static void mmid16_gemm_launch(
@@ -847,7 +850,9 @@ bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
     cudaStream_t stream = ctx.stream();
     mmid16_gemm_plan p(ctx);
-    mmid16_gemm_setup(ctx, p, dst->src[0], dst->src[1], dst->src[2], dst, /*skip_cold =*/ false, /*cold_vram =*/ nullptr);
+    // the cold experts come from the prefetched piece buffers: the setup must not stage them again (it did in qp1-qp3:
+    // a second copy of every op's cold experts through UVA loads, +22% prefill time and +228 MiB of pool)
+    mmid16_gemm_setup(ctx, p, dst->src[0], dst->src[1], dst->src[2], dst, /*skip_cold =*/ false, MMID16_COLD_BY_LAUNCH);
     for (; pf.pnext < s_end; pf.pnext++) {
         const int s = pf.pnext;
         const int b = s % 2;

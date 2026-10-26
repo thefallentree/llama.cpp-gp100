@@ -994,44 +994,74 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
-    // which is the lightning indexer with every head weight set to that scale
-    ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    cb(score, "indexer_score", il);
-
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-    ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
-    cb(top_k, "indexer_top_k", il);
+    const int64_t n_kv       = inp_kpool->n_kv;
 
-    // the top blocks' member cells, from the device's member table (as floats: exact up to 2^24), then the
-    // incomplete tail with n_kv for missing cells
-    ggml_tensor * idx_f = ggml_get_rows(ctx0, kpool_cache.member_rows(n_pool),
-            ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens)); // [kpool, n_top_pool*n_tokens]
-    idx_f = ggml_reshape_2d(ctx0, idx_f, kpool*n_top_pool, n_tokens);
-    ggml_tensor * tail_f = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
-    idx_f = ggml_concat(ctx0, idx_f, tail_f, 0);
-    const int64_t n_sel = idx_f->ne[0];
-    GGML_ASSERT(n_sel == inp_kpool->n_sel);
+    // The score matrix is [n_pool, n_tokens] F32 (210 MiB per 1024 tokens at a 204800 context, on every device: the
+    // selection is mirrored), the biggest tensor of a prompt ubatch. LLAMA_QSA_SEL_CHUNK=n scores and selects n
+    // tokens at a time (the chunks' scores share one allocation), the selection is the same; 0 = all at once.
+    static const int64_t sel_chunk = [] {
+        const char * e = getenv("LLAMA_QSA_SEL_CHUNK");
+        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : 0;
+    }();
+    const int64_t nt_chunk = sel_chunk > 0 ? std::min<int64_t>(sel_chunk, n_tokens) : n_tokens;
 
-    ggml_build_forward_expand(gf, idx_f);
+    // the incomplete tail's cells, with n_kv for missing cells; a tail cell is live unless it is the n_kv sentinel
+    ggml_tensor * tail_f_all   = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32); // [kpool - 1, n_tokens]
+    ggml_tensor * live_tail_all = ggml_clamp(ctx0, ggml_scale_bias(ctx0, tail_f_all, -1.0f, (float) n_kv), 0.0f, 1.0f);
 
-    // the attention skips the cells at or beyond n_kv: send every dead slot there, idx = n_kv + live*(idx - n_kv).
-    // the missing tail cells carry the n_kv sentinel, but top_k fills a short selection with invisible pools
-    // (padded slots among them): a picked pool is live when visible, that is when its rectified score is not
-    // -inf (a visible score is a sum >= 0)
-    const int64_t n_kv = inp_kpool->n_kv;
+    ggml_tensor * idx_all = nullptr; // [n_sel, n_tokens] F32, the chunks concatenated
 
-    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
-    ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
-    live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
-    // a tail cell is live unless it is the n_kv sentinel
-    ggml_tensor * live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, tail_f, -1.0f, (float) n_kv), 0.0f, 1.0f);
-    ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += nt_chunk) {
+        const int64_t nt    = std::min<int64_t>(nt_chunk, n_tokens - t0);
+        const bool    whole = nt == n_tokens;
 
-    idx_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, idx_f, 1.0f, (float) -n_kv), live), 1.0f, (float) n_kv);
-    ggml_tensor * sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+        // token slices of contiguous tensors are contiguous views
+        ggml_tensor * q_c    = whole ? q : ggml_view_3d(ctx0, q, idx_dim, n_idx_h, nt, q->nb[1], q->nb[2], t0*q->nb[2]);
+        ggml_tensor * mask_c = whole ? inp_kpool->pool_mask :
+            ggml_view_2d(ctx0, inp_kpool->pool_mask, n_pool, nt, inp_kpool->pool_mask->nb[1], t0*inp_kpool->pool_mask->nb[1]);
+        ggml_tensor * tail_f = whole ? tail_f_all :
+            ggml_view_2d(ctx0, tail_f_all, kpool - 1, nt, tail_f_all->nb[1], t0*tail_f_all->nb[1]);
+        ggml_tensor * live_tail = whole ? live_tail_all :
+            ggml_view_2d(ctx0, live_tail_all, kpool - 1, nt, live_tail_all->nb[1], t0*live_tail_all->nb[1]);
+
+        // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
+        // which is the lightning indexer with every head weight set to that scale
+        ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, nt), 1.0f/sqrtf((float) idx_dim));
+        ggml_tensor * score = ggml_lightning_indexer(ctx0, q_c, pooled, weights, mask_c); // [n_pool, nt]
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        cb(score, "indexer_score", il);
+
+        ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, nt], unordered
+        cb(top_k, "indexer_top_k", il);
+
+        // the top blocks' member cells, from the device's member table (as floats: exact up to 2^24), then the
+        // incomplete tail with n_kv for missing cells
+        ggml_tensor * idx_f = ggml_get_rows(ctx0, kpool_cache.member_rows(n_pool),
+                ggml_reshape_1d(ctx0, top_k, n_top_pool*nt)); // [kpool, n_top_pool*nt]
+        idx_f = ggml_reshape_2d(ctx0, idx_f, kpool*n_top_pool, nt);
+        idx_f = ggml_concat(ctx0, idx_f, tail_f, 0);
+        GGML_ASSERT(idx_f->ne[0] == inp_kpool->n_sel);
+
+        ggml_build_forward_expand(gf, idx_f);
+
+        // the attention skips the cells at or beyond n_kv: send every dead slot there, idx = n_kv + live*(idx - n_kv).
+        // the missing tail cells carry the n_kv sentinel, but top_k fills a short selection with invisible pools
+        // (padded slots among them): a picked pool is live when visible, that is when its rectified score is not
+        // -inf (a visible score is a sum >= 0)
+        ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, nt), top_k); // [1, n_top_pool, nt]
+        ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
+        live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, nt, 1), kpool*n_top_pool, nt);
+        ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, nt]
+
+        idx_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, idx_f, 1.0f, (float) -n_kv), live), 1.0f, (float) n_kv);
+        ggml_build_forward_expand(gf, idx_f);
+        idx_all = idx_all == nullptr ? idx_f : ggml_concat(ctx0, idx_all, idx_f, 1);
+    }
+    const int64_t n_sel = idx_all->ne[0];
+    GGML_ASSERT(n_sel == inp_kpool->n_sel && idx_all->ne[1] == n_tokens);
+
+    ggml_tensor * sel_idx = ggml_cast(ctx0, idx_all, GGML_TYPE_I32);
     cb(sel_idx, "indexer_sel", il);
 
     return sel_idx;

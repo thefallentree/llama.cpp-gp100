@@ -676,16 +676,25 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     idx_w = ggml_scale(ctx0, idx_w, 1.0f/sqrtf(float(n_idx_head_dim*n_idx_head)));
     cb(idx_w, "idx_weights", il);
 
-    ggml_tensor * idx_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
-
     const int64_t n_comp = inp_comp.kq_mask->ne[0];
     GGML_ASSERT(n_comp > 0);
-    GGML_ASSERT(n_comp <= idx_k->ne[2]);
 
-    idx_k = ggml_view_4d(ctx0, idx_k,
-            idx_k->ne[0], idx_k->ne[1], n_comp, idx_k->ne[3],
-            idx_k->nb[1], idx_k->nb[2], idx_k->nb[3], 0);
-    cb(idx_k, "idx_k", il);
+    // one view per key owner, shared by every layer that reads its keys (see idx_k_views)
+    const int idx_owner = hparams.dsv41_index_key_source[il] >= 0 ? hparams.dsv41_index_key_source[il] : il;
+    if (idx_k_views.size() < (size_t) n_layer) {
+        idx_k_views.resize(n_layer, nullptr);
+    }
+    ggml_tensor * idx_k = idx_k_views[idx_owner];
+    if (idx_k == nullptr || idx_k->ne[2] != n_comp) {
+        idx_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
+        GGML_ASSERT(n_comp <= idx_k->ne[2]);
+
+        idx_k = ggml_view_4d(ctx0, idx_k,
+                idx_k->ne[0], idx_k->ne[1], n_comp, idx_k->ne[3],
+                idx_k->nb[1], idx_k->nb[2], idx_k->nb[3], 0);
+        cb(idx_k, "idx_k", idx_owner);
+        idx_k_views[idx_owner] = idx_k;
+    }
 
     const int64_t n_stream = idx_k->ne[3];
     idx_q = ggml_view_4d(ctx0, idx_q,
@@ -932,16 +941,25 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "raw_k", il);
 
-    ggml_tensor * comp_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
-
     const int64_t n_comp = inp_comp.kq_mask->ne[0];
     GGML_ASSERT(n_comp > 0);
-    GGML_ASSERT(n_comp <= comp_k->ne[2]);
 
-    comp_k = ggml_view_4d(ctx0, comp_k,
-            comp_k->ne[0], comp_k->ne[1], n_comp, comp_k->ne[3],
-            comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
-    cb(comp_k, "comp_k", il);
+    // one view per source layer, shared by its readers (see comp_k_views)
+    const int kv_src = hparams.dsv41_kv_source[il] >= 0 ? hparams.dsv41_kv_source[il] : il;
+    if (comp_k_views.size() < (size_t) n_layer) {
+        comp_k_views.resize(n_layer, nullptr);
+    }
+    ggml_tensor * comp_k = comp_k_views[kv_src];
+    if (comp_k == nullptr || comp_k->ne[2] != n_comp) {
+        comp_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+        GGML_ASSERT(n_comp <= comp_k->ne[2]);
+
+        comp_k = ggml_view_4d(ctx0, comp_k,
+                comp_k->ne[0], comp_k->ne[1], n_comp, comp_k->ne[3],
+                comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
+        cb(comp_k, "comp_k", kv_src);
+        comp_k_views[kv_src] = comp_k;
+    }
 
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
     cb(k_all, "k_all", il);

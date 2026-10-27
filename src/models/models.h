@@ -1581,6 +1581,12 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
 
         std::vector<comp_pick> comp_picks; // per layer, set by the index sources
 
+        // the views of a source layer's compressed K and index keys, built once and shared by the layers that read them:
+        // the scheduler copies a view to another device once per view, so a view per reader layer meant one copy of the
+        // whole compressed stream per reader (and per pipeline copy) on a device that does not hold the source
+        mutable std::vector<ggml_tensor *> comp_k_views; // per source layer
+        mutable std::vector<ggml_tensor *> idx_k_views;  // per index key owner
+
         ggml_tensor * build_attention_v41(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,

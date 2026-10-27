@@ -110,6 +110,13 @@ struct ec_device {
 
 static ec_device g_ec[GGML_CUDA_MAX_DEVICES];
 
+// GGML_CUDA_EXPERT_CACHE_MIRROR_WRITE=0: DIAGNOSTICS ONLY, the exchanges leave the host tier's copies stale (wrong results
+// for the experts that move): measures what the second write of an evicted slice costs
+static bool ec_mirror_writes() {
+    static const bool on = getenv("GGML_CUDA_EXPERT_CACHE_MIRROR_WRITE") == nullptr || atoi(getenv("GGML_CUDA_EXPERT_CACHE_MIRROR_WRITE")) != 0;
+    return on;
+}
+
 static bool ec_enabled() {
     static const bool enabled = getenv("GGML_CUDA_EXPERT_CACHE") == nullptr || atoi(getenv("GGML_CUDA_EXPERT_CACHE")) != 0;
     return enabled;
@@ -665,7 +672,7 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
         for (int k = 0; k < 3; ++k) {
             d.jobs_host[3*n_taken + k] = { (uint4 *) (l.hot[k] + (size_t) v*l.nb2[k]), (uint4 *) (l.cold[k] + (size_t) h*l.nb2[k]),
                                            (uint4 *) (l.hot[k] + (size_t) v_to*l.nb2[k]), (uint4 *) (l.cold[k] + (size_t) h_to*l.nb2[k]),
-                                           l.mir[k] != nullptr ? (uint4 *) (l.mir[k] + (size_t) h_to*l.nb2[k]) : nullptr,
+                                           l.mir[k] != nullptr && ec_mirror_writes() ? (uint4 *) (l.mir[k] + (size_t) h_to*l.nb2[k]) : nullptr,
                                            (uint32_t) (l.nb2[k]/16), 0 };
         }
         l.perm[s.e_in]  = v_to;
@@ -687,7 +694,9 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
         patches = (ec_patch *) (d.jobs_host + n_jobs);
     }
     CUDA_CHECK(cudaMemcpyAsync(d.jobs_dev, d.jobs_host, n_jobs*sizeof(ec_job) + n_taken*sizeof(ec_patch), cudaMemcpyHostToDevice, xs));
-    ec_swap<<<std::min(n_jobs, EC_SWAP_GRID), EC_SWAP_TPB, 0, xs>>>(d.jobs_dev, n_jobs);
+    // GGML_CUDA_EC_SWAP_GRID: blocks of the exchange kernel (diagnostics: it runs beside the draft window)
+    static const int swap_grid = getenv("GGML_CUDA_EC_SWAP_GRID") != nullptr ? std::max(1, atoi(getenv("GGML_CUDA_EC_SWAP_GRID"))) : EC_SWAP_GRID;
+    ec_swap<<<std::min(n_jobs, swap_grid), EC_SWAP_TPB, 0, xs>>>(d.jobs_dev, n_jobs);
     CUDA_CHECK(cudaGetLastError());
     ec_patch_perm<<<(n_taken + 63)/64, 64, 0, xs>>>((const ec_patch *) (d.jobs_dev + n_jobs), n_taken, d.perm_dev);
     CUDA_CHECK(cudaGetLastError());

@@ -445,8 +445,14 @@ ggml_backend_buffer_type_t ggml_backend_meta_device_host_split_buffer_type(ggml_
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
     simple_bufts.reserve(n_devs);
     for (size_t i = 0; i < n_devs; i++) {
-        // the host buffer types of the devices may differ in their NUMA node (GGML_CUDA_MOE_HOST_NUMA_POOLS) but not in kind
-        ggml_backend_buffer_type_t simple_host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i));
+        // the host buffer types of the devices may differ in their NUMA node (GGML_CUDA_MOE_HOST_NUMA_POOLS) but not in kind;
+        // a backend may keep the slices (the cold experts) on another node than its other host buffers
+        ggml_backend_dev_t         simple_dev = ggml_backend_meta_dev_simple_dev(dev, i);
+        ggml_backend_reg_t         simple_reg = ggml_backend_dev_backend_reg(simple_dev);
+        typedef ggml_backend_buffer_type_t (*cold_host_buft_t)(ggml_backend_dev_t);
+        cold_host_buft_t           cold_fn    = simple_reg != nullptr ?
+            (cold_host_buft_t) ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_dev_cold_host_buffer_type") : nullptr;
+        ggml_backend_buffer_type_t simple_host_buft = cold_fn != nullptr ? cold_fn(simple_dev) : ggml_backend_dev_host_buffer_type(simple_dev);
         if (simple_host_buft == nullptr || strcmp(ggml_backend_buft_name(simple_host_buft), ggml_backend_buft_name(host_buft)) != 0) {
             return nullptr;
         }

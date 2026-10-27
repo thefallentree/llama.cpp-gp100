@@ -8262,7 +8262,27 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type_node(int no
     return &types[node];
 }
 
+// GGML_CUDA_MOE_HOST_NUMA_POOLS=1 places a device's cold experts on its pool's NUMA node. Its other host buffers (the
+// context's outputs, the CPU compute buffers, the staging of uploads) stay next to the GPUs (GGML_CUDA_HOST_NUMA): on
+// the node of a pool on the other socket the draft context's output reads took 0.8 ms instead of 16 us and the gap
+// between two target windows doubled (Q262 z19). GGML_CUDA_MOE_HOST_NUMA_COLD_ONLY=0: every host buffer of the device
+// on its pool's node, as before.
+static bool ggml_cuda_host_numa_cold_only() {
+    static const bool on = getenv("GGML_CUDA_MOE_HOST_NUMA_COLD_ONLY") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_NUMA_COLD_ONLY")) != 0;
+    return on;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+    const int node = ggml_cuda_host_numa_node_of_device(ctx->device);
+    if (node >= 0 && node != 7 && ggml_cuda_host_numa_cold_only()) {
+        return ggml_backend_cuda_host_buffer_type();
+    }
+    return node >= 0 ? ggml_backend_cuda_host_buffer_type_node(node) : ggml_backend_cuda_host_buffer_type();
+}
+
+// the host buffer type of a device's cold experts (ggml_backend_meta_device_host_split_buffer_type asks for it)
+static ggml_backend_buffer_type_t ggml_backend_cuda_device_cold_host_buffer_type(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     const int node = ggml_cuda_host_numa_node_of_device(ctx->device);
     return node >= 0 ? ggml_backend_cuda_host_buffer_type_node(node) : ggml_backend_cuda_host_buffer_type();
@@ -9341,6 +9361,9 @@ static void ggml_backend_cuda_comm_window_free(void * comm_ctx_v, void * window_
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_cold_host_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_device_cold_host_buffer_type;
+    }
     if (strcmp(name, "ggml_backend_comm_allreduce_epilogue_match") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_epilogue_match;
     }

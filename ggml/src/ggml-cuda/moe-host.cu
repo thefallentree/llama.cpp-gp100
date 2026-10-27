@@ -849,8 +849,10 @@ bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     const int32_t * perm   = nullptr;
     uint32_t *      counts = nullptr;
     ggml_cuda_expert_cache_take(ctx, node, &perm, &counts);
-    // GGML_CUDA_FN_MOE_GROUPS=0: fn_moe_up reads an expert once per pair, as before
-    static const bool use_groups = getenv("GGML_CUDA_FN_MOE_GROUPS") == nullptr || atoi(getenv("GGML_CUDA_FN_MOE_GROUPS")) != 0;
+    // GGML_CUDA_FN_MOE_GROUPS=1: fn_moe_up_g reads an expert once for two tokens (opt-in: -4.5 us of the hot experts per
+    // layer, but the layer waits for the host tier anyway, and the attention segments of the window measured 4-7 us
+    // longer with it on, consistently - the larger kernel's code is the suspect)
+    static const bool use_groups = getenv("GGML_CUDA_FN_MOE_GROUPS") != nullptr && atoi(getenv("GGML_CUDA_FN_MOE_GROUPS")) != 0;
     uint32_t * groups = use_groups && n_tokens*n_used <= WARP_SIZE ? ctx.moe_host_dstate + MH_DSTATE_PAIR + ctx.moe_host_mb->cap_pairs : nullptr;
     ctx.fn_moe_groups = groups;
     mh_route<<<1 + MH_ROUTE_QBLOCKS, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(

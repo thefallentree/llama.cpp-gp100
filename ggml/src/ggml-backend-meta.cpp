@@ -3437,8 +3437,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
     if (win != nullptr) {
         static const bool capture_first = getenv("GGML_META_WINDOW_CAPTURE_FIRST") == nullptr || atoi(getenv("GGML_META_WINDOW_CAPTURE_FIRST")) != 0;
-        window_capture = win->n_compute >= 1 || (capture_first &&
-            std::find(backend_ctx->window_shapes.begin(), backend_ctx->window_shapes.end(), window_shape) != backend_ctx->window_shapes.end());
+        // GGML_META_WINDOW_NOCAPTURE=1 (profiling): the windows run as submitted every time, so a plain kernel trace sees
+        // the same kernels (window-mode AllReduces and their epilogues) that a captured window replays
+        static const bool no_capture = getenv("GGML_META_WINDOW_NOCAPTURE") != nullptr && atoi(getenv("GGML_META_WINDOW_NOCAPTURE")) != 0;
+        window_capture = !no_capture && (win->n_compute >= 1 || (capture_first &&
+            std::find(backend_ctx->window_shapes.begin(), backend_ctx->window_shapes.end(), window_shape) != backend_ctx->window_shapes.end()));
         backend_ctx->comm_window_begin(backend_ctx->comm_ctx, window_capture);
     }
 

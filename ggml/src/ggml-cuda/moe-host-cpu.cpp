@@ -176,6 +176,45 @@ static void dot2_avx512(const q2_block * w0, const q2_block * w1, const act_bloc
     *s1 = _mm512_reduce_add_ps(acc1) - c1;
 }
 
+// Four weight rows against one activation (the down projection's rows of n_ff = 320 are five blocks: two rows per call
+// spent a quarter of the time in the call and its two horizontal sums): the activation loads are shared and the four
+// sums reduced together. The sums are those of dot2_avx512 up to the order of the last additions (~1e-5 relative).
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,f16c,fma")))
+static void dot4_avx512(const q2_block * w0, const q2_block * w1, const q2_block * w2, const q2_block * w3, const act_block * a,
+                        int nb, float * out) {
+    const __m512i shifts = _mm512_set_epi64(6, 6, 4, 4, 2, 2, 0, 0);
+    const __m512i m3     = _mm512_set1_epi8(3);
+    const __m512i ones   = _mm512_set1_epi16(1);
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
+    __m128 cs = _mm_setzero_ps();
+    for (int b = 0; b < nb; ++b) {
+        const __m512i y  = _mm512_loadu_si512((const void *) a[b].q);
+        const __m512  s  = _mm512_loadu_ps(a[b].s);
+        const __m128  dd = _mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, (short) w3[b].d, (short) w2[b].d, (short) w1[b].d, (short) w0[b].d));
+        cs = _mm_fmadd_ps(dd, _mm_set1_ps(a[b].corr), cs);
+        const __m512i q0 = _mm512_and_si512(_mm512_srlv_epi64(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) w0[b].qs)), shifts), m3);
+        const __m512i q1 = _mm512_and_si512(_mm512_srlv_epi64(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) w1[b].qs)), shifts), m3);
+        const __m512i q2 = _mm512_and_si512(_mm512_srlv_epi64(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) w2[b].qs)), shifts), m3);
+        const __m512i q3 = _mm512_and_si512(_mm512_srlv_epi64(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) w3[b].qs)), shifts), m3);
+        const __m512  f0 = _mm512_cvtepi32_ps(_mm512_madd_epi16(_mm512_maddubs_epi16(q0, y), ones));
+        const __m512  f1 = _mm512_cvtepi32_ps(_mm512_madd_epi16(_mm512_maddubs_epi16(q1, y), ones));
+        const __m512  f2 = _mm512_cvtepi32_ps(_mm512_madd_epi16(_mm512_maddubs_epi16(q2, y), ones));
+        const __m512  f3 = _mm512_cvtepi32_ps(_mm512_madd_epi16(_mm512_maddubs_epi16(q3, y), ones));
+        const __m512  dz = _mm512_castps128_ps512(dd);
+        acc0 = _mm512_fmadd_ps(f0, _mm512_mul_ps(s, _mm512_permutexvar_ps(_mm512_set1_epi32(0), dz)), acc0);
+        acc1 = _mm512_fmadd_ps(f1, _mm512_mul_ps(s, _mm512_permutexvar_ps(_mm512_set1_epi32(1), dz)), acc1);
+        acc2 = _mm512_fmadd_ps(f2, _mm512_mul_ps(s, _mm512_permutexvar_ps(_mm512_set1_epi32(2), dz)), acc2);
+        acc3 = _mm512_fmadd_ps(f3, _mm512_mul_ps(s, _mm512_permutexvar_ps(_mm512_set1_epi32(3), dz)), acc3);
+    }
+    // 512 -> 256 halves added, then a 4-way hadd tree (a macro: a lambda would not inherit the target attribute)
+#define MH_HALF(v) _mm256_add_ps(_mm512_castps512_ps256(v), _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(v), 1)))
+    const __m256 ab   = _mm256_hadd_ps(MH_HALF(acc0), MH_HALF(acc1));
+    const __m256 cd   = _mm256_hadd_ps(MH_HALF(acc2), MH_HALF(acc3));
+#undef MH_HALF
+    const __m256 abcd = _mm256_hadd_ps(ab, cd);
+    _mm_storeu_ps(out, _mm_sub_ps(_mm_add_ps(_mm256_castps256_ps128(abcd), _mm256_extractf128_ps(abcd, 1)), cs));
+}
+
 __attribute__((target("avx2,f16c,fma")))
 static void dot2_avx2(const q2_block * w0, const q2_block * w1, const act_block * a, int nb, float * s0, float * s1) {
     // lanes 0,1 of the 512-bit layout in the low ymm, lanes 2,3 in the high one
@@ -1068,6 +1107,7 @@ static void keep_warm_avx2() {
 #endif
 
 typedef void (*dot2_fn)(const q2_block *, const q2_block *, const act_block *, int, float *, float *);
+typedef void (*dot4_fn)(const q2_block *, const q2_block *, const q2_block *, const q2_block *, const act_block *, int, float *);
 typedef void (*quant_fn)(const float *, int, act_block *);
 typedef void (*kfrom_fn)(const act_block *, int, kact_block *);
 typedef void (*kquant_fn)(const float *, kact_block &);
@@ -1247,6 +1287,7 @@ struct pool {
     int          n_threads = 0;
     int          id        = 0;
     dot2_fn      dot2  = nullptr;
+    dot4_fn      dot4  = nullptr;   // the down projection's rows four at a time (AVX-512), or null
     quant_fn     quant = nullptr;
     dot2k_fn     dot2k  = nullptr;   // Q2_K cold experts (natural-order activations)
     dot2k_fn     dot2k3 = nullptr;   // Q3_K cold experts (the down of deepseek41's Q2_K files)
@@ -1440,6 +1481,20 @@ struct pool {
             }
             MH_TR({ const int64_t t = tns(); T.wait += t - t_prev; t_prev = t; })
             const int * gp = pair_of.data() + g.first;
+            if (s.wtype == 0 && dot4 != nullptr && ch3 % 4 == 0) {
+                for (int r = r0; r < r0 + ch3; r += 4) {
+                    const q2_block * w0 = (const q2_block *) (down + (size_t) (r + 0)*s.down_nb1);
+                    const q2_block * w1 = (const q2_block *) (down + (size_t) (r + 1)*s.down_nb1);
+                    const q2_block * w2 = (const q2_block *) (down + (size_t) (r + 2)*s.down_nb1);
+                    const q2_block * w3 = (const q2_block *) (down + (size_t) (r + 3)*s.down_nb1);
+                    for (int i = 0; i < g.n; ++i) {
+                        const int p = gp[i];
+                        dot4(w0, w1, w2, w3, hq.data() + (size_t) p*nb_f, nb_f, jy + (size_t) p*s.n_embd + r);
+                    }
+                }
+                MH_TR({ const int64_t t = tns(); T.p3 += t - t_prev; t_prev = t; })
+                continue;
+            }
             for (int r = r0; r < r0 + ch3; r += 2) {
                 const q2_block * w0 = (const q2_block *) (down + (size_t) (r + 0)*s.down_nb1);
                 const q2_block * w1 = (const q2_block *) (down + (size_t) (r + 1)*s.down_nb1);
@@ -1876,6 +1931,12 @@ struct pool {
     void start(const int pool_id, const int n_pools) {
         id = pool_id;
         pick_kernels(dot2, quant, dot2k, dot2k3, quantn, isa);
+#if MH_X86
+        // GGML_CUDA_MOE_HOST_DOT4=0: the down rows two at a time as before
+        if (dot2 == dot2_avx512 && (getenv("GGML_CUDA_MOE_HOST_DOT4") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_DOT4")) != 0)) {
+            dot4 = dot4_avx512;
+        }
+#endif
         stat_every = getenv("GGML_CUDA_MOE_HOST_STATS") ? atoll(getenv("GGML_CUDA_MOE_HOST_STATS")) : 0;
         const char * env = getenv("GGML_CUDA_MOE_HOST_THREADS");
         const int hw = (int) std::thread::hardware_concurrency();

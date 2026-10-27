@@ -912,6 +912,13 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
     return kpool_cur().n_new_g;
 }
 
+bool llama_memory_hybrid_idx_context::graph_is_large() const {
+    // a decode ubatch re-pools at most n_tokens/kpool + 1 pools; after a restore (cache-ram, state load) the first
+    // ubatch re-pools every pool: 255K cells gather 125 MiB of f32 rows, 160 MiB of compute buffer in all
+    static const uint32_t n_max = getenv("LLAMA_KPOOL_NEW_SLOT_MAX") != nullptr ? (uint32_t) atoi(getenv("LLAMA_KPOOL_NEW_SLOT_MAX")) : 64;
+    return kpool_st != nullptr && i_kpool == i_cur && kpool_st->n_new_g > n_max;
+}
+
 int32_t llama_memory_hybrid_idx_context::kpool_cells_layer() const {
     GGML_ASSERT(mem != nullptr);
     return mem->kpool_cells_layer();

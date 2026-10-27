@@ -620,6 +620,89 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     }
 }
 
+// GGML_GALLOCR_DUMP_MB support: the tensors live in each buffer, and their totals by name stem (layer numbers removed)
+// at the moment the buffer's high-water mark was last raised, i.e. what the buffer's size is made of
+#define GALLOCR_DUMP_BUFS  8
+#define GALLOCR_DUMP_STEMS 24
+struct gallocr_dump_stem { char name[48]; size_t bytes; int count; };
+static struct {
+    int on;                                                        // -1 unknown, 0 off, 1 on
+    double mb;
+    const struct ggml_tensor ** live[GALLOCR_DUMP_BUFS];
+    size_t                    * live_size[GALLOCR_DUMP_BUFS];
+    int n_live[GALLOCR_DUMP_BUFS], cap_live[GALLOCR_DUMP_BUFS];
+    size_t peak[GALLOCR_DUMP_BUFS];
+    struct gallocr_dump_stem stems[GALLOCR_DUMP_BUFS][GALLOCR_DUMP_STEMS];
+    int n_stems[GALLOCR_DUMP_BUFS];
+} g_gdump = { .on = -1 };
+
+static bool gallocr_dump_on(void) {
+    if (g_gdump.on < 0) {
+        const char * env = getenv("GGML_GALLOCR_DUMP_MB");
+        g_gdump.mb = env != NULL ? atof(env) : 0.0;
+        g_gdump.on = g_gdump.mb > 0.0 ? 1 : 0;
+    }
+    return g_gdump.on == 1;
+}
+
+static void gallocr_dump_stem_of(const char * name, char * out, size_t n) {
+    size_t j = 0;
+    for (const char * c = name; *c && j + 1 < n; ++c) {
+        if (*c >= '0' && *c <= '9') {
+            if (j == 0 || out[j-1] != '#') { out[j++] = '#'; }
+        } else {
+            out[j++] = *c;
+        }
+    }
+    out[j] = 0;
+}
+
+static void gallocr_dump_reset(void) {
+    for (int b = 0; b < GALLOCR_DUMP_BUFS; ++b) { g_gdump.n_live[b] = 0; g_gdump.peak[b] = 0; g_gdump.n_stems[b] = 0; }
+}
+
+static void gallocr_dump_add(int b, const struct ggml_tensor * t, size_t size, size_t chunk_max) {
+    if (b >= GALLOCR_DUMP_BUFS) { return; }
+    if (g_gdump.n_live[b] == g_gdump.cap_live[b]) {
+        g_gdump.cap_live[b] = g_gdump.cap_live[b] ? 2*g_gdump.cap_live[b] : 1024;
+        g_gdump.live[b]      = realloc(g_gdump.live[b],      g_gdump.cap_live[b]*sizeof(*g_gdump.live[b]));
+        g_gdump.live_size[b] = realloc(g_gdump.live_size[b], g_gdump.cap_live[b]*sizeof(*g_gdump.live_size[b]));
+    }
+    g_gdump.live[b][g_gdump.n_live[b]] = t;
+    g_gdump.live_size[b][g_gdump.n_live[b]] = size;
+    g_gdump.n_live[b]++;
+    if (chunk_max <= g_gdump.peak[b]) { return; }
+    g_gdump.peak[b] = chunk_max;
+    // snapshot the live set by stem
+    int ns = 0;
+    struct gallocr_dump_stem * st = g_gdump.stems[b];
+    for (int i = 0; i < g_gdump.n_live[b]; ++i) {
+        char stem[48];
+        gallocr_dump_stem_of(g_gdump.live[b][i]->name, stem, sizeof(stem));
+        int k = 0;
+        for (; k < ns; ++k) { if (strcmp(st[k].name, stem) == 0) { break; } }
+        if (k == ns) {
+            if (ns == GALLOCR_DUMP_STEMS) { k = ns - 1; snprintf(st[k].name, sizeof(st[k].name), "(other)"); }
+            else { snprintf(st[k].name, sizeof(st[k].name), "%s", stem); st[k].bytes = 0; st[k].count = 0; ns++; }
+        }
+        st[k].bytes += g_gdump.live_size[b][i];
+        st[k].count++;
+    }
+    g_gdump.n_stems[b] = ns;
+}
+
+static void gallocr_dump_remove(int b, const struct ggml_tensor * t) {
+    if (b >= GALLOCR_DUMP_BUFS) { return; }
+    for (int i = g_gdump.n_live[b] - 1; i >= 0; --i) {
+        if (g_gdump.live[b][i] == t) {
+            g_gdump.live[b][i] = g_gdump.live[b][g_gdump.n_live[b]-1];
+            g_gdump.live_size[b][i] = g_gdump.live_size[b][g_gdump.n_live[b]-1];
+            g_gdump.n_live[b]--;
+            return;
+        }
+    }
+}
+
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
@@ -685,6 +768,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        if (gallocr_dump_on()) {
+            gallocr_dump_add(buffer_id, node, size, ggml_dyn_tallocr_max_size(alloc, hn->addr.chunk));
+        }
     }
 }
 
@@ -709,6 +795,9 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 
     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;
+    if (gallocr_dump_on()) {
+        gallocr_dump_remove(buffer_id, node);
+    }
 }
 
 static int get_node_buffer_id(const int * node_buffer_ids, int i) {
@@ -825,41 +914,19 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 // GGML_GALLOCR_DUMP_MB=X: when a compute buffer of at least X MiB is (re)allocated, print its size and the largest
 // tensors placed in it (the peak is not their sum, the allocator reuses memory, but it names what fills the buffer)
 static void ggml_gallocr_dump_large(ggml_gallocr_t galloc, struct ggml_cgraph * graph, int buffer_id, size_t new_size) {
-    static double dump_mb = -1.0;
-    if (dump_mb < 0.0) {
-        const char * env = getenv("GGML_GALLOCR_DUMP_MB");
-        dump_mb = env != NULL ? atof(env) : 0.0;
-    }
-    if (dump_mb <= 0.0 || new_size < (size_t) (dump_mb*1024*1024)) {
+    if (!gallocr_dump_on() || new_size < (size_t) (g_gdump.mb*1024*1024) || buffer_id >= GALLOCR_DUMP_BUFS) {
         return;
     }
-    enum { TOP = 12 };
-    struct ggml_tensor * top[TOP] = {0};
-    size_t top_size[TOP] = {0};
-    for (int i = 0; i < graph->n_nodes; i++) {
-        struct ggml_tensor * node = graph->nodes[i];
-        if (node->view_src || node->data) {
-            continue;
-        }
-        struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
-        if (hn->buffer_id != buffer_id) {
-            continue;
-        }
-        const size_t sz = ggml_nbytes(node);
-        for (int k = 0; k < TOP; k++) {
-            if (sz > top_size[k]) {
-                for (int m = TOP - 1; m > k; m--) { top[m] = top[m-1]; top_size[m] = top_size[m-1]; }
-                top[k] = node; top_size[k] = sz;
-                break;
-            }
-        }
-    }
-    GGML_LOG_WARN("%s: %s buffer %.1f MiB for a graph of %d nodes; largest tensors:\n", __func__,
-        ggml_backend_buft_name(galloc->bufts[buffer_id]), new_size/1024.0/1024.0, graph->n_nodes);
-    for (int k = 0; k < TOP && top[k]; k++) {
-        GGML_LOG_WARN("%s:   %8.2f MiB %-14s %-28s [%lld %lld %lld %lld] %s\n", __func__, top_size[k]/1024.0/1024.0,
-            ggml_op_desc(top[k]), top[k]->name, (long long) top[k]->ne[0], (long long) top[k]->ne[1], (long long) top[k]->ne[2],
-            (long long) top[k]->ne[3], ggml_type_name(top[k]->type));
+    GGML_LOG_WARN("%s: %s buffer %.1f MiB for a graph of %d nodes; live at its high-water mark (%.1f MiB), by name:\n", __func__,
+        ggml_backend_buft_name(galloc->bufts[buffer_id]), new_size/1024.0/1024.0, graph->n_nodes, g_gdump.peak[buffer_id]/1024.0/1024.0);
+    struct gallocr_dump_stem * st = g_gdump.stems[buffer_id];
+    const int ns = g_gdump.n_stems[buffer_id];
+    bool printed[GALLOCR_DUMP_STEMS] = {0};
+    for (int r = 0; r < ns && r < 12; ++r) {
+        int best = -1;
+        for (int k = 0; k < ns; ++k) { if (!printed[k] && (best < 0 || st[k].bytes > st[best].bytes)) { best = k; } }
+        printed[best] = true;
+        GGML_LOG_WARN("%s:   %8.2f MiB in %4d x %s\n", __func__, st[best].bytes/1024.0/1024.0, st[best].count, st[best].name);
     }
 }
 
@@ -886,6 +953,9 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     // allocate in hash table
+    if (gallocr_dump_on()) {
+        gallocr_dump_reset();
+    }
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
     // set the node_allocs from the hash table

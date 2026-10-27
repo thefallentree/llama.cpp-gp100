@@ -269,16 +269,41 @@ top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * 
         }
         top_k_fused_grid_sync(bar, (unsigned int) (pass + 1)*nblocks);
         // the row's bins of this pass (through L2: other blocks' atomics), the bin at which the rank is reached
-        hist[tid] = __ldcg(&rw[pass*256 + tid]);
-        __syncthreads();
-        if (tid == 0) {
-            int r   = rank;
-            int bin = 255;
-            while (bin > 0 && hist[bin] < r) {
-                r -= hist[bin--];
+        // the bin from the top at which the count reaches the rank: a block-wide scan of the bins from 255 down
+        // (P[t] = hist[255] + ... + hist[255 - t]); the thread where P crosses the rank writes the bin. It was a
+        // serial loop of thread 0 over up to 256 bins per pass, ~5 us each on GP100.
+        {
+            int v = __ldcg(&rw[pass*256 + (255 - tid)]);
+            const int lane = tid % WARP_SIZE;
+            const int warp = tid / WARP_SIZE;
+#pragma unroll
+            for (int o = 1; o < WARP_SIZE; o <<= 1) {
+                const int u = __shfl_up_sync(0xffffffff, v, o);
+                if (lane >= o) {
+                    v += u;
+                }
             }
-            s_prefix = prefix | ((uint32_t) bin << shift);
-            s_rank   = r;
+            if (lane == WARP_SIZE - 1) {
+                hist[warp] = v; // the warps' totals (hist is free here)
+            }
+            __syncthreads();
+            int off = 0;
+            for (int w = 0; w < warp; ++w) {
+                off += hist[w];
+            }
+            const int incl = v + off;            // P[tid]
+            __syncthreads();
+            hist[tid] = incl;
+            __syncthreads();
+            const int excl = tid > 0 ? hist[tid - 1] : 0; // P[tid - 1]
+            if (incl >= rank && excl < rank) {
+                s_prefix = prefix | ((uint32_t) (255 - tid) << shift);
+                s_rank   = rank - excl;
+            } else if (tid == BS - 1 && incl < rank) {
+                // fewer keys than the rank (not expected): the serial loop stopped at bin 0
+                s_prefix = prefix;
+                s_rank   = rank - hist[BS - 2];
+            }
         }
         __syncthreads();
         prefix = s_prefix;

@@ -1850,6 +1850,13 @@ struct pool {
             }
         }
         chunk1.store(0, std::memory_order_relaxed);
+        // GGML_CUDA_MOE_HOST_DIAG_EMPTY=1: DIAGNOSTICS ONLY (wrong results): the job answers without computing, so the GPU's
+        // collect wait shows the transport latency alone
+        static const bool diag_empty = getenv("GGML_CUDA_MOE_HOST_DIAG_EMPTY") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_DIAG_EMPTY")) != 0;
+        if (diag_empty) {
+            std::atomic_thread_fence(std::memory_order_release);
+            return;
+        }
         job_gen.fetch_add(1, std::memory_order_acq_rel);
         run_work();
         const auto t_work = std::chrono::steady_clock::now();

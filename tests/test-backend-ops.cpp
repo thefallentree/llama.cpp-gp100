@@ -12966,6 +12966,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Qwen3.8-Flash-Next hyper-connection inject (BF16 [10240, 4]: four output rows over a 10240-long row) at the
+    // decode widths: 96 per target step
+    for (int n : {1, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4, n, 10240, {1, 1}, {1, 1}));
+    }
+
     // Sharded output head of a 248k-vocabulary model on two GPUs (124160 rows x 5120) at the
     // speculative verify widths; Q8_0 is the usual head type, Q4_1 the sm_60 FP16 path's type.
     for (int n : {4, 8}) {

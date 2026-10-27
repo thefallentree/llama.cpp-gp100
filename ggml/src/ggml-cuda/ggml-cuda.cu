@@ -1369,11 +1369,70 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Narrow strided copies between a device buffer and pageable host memory (the rows of a tensor split along its first
+// axis under -sm tensor: the K/V cache's state save and restore moves 255K rows of 272 bytes per layer and card) run at
+// a fraction of the bus as cudaMemcpy2D. They go through a pinned bounce buffer instead: one contiguous copy of the
+// device span per chunk, the rows (un)packed on the host. GGML_CUDA_2D_STAGED=0 keeps cudaMemcpy2D.
+static bool ggml_cuda_2d_staged_ok(size_t size, size_t n_copies, size_t stride_tensor, bool to_device) {
+    static const bool on = getenv("GGML_CUDA_2D_STAGED") == nullptr || atoi(getenv("GGML_CUDA_2D_STAGED")) != 0;
+    // the device span holds the rows' gaps too: only for dense spans, and a write must not touch the gaps
+    return on && n_copies >= 64 && size < 65536 && (to_device ? stride_tensor == size : stride_tensor <= 2*size);
+}
+
+static std::mutex ggml_cuda_2d_stage_mutex;
+
+static char * ggml_cuda_2d_stage(size_t & cap) {
+    static char * buf = nullptr;
+    static const size_t n = 64u << 20;
+    if (buf == nullptr) {
+        if (cudaMallocHost((void **) &buf, n) != cudaSuccess) {
+            (void) cudaGetLastError();
+            buf = nullptr;
+            cap = 0;
+            return nullptr;
+        }
+    }
+    cap = n;
+    return buf;
+}
+
+static bool ggml_cuda_2d_staged_copy(char * dev, char * host, size_t size, size_t n_copies, size_t stride_dev, size_t stride_host, bool to_device) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_2d_stage_mutex);
+    size_t cap = 0;
+    char * stage = ggml_cuda_2d_stage(cap);
+    if (stage == nullptr || cap < stride_dev) {
+        return false;
+    }
+    const size_t rows_per_chunk = std::max<size_t>(1, (cap - size) / stride_dev + 1);
+    for (size_t r0 = 0; r0 < n_copies; r0 += rows_per_chunk) {
+        const size_t nr   = std::min(rows_per_chunk, n_copies - r0);
+        const size_t span = (nr - 1)*stride_dev + size;
+        if (to_device) {
+            for (size_t i = 0; i < nr; ++i) {
+                memcpy(stage + i*stride_dev, host + (r0 + i)*stride_host, size);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(dev + r0*stride_dev, stage, span, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(stage, dev + r0*stride_dev, span, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            for (size_t i = 0; i < nr; ++i) {
+                memcpy(host + (r0 + i)*stride_host, stage + i*stride_dev, size);
+            }
+        }
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_2d_staged_ok(size, n_copies, stride_tensor, true) &&
+            ggml_cuda_2d_staged_copy((char *) tensor->data + offset, (char *) data, size, n_copies, stride_tensor, stride_data, true)) {
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1384,6 +1443,10 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_2d_staged_ok(size, n_copies, stride_tensor, false) &&
+            ggml_cuda_2d_staged_copy((char *) tensor->data + offset, (char *) data, size, n_copies, stride_tensor, stride_data, false)) {
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));

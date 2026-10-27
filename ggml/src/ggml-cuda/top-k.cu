@@ -327,7 +327,9 @@ top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * 
 
 static bool top_k_radix_fused_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int nrows, const int k, cudaStream_t stream) {
     static const bool enabled = getenv("GGML_CUDA_TOP_K_FUSED") == nullptr || atoi(getenv("GGML_CUDA_TOP_K_FUSED")) != 0;
-    if (!enabled || nrows < 1 || nrows > 8 || ncols < 32768 || ncols > (1 << 20)) {
+    // GGML_CUDA_TOP_K_FUSED_MIN: the shortest row it takes (the caller decides from which length it is asked)
+    static const int min_cols = getenv("GGML_CUDA_TOP_K_FUSED_MIN") != nullptr ? atoi(getenv("GGML_CUDA_TOP_K_FUSED_MIN")) : 32768;
+    if (!enabled || nrows < 1 || nrows > 8 || ncols < std::max(min_cols, 2048) || ncols > (1 << 20)) {
         return false;
     }
     // every block of the grid must be resident at once for the barrier
@@ -836,6 +838,11 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // GGML_CUDA_TOP_K_GRID columns (32K; 0 never), the one-block-per-row select below it: measured on a P100 for 3
     // rows and k = 512, 64 / 77 us (grid) against 49 / 173 us (one block) at 16K / 64K columns
     static const int64_t grid_min = getenv("GGML_CUDA_TOP_K_GRID") != nullptr ? atoll(getenv("GGML_CUDA_TOP_K_GRID")) : 32768;
+    // the one-launch select from GGML_CUDA_TOP_K_FUSED_MIN columns, also below the grid's threshold
+    if (ncols < grid_min && ncols <= INT_MAX && nrows <= INT_MAX && k > CUDA_TOP_K_MAX_K && k < ncols &&
+            top_k_radix_fused_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
+        return;
+    }
     if (grid_min > 0 && ncols >= grid_min && ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX && k > CUDA_TOP_K_MAX_K && k < ncols) {
         // a few long rows: the same select as one launch (GGML_CUDA_TOP_K_FUSED=0 keeps the dozen launches)
         if (top_k_radix_fused_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {

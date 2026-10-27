@@ -13091,7 +13091,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     // the pools of a qwen4exp decode window at a 4K, a 64K and a 200K context (k = top_k/kpool)
-    for (auto cols : {1024, 16384, 65536}) {
+    for (auto cols : {1024, 4096, 8192, 16384, 32768, 65536}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 3, 1, 1}, 512));
     }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)

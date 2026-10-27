@@ -2157,16 +2157,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            // accept() reads row min(n_accepted, rows - 1) with n_accepted <= n_max: of a prompt batch (3072 rows of 40 KB)
+            // only the first few rows can ever be read, the last one goes to pending_h directly
+            const int32_t n_keep = std::min<int32_t>(n_rows, 16);
+            verify_h_rows[seq_id] = n_keep;
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
+            for (int32_t i = 0; i < n_keep; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
         }
         if (timing) { t_phase_us[3] += ggml_time_us() - t_r0; }
 

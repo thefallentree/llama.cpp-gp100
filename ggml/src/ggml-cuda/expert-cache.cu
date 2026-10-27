@@ -627,6 +627,7 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
             return;
         }
     }
+    const bool   was_pending = d.prompt_pending;
     const size_t budget = prompt || d.prompt_pending ? (size_t) EC_MAX_SWAPS : (size_t) std::max(0, n_swaps_max);
     d.prompt_pending = false;
     if (swaps.size() > budget) {
@@ -641,7 +642,23 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     ec_patch * patches = (ec_patch *) (d.jobs_host + 3*n_swaps);
     // the slots the last exchange freed are free once it is done: it had the round (the join is usually immediate)
     if (ctx.ec_event != nullptr && ctx.ec_pend) {
-        CUDA_CHECK(cudaEventSynchronize(ctx.ec_event));
+        // GGML_CUDA_EXPERT_CACHE_NOWAIT=1: when the last exchange is still running (the bursts after a prompt: up to 4
+        // experts per layer and update, ~130 MB over each GPU's link, longer than a round with the mirror's second write)
+        // this update exchanges nothing instead of blocking the host until it is done; a prompt's pending exchanges stay
+        // pending for the next update
+        static const bool nowait = getenv("GGML_CUDA_EXPERT_CACHE_NOWAIT") != nullptr && atoi(getenv("GGML_CUDA_EXPERT_CACHE_NOWAIT")) != 0;
+        if (nowait) {
+            const cudaError_t q = cudaEventQuery(ctx.ec_event);
+            if (q == cudaErrorNotReady) {
+                (void) cudaGetLastError();
+                d.prompt_pending = was_pending || prompt;
+                FN_PROF_ADD("ec.skip_busy", t_ec2);
+                return;
+            }
+            CUDA_CHECK(q);
+        } else {
+            CUDA_CHECK(cudaEventSynchronize(ctx.ec_event));
+        }
         ctx.ec_pend = false;
         for (ec_layer & l : d.layers) {
             l.free_v.insert(l.free_v.end(), l.pend_v.begin(), l.pend_v.end());

@@ -5338,15 +5338,26 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
     return ctx->state_seq_get_size(seq_id, flags);
 }
 
+// a sequence state above 64 MiB (a long prompt's save or restore) logs its time: the cost of a conversation switch
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
 
-    return ctx->state_seq_get_data(seq_id, dst, size, flags);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_get_data(seq_id, dst, size, flags);
+    if (size > (64u << 20)) {
+        LLAMA_LOG_WARN("%s: seq %d: %.1f MiB saved in %.1f ms\n", __func__, seq_id, n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
+    return n;
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
 
-    return ctx->state_seq_set_data(seq_id, src, size, flags);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_set_data(seq_id, src, size, flags);
+    if (size > (64u << 20)) {
+        LLAMA_LOG_WARN("%s: seq %d: %.1f MiB restored in %.1f ms\n", __func__, seq_id, n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
+    return n;
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

@@ -7355,10 +7355,28 @@ static void ggml_cuda_graph_log_blocker(const int device, const int n_nodes, con
     }
 }
 
+// GGML_CUDA_NODE_TIMING_PRINT_S=S: also print (and reset) the node timing table every S seconds, at the next graph of
+// the device: for processes that never free their backends (the rpc-server)
+static void ggml_cuda_node_time_maybe_print(int device) {
+    static const double every_s = getenv("GGML_CUDA_NODE_TIMING_PRINT_S") != nullptr ? atof(getenv("GGML_CUDA_NODE_TIMING_PRINT_S")) : 0.0;
+    static int64_t last_us[GGML_CUDA_MAX_DEVICES] = {};
+    if (every_s <= 0.0 || !ggml_cuda_node_timing()) {
+        return;
+    }
+    const int64_t now = ggml_time_us();
+    if (last_us[device] == 0) {
+        last_us[device] = now;
+    } else if (now - last_us[device] >= (int64_t) (every_s*1e6)) {
+        ggml_cuda_node_time_print(device);
+        last_us[device] = now;
+    }
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_node_time_maybe_print(cuda_ctx->device);
     ggml_cuda_mem_checkpoint(cuda_ctx->device, "before graph_compute", "");
     ggml_cuda_in_flush(*cuda_ctx);
     FN_PROF_T(t_gc0);

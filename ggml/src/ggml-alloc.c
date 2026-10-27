@@ -822,6 +822,47 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// GGML_GALLOCR_DUMP_MB=X: when a compute buffer of at least X MiB is (re)allocated, print its size and the largest
+// tensors placed in it (the peak is not their sum, the allocator reuses memory, but it names what fills the buffer)
+static void ggml_gallocr_dump_large(ggml_gallocr_t galloc, struct ggml_cgraph * graph, int buffer_id, size_t new_size) {
+    static double dump_mb = -1.0;
+    if (dump_mb < 0.0) {
+        const char * env = getenv("GGML_GALLOCR_DUMP_MB");
+        dump_mb = env != NULL ? atof(env) : 0.0;
+    }
+    if (dump_mb <= 0.0 || new_size < (size_t) (dump_mb*1024*1024)) {
+        return;
+    }
+    enum { TOP = 12 };
+    struct ggml_tensor * top[TOP] = {0};
+    size_t top_size[TOP] = {0};
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->view_src || node->data) {
+            continue;
+        }
+        struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+        if (hn->buffer_id != buffer_id) {
+            continue;
+        }
+        const size_t sz = ggml_nbytes(node);
+        for (int k = 0; k < TOP; k++) {
+            if (sz > top_size[k]) {
+                for (int m = TOP - 1; m > k; m--) { top[m] = top[m-1]; top_size[m] = top_size[m-1]; }
+                top[k] = node; top_size[k] = sz;
+                break;
+            }
+        }
+    }
+    GGML_LOG_WARN("%s: %s buffer %.1f MiB for a graph of %d nodes; largest tensors:\n", __func__,
+        ggml_backend_buft_name(galloc->bufts[buffer_id]), new_size/1024.0/1024.0, graph->n_nodes);
+    for (int k = 0; k < TOP && top[k]; k++) {
+        GGML_LOG_WARN("%s:   %8.2f MiB %-14s %-28s [%lld %lld %lld %lld] %s\n", __func__, top_size[k]/1024.0/1024.0,
+            ggml_op_desc(top[k]), top[k]->name, (long long) top[k]->ne[0], (long long) top[k]->ne[1], (long long) top[k]->ne[2],
+            (long long) top[k]->ne[3], ggml_type_name(top[k]->type));
+    }
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -923,6 +964,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            ggml_gallocr_dump_large(galloc, graph, i, new_size);
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;

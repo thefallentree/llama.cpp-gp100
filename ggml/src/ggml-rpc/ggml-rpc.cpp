@@ -544,6 +544,7 @@ private:
     };
     std::mutex graph_mutex;
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+    std::string      endpoint;
     rpc_msg_queue    queue;
     socket_ptr       sock;
     std::atomic_uint busy_spin_users = 0;
@@ -648,6 +649,7 @@ void rpc_dispatcher::busy_spin_release() {
 }
 
 void rpc_dispatcher::start(const std::string & endpoint) {
+    this->endpoint = endpoint;
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
@@ -669,8 +671,49 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     thread = std::thread(rpc_dispatcher_trampoline, this);
 }
 
+// GGML_RPC_STATS=S: the dispatcher prints, every S seconds in which commands were sent and when it stops, the commands
+// it sent per kind: count, bytes out and in, and the time from sending a command to the end of its response (for a
+// command with a response this includes the server's wait for earlier asynchronous work, e.g. a GET_TENSOR after a
+// GRAPH_COMPUTE: the head's wait on the remote node), plus the time the dispatcher waited for the next command.
+static double rpc_stats_interval_s() {
+    static const double s = std::getenv("GGML_RPC_STATS") != nullptr ? std::atof(std::getenv("GGML_RPC_STATS")) : 0.0;
+    return s;
+}
+
+struct rpc_cmd_stats {
+    struct entry { uint64_t n = 0, bytes_out = 0, bytes_in = 0; double ms = 0.0; };
+    std::array<entry, RPC_CMD_COUNT> e;
+    double idle_ms = 0.0;
+    std::chrono::steady_clock::time_point t_print = std::chrono::steady_clock::now();
+
+    void print(const std::string & endpoint) {
+        double total = 0.0;
+        uint64_t n = 0;
+        for (const auto & x : e) { total += x.ms; n += x.n; }
+        if (n == 0) {
+            return;
+        }
+        const std::chrono::duration<double> span = std::chrono::steady_clock::now() - t_print;
+        GGML_LOG_WARN("rpc-stats %s: %.1f s, %llu commands, %.1f ms in commands, %.1f ms idle\n", endpoint.c_str(), span.count(),
+                      (unsigned long long) n, total, idle_ms);
+        for (int c = 0; c < RPC_CMD_COUNT; ++c) {
+            const auto & x = e[c];
+            if (x.n == 0) {
+                continue;
+            }
+            GGML_LOG_WARN("rpc-stats %s: %-18s n %8llu  out %10.1f MB  in %9.1f MB  %9.1f ms  %8.1f us/cmd\n", endpoint.c_str(),
+                          rpc_cmd_name((rpc_cmd) c), (unsigned long long) x.n, x.bytes_out/1e6, x.bytes_in/1e6, x.ms, 1000.0*x.ms/x.n);
+        }
+        e = {};
+        idle_ms = 0.0;
+        t_print = std::chrono::steady_clock::now();
+    }
+};
+
 void rpc_dispatcher::work() {
     auto last_cmd = std::chrono::steady_clock::now();
+    const double stats_s = rpc_stats_interval_s();
+    std::unique_ptr<rpc_cmd_stats> stats(stats_s > 0.0 ? new rpc_cmd_stats : nullptr);
     while (running) {
         rpc_msg_ptr msg_ptr;
         // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
@@ -700,11 +743,26 @@ void rpc_dispatcher::work() {
                 const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - t0;
                 LOG_DBG3("[%s] %s done in %.3f ms\n", __func__, rpc_cmd_name(msg_ptr->cmd), elapsed.count());
             }
+            if (stats) {
+                const auto t1 = std::chrono::steady_clock::now();
+                auto & x = stats->e[msg_ptr->cmd];
+                x.n++;
+                x.bytes_out += msg_ptr->input_size;
+                x.bytes_in  += msg_ptr->output_size;
+                x.ms        += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                stats->idle_ms += std::chrono::duration<double, std::milli>(t0 - last_cmd).count();
+                if (std::chrono::duration<double>(t1 - stats->t_print).count() >= stats_s) {
+                    stats->print(endpoint);
+                }
+            }
         } else {
             LOG_DBG3("[%s] sync barrier\n", __func__);
         }
         msg_ptr->completion.set_value();
         last_cmd = std::chrono::steady_clock::now();
+    }
+    if (stats) {
+        stats->print(endpoint);
     }
 }
 

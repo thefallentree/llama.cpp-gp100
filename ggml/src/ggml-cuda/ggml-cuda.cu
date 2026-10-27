@@ -1374,9 +1374,12 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 // a fraction of the bus as cudaMemcpy2D. They go through a pinned bounce buffer instead: one contiguous copy of the
 // device span per chunk, the rows (un)packed on the host. GGML_CUDA_2D_STAGED=0 keeps cudaMemcpy2D.
 static bool ggml_cuda_2d_staged_ok(size_t size, size_t n_copies, size_t stride_tensor, bool to_device) {
-    static const bool on = getenv("GGML_CUDA_2D_STAGED") == nullptr || atoi(getenv("GGML_CUDA_2D_STAGED")) != 0;
+    // 1 = reads only (measured, x13: a 128K state's save 3184 -> 1431 ms; its restore 786 -> 1598 ms, so writes keep
+    // cudaMemcpy2D), 2 = reads and writes, 0 = off
+    static const int mode = getenv("GGML_CUDA_2D_STAGED") != nullptr ? atoi(getenv("GGML_CUDA_2D_STAGED")) : 1;
     // the device span holds the rows' gaps too: only for dense spans, and a write must not touch the gaps
-    return on && n_copies >= 64 && size < 65536 && (to_device ? stride_tensor == size : stride_tensor <= 2*size);
+    return (to_device ? mode >= 2 : mode >= 1) && n_copies >= 64 && size <= 2048 &&
+           (to_device ? stride_tensor == size : stride_tensor <= 2*size);
 }
 
 static std::mutex ggml_cuda_2d_stage_mutex;
@@ -1400,26 +1403,57 @@ static bool ggml_cuda_2d_staged_copy(char * dev, char * host, size_t size, size_
     std::lock_guard<std::mutex> lock(ggml_cuda_2d_stage_mutex);
     size_t cap = 0;
     char * stage = ggml_cuda_2d_stage(cap);
-    if (stage == nullptr || cap < stride_dev) {
+    // two halves: the copy of one chunk runs while the host (un)packs the other
+    const size_t half_cap = cap/2;
+    if (stage == nullptr || half_cap < stride_dev + size) {
         return false;
     }
-    const size_t rows_per_chunk = std::max<size_t>(1, (cap - size) / stride_dev + 1);
-    for (size_t r0 = 0; r0 < n_copies; r0 += rows_per_chunk) {
-        const size_t nr   = std::min(rows_per_chunk, n_copies - r0);
-        const size_t span = (nr - 1)*stride_dev + size;
-        if (to_device) {
-            for (size_t i = 0; i < nr; ++i) {
-                memcpy(stage + i*stride_dev, host + (r0 + i)*stride_host, size);
+    // events belong to a device: one pair per device
+    static cudaEvent_t evs[GGML_CUDA_MAX_DEVICES][2] = {};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaEvent_t * ev = evs[device];
+    if (ev[0] == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[0], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[1], cudaEventDisableTiming));
+    }
+    const size_t rows_per_chunk = (half_cap - size) / stride_dev + 1;
+    const size_t n_chunks = (n_copies + rows_per_chunk - 1) / rows_per_chunk;
+    const cudaStream_t st = cudaStreamPerThread;
+    auto span_of = [&](size_t c) { return (std::min(rows_per_chunk, n_copies - c*rows_per_chunk) - 1)*stride_dev + size; };
+    if (to_device) {
+        for (size_t c = 0; c < n_chunks; ++c) {
+            char * buf = stage + (c % 2)*half_cap;
+            if (c >= 2) {
+                CUDA_CHECK(cudaEventSynchronize(ev[c % 2]));
             }
-            CUDA_CHECK(cudaMemcpyAsync(dev + r0*stride_dev, stage, span, cudaMemcpyHostToDevice, cudaStreamPerThread));
-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-        } else {
-            CUDA_CHECK(cudaMemcpyAsync(stage, dev + r0*stride_dev, span, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            const size_t r0 = c*rows_per_chunk;
+            const size_t nr = std::min(rows_per_chunk, n_copies - r0);
             for (size_t i = 0; i < nr; ++i) {
-                memcpy(host + (r0 + i)*stride_host, stage + i*stride_dev, size);
+                memcpy(buf + i*stride_dev, host + (r0 + i)*stride_host, size);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(dev + r0*stride_dev, buf, span_of(c), cudaMemcpyHostToDevice, st));
+            CUDA_CHECK(cudaEventRecord(ev[c % 2], st));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(st));
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(stage, dev, span_of(0), cudaMemcpyDeviceToHost, st));
+        CUDA_CHECK(cudaEventRecord(ev[0], st));
+        for (size_t c = 0; c < n_chunks; ++c) {
+            if (c + 1 < n_chunks) {
+                CUDA_CHECK(cudaMemcpyAsync(stage + ((c + 1) % 2)*half_cap, dev + (c + 1)*rows_per_chunk*stride_dev, span_of(c + 1),
+                    cudaMemcpyDeviceToHost, st));
+                CUDA_CHECK(cudaEventRecord(ev[(c + 1) % 2], st));
+            }
+            CUDA_CHECK(cudaEventSynchronize(ev[c % 2]));
+            const char * buf = stage + (c % 2)*half_cap;
+            const size_t r0 = c*rows_per_chunk;
+            const size_t nr = std::min(rows_per_chunk, n_copies - r0);
+            for (size_t i = 0; i < nr; ++i) {
+                memcpy(host + (r0 + i)*stride_host, buf + i*stride_dev, size);
             }
         }
+        CUDA_CHECK(cudaStreamSynchronize(st));
     }
     return true;
 }

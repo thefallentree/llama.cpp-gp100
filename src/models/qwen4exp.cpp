@@ -1408,7 +1408,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
-    ggml_tensor * z_2d = ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+    // a RESHAPE for a contiguous z (the CUDA fused gated norm fn_gdn_out matches on it), a view for the rows of a merged qkvz
+    ggml_tensor * z_2d = ggml_is_contiguous(z) ?
+        ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs) :
+        ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
             ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference

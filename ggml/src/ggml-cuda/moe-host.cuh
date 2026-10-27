@@ -54,4 +54,7 @@ void ggml_cuda_moe_host_reorder(ggml_cgraph * cgraph);
 // GGML_CUDA_MOE_HOST_NUMA_POOLS=1 (ggml-cuda.cu): the NUMA node of a device's cold experts and pool, -1 when off; and the
 // memory policy around an allocation that is to land on a node
 int  ggml_cuda_host_numa_node_of_device(int device);
+// GGML_CUDA_MOE_HOST_MIRROR=1 (with the per-socket pools): the cold experts stay next to the GPUs, a pool on the other
+// socket reads a copy on its node (moe-host.cu)
+bool ggml_cuda_moe_host_mirror();
 void ggml_cuda_host_numa_bind_node(bool on, int node);

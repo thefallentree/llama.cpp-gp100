@@ -8,8 +8,17 @@
 #include <atomic>
 #include <climits>
 #include <cstring>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #define MH_DSTATE_SEQ  0 // last request number
 #define MH_DSTATE_NEED 1 // cold pairs of the last request
@@ -691,6 +700,116 @@ static bool mh_triple(const ggml_cgraph * cgraph, const int i, const ggml_tensor
     return n_up == n_gate && n_up == n_down && n_up > 0;
 }
 
+// GGML_CUDA_MOE_HOST_MIRROR=1 (with GGML_CUDA_MOE_HOST_NUMA_POOLS=1): the cold experts stay pinned next to the GPUs, where
+// the prompt path copies them to VRAM (cold prefetch), and the host tier pool of a device on the other socket reads a copy
+// of them on its own node. Q262 z20: the per-socket pools take 0.7-1.0 ms off a decode step, but with device 0's cold
+// experts on node 0 every prompt ubatch fetched them across the sockets (+4-6% cold prefill). The copy is made when the
+// layer is first seen (before the expert cache registers it), is pinned and mapped so that the expert cache's exchanges
+// write evicted slices into both (ec_swap), and costs the cold set of that device once more in host memory.
+struct mh_mirror_tab {
+    std::mutex                                     mtx;
+    std::unordered_map<const char *, const char *> map;   // primary -> copy (itself when no copy is needed)
+    size_t                                         bytes = 0;
+    int                                            n     = 0;
+};
+static mh_mirror_tab g_mh_mirror;
+
+#if defined(__linux__)
+static int mh_page_node(const void * p) {
+    void * page   = (void *) ((uintptr_t) p & ~(uintptr_t) 4095);
+    int    status = -1;
+    if (syscall(SYS_move_pages, 0, 1, &page, nullptr, &status, 0) != 0) {
+        return -1;
+    }
+    return status;
+}
+
+static const char * mh_mirror_make(const char * c, const size_t bytes, const int node) {
+    const size_t len = (bytes + 4095)/4096*4096;
+    char * p = (char *) mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        return nullptr;
+    }
+    const unsigned long mask = 1ul << node;
+    // MPOL_PREFERRED: a full node spills over instead of an OOM kill
+    if (syscall(SYS_mbind, p, len, 1 /* MPOL_PREFERRED */, &mask, 64, 0) != 0) {
+        GGML_LOG_WARN("%s: mbind to NUMA node %d failed\n", __func__, node);
+    }
+    {
+        const size_t n_threads = 8;
+        std::vector<std::thread> workers;
+        for (size_t t = 0; t < n_threads; ++t) {
+            workers.emplace_back([=] {
+                const size_t a = std::min(bytes, (bytes*t/n_threads + 4095)/4096*4096);
+                const size_t b = t + 1 == n_threads ? bytes : std::min(bytes, (bytes*(t + 1)/n_threads + 4095)/4096*4096);
+                if (b > a) {
+                    memcpy(p + a, c + a, b - a);
+                }
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+    cudaError_t err = cudaHostRegister(p, len, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    void * dp = nullptr;
+    if (err == cudaSuccess) {
+        err = cudaHostGetDevicePointer(&dp, p, 0);
+        if (err == cudaSuccess && dp != (void *) p) {
+            // the expert cache writes the copy through the host address (UVA)
+            cudaHostUnregister(p);
+            err = cudaErrorInvalidValue;
+        }
+    }
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: cudaHostRegister of the %.1f MiB copy failed (%s): the pool reads the primary\n", __func__,
+                      len/1048576.0, cudaGetErrorString(err));
+        munmap(p, len);
+        return nullptr;
+    }
+    return p;
+}
+#endif
+
+// the copy of the cold tensor data at c (bytes long) that the device's pool reads, or c itself; create: make it if there
+// is none yet (outside a capture only; mh_open only looks up)
+static const char * mh_mirror_of(const int device, const char * c, const size_t bytes, const bool create) {
+    if (c == nullptr || !ggml_cuda_moe_host_mirror()) {
+        return c;
+    }
+    const int node = ggml_cuda_host_numa_node_of_device(device);
+    if (node < 0 || node == 7) {
+        return c;
+    }
+    std::lock_guard<std::mutex> lock(g_mh_mirror.mtx);
+    auto it = g_mh_mirror.map.find(c);
+    if (it != g_mh_mirror.map.end()) {
+        return it->second;
+    }
+    if (!create) {
+        return c;
+    }
+    const char * m = c;
+#if defined(__linux__)
+    const int pn = mh_page_node(c);
+    if (pn >= 0 && pn != node) {
+        const char * p = mh_mirror_make(c, bytes, node);
+        if (p != nullptr) {
+            m = p;
+            g_mh_mirror.bytes += bytes;
+            g_mh_mirror.n++;
+            if (g_mh_mirror.n <= 3 || g_mh_mirror.n % 48 == 0) {
+                GGML_LOG_WARN("moe-host: dev%d cold copy %d on NUMA node %d (primary on node %d): %.1f MiB, %.2f GiB in all\n", device,
+                              g_mh_mirror.n, mh_page_node(p), pn, bytes/1048576.0, g_mh_mirror.bytes/1073741824.0);
+            }
+        }
+    }
+#endif
+    g_mh_mirror.map[c] = m;
+    return m;
+}
+
 void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     const ggml_tensor * node = cgraph->nodes[i];
     if (!ggml_cuda_mmid_cold(node) || !ggml_cuda_moe_host_enabled() || ggml_cuda_expert_cache_known(ctx, node->src[0])) {
@@ -705,7 +824,21 @@ void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgr
     ggml_cuda_mmid_cold(up,   &c_up,   &n_cold);
     ggml_cuda_mmid_cold(gate, &c_gate, &n_cold);
     ggml_cuda_mmid_cold(down, &c_down, &n_cold);
-    ggml_cuda_expert_cache_register(ctx, up, gate, down, c_up, c_gate, c_down, n_cold);
+    const char * m[3] = { nullptr, nullptr, nullptr };
+    if (ggml_cuda_moe_host_mirror()) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            return; // the copies and the expert cache's registration wait for a call outside a capture
+        }
+        const ggml_tensor * w[3] = { up->src[0], gate->src[0], down->src[0] };
+        const char *        c[3] = { c_up, c_gate, c_down };
+        for (int k = 0; k < 3; ++k) {
+            m[k] = mh_mirror_of(ctx.device, c[k], (size_t) n_cold*w[k]->nb[2], true);
+            m[k] = m[k] != c[k] ? m[k] : nullptr;
+        }
+    }
+    ggml_cuda_expert_cache_register(ctx, up, gate, down, c_up, c_gate, c_down, n_cold, m[0], m[1], m[2]);
 }
 
 // what the publish of a triple needs
@@ -763,9 +896,12 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     }
 
     mh_slot_desc d;
-    d.up       = (const uint8_t *) c_up;
-    d.gate     = (const uint8_t *) c_gate;
-    d.down     = (const uint8_t *) c_down;
+    d.n_cold   = 0;
+    ggml_cuda_mmid_cold(up, nullptr, &d.n_cold);
+    // the pool's copy of the cold experts (GGML_CUDA_MOE_HOST_MIRROR), when there is one
+    d.up       = (const uint8_t *) mh_mirror_of(ctx.device, c_up,   (size_t) d.n_cold*up->src[0]->nb[2],   false);
+    d.gate     = (const uint8_t *) mh_mirror_of(ctx.device, c_gate, (size_t) d.n_cold*gate->src[0]->nb[2], false);
+    d.down     = (const uint8_t *) mh_mirror_of(ctx.device, c_down, (size_t) d.n_cold*down->src[0]->nb[2], false);
     d.up_nb1   = up->src[0]->nb[1];
     d.up_nb2   = up->src[0]->nb[2];
     d.gate_nb1 = gate->src[0]->nb[1];
@@ -774,8 +910,6 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     d.down_nb2 = down->src[0]->nb[2];
     d.n_embd   = (int) n_embd;
     d.n_ff     = (int) n_ff;
-    d.n_cold   = 0;
-    ggml_cuda_mmid_cold(up, nullptr, &d.n_cold);
     d.wtype    = up->src[0]->type == GGML_TYPE_Q2_K ? 1 : up->src[0]->type == GGML_TYPE_Q4_0 ? 3 : 0;
     d.wtype_down = down->src[0]->type == GGML_TYPE_Q3_K ? 2 : down->src[0]->type == GGML_TYPE_Q4_0 ? 3 : d.wtype;
     GGML_ASSERT((d.wtype == 1 || d.wtype_down != 2) && "a Q3_K down needs Q2_K gate/up (natural-order activations)");

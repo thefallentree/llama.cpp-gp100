@@ -2123,6 +2123,12 @@ int ggml_cuda_host_numa_node_of_device(const int device) {
     return nodes[(size_t) device % nodes.size()];
 }
 
+bool ggml_cuda_moe_host_mirror() {
+    static const bool on = ggml_cuda_host_numa_pools() && getenv("GGML_CUDA_MOE_HOST_MIRROR") != nullptr &&
+                           atoi(getenv("GGML_CUDA_MOE_HOST_MIRROR")) != 0;
+    return on;
+}
+
 void ggml_cuda_host_numa_bind_node(const bool on, const int node) {
     ggml_cuda_host_numa_bind(on, node);
 }
@@ -8410,7 +8416,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 // the host buffer type of a device's cold experts (ggml_backend_meta_device_host_split_buffer_type asks for it)
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_cold_host_buffer_type(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
-    const int node = ggml_cuda_host_numa_node_of_device(ctx->device);
+    // GGML_CUDA_MOE_HOST_MIRROR: the primary next to the GPUs (the prompt path's copies), the pool reads its own copy
+    const int node = ggml_cuda_moe_host_mirror() ? -1 : ggml_cuda_host_numa_node_of_device(ctx->device);
     return node >= 0 ? ggml_backend_cuda_host_buffer_type_node(node) : ggml_backend_cuda_host_buffer_type();
 }
 

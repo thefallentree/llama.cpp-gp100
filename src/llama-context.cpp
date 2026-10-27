@@ -2104,10 +2104,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
     FN_PROF_ADD("pu.set_inputs", t_pu3);
+    if (ubatch.n_tokens > 8) { FN_PROF_ADD("pu.set_inputs(T>8)", t_pu3); }
     FN_PROF_T(t_pu4);
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     FN_PROF_ADD("pu.graph_compute", t_pu4);
+    if (ubatch.n_tokens > 8) { FN_PROF_ADD("pu.graph_compute(T>8)", t_pu4); }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2436,6 +2438,7 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
     fn_prof_t_window[ggml_fn_prof_tag] = t_d0;
     fn_prof_n_window[ggml_fn_prof_tag] = (int) batch_inp.tokens.size();
     if (decode_t_last_end != 0) { FN_PROF_ADD("decode.between", decode_t_last_end); }
+    if (decode_t_last_end != 0 && batch_inp.tokens.size() > 8) { FN_PROF_ADD("decode.between(T>8)", decode_t_last_end); }
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2890,6 +2893,7 @@ void llama_context::decode_extract(const llm_graph_result * res, const llama_uba
         }
 
         FN_PROF_ADD("extract.h_nextn", t_x3);
+        if (ubatch.n_tokens > 8) { FN_PROF_ADD("extract.h_nextn(T>8)", t_x3); }
         FN_PROF_T(t_x4);
         if (has_samplers) {
             const auto stride = n_vocab;
@@ -2975,6 +2979,7 @@ void llama_context::decode_finish(uint32_t n_outputs_all, int64_t t_d0) {
     //synchronize();
     FN_PROF_ADD("decode.tail", t_d6);
     FN_PROF_ADD("decode.total", t_d0);
+    if (fn_prof_n_window[ggml_fn_prof_tag] > 8) { FN_PROF_ADD("decode.total(T>8)", t_d0); }
     decode_t_last_end = g_fn_prof.on ? fn_prof_now() : 0;
 }
 

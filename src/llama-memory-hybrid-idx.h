@@ -231,6 +231,7 @@ public:
     // cover the slots up to the last one in use, padded, where unused slots carry the sentinel members and are masked.
     uint32_t get_n_kpool    () const; // Padded slot count, where the last slot is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
+    bool graph_is_large() const override; // more than LLAMA_KPOOL_NEW_SLOT_MAX (64) pools to re-pool
     int32_t  kpool_cells_layer() const; // the layer whose kpool_access carries the member table (any layer reads it)
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     // pool_cells (I32 [n_pool], can be null): the slot of each pool, for a gather of the pooled keys

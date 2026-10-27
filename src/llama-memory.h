@@ -68,6 +68,11 @@ struct llama_memory_context_i {
     // launch-ahead (llama_decode_prepare/commit): the current ubatch's token ids were placeholders when apply() ran
     // and are known now, in the ubatch: store them again where the memory keeps tokens (the cells' ext.tok)
     virtual void reapply_tokens() {}
+
+    // the current ubatch builds a graph far larger than its token count suggests (a hybrid-idx context that re-pools
+    // the whole k-pool table after a state restore): it belongs on the main scheduler, whose reserve covers it, and
+    // not on a small-ubatch graph slot that would allocate a compute buffer of its own
+    virtual bool graph_is_large() const { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

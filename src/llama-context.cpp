@@ -1791,7 +1791,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_DEBUG("%s: graph slots = %zu (n_tokens <= %d)\n", __func__, gf_slots.size(), LLAMA_GRAPH_SLOT_N_TOKENS_MAX);
     }
 
-    const bool use_slot = !gf_slots.empty() && (int) ubatch.n_tokens <= LLAMA_GRAPH_SLOT_N_TOKENS_MAX;
+    const bool use_slot = !gf_slots.empty() && (int) ubatch.n_tokens <= LLAMA_GRAPH_SLOT_N_TOKENS_MAX && !(mctx && mctx->graph_is_large());
 
     // large ubatches (prefill) use the main scheduler. leftover decode-slot
     // compute buffers from the previous turn would otherwise stay resident and

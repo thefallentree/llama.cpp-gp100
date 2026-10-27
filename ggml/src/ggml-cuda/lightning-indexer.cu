@@ -446,27 +446,18 @@ lightning_indexer_kernel_lanes(
     for (int th = 0; th < NT*NH; ++th) {
         acc[th] = 0.0f;
     }
-    // the row in two groups of 8 loads in flight (a thread per key at 16 warps per SM leaves the HBM latency bare)
+#pragma unroll 4
+    for (int i = 0; i < D/8; ++i) {
+        const uint4  u  = kr[i];
+        const float2 k0 = __half22float2(*(const half2 *) &u.x);
+        const float2 k1 = __half22float2(*(const half2 *) &u.y);
+        const float2 k2 = __half22float2(*(const half2 *) &u.z);
+        const float2 k3 = __half22float2(*(const half2 *) &u.w);
 #pragma unroll
-    for (int i0 = 0; i0 < D/8; i0 += 8) {
-        uint4 u[8];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            u[j] = kr[i0 + j];
-        }
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int    i  = i0 + j;
-            const float2 k0 = __half22float2(*(const half2 *) &u[j].x);
-            const float2 k1 = __half22float2(*(const half2 *) &u[j].y);
-            const float2 k2 = __half22float2(*(const half2 *) &u[j].z);
-            const float2 k3 = __half22float2(*(const half2 *) &u[j].w);
-#pragma unroll
-            for (int th = 0; th < NT*NH; ++th) {
-                const float4 q0 = s_q[th][2*i];
-                const float4 q1 = s_q[th][2*i + 1];
-                acc[th] += k0.x*q0.x + k0.y*q0.y + k1.x*q0.z + k1.y*q0.w + k2.x*q1.x + k2.y*q1.y + k3.x*q1.z + k3.y*q1.w;
-            }
+        for (int th = 0; th < NT*NH; ++th) {
+            const float4 q0 = s_q[th][2*i];
+            const float4 q1 = s_q[th][2*i + 1];
+            acc[th] += k0.x*q0.x + k0.y*q0.y + k1.x*q0.z + k1.y*q0.w + k2.x*q1.x + k2.y*q1.y + k3.x*q1.z + k3.y*q1.w;
         }
     }
 #pragma unroll

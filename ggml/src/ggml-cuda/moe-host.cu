@@ -728,7 +728,7 @@ static int mh_page_node(const void * p) {
     return status;
 }
 
-static const char * mh_mirror_make(const char * c, const size_t bytes, const int node) {
+static const char * mh_mirror_make(const char * c, const size_t bytes, const int node, const int device) {
     // GGML_CUDA_MOE_HOST_MIRROR_HUGE=1: the copy on 2 MB pages (p6e: the same VRAM at load, 15119 MiB, and no faster jobs; off)
     static const bool huge = getenv("GGML_CUDA_MOE_HOST_MIRROR_HUGE") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_MIRROR_HUGE")) != 0;
     const size_t align = huge ? (size_t) 2 << 20 : 4096;
@@ -768,7 +768,10 @@ static const char * mh_mirror_make(const char * c, const size_t bytes, const int
             w.join();
         }
     }
-    cudaError_t err = cudaHostRegister(p, len, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    // mapped into the pool's device only (its exchange kernel writes the copy): a portable registration maps it into every
+    // device and the page tables of 8.75 GiB cost each one ~18 MiB of VRAM (g5: card 1 16195 vs 16175 MiB)
+    ggml_cuda_set_device(device);
+    cudaError_t err = cudaHostRegister(p, len, cudaHostRegisterMapped);
     void * dp = nullptr;
     if (err == cudaSuccess) {
         err = cudaHostGetDevicePointer(&dp, p, 0);
@@ -811,7 +814,7 @@ static const char * mh_mirror_of(const int device, const char * c, const size_t 
 #if defined(__linux__)
     const int pn = mh_page_node(c);
     if (pn >= 0 && pn != node) {
-        const char * p = mh_mirror_make(c, bytes, node);
+        const char * p = mh_mirror_make(c, bytes, node, device);
         if (p != nullptr) {
             m = p;
             g_mh_mirror.bytes += bytes;

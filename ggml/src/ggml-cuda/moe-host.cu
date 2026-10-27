@@ -32,6 +32,12 @@
 #define MH_RING_THREADS    1024
 #define MH_SMALL_TOK       8   // up to this many tokens the fused publish is used
 
+static __device__ __forceinline__ unsigned long long mh_globaltimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
 static bool ggml_cuda_moe_host_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_MOE_HOST");
@@ -444,6 +450,9 @@ static __global__ void mh_route(
     // counts itself): the fence (~6 us on GP100) used to start only after the counter said they were done. The doorbell
     // store follows the counter's spin, so the host cannot see it before any of the request's data.
     // GGML_CUDA_MOE_HOST_EARLY_FENCE=0: fence after the spin, as before.
+    if (stats != nullptr && i == 0) {
+        mb->t_req = mh_globaltimer(); // FN_WAITS: the transport latency of the request (fences, doorbell, host's poll)
+    }
     if (early_fence) {
         __threadfence_system();
         __syncthreads();
@@ -482,6 +491,7 @@ static __global__ void mh_collect(
     if (threadIdx.x == 0) {
         const uint32_t  s  = dstate[MH_DSTATE_SEQ];
         const long long t0 = clock64();
+        const unsigned long long g0 = dbg != nullptr ? mh_globaltimer() : 0;
         while (*((volatile const uint32_t *) &mb->done) != s) {
             if (clock64() - t0 > 20000000000LL) {
                 printf("moe-host: no answer from the host threads for request %u\n", s);
@@ -491,6 +501,17 @@ static __global__ void mh_collect(
         if (dbg != nullptr && blockIdx.x == 0) {
             atomicAdd(dbg + 0, (unsigned long long) (clock64() - t0));
             atomicAdd(dbg + 1, 1ull);
+            // ns: the answer's flight to the GPU (in the host's estimate of the GPU time base), and the GPU's work from the
+            // request to the collect
+            const unsigned long long g2 = mh_globaltimer();
+            const unsigned long long td = mb->t_done;
+            const unsigned long long tr = mb->t_req;
+            if (td != 0 && tr != 0) {
+                atomicAdd(dbg + 269, (unsigned long long) ((long long) g2 - (long long) td));
+                atomicAdd(dbg + 270, 1ull);
+                atomicAdd(dbg + 4, (unsigned long long) ((long long) g0 - (long long) tr));
+                atomicAdd(dbg + 5, 1ull);
+            }
         }
     }
     __syncthreads();
@@ -519,6 +540,7 @@ static __global__ void mh_collect_weighted(
     if (threadIdx.x == 0) {
         const uint32_t  s  = dstate[MH_DSTATE_SEQ];
         const long long t0 = clock64();
+        const unsigned long long g0 = dbg != nullptr ? mh_globaltimer() : 0;
         while (*((volatile const uint32_t *) &mb->done) != s) {
             if (clock64() - t0 > 20000000000LL) {
                 printf("moe-host: no answer from the host threads for request %u\n", s);
@@ -528,6 +550,17 @@ static __global__ void mh_collect_weighted(
         if (dbg != nullptr && blockIdx.x == 0) {
             atomicAdd(dbg + 0, (unsigned long long) (clock64() - t0));
             atomicAdd(dbg + 1, 1ull);
+            // ns: the answer's flight to the GPU (in the host's estimate of the GPU time base), and the GPU's work from the
+            // request to the collect
+            const unsigned long long g2 = mh_globaltimer();
+            const unsigned long long td = mb->t_done;
+            const unsigned long long tr = mb->t_req;
+            if (td != 0 && tr != 0) {
+                atomicAdd(dbg + 269, (unsigned long long) ((long long) g2 - (long long) td));
+                atomicAdd(dbg + 270, 1ull);
+                atomicAdd(dbg + 4, (unsigned long long) ((long long) g0 - (long long) tr));
+                atomicAdd(dbg + 5, 1ull);
+            }
         }
     }
     __syncthreads();

@@ -19,6 +19,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <string>
+#include <ctime>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -1080,6 +1082,12 @@ static void kdot_q40_avx2(const uint8_t * const * w, const kact_block * a, int n
 
 typedef void (*kdot_fn)(const uint8_t * const *, const kact_block *, int, float *);
 
+static inline int64_t mh_realtime_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t) ts.tv_sec*1000000000LL + ts.tv_nsec;
+}
+
 static inline void mh_prefetch(const void * p) {
 #if MH_X86
     _mm_prefetch((const char *) p, _MM_HINT_T0);
@@ -1698,6 +1706,7 @@ struct pool {
     // GGML_CUDA_MOE_HOST_STATS=N: every N jobs, print the mean job time, cold pairs and distinct experts per job
     int64_t stat_every = 0, stat_jobs = 0, stat_pairs = 0, stat_groups = 0;
     int     n_dumped = 0;   // the first jobs of this pool are logged (parameters from the mailbox)
+    int64_t clk_off = 0, stat_seen_ns = 0, stat_seen_n = 0; // FN_WAITS transport timing (leader())
     double  stat_us = 0.0, stat_quant_us = 0.0, stat_p1_us = 0.0, stat_work_us = 0.0;
     std::atomic<int>     p1_left { 0 };
     std::atomic<int64_t> t_p1_ns { 0 };
@@ -1871,9 +1880,11 @@ struct pool {
             stat_pairs    += n_pairs;
             stat_groups   += n_groups;
             if (++stat_jobs == stat_every) {
-                fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs, %.2f experts per job, %s kernels\n",
+                fprintf(stderr, "moe-host: pool %d: %lld jobs: %.1f us/job (setup %.1f, gate/up done at %.1f, leader's work done at %.1f us), %.2f cold pairs, %.2f experts per job, %s kernels%s\n",
                               id, (long long) stat_jobs, stat_us/stat_jobs, stat_quant_us/stat_jobs, stat_p1_us/stat_jobs, stat_work_us/stat_jobs,
-                              (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs, jmode == 2 ? "k" : "old");
+                              (double) stat_pairs/stat_jobs, (double) stat_groups/stat_jobs, jmode == 2 ? "k" : "old",
+                              stat_seen_n > 0 ? (", request seen " + std::to_string((double) stat_seen_ns/1e3/stat_seen_n) + " us after the GPU's fence (offset by the clock estimate)").c_str() : "");
+                stat_seen_ns = stat_seen_n = 0;
                 if (nsplit) {
                     fprintf(stderr, "moe-host: pool %d: NUMA split: %lld chunks from the thread's own node, %lld from the other\n", id,
                             (long long) st_own.exchange(0), (long long) st_steal.exchange(0));
@@ -1900,12 +1911,26 @@ struct pool {
                     continue;
                 }
                 seen[d] = r;
+                // GGML_CUDA_FN_WAITS: the request's flight (the GPU wrote its %globaltimer before the fences); the first one
+                // sets this pool's estimate of the GPU clock (host ns - GPU ns), so the figures carry that request's latency
+                const uint64_t t_req = m->t_req;
+                if (t_req != 0) {
+                    const int64_t h1 = mh_realtime_ns();
+                    if (clk_off == 0) {
+                        clk_off = h1 - (int64_t) t_req;
+                    }
+                    stat_seen_ns += h1 - (int64_t) t_req - clk_off;
+                    stat_seen_n++;
+                }
                 if (!hot.load(std::memory_order_relaxed)) {
                     hot.store(true);
                     std::lock_guard<std::mutex> lock(cv_mtx);
                     cv.notify_all();
                 }
                 run_job(m);
+                if (clk_off != 0) {
+                    m->t_done = (uint64_t) (mh_realtime_ns() - clk_off);
+                }
                 m->done = r;
                 found    = true;
                 last_job = std::chrono::steady_clock::now();

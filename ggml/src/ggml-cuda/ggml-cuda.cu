@@ -1253,6 +1253,13 @@ void ggml_backend_cuda_context::fn_dbg_report() {
     const double tpu = (double) (c1 - c0)/(double) (t1 - t0);
     fprintf(stderr, "fn-waits dev%d: %.1f ticks/us; collect: n %llu, mean wait %.1f us, total %.1f ms; allreduce: n %llu, mean wait %.1f us, total %.1f ms\n",
             device, tpu, v[1], v[1] ? v[0]/tpu/v[1] : 0.0, v[0]/tpu/1000.0, v[3], v[3] ? v[2]/tpu/v[3] : 0.0, v[2]/tpu/1000.0);
+    // the host tier's transport (FN_WAITS): the answer's flight from the host to the GPU's collect (in the host's estimate of
+    // the GPU clock: add the host's 'request seen' figure of the moe-host stats line for the round trip without the job),
+    // and the GPU's own work between the request and the collect
+    if (v[270] != 0 && v[5] != 0) {
+        fprintf(stderr, "fn-mh dev%d: answer flight %.1f us (n %llu, offset by the host's clock estimate); request -> collect start %.1f us of GPU work\n",
+                device, (double) (long long) v[269]/1e3/v[270], v[270], (double) (long long) v[4]/1e3/v[5]);
+    }
     // the routing of the 3-token windows (mh_route): how many of a layer's pairs share an expert with an earlier pair
     if (v[264] != 0) {
         fprintf(stderr, "fn-route dev%d: %llu routings of 3 tokens: pairs %.2f, distinct experts %.2f; hot pairs %.2f, distinct hot experts %.2f per routing\n",

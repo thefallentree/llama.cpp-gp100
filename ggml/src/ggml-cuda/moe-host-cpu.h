@@ -34,8 +34,12 @@ static_assert(sizeof(mh_act_block) == 192, "unexpected act block size");
 // cap_pairs cold pairs). The GPU writes the request and then `req`; the host writes the results and then `done`.
 // Layers run one after another on a device, so one mailbox per device is enough.
 struct alignas(64) mh_mailbox {
-    volatile uint32_t req;   uint32_t pad0[15];
-    volatile uint32_t done;  uint32_t pad1[15];
+    volatile uint32_t req;   uint32_t pad0a;
+    volatile uint64_t t_req;               // GGML_CUDA_FN_WAITS: the GPU's %globaltimer at the request's fence
+    uint32_t pad0[12];
+    volatile uint32_t done;  uint32_t pad1a;
+    volatile uint64_t t_done;              // the host's answer time, in the GPU's time base as the host estimates it
+    uint32_t pad1[12];
     int32_t slot;
     int32_t n_tokens;
     int32_t n_used;

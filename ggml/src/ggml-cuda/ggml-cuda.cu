@@ -619,8 +619,37 @@ static int ggml_cuda_parse_id(const char * devName) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// GGML_NUMA_SCAN_OFF=1: the calling thread (and the threads it creates later) allocates with MPOL_LOCAL instead of the
+// default policy. Placement is the same (first touch on the allocating CPU's node), but the kernel's automatic NUMA
+// balancing only scans the memory of tasks whose policy allows migrate-on-fault (MPOL_F_MOF, which the default policy
+// carries): with it on (pve-40: kernel.numa_balancing=1, billions of failed migrations of pinned pages) the PLE table,
+// the host tier's buffers and the CUDA host buffers take NUMA hint faults (page-table updates and a fault per page and
+// scan period) in the decode loop. 0 when the call failed or is off; the mode that ggml_cuda_host_numa_bind restores.
+static int ggml_cuda_default_mempolicy() {
+    static const int mode = [] {
+#if defined(__linux__)
+        const char * e = getenv("GGML_NUMA_SCAN_OFF");
+        if (e != nullptr && atoi(e) != 0) {
+            if (syscall(SYS_set_mempolicy, 4 /* MPOL_LOCAL */, nullptr, 0) == 0) {
+                GGML_LOG_WARN("%s: MPOL_LOCAL for this thread and its children (no automatic NUMA balancing scans)\n", __func__);
+                return 4;
+            }
+            GGML_LOG_WARN("%s: set_mempolicy(MPOL_LOCAL) failed\n", __func__);
+        }
+#endif
+        return 0;
+    }();
+    return mode;
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
+    (void) ggml_cuda_default_mempolicy();
 
     cudaError_t err = cudaGetDeviceCount(&info.physical_device_count);
     if (err != cudaSuccess) {
@@ -2077,7 +2106,7 @@ static void ggml_cuda_host_numa_bind(const bool on, const int node_override = -1
     // spills over instead of an OOM kill; GGML_CUDA_HOST_NUMA_STRICT=1 keeps MPOL_BIND 2), MPOL_INTERLEAVE 3
     static const int mode_pref = getenv("GGML_CUDA_HOST_NUMA_STRICT") != nullptr && atoi(getenv("GGML_CUDA_HOST_NUMA_STRICT")) != 0 ? 2 : 1;
     const int mode = inter ? 3 : mode_pref;
-    if (syscall(SYS_set_mempolicy, on ? mode : 0, on ? &mask : nullptr, on ? 64 : 0) != 0) {
+    if (syscall(SYS_set_mempolicy, on ? mode : ggml_cuda_default_mempolicy(), on ? &mask : nullptr, on ? 64 : 0) != 0) {
         GGML_LOG_WARN("%s: set_mempolicy failed for NUMA node %d\n", __func__, node);
     }
 }

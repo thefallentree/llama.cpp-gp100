@@ -12,3 +12,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+// 4 or 8 output rows over a long row (>= 2048), 1-4 columns: K-sliced partial sums, then their sum in order
+bool ggml_cuda_mul_mat_vec_f_skinny_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_vec_f_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

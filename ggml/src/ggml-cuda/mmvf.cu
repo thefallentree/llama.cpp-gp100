@@ -886,3 +886,148 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
             return false;
     }
 }
+
+// A few output rows over a long row (Qwen3.8's hyper-connection inject, BF16 [10240, 4], 96 per decode step): the
+// one-block-per-row kernel above runs 4 blocks on 56 SMs, ~13 us of latency for 40 KB of weights. Here every block
+// takes a K-slice of all rows and columns and writes its partial sums; a second kernel adds the slices in order, so the
+// result does not depend on the block schedule.
+#define MMVF_SKINNY_THREADS 128
+#define MMVF_SKINNY_K       (2*MMVF_SKINNY_THREADS) // per block: one pair of values per thread
+
+static __device__ __forceinline__ float2 mmvf_skinny_load2(const float * x)         { return *(const float2 *) x; }
+static __device__ __forceinline__ float2 mmvf_skinny_load2(const half * x)          { return __half22float2(*(const half2 *) x); }
+static __device__ __forceinline__ float2 mmvf_skinny_load2(const nv_bfloat16 * x)   {
+    const uint32_t u = *(const uint32_t *) x;
+    return make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+}
+
+template <typename T, int R, int C>
+static __global__ void __launch_bounds__(MMVF_SKINNY_THREADS)
+mul_mat_vec_f_skinny_part(const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ part,
+                          const int ncols, const int64_t stride_row, const int64_t stride_col_y) {
+    const int k = blockIdx.x*MMVF_SKINNY_K + 2*threadIdx.x;
+    float acc[R][C];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    if (k < ncols) {
+        float2 yv[C];
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            yv[c] = *(const float2 *) (y + c*stride_col_y + k);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float2 xv = mmvf_skinny_load2(x + r*stride_row + k);
+#pragma unroll
+            for (int c = 0; c < C; ++c) {
+                acc[r][c] = fmaf(xv.x, yv[c].x, fmaf(xv.y, yv[c].y, acc[r][c]));
+            }
+        }
+    }
+    __shared__ float sh[MMVF_SKINNY_THREADS/WARP_SIZE][R*C];
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            const float v = warp_reduce_sum<WARP_SIZE>(acc[r][c]);
+            if (lane == 0) {
+                sh[warp][r*C + c] = v;
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < R*C) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < MMVF_SKINNY_THREADS/WARP_SIZE; ++w) {
+            s += sh[w][threadIdx.x];
+        }
+        part[(int64_t) blockIdx.x*R*C + threadIdx.x] = s;
+    }
+}
+
+// dst[c*stride_col_dst + r] = sum over the blocks of part[b][r*C + c], in block order
+static __global__ void mul_mat_vec_f_skinny_sum(const float * __restrict__ part, float * __restrict__ dst, const int nblocks,
+                                                const int R, const int C, const int64_t stride_col_dst) {
+    const int i = threadIdx.x;
+    if (i >= R*C) {
+        return;
+    }
+    float s = 0.0f;
+    for (int b = 0; b < nblocks; ++b) {
+        s += part[(int64_t) b*R*C + i];
+    }
+    dst[(i % C)*stride_col_dst + i / C] = s;
+}
+
+bool ggml_cuda_mul_mat_vec_f_skinny_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const bool on = getenv("GGML_CUDA_MMVF_SKINNY") == nullptr || atoi(getenv("GGML_CUDA_MMVF_SKINNY")) != 0;
+    if (!on) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t R = src0->ne[1];
+    const int64_t C = src1->ne[1];
+    return (R == 4 || R == 8) && C >= 1 && C <= 4 && src0->ne[0] >= 2048 && src0->ne[0] % 2 == 0 &&
+           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           ggml_nrows(src0) == R && ggml_nrows(src1) == C && ggml_nrows(dst) == C && dst->ne[0] == R &&
+           src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
+           src0->nb[1] % (2*ggml_type_size(src0->type)) == 0 && src1->nb[1] % (2*sizeof(float)) == 0 &&
+           (uintptr_t) src0->data % (2*ggml_type_size(src0->type)) == 0 && (uintptr_t) src1->data % (2*sizeof(float)) == 0;
+}
+
+template <typename T, int R>
+static void mul_mat_vec_f_skinny_launch(const T * x, const float * y, float * part, const int ncols, const int64_t stride_row,
+                                        const int64_t stride_col_y, const int C, const int nblocks, cudaStream_t stream) {
+    switch (C) {
+        case 1: mul_mat_vec_f_skinny_part<T, R, 1><<<nblocks, MMVF_SKINNY_THREADS, 0, stream>>>(x, y, part, ncols, stride_row, stride_col_y); break;
+        case 2: mul_mat_vec_f_skinny_part<T, R, 2><<<nblocks, MMVF_SKINNY_THREADS, 0, stream>>>(x, y, part, ncols, stride_row, stride_col_y); break;
+        case 3: mul_mat_vec_f_skinny_part<T, R, 3><<<nblocks, MMVF_SKINNY_THREADS, 0, stream>>>(x, y, part, ncols, stride_row, stride_col_y); break;
+        case 4: mul_mat_vec_f_skinny_part<T, R, 4><<<nblocks, MMVF_SKINNY_THREADS, 0, stream>>>(x, y, part, ncols, stride_row, stride_col_y); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+template <typename T>
+static void mul_mat_vec_f_skinny_type(const T * x, const float * y, float * part, const int ncols, const int64_t stride_row,
+                                      const int64_t stride_col_y, const int R, const int C, const int nblocks, cudaStream_t stream) {
+    if (R == 4) {
+        mul_mat_vec_f_skinny_launch<T, 4>(x, y, part, ncols, stride_row, stride_col_y, C, nblocks, stream);
+    } else {
+        mul_mat_vec_f_skinny_launch<T, 8>(x, y, part, ncols, stride_row, stride_col_y, C, nblocks, stream);
+    }
+}
+
+void ggml_cuda_mul_mat_vec_f_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int     R       = (int) src0->ne[1];
+    const int     C       = (int) src1->ne[1];
+    const int     ncols   = (int) src0->ne[0];
+    const int     nblocks = (ncols + MMVF_SKINNY_K - 1) / MMVF_SKINNY_K;
+    const int64_t stride_row   = src0->nb[1] / ggml_type_size(src0->type);
+    const int64_t stride_col_y = src1->nb[1] / sizeof(float);
+    cudaStream_t  stream  = ctx.stream();
+
+    ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) nblocks*R*C);
+    switch (src0->type) {
+        case GGML_TYPE_BF16:
+            mul_mat_vec_f_skinny_type((const nv_bfloat16 *) src0->data, (const float *) src1->data, part.get(), ncols, stride_row, stride_col_y, R, C, nblocks, stream);
+            break;
+        case GGML_TYPE_F16:
+            mul_mat_vec_f_skinny_type((const half *) src0->data, (const float *) src1->data, part.get(), ncols, stride_row, stride_col_y, R, C, nblocks, stream);
+            break;
+        default:
+            mul_mat_vec_f_skinny_type((const float *) src0->data, (const float *) src1->data, part.get(), ncols, stride_row, stride_col_y, R, C, nblocks, stream);
+            break;
+    }
+    mul_mat_vec_f_skinny_sum<<<1, 32, 0, stream>>>(part.get(), (float *) dst->data, nblocks, R, C, dst->nb[1] / sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+}

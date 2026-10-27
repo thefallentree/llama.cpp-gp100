@@ -968,7 +968,9 @@ static __global__ void mul_mat_vec_f_skinny_sum(const float * __restrict__ part,
 }
 
 bool ggml_cuda_mul_mat_vec_f_skinny_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    static const bool on = getenv("GGML_CUDA_MMVF_SKINNY") == nullptr || atoi(getenv("GGML_CUDA_MMVF_SKINNY")) != 0;
+    // off by default: no measurable gain in the model (x15, 1K step_bench x 20 alternating: 20.02 / 19.84 ms/step on vs
+    // 19.64 / 20.38 off; test-backend-ops perf 9.3 vs 8.7 us at n = 3, two launches against one)
+    static const bool on = getenv("GGML_CUDA_MMVF_SKINNY") != nullptr && atoi(getenv("GGML_CUDA_MMVF_SKINNY")) != 0;
     if (!on) {
         return false;
     }

@@ -1,4 +1,5 @@
 #include "llama-hparams.h"
+#include "llama-impl.h"
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
@@ -481,6 +482,11 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+
+    // the table is read lazily from the mapped file (TENSOR_READ_LAZY): ask for all the rows of this ubatch at once, so a
+    // cold table is read with many requests in flight instead of one page fault at a time inside the gather. A 128-token
+    // prompt ubatch reads ~2K random rows; on a SATA disk the serial faults cost ~18% of the prompt time (2-node DeepSeek)
+    llama_prefetch_rows(pmodel.layers[pmodel.hparams.engram_layer_ids[eg]].engram_embd, idx.data(), idx.size());
 }
 
 ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(

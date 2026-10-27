@@ -912,9 +912,16 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool use_token = batch.token && !(mixed_batch && n_embd_rows == n_tokens);
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
     const bool has_state = state_ptr != nullptr;
+    // a large ubatch of consecutive rows (the drafter's catch-up: 512 rows of 40 KB) points into the rows themselves
+    // instead of a fresh 21 MB copy per ubatch (its page faults made the split ~90 ms per catch-up batch); the rows stay
+    // valid while the decode call that owns the batch runs
+    bool state_view = has_state && n_tokens > 64 && !idxs.empty();
+    for (size_t i = 1; state_view && i < idxs.size(); ++i) {
+        state_view = idxs[i] == idxs[0] + (int32_t) i;
+    }
 
     const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
-    const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
+    const int64_t n_state_all = has_state && !state_view ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -947,7 +954,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->type[i] = is_embd_vec[idxs[i]];
         }
 
-        if (has_state) {
+        if (has_state && !state_view) {
             memcpy(udata->embd_state.data() + i*n_embd_state, state_ptr + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
         }
 
@@ -997,7 +1004,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
         /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
-        /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
+        /*.embd_state   =*/ !has_state ? nullptr : state_view ? const_cast<float *>(state_ptr + (int64_t) idxs[0]*n_embd_state) : udata->embd_state.data(),
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

@@ -34,7 +34,10 @@ bool ggml_cuda_expert_cache_known(ggml_backend_cuda_context & ctx, const ggml_te
 // a hot/cold triple was identified (moe-host.cu): the layer's tensors on this device and their cold slices
 void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
                                      const ggml_tensor * down, const char * c_up, const char * c_gate, const char * c_down,
-                                     int n_cold);
+                                     int n_cold, const char * m_up = nullptr, const char * m_gate = nullptr,
+                                     const char * m_down = nullptr);
+// m_*: copies of the cold slices that the host tier reads (GGML_CUDA_MOE_HOST_MIRROR): an exchange writes the evicted
+// slice into both
 
 // before a MUL_MAT_ID node is computed: its ids become positions (once per ids tensor and graph)
 void ggml_cuda_expert_cache_remap(ggml_backend_cuda_context & ctx, const ggml_tensor * node);

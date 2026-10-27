@@ -25,9 +25,11 @@ struct ec_job {
     uint4 *  host;
     uint4 *  dev_to;
     uint4 *  host_to;
+    uint4 *  host_to2; // the same slot in the layer's mirror (GGML_CUDA_MOE_HOST_MIRROR), or null
     uint32_t n16;
-    uint32_t pad[3];
+    uint32_t pad;
 };
+static_assert(sizeof(ec_job) == 48, "unexpected ec_job size");
 
 // the new positions of the two experts of an exchange (indexes into the table of all layers)
 struct ec_patch {
@@ -62,6 +64,7 @@ struct ec_res {
 struct ec_layer {
     char * hot[3]  = {};          // up, gate, down: the slices of the experts in VRAM
     char * cold[3] = {};          // their slices in pinned host memory
+    char * mir[3]  = {};          // a copy of the cold slices on the host tier pool's NUMA node (moe-host.cu), or null
     size_t nb2[3]  = {};          // bytes per expert
     int    n_hot   = 0;           // VRAM slots (the experts there plus the spares)
     int    n_cold  = 0;           // host slots
@@ -139,6 +142,9 @@ static __global__ void ec_swap(const ec_job * __restrict__ jobs, const int n_job
             const uint4 d = job.dev[i];
             job.dev_to[i]  = h;
             job.host_to[i] = d;
+            if (job.host_to2 != nullptr) {
+                job.host_to2[i] = d;
+            }
         }
     }
     // the host threads read the slices in the next graph
@@ -387,7 +393,7 @@ bool ggml_cuda_expert_cache_known(ggml_backend_cuda_context & ctx, const ggml_te
 
 void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
                                      const ggml_tensor * down, const char * c_up, const char * c_gate, const char * c_down,
-                                     const int n_cold) {
+                                     const int n_cold, const char * m_up, const char * m_gate, const char * m_down) {
     ec_device & d = g_ec[ctx.device];
     if (!d.ready.load(std::memory_order_acquire)) {
         return;
@@ -398,6 +404,7 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
     std::lock_guard<std::mutex> lock(d.mtx);
     const ggml_tensor * w[3]    = { up->src[0], gate->src[0], down->src[0] };
     const char *        cold[3] = { c_up, c_gate, c_down };
+    const char *        mir[3]  = { m_up, m_gate, m_down };
     const int n_hot = (int) down->src[0]->ne[2];
     // the spare slots at the end of both tensors (llama-model: LLAMA_EXPERT_SPARE pads them past the file's data)
     static const int n_spare_env = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
@@ -406,7 +413,7 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
     bool ok = n_hot + n_cold < EC_MAX_EXPERTS && n_cold > 0 && d.layers.size() < EC_MAX_LAYERS && n_spare >= 0;
     for (int k = 0; k < 3 && ok; ++k) {
         ok = w[k]->ne[2] == n_hot && w[k]->nb[2] % 16 == 0 && ((uintptr_t) w[k]->data & 0xF) == 0 &&
-             ((uintptr_t) cold[k] & 0xF) == 0 && cold[k] != nullptr;
+             ((uintptr_t) cold[k] & 0xF) == 0 && cold[k] != nullptr && ((uintptr_t) mir[k] & 0xF) == 0;
     }
     for (const ec_layer & l : d.layers) {
         ok = ok && (l.dead || l.hot[2] != w[2]->data);
@@ -418,6 +425,7 @@ void ggml_cuda_expert_cache_register(ggml_backend_cuda_context & ctx, const ggml
     for (int k = 0; k < 3; ++k) {
         l.hot[k]  = (char *) w[k]->data;
         l.cold[k] = (char *) cold[k];
+        l.mir[k]  = (char *) mir[k];
         l.nb2[k]  = w[k]->nb[2];
     }
     l.n_hot    = n_hot;
@@ -657,7 +665,8 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
         for (int k = 0; k < 3; ++k) {
             d.jobs_host[3*n_taken + k] = { (uint4 *) (l.hot[k] + (size_t) v*l.nb2[k]), (uint4 *) (l.cold[k] + (size_t) h*l.nb2[k]),
                                            (uint4 *) (l.hot[k] + (size_t) v_to*l.nb2[k]), (uint4 *) (l.cold[k] + (size_t) h_to*l.nb2[k]),
-                                           (uint32_t) (l.nb2[k]/16), { 0, 0, 0 } };
+                                           l.mir[k] != nullptr ? (uint4 *) (l.mir[k] + (size_t) h_to*l.nb2[k]) : nullptr,
+                                           (uint32_t) (l.nb2[k]/16), 0 };
         }
         l.perm[s.e_in]  = v_to;
         l.perm[s.e_out] = l.n_hot + h_to;

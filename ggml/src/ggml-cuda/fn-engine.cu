@@ -935,7 +935,7 @@ static __device__ __forceinline__ float fn_epilogue(const float y, const int epi
 // A launch computes up to FN_MAX_SEG mat-vecs of one geometry (segments), e.g. the projections that read the same
 // vector: a launch has a fixed cost of several microseconds (its code and the activations reach every SM again),
 // more than the mat-vec of a small matrix takes. Each block serves one segment.
-#define FN_MAX_SEG 4
+#define FN_MAX_SEG 5
 
 struct fn_dense_seg {
     const char *  W;          // the codes of the segment's part of the first row (16 or 8 bytes per 16 columns)

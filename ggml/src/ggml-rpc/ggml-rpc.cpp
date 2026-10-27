@@ -502,10 +502,13 @@ public:
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     // the server discards every cached graph when a buffer is freed (nodes may point into it): forget ours too, so
-    // the next compute serializes the graph again instead of asking for a uid the server no longer has
-    void forget_graphs() {
+    // the next compute serializes the graph again instead of asking for a uid the server no longer has.
+    // the uids are cleared and the command queued under the graph lock, so no graph_compute of another thread can
+    // register a uid between the two that the server's free would then drop
+    void free_buffer(std::shared_ptr<const void> request, size_t request_size) {
         std::lock_guard<std::mutex> lock(graph_mutex);
         graph_uids.clear();
+        send(RPC_CMD_FREE_BUFFER, request, request_size);
     }
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
@@ -737,8 +740,7 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto request = std::make_shared<rpc_msg_free_buffer_req>();
     request->remote_ptr = ctx->remote_ptr;
     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
-    ctx->dispatcher->forget_graphs();
-    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
+    ctx->dispatcher->free_buffer(request, sizeof(*request));
     delete ctx;
 }
 
@@ -1670,11 +1672,12 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     }
     // Discard all cached graphs to avoid use-after-free in graph_recompute,
     // since their nodes may hold pointers to the buffer being freed. The client
-    // will have to re-serialize its graphs from now on.
+    // forgets its graph uids at the same point (rpc_dispatcher::free_buffer).
+    // The entries are erased, not only invalidated: the client counts its cached
+    // uids from zero again, and both sides must reach GRAPH_CACHE_MAX (and clear)
+    // at the same graph, or the client asks to recompute a uid the server dropped.
     for (auto & sgs : stored_graphs) {
-        for (auto & sg : sgs) {
-            sg.second.graph = nullptr;
-        }
+        sgs.clear();
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);

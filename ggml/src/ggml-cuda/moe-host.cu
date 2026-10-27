@@ -626,7 +626,10 @@ static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n
     return true;
 }
 
+static void mh_mirror_check(int device);
+
 void ggml_cuda_moe_host_free(ggml_backend_cuda_context & ctx) {
+    mh_mirror_check(ctx.device);
     // the host threads may still look at the mailbox: it is left to the process exit
     if (ctx.moe_host_dstate != nullptr) {
         CUDA_CHECK(cudaFree(ctx.moe_host_dstate));
@@ -742,6 +745,7 @@ static bool mh_triple(const ggml_cgraph * cgraph, const int i, const ggml_tensor
 struct mh_mirror_tab {
     std::mutex                                     mtx;
     std::unordered_map<const char *, const char *> map;   // primary -> copy (itself when no copy is needed)
+    std::unordered_map<const char *, size_t>       size;  // primary -> bytes of a copy
     size_t                                         bytes = 0;
     int                                            n     = 0;
 };
@@ -845,6 +849,7 @@ static const char * mh_mirror_of(const int device, const char * c, const size_t 
             m = p;
             g_mh_mirror.bytes += bytes;
             g_mh_mirror.n++;
+            g_mh_mirror.size[c] = bytes;
             if (g_mh_mirror.n <= 3 || g_mh_mirror.n % 48 == 0) {
                 GGML_LOG_WARN("moe-host: dev%d cold copy %d on NUMA node %d (primary on node %d): %.1f MiB, %.2f GiB in all\n", device,
                               g_mh_mirror.n, mh_page_node(p), pn, bytes/1048576.0, g_mh_mirror.bytes/1073741824.0);
@@ -854,6 +859,38 @@ static const char * mh_mirror_of(const int device, const char * c, const size_t 
 #endif
     g_mh_mirror.map[c] = m;
     return m;
+}
+
+// GGML_CUDA_MOE_HOST_MIRROR_CHECK=1: when a context is freed, every copy is compared with its primary (they must be equal
+// whenever no exchange is in flight: the exchanges write an evicted slice into both)
+static void mh_mirror_check(const int device) {
+    static const bool check = getenv("GGML_CUDA_MOE_HOST_MIRROR_CHECK") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_MIRROR_CHECK")) != 0;
+    if (!check || !ggml_cuda_moe_host_mirror()) {
+        return;
+    }
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::lock_guard<std::mutex> lock(g_mh_mirror.mtx);
+    size_t n = 0, n_bad = 0, bytes = 0;
+    for (const auto & kv : g_mh_mirror.size) {
+        const char * c = kv.first;
+        const char * m = g_mh_mirror.map[c];
+        if (m == c) {
+            continue;
+        }
+        n++;
+        bytes += kv.second;
+        size_t bad = 0;
+        for (size_t o = 0; o < kv.second; o += 4096) {
+            const size_t len = std::min<size_t>(4096, kv.second - o);
+            bad += memcmp(c + o, m + o, len) != 0;
+        }
+        if (bad > 0) {
+            n_bad++;
+            GGML_LOG_WARN("moe-host: mirror check: copy of %p differs from its primary in %zu of %zu pages\n", (const void *) c, bad, (kv.second + 4095)/4096);
+        }
+    }
+    GGML_LOG_WARN("moe-host: mirror check (device %d freed): %zu copies, %.2f GiB, %zu differ from their primary\n", device, n, bytes/1073741824.0, n_bad);
 }
 
 void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {

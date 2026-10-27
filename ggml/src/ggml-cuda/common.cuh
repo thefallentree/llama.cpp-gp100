@@ -1530,6 +1530,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_moe_host_triple moe_host;
     mh_mailbox *              moe_host_mb     = nullptr;
     uint32_t *                moe_host_dstate = nullptr;
+    // the routing kernel's groups of the open triple's hot pairs by expert (moe-host.cu mh_route), for fn_moe_up_g;
+    // null when the triple was not routed by it
+    const uint32_t *          fn_moe_groups   = nullptr;
 
     // Single-slot cache of the sm_60 mat-vec's quantized activations.  Gate and up
     // projections consume the same activation tensor back to back, so the second

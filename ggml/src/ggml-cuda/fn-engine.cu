@@ -2605,6 +2605,130 @@ fn_moe_up(const char * __restrict__ wg, const char * __restrict__ wu, const int6
 #endif // FP16_AVAILABLE
 }
 
+// The dot products of one Q2_0 block with the activations of two tokens: the codes are decoded once. Each token's sum
+// is formed in the order of fn_q2_dot, so the results are those of two fn_q2_dot calls.
+static __device__ __forceinline__ void fn_q2_dot2(const fn_q2_raw & r, const int par, const half2 a0[32], const half2 a1[32],
+                                                  float & d0, float & d1) {
+    const int sel = par ? 0x7654 : 0x5432;
+    half2 acc0 = make_half2(0.0f, 0.0f);
+    half2 acc1 = make_half2(0.0f, 0.0f);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        half2 h[8];
+        fn_q2_decode16((uint32_t) __byte_perm(r.w[q], r.w[q + 1], sel), h);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc0 = __hfma2(h[j], a0[8*q + j], acc0);
+            acc1 = __hfma2(h[j], a1[8*q + j], acc1);
+        }
+    }
+    const uint32_t db   = (r.w[0] >> (par*16)) & 0xffffu;
+    const uint32_t sum0 = (uint32_t) __half_as_ushort(__hadd(__low2half(acc0), __high2half(acc0)));
+    const uint32_t sum1 = (uint32_t) __half_as_ushort(__hadd(__low2half(acc1), __high2half(acc1)));
+    const float2   f0   = __half22float2(fn_h2((int) (db | (sum0 << 16))));
+    const float2   f1   = __half22float2(fn_h2((int) (db | (sum1 << 16))));
+    d0 = f0.x*f0.y;
+    d1 = f1.x*f1.y;
+}
+
+// fn_moe_up over groups of pairs instead of pairs: the routing kernel (mh_route) groups the hot pairs of a window by
+// expert, two pairs per group, and a block of a group reads the expert's rows once for the two tokens (a 3-token window
+// routes ~30 pairs to ~21 experts). grid: (n_ff/16, pairs); block y < groups[0] computes group y, block (0, y) also
+// writes the route of pair y for fn_moe_down. Q2_0 experts only. h and route as in fn_moe_up, bit for bit.
+static __global__ void __launch_bounds__(FN_MOE_UP_G*FN_Q2_TPR, 4)
+fn_moe_up_g(const char * __restrict__ wg, const char * __restrict__ wu, const int64_t nb1, const int64_t nb2,
+            const half2 * __restrict__ X, const int xstride, const float * __restrict__ xscale,
+            const int32_t * __restrict__ ids, const int si1, const int n_used,
+            const float * __restrict__ weights, const int sw1,
+            float * __restrict__ h, const int n_ff, fn_moe_route * __restrict__ route, const uint32_t * __restrict__ groups) {
+#if defined(FP16_AVAILABLE)
+    constexpr int G  = FN_MOE_UP_G;
+    constexpr int R  = FN_MOE_UP_R;
+    constexpr int NT = G*FN_Q2_TPR;
+    __shared__ float s_part[2][2*R][NT + 1];
+    const int tid = threadIdx.x;
+    const int g   = tid/FN_Q2_TPR;
+    const int k   = tid - g*FN_Q2_TPR;
+    const int y   = blockIdx.y;
+    if (route != nullptr && blockIdx.x == 0 && tid == 0) {
+        const int t = y/n_used;
+        route[y].e = ids[t*si1 + y % n_used];
+        route[y].w = weights[t*sw1 + y % n_used];
+    }
+    if (y >= (int) groups[0]) {
+        return;
+    }
+    const uint32_t gr = groups[1 + y];
+    const int c0 = (int) (gr & 0xffffu);
+    const int c1 = (int) (gr >> 16) - 1;
+    const int t0 = c0/n_used;
+    const int e  = ids[t0*si1 + c0 % n_used];
+
+    half2 a0[32];
+    fn_q2_load_act(X + (int64_t) t0*xstride + k*32, a0);
+    const int64_t row0 = (int64_t) blockIdx.x*(G*R) + g;
+    if (c1 < 0) {
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+            const char * w = (m == 0 ? wg : wu) + (int64_t) e*nb2 + row0*nb1;
+            fn_q2_raw raw[R];
+            int       par[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                par[r] = fn_q2_par(w + (int64_t) r*G*nb1, k);
+                fn_q2_load(w + (int64_t) r*G*nb1, k, par[r], raw[r]);
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                s_part[0][m*R + r][tid] = fn_q2_dot(raw[r], par[r], a0);
+            }
+        }
+    } else {
+        half2 a1[32];
+        fn_q2_load_act(X + (int64_t) (c1/n_used)*xstride + k*32, a1);
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+            const char * w = (m == 0 ? wg : wu) + (int64_t) e*nb2 + row0*nb1;
+            fn_q2_raw raw[R];
+            int       par[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                par[r] = fn_q2_par(w + (int64_t) r*G*nb1, k);
+                fn_q2_load(w + (int64_t) r*G*nb1, k, par[r], raw[r]);
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                fn_q2_dot2(raw[r], par[r], a0, a1, s_part[0][m*R + r][tid], s_part[1][m*R + r][tid]);
+            }
+        }
+    }
+    __syncthreads();
+    // thread (which, gg, r) of the first 2*G*R: row r of group gg of the group's first or second pair
+    if (tid < 2*G*R) {
+        const int which = tid/(G*R);
+        const int c     = which == 0 ? c0 : c1;
+        if (c >= 0) {
+            const int tt = tid - which*(G*R);
+            const int gg = tt/R;
+            const int r  = tt - gg*R;
+            float sg = 0.0f, su = 0.0f;
+#pragma unroll 4
+            for (int j = 0; j < FN_Q2_TPR; ++j) {
+                sg += s_part[which][r][gg*FN_Q2_TPR + j];
+                su += s_part[which][R + r][gg*FN_Q2_TPR + j];
+            }
+            const float xs = xscale[c/n_used];
+            sg *= xs;
+            su *= xs;
+            h[(int64_t) c*n_ff + blockIdx.x*(G*R) + r*G + gg] = sg/(1.0f + expf(-sg))*su;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wg, wu, nb1, nb2, X, xstride, xscale, ids, si1, n_used, weights, sw1, h, n_ff, route, groups);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
 #define FN_MOE_NU     10  // pairs of a token that a block of fn_moe_down has threads for
 #define FN_MOE_DOWN_R 8   // rows per row group of a tile, in two passes
 
@@ -3791,9 +3915,18 @@ void ggml_cuda_fn_moe_up(ggml_backend_cuda_context & ctx, const ggml_tensor * ga
         fn_moe_h(ctx), n_ff, fn_moe_route_ptr(ctx))
     if (gate->src[0]->type == GGML_TYPE_Q4_0) {
         FN_UP(fn_moe_q4);
+    } else if (ctx.fn_moe_groups != nullptr && ids == ctx.moe_host.ids) {
+        // the routing kernel grouped the pairs by expert
+        fn_moe_up_g<<<dim3(n_ff/(FN_MOE_UP_G*FN_MOE_UP_R), np, 1), FN_MOE_UP_G*FN_Q2_TPR, 0, ctx.stream()>>>(
+            (const char *) gate->src[0]->data, (const char *) up->src[0]->data, gate->src[0]->nb[1], gate->src[0]->nb[2],
+            (const half2 *) fn_act_X(sx), n_embd/2, fn_act_xs(sx),
+            (const int32_t *) ids->data, (int) (ids->nb[1]/sizeof(int32_t)), n_used,
+            (const float *) weights->data, (int) (weights->nb[2]/sizeof(float)),
+            fn_moe_h(ctx), n_ff, fn_moe_route_ptr(ctx), ctx.fn_moe_groups);
     } else {
         FN_UP(fn_moe_q2);
     }
+    ctx.fn_moe_groups = nullptr;
 #undef FN_UP
     CUDA_CHECK(cudaGetLastError());
 }

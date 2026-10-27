@@ -253,7 +253,7 @@ static __global__ void mh_route(
         const float * logits, const float * __restrict__ logits2, float * weights, int32_t * ids, const int si1, const int n_used, const int n_tokens,
         const float clamp_val, const int32_t * __restrict__ perm, uint32_t * counts, const int n_hot,
         const float * __restrict__ x, const int64_t sx_tok, const int n_embd,
-        mh_mailbox * mb, uint32_t * dstate, const int slot, unsigned long long * stats, uint32_t * groups) {
+        mh_mailbox * mb, uint32_t * dstate, const int slot, unsigned long long * stats, uint32_t * groups, const bool early_fence) {
     __shared__ int   s_e[MH_PUBLISH_THREADS];
     __shared__ float s_wt[MH_PUBLISH_THREADS];
     __shared__ float s_norm[MH_PUBLISH_THREADS/WARP_SIZE];
@@ -430,6 +430,16 @@ static __global__ void mh_route(
         mb->n_tokens = n_tokens;
         mb->n_used   = n_used;
         mb->n_pairs  = np;
+    }
+    // This block's mailbox writes are made visible while the quantize blocks finish theirs (each fences before it
+    // counts itself): the fence (~6 us on GP100) used to start only after the counter said they were done. The doorbell
+    // store follows the counter's spin, so the host cannot see it before any of the request's data.
+    // GGML_CUDA_MOE_HOST_EARLY_FENCE=0: fence after the spin, as before.
+    if (early_fence) {
+        __threadfence_system();
+        __syncthreads();
+    }
+    if (i == 0) {
         // the quantize blocks of this launch are done (the counter counts every launch's)
         const long long t0 = clock64();
         while ((uint32_t) (atomicAdd(dstate + MH_DSTATE_QCNT, 0u) - rseq*MH_ROUTE_QBLOCKS) & 0x80000000u) {
@@ -438,8 +448,10 @@ static __global__ void mh_route(
             }
         }
     }
-    __threadfence_system();
-    __syncthreads();
+    if (!early_fence) {
+        __threadfence_system();
+        __syncthreads();
+    }
     if (i == 0) {
         const uint32_t s = dstate[MH_DSTATE_SEQ] + 1;
         dstate[MH_DSTATE_SEQ] = s;
@@ -855,11 +867,12 @@ bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     static const bool use_groups = getenv("GGML_CUDA_FN_MOE_GROUPS") != nullptr && atoi(getenv("GGML_CUDA_FN_MOE_GROUPS")) != 0;
     uint32_t * groups = use_groups && n_tokens*n_used <= WARP_SIZE ? ctx.moe_host_dstate + MH_DSTATE_PAIR + ctx.moe_host_mb->cap_pairs : nullptr;
     ctx.fn_moe_groups = groups;
+    static const bool early_fence = getenv("GGML_CUDA_MOE_HOST_EARLY_FENCE") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_EARLY_FENCE")) != 0;
     mh_route<<<1 + MH_ROUTE_QBLOCKS, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
         (const float *) logits->data, ggml_cuda_fn_router_rest(ctx, logits), (float *) weights->data, (int32_t *) ids->data,
         MH_ROUTE_EXPERTS, n_used, n_tokens, clamp_val,
         perm, counts, a.n_hot, (const float *) a.x->data, (int64_t) (a.x->nb[2]/sizeof(float)), a.n_embd,
-        ctx.moe_host_mb, ctx.moe_host_dstate, a.slot, ctx.fn_dbg_get(), groups);
+        ctx.moe_host_mb, ctx.moe_host_dstate, a.slot, ctx.fn_dbg_get(), groups, early_fence);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

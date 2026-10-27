@@ -229,7 +229,7 @@ static __global__ void mh_route(
         const float * logits, const float * __restrict__ logits2, float * weights, int32_t * ids, const int si1, const int n_used, const int n_tokens,
         const float clamp_val, const int32_t * __restrict__ perm, uint32_t * counts, const int n_hot,
         const float * __restrict__ x, const int64_t sx_tok, const int n_embd,
-        mh_mailbox * mb, uint32_t * dstate, const int slot) {
+        mh_mailbox * mb, uint32_t * dstate, const int slot, unsigned long long * stats) {
     __shared__ int   s_e[MH_PUBLISH_THREADS];
     __shared__ float s_wt[MH_PUBLISH_THREADS];
     __shared__ float s_norm[MH_PUBLISH_THREADS/WARP_SIZE];
@@ -354,6 +354,26 @@ static __global__ void mh_route(
         ids[t*si1 + k]         = e;
         weights[t*n_used + k]  = s_wt[i]*s_norm[t];
         cold = e >= n_hot;
+    }
+    // temporary (GGML_CUDA_FN_WAITS): pairs whose expert an earlier pair of the window already has
+    if (stats != nullptr && n_tokens == 3 && i < n_all) {
+        bool first = true;
+        for (int q = 0; q < i; ++q) {
+            first = first && s_e[q] != s_e[i];
+        }
+        atomicAdd(stats + 267, 1ull);
+        if (first) {
+            atomicAdd(stats + 268, 1ull);
+        }
+        if (!cold) {
+            atomicAdd(stats + 265, 1ull);
+            if (first) {
+                atomicAdd(stats + 266, 1ull);
+            }
+        }
+        if (i == 0) {
+            atomicAdd(stats + 264, 1ull);
+        }
     }
     const unsigned int m = __ballot_sync(0xffffffff, cold);
     if (lane == 0) {
@@ -801,7 +821,7 @@ bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
         (const float *) logits->data, ggml_cuda_fn_router_rest(ctx, logits), (float *) weights->data, (int32_t *) ids->data,
         MH_ROUTE_EXPERTS, n_used, n_tokens, clamp_val,
         perm, counts, a.n_hot, (const float *) a.x->data, (int64_t) (a.x->nb[2]/sizeof(float)), a.n_embd,
-        ctx.moe_host_mb, ctx.moe_host_dstate, a.slot);
+        ctx.moe_host_mb, ctx.moe_host_dstate, a.slot, ctx.fn_dbg_get());
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

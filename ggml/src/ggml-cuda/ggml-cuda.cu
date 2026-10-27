@@ -1160,8 +1160,8 @@ unsigned long long * ggml_backend_cuda_context::fn_dbg_get() {
             return nullptr;
         }
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaMalloc((void **) &fn_dbg, 264*sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMemset(fn_dbg, 0, 264*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMalloc((void **) &fn_dbg, 272*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(fn_dbg, 0, 272*sizeof(unsigned long long)));
         // temporary: the first context of device 0 gets the probe; a thread stamps the changes of its two words
         static std::atomic<bool> probe_taken { false };
         if (getenv("GGML_CUDA_FN_PROBE") != nullptr && device == atoi(getenv("GGML_CUDA_FN_PROBE")) - 1 && !probe_taken.exchange(true)) {
@@ -1192,7 +1192,7 @@ void ggml_backend_cuda_context::fn_dbg_report() {
         return;
     }
     ggml_cuda_set_device(device);
-    unsigned long long v[264], c0 = 0, c1 = 0;
+    unsigned long long v[272], c0 = 0, c1 = 0;
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(v, fn_dbg, sizeof(v), cudaMemcpyDeviceToHost));
     // ticks per microsecond
@@ -1209,6 +1209,11 @@ void ggml_backend_cuda_context::fn_dbg_report() {
     const double tpu = (double) (c1 - c0)/(double) (t1 - t0);
     fprintf(stderr, "fn-waits dev%d: %.1f ticks/us; collect: n %llu, mean wait %.1f us, total %.1f ms; allreduce: n %llu, mean wait %.1f us, total %.1f ms\n",
             device, tpu, v[1], v[1] ? v[0]/tpu/v[1] : 0.0, v[0]/tpu/1000.0, v[3], v[3] ? v[2]/tpu/v[3] : 0.0, v[2]/tpu/1000.0);
+    // the routing of the 3-token windows (mh_route): how many of a layer's pairs share an expert with an earlier pair
+    if (v[264] != 0) {
+        fprintf(stderr, "fn-route dev%d: %llu routings of 3 tokens: pairs %.2f, distinct experts %.2f; hot pairs %.2f, distinct hot experts %.2f per routing\n",
+                device, v[264], (double) v[267]/v[264], (double) v[268]/v[264], (double) v[265]/v[264], (double) v[266]/v[264]);
+    }
     // the segments between the AllReduce sites of a window: mean us since the site before (temporary)
     std::string seg;
     for (int site = 1; site < 126; ++site) {

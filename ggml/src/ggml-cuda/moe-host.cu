@@ -216,6 +216,30 @@ static __global__ void mh_publish(
     }
 }
 
+// The hot pairs of a window grouped by expert, two pairs (tokens) per group, for fn_moe_up_g, which reads such an expert
+// once for both: groups = [count][group: first pair | (second pair + 1) << 16, 0 when there is none], in pair order.
+// Windows of up to 32 pairs (mh_route's caller passes null otherwise); called by warp 0 of mh_route with lane i = pair i:
+// an occurrence of an expert of even rank starts a group, the next occurrence is its second pair.
+static __device__ __forceinline__ void mh_groups(uint32_t * groups, const int i, const bool hot, const int e) {
+    const int ek = hot ? e : -1 - i; // cold pairs and unused lanes match nothing
+    int rank = 0;
+    int nxt  = -1;
+#pragma unroll
+    for (int j = 0; j < WARP_SIZE; ++j) {
+        const int ej = __shfl_sync(0xffffffff, ek, j);
+        rank += j < i && ej == ek;
+        nxt   = j > i && ej == ek && nxt < 0 ? j : nxt;
+    }
+    const bool         start = hot && (rank & 1) == 0;
+    const unsigned int sb    = __ballot_sync(0xffffffff, start);
+    if (start) {
+        groups[1 + __popc(sb & ((1u << i) - 1))] = (uint32_t) i | ((uint32_t) (nxt + 1) << 16);
+    }
+    if (i == 0) {
+        groups[0] = (uint32_t) __popc(sb);
+    }
+}
+
 #define MH_ROUTE_EXPERTS 512
 #define MH_ROUTE_EPT     (MH_ROUTE_EXPERTS/WARP_SIZE) // experts per thread
 
@@ -355,47 +379,6 @@ static __global__ void mh_route(
         weights[t*n_used + k]  = s_wt[i]*s_norm[t];
         cold = e >= n_hot;
     }
-    // The hot pairs grouped by expert, two pairs (tokens) per group: fn_moe_up_g reads such an expert once for both.
-    // groups: [count][group: first pair | (second pair + 1) << 16, 0 when there is none]. A pair leads when no earlier
-    // pair has its expert; the leader walks the later ones.
-    if (groups != nullptr) {
-        __shared__ int s_hot[MH_PUBLISH_THREADS];
-        __shared__ int s_ng;
-        if (i < n_all) {
-            s_hot[i] = !cold;
-        }
-        if (i == 0) {
-            s_ng = 0;
-        }
-        __syncthreads();
-        if (i < n_all && !cold) {
-            const int ex = s_e[i];
-            bool lead = true;
-            for (int q = 0; q < i; ++q) {
-                lead = lead && s_e[q] != ex;
-            }
-            if (lead) {
-                int pending = i;
-                for (int q = i + 1; q < n_all; ++q) {
-                    if (s_e[q] == ex && s_hot[q]) {
-                        if (pending < 0) {
-                            pending = q;
-                        } else {
-                            groups[1 + atomicAdd(&s_ng, 1)] = (uint32_t) pending | ((uint32_t) (q + 1) << 16);
-                            pending = -1;
-                        }
-                    }
-                }
-                if (pending >= 0) {
-                    groups[1 + atomicAdd(&s_ng, 1)] = (uint32_t) pending;
-                }
-            }
-        }
-        __syncthreads();
-        if (i == 0) {
-            groups[0] = (uint32_t) s_ng;
-        }
-    }
     // temporary (GGML_CUDA_FN_WAITS): pairs whose expert an earlier pair of the window already has
     if (stats != nullptr && n_tokens == 3 && i < n_all) {
         bool first = true;
@@ -437,6 +420,9 @@ static __global__ void mh_route(
         dstate[MH_DSTATE_NEED] = np;
     }
     if (np == 0) {
+        if (groups != nullptr && w == 0) {
+            mh_groups(groups, i, i < n_all && !cold, e);
+        }
         return;
     }
     if (i == 0) {
@@ -458,6 +444,10 @@ static __global__ void mh_route(
         const uint32_t s = dstate[MH_DSTATE_SEQ] + 1;
         dstate[MH_DSTATE_SEQ] = s;
         mb->req = s;
+    }
+    // after the doorbell: the host threads need nothing of this
+    if (groups != nullptr && w == 0) {
+        mh_groups(groups, i, i < n_all && !cold, e);
     }
 }
 
@@ -861,7 +851,7 @@ bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     ggml_cuda_expert_cache_take(ctx, node, &perm, &counts);
     // GGML_CUDA_FN_MOE_GROUPS=0: fn_moe_up reads an expert once per pair, as before
     static const bool use_groups = getenv("GGML_CUDA_FN_MOE_GROUPS") == nullptr || atoi(getenv("GGML_CUDA_FN_MOE_GROUPS")) != 0;
-    uint32_t * groups = use_groups ? ctx.moe_host_dstate + MH_DSTATE_PAIR + ctx.moe_host_mb->cap_pairs : nullptr;
+    uint32_t * groups = use_groups && n_tokens*n_used <= WARP_SIZE ? ctx.moe_host_dstate + MH_DSTATE_PAIR + ctx.moe_host_mb->cap_pairs : nullptr;
     ctx.fn_moe_groups = groups;
     mh_route<<<1 + MH_ROUTE_QBLOCKS, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
         (const float *) logits->data, ggml_cuda_fn_router_rest(ctx, logits), (float *) weights->data, (int32_t *) ids->data,

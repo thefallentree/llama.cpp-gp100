@@ -725,10 +725,24 @@ static int mh_page_node(const void * p) {
 }
 
 static const char * mh_mirror_make(const char * c, const size_t bytes, const int node) {
-    const size_t len = (bytes + 4095)/4096*4096;
-    char * p = (char *) mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) {
+    // 2 MB pages (GGML_CUDA_MOE_HOST_MIRROR_HUGE=0: 4 KB): the GPUs map the registered copy too, and 8.75 GiB of 4 KB pages
+    // cost ~18 MiB of VRAM page tables per device (q74: 15119 vs 15101 MiB at load)
+    static const bool huge = getenv("GGML_CUDA_MOE_HOST_MIRROR_HUGE") == nullptr || atoi(getenv("GGML_CUDA_MOE_HOST_MIRROR_HUGE")) != 0;
+    const size_t align = huge ? (size_t) 2 << 20 : 4096;
+    const size_t len   = (bytes + align - 1)/align*align;
+    char * base = (char *) mmap(nullptr, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
         return nullptr;
+    }
+    char * p = (char *) (((uintptr_t) base + align - 1) & ~(uintptr_t) (align - 1));
+    if (p != base) {
+        munmap(base, p - base);
+    }
+    if (p + len != base + len + align) {
+        munmap(p + len, base + len + align - (p + len));
+    }
+    if (huge) {
+        madvise(p, len, MADV_HUGEPAGE);
     }
     const unsigned long mask = 1ul << node;
     // MPOL_PREFERRED: a full node spills over instead of an OOM kill

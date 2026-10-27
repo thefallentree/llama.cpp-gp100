@@ -770,7 +770,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    ggml_tensor * eh_in  = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens], contiguous
+    ggml_tensor * res_hc = nullptr;
+    // a prompt-sized draft ubatch (the drafter's catch-up over a prompt, -ubd 512) multiplies the projection as ONE 2D product
+    // [2*n_embd, hc*n_tokens]: as a 3D operand CUDA ran it as a batched GEMM of n_tokens products of 4 columns each (38 ms
+    // per 512-token draft ubatch, ~4% of a cold prefill, trace p5). Decode-sized batches keep the 3D form (fused paths);
+    // LLAMA_MTP_EH_2D=0: always 3D, as before.
+    static const bool eh_2d = getenv("LLAMA_MTP_EH_2D") == nullptr || atoi(getenv("LLAMA_MTP_EH_2D")) != 0;
+    if (eh_2d && n_tokens > 8 && ggml_is_contiguous(eh_in)) {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens));
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, n_tokens);
+    } else {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, eh_in); // [n_embd, hc, n_tokens]
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;

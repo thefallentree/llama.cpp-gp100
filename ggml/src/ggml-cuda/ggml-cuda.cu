@@ -7516,6 +7516,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         cuda_ctx->fn_act_clear();
     }
     cuda_ctx->moe_host = {};
+    cuda_ctx->fn_moe_groups = nullptr;
     cuda_ctx->ec_last_ids = nullptr;
     cuda_ctx->ec_pending  = true;
     cuda_ctx->fn_router_node = nullptr;

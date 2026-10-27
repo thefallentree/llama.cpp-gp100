@@ -229,7 +229,7 @@ static __global__ void mh_route(
         const float * logits, const float * __restrict__ logits2, float * weights, int32_t * ids, const int si1, const int n_used, const int n_tokens,
         const float clamp_val, const int32_t * __restrict__ perm, uint32_t * counts, const int n_hot,
         const float * __restrict__ x, const int64_t sx_tok, const int n_embd,
-        mh_mailbox * mb, uint32_t * dstate, const int slot, unsigned long long * stats) {
+        mh_mailbox * mb, uint32_t * dstate, const int slot, unsigned long long * stats, uint32_t * groups) {
     __shared__ int   s_e[MH_PUBLISH_THREADS];
     __shared__ float s_wt[MH_PUBLISH_THREADS];
     __shared__ float s_norm[MH_PUBLISH_THREADS/WARP_SIZE];
@@ -354,6 +354,47 @@ static __global__ void mh_route(
         ids[t*si1 + k]         = e;
         weights[t*n_used + k]  = s_wt[i]*s_norm[t];
         cold = e >= n_hot;
+    }
+    // The hot pairs grouped by expert, two pairs (tokens) per group: fn_moe_up_g reads such an expert once for both.
+    // groups: [count][group: first pair | (second pair + 1) << 16, 0 when there is none]. A pair leads when no earlier
+    // pair has its expert; the leader walks the later ones.
+    if (groups != nullptr) {
+        __shared__ int s_hot[MH_PUBLISH_THREADS];
+        __shared__ int s_ng;
+        if (i < n_all) {
+            s_hot[i] = !cold;
+        }
+        if (i == 0) {
+            s_ng = 0;
+        }
+        __syncthreads();
+        if (i < n_all && !cold) {
+            const int ex = s_e[i];
+            bool lead = true;
+            for (int q = 0; q < i; ++q) {
+                lead = lead && s_e[q] != ex;
+            }
+            if (lead) {
+                int pending = i;
+                for (int q = i + 1; q < n_all; ++q) {
+                    if (s_e[q] == ex && s_hot[q]) {
+                        if (pending < 0) {
+                            pending = q;
+                        } else {
+                            groups[1 + atomicAdd(&s_ng, 1)] = (uint32_t) pending | ((uint32_t) (q + 1) << 16);
+                            pending = -1;
+                        }
+                    }
+                }
+                if (pending >= 0) {
+                    groups[1 + atomicAdd(&s_ng, 1)] = (uint32_t) pending;
+                }
+            }
+        }
+        __syncthreads();
+        if (i == 0) {
+            groups[0] = (uint32_t) s_ng;
+        }
     }
     // temporary (GGML_CUDA_FN_WAITS): pairs whose expert an earlier pair of the window already has
     if (stats != nullptr && n_tokens == 3 && i < n_all) {
@@ -533,8 +574,9 @@ static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n
     }
     memset((void *) mb, 0, sizeof(mh_mailbox));
     mh_mailbox_layout(mb, cap_tok, cap_pairs, n_embd);
-    CUDA_CHECK(cudaMalloc((void **) &ctx.moe_host_dstate, (MH_DSTATE_PAIR + (size_t) cap_pairs)*sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(ctx.moe_host_dstate, 0, (MH_DSTATE_PAIR + (size_t) cap_pairs)*sizeof(uint32_t)));
+    // [state][pairs: cap_pairs][groups: 1 + cap_pairs] (mh_route)
+    CUDA_CHECK(cudaMalloc((void **) &ctx.moe_host_dstate, (MH_DSTATE_PAIR + 1 + 2*(size_t) cap_pairs)*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(ctx.moe_host_dstate, 0, (MH_DSTATE_PAIR + 1 + 2*(size_t) cap_pairs)*sizeof(uint32_t)));
     ctx.moe_host_mb = mb;
     mh_pool_attach(g_mh_mailboxes.fetch_add(1), mb, ggml_cuda_info().device_count, numa_node >= 0 ? ctx.device : -1);
     return true;
@@ -817,11 +859,15 @@ bool ggml_cuda_moe_host_route(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     const int32_t * perm   = nullptr;
     uint32_t *      counts = nullptr;
     ggml_cuda_expert_cache_take(ctx, node, &perm, &counts);
+    // GGML_CUDA_FN_MOE_GROUPS=0: fn_moe_up reads an expert once per pair, as before
+    static const bool use_groups = getenv("GGML_CUDA_FN_MOE_GROUPS") == nullptr || atoi(getenv("GGML_CUDA_FN_MOE_GROUPS")) != 0;
+    uint32_t * groups = use_groups ? ctx.moe_host_dstate + MH_DSTATE_PAIR + ctx.moe_host_mb->cap_pairs : nullptr;
+    ctx.fn_moe_groups = groups;
     mh_route<<<1 + MH_ROUTE_QBLOCKS, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
         (const float *) logits->data, ggml_cuda_fn_router_rest(ctx, logits), (float *) weights->data, (int32_t *) ids->data,
         MH_ROUTE_EXPERTS, n_used, n_tokens, clamp_val,
         perm, counts, a.n_hot, (const float *) a.x->data, (int64_t) (a.x->nb[2]/sizeof(float)), a.n_embd,
-        ctx.moe_host_mb, ctx.moe_host_dstate, a.slot, ctx.fn_dbg_get());
+        ctx.moe_host_mb, ctx.moe_host_dstate, a.slot, ctx.fn_dbg_get(), groups);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -837,6 +883,7 @@ void ggml_cuda_moe_host_end(ggml_backend_cuda_context & ctx, const ggml_tensor *
         (int64_t) (node->nb[1]/sizeof(float)), (int64_t) (node->nb[2]/sizeof(float)), n_used, (int) node->ne[0], ctx.fn_dbg_get());
     CUDA_CHECK(cudaGetLastError());
     ctx.moe_host = {};
+    ctx.fn_moe_groups = nullptr;
 }
 
 void ggml_cuda_moe_host_end_weighted(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_tensor * dst) {
@@ -849,6 +896,7 @@ void ggml_cuda_moe_host_end_weighted(ggml_backend_cuda_context & ctx, const ggml
         (int64_t) (dst->nb[1]/sizeof(float)), n_used, (int) dst->ne[0], ctx.fn_dbg_get());
     CUDA_CHECK(cudaGetLastError());
     ctx.moe_host = {};
+    ctx.fn_moe_groups = nullptr;
 }
 
 static const ggml_tensor * mh_root(const ggml_tensor * t) {

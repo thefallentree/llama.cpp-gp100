@@ -327,8 +327,9 @@ top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * 
 
 static bool top_k_radix_fused_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int nrows, const int k, cudaStream_t stream) {
     static const bool enabled = getenv("GGML_CUDA_TOP_K_FUSED") == nullptr || atoi(getenv("GGML_CUDA_TOP_K_FUSED")) != 0;
-    // GGML_CUDA_TOP_K_FUSED_MIN: the shortest row it takes (the caller decides from which length it is asked)
-    static const int min_cols = getenv("GGML_CUDA_TOP_K_FUSED_MIN") != nullptr ? atoi(getenv("GGML_CUDA_TOP_K_FUSED_MIN")) : 32768;
+    // GGML_CUDA_TOP_K_FUSED_MIN: the shortest row it takes. x18 (3 rows, k = 512, P100): 25 us at 4K..16K columns
+    // against 24 / 33 / 49 us for the one-block select at 4K / 8K / 16K, 31 vs 62 at 32K, 41 vs 77 at 64K
+    static const int min_cols = getenv("GGML_CUDA_TOP_K_FUSED_MIN") != nullptr ? atoi(getenv("GGML_CUDA_TOP_K_FUSED_MIN")) : 8192;
     if (!enabled || nrows < 1 || nrows > 8 || ncols < std::max(min_cols, 2048) || ncols > (1 << 20)) {
         return false;
     }

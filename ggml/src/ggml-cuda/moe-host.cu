@@ -715,13 +715,6 @@ struct mh_mirror_tab {
     std::unordered_map<const char *, size_t>       size;  // primary -> bytes of a copy
     size_t                                         bytes = 0;
     int                                            n     = 0;
-    // the copies are carved from one reserved range and registered with CUDA in one call per batch of new copies
-    // (ggml_cuda_moe_host_mirror_sync): a registration per copy (144) cost 128 KiB of VRAM each on every card (+18 MiB)
-    char *                                         arena      = nullptr;
-    size_t                                         arena_cap  = 0;
-    size_t                                         used       = 0;
-    size_t                                         registered = 0;
-    unsigned                                       devices    = 0; // the devices whose pools read copies (bit mask)
 };
 static mh_mirror_tab g_mh_mirror;
 
@@ -735,25 +728,22 @@ static int mh_page_node(const void * p) {
     return status;
 }
 
-static const char * mh_mirror_make(const char * c, const size_t bytes, const int node, const int device) {
-    // GGML_CUDA_MOE_HOST_MIRROR_HUGE=1: the copies on 2 MB pages (p6e: the same VRAM at load, 15119 MiB, and no faster jobs; off)
+static const char * mh_mirror_make(const char * c, const size_t bytes, const int node) {
+    // GGML_CUDA_MOE_HOST_MIRROR_HUGE=1: the copy on 2 MB pages (p6e: the same VRAM at load, 15119 MiB, and no faster jobs; off)
     static const bool huge = getenv("GGML_CUDA_MOE_HOST_MIRROR_HUGE") != nullptr && atoi(getenv("GGML_CUDA_MOE_HOST_MIRROR_HUGE")) != 0;
     const size_t align = huge ? (size_t) 2 << 20 : 4096;
     const size_t len   = (bytes + align - 1)/align*align;
-    if (g_mh_mirror.arena == nullptr) {
-        // address space only (MAP_NORESERVE): the copies fault their pages in as they are written
-        const size_t cap = (size_t) 256 << 30;
-        char * base = (char *) mmap(nullptr, cap + ((size_t) 2 << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (base == MAP_FAILED) {
-            return nullptr;
-        }
-        g_mh_mirror.arena     = (char *) (((uintptr_t) base + ((size_t) 2 << 20) - 1) & ~(uintptr_t) (((size_t) 2 << 20) - 1));
-        g_mh_mirror.arena_cap = cap;
-    }
-    if (g_mh_mirror.used + len > g_mh_mirror.arena_cap) {
+    char * base = (char *) mmap(nullptr, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
         return nullptr;
     }
-    char * p = g_mh_mirror.arena + g_mh_mirror.used;
+    char * p = (char *) (((uintptr_t) base + align - 1) & ~(uintptr_t) (align - 1));
+    if (p != base) {
+        munmap(base, p - base);
+    }
+    if (p + len != base + len + align) {
+        munmap(p + len, base + len + align - (p + len));
+    }
     if (huge) {
         madvise(p, len, MADV_HUGEPAGE);
     }
@@ -778,8 +768,23 @@ static const char * mh_mirror_make(const char * c, const size_t bytes, const int
             w.join();
         }
     }
-    g_mh_mirror.used    += len;
-    g_mh_mirror.devices |= 1u << device;
+    cudaError_t err = cudaHostRegister(p, len, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    void * dp = nullptr;
+    if (err == cudaSuccess) {
+        err = cudaHostGetDevicePointer(&dp, p, 0);
+        if (err == cudaSuccess && dp != (void *) p) {
+            // the expert cache writes the copy through the host address (UVA)
+            cudaHostUnregister(p);
+            err = cudaErrorInvalidValue;
+        }
+    }
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: cudaHostRegister of the %.1f MiB copy failed (%s): the pool reads the primary\n", __func__,
+                      len/1048576.0, cudaGetErrorString(err));
+        munmap(p, len);
+        return nullptr;
+    }
     return p;
 }
 #endif
@@ -806,7 +811,7 @@ static const char * mh_mirror_of(const int device, const char * c, const size_t 
 #if defined(__linux__)
     const int pn = mh_page_node(c);
     if (pn >= 0 && pn != node) {
-        const char * p = mh_mirror_make(c, bytes, node, device);
+        const char * p = mh_mirror_make(c, bytes, node);
         if (p != nullptr) {
             m = p;
             g_mh_mirror.bytes += bytes;
@@ -821,45 +826,6 @@ static const char * mh_mirror_of(const int device, const char * c, const size_t 
 #endif
     g_mh_mirror.map[c] = m;
     return m;
-}
-
-// Registers the copies made since the last call with CUDA (one cudaHostRegister for all of them): the expert cache's
-// exchange kernel writes evicted slices into them through their host addresses (UVA). Called before an update enqueues
-// exchanges; the copies are all made while the first graph runs, so this registers them once.
-void ggml_cuda_moe_host_mirror_sync() {
-    if (!ggml_cuda_moe_host_mirror()) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_mh_mirror.mtx);
-    if (g_mh_mirror.registered >= g_mh_mirror.used) {
-        return;
-    }
-    int cur = 0;
-    CUDA_CHECK(cudaGetDevice(&cur));
-    const unsigned devs = g_mh_mirror.devices;
-    int dev = 0;
-    while (dev < 31 && !(devs & (1u << dev))) {
-        dev++;
-    }
-    // one device's pool reads the copies (the per-socket layout of two cards): mapped there only; several: portable
-    const unsigned flags = (devs & (devs - 1)) ? (cudaHostRegisterPortable | cudaHostRegisterMapped) : cudaHostRegisterMapped;
-    char *       p   = g_mh_mirror.arena + g_mh_mirror.registered;
-    const size_t len = g_mh_mirror.used - g_mh_mirror.registered;
-    ggml_cuda_set_device(dev);
-    const int64_t t0 = ggml_time_us();
-    cudaError_t err = cudaHostRegister(p, len, flags);
-    void * dp = nullptr;
-    if (err == cudaSuccess) {
-        err = cudaHostGetDevicePointer(&dp, p, 0);
-    }
-    if (err != cudaSuccess || dp != (void *) p) {
-        GGML_LOG_ERROR("%s: cudaHostRegister of the %.2f GiB of cold copies failed (%s)\n", __func__, len/1073741824.0,
-                       err != cudaSuccess ? cudaGetErrorString(err) : "device pointer differs from the host pointer");
-        GGML_ABORT("moe-host: the cold copies cannot be mapped for the expert cache's exchanges (unset GGML_CUDA_MOE_HOST_MIRROR)");
-    }
-    GGML_LOG_WARN("moe-host: %.2f GiB of cold copies registered for device %d in %.1f s\n", len/1073741824.0, dev, (ggml_time_us() - t0)/1e6);
-    g_mh_mirror.registered = g_mh_mirror.used;
-    ggml_cuda_set_device(cur);
 }
 
 // GGML_CUDA_MOE_HOST_MIRROR_CHECK=1: when a context is freed, every copy is compared with its primary (they must be equal

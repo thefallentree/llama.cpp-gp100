@@ -57,6 +57,4 @@ int  ggml_cuda_host_numa_node_of_device(int device);
 // GGML_CUDA_MOE_HOST_MIRROR=1 (with the per-socket pools): the cold experts stay next to the GPUs, a pool on the other
 // socket reads a copy on its node (moe-host.cu)
 bool ggml_cuda_moe_host_mirror();
-// registers the cold copies made so far with CUDA (before the expert cache's exchanges write into them)
-void ggml_cuda_moe_host_mirror_sync();
 void ggml_cuda_host_numa_bind_node(bool on, int node);

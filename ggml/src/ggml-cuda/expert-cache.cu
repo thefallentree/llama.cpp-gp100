@@ -1,5 +1,4 @@
 #include "expert-cache.cuh"
-#include "moe-host.cuh"
 #include "mmid-f16-sm60.cuh"
 
 #include <algorithm>
@@ -541,8 +540,6 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     static const int   n_swaps_max = getenv("GGML_CUDA_EXPERT_CACHE_SWAPS") != nullptr ? atoi(getenv("GGML_CUDA_EXPERT_CACHE_SWAPS")) : 96;
     static const float decay       = getenv("GGML_CUDA_EXPERT_CACHE_DECAY") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_DECAY")) : 0.98f;
 
-    // the cold copies of the per-socket pools (GGML_CUDA_MOE_HOST_MIRROR) are mapped before an exchange writes into them
-    ggml_cuda_moe_host_mirror_sync();
     ggml_cuda_set_device(ctx.device);
     cudaStream_t stream = ctx.stream();
     const size_t n_rows = d.layers.size();

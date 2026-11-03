@@ -46,6 +46,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
             (uint64_t) hparams.lilicorr_candidate_topk * (hparams.lilicorr_candidate_topk + 1) > hparams.n_embd)) {
         throw std::runtime_error("invalid LiLiCorr DFlash metadata");
     }
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_EDGE_SCALE, hparams.dflash_selector_edge_scale, false);
+    // The selector's transition term is calibrated against the target head's
+    // unary logits.  A checkpoint may ship a scale; a serving stack may override
+    // it without touching the file.
+    if (const char * value = std::getenv("LLAMA_DFLASH_SELECTOR_EDGE_SCALE")) {
+        char * end = nullptr;
+        const float parsed = std::strtof(value, &end);
+        if (end != value && *end == '\0' && std::isfinite(parsed) && parsed >= 0.0f) {
+            hparams.dflash_selector_edge_scale = parsed;
+        } else {
+            LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_DFLASH_SELECTOR_EDGE_SCALE='%s'\n", __func__, value);
+        }
+    }
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
@@ -80,6 +93,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
         ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
         ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+
+        // A V4.1 draft ships no output_hc_* head: its mixes lag by one sublayer and the last FFN mix
+        // collapses the copies, exactly as in the V4.1 body (see deepseek41.cpp). The absent head is the signature.
+        hparams.dflash_dsv41 = ml.get_tensor_meta("output_hc_base.weight") == nullptr;
+        LLAMA_LOG_INFO("%s: DSV4 draft flavor = %s\n", __func__,
+                hparams.dflash_dsv41 ? "V4.1 (lagged hyper-connections, no output head)" : "V4");
         ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS,            hparams.dsv4_compress_ratios, false);
 
         GGML_ASSERT(hparams.dsv4_o_group_count > 0); // avoid div by zero
@@ -202,9 +221,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         dflash_selector_next   = create_tensor(tn(LLM_TENSOR_DFLASH_SELECTOR_NEXT,   "weight"), { rank, n_vocab }, 0);
         dflash_selector_hidden = create_tensor(tn(LLM_TENSOR_DFLASH_SELECTOR_HIDDEN, "weight"), { n_embd, rank }, 0);
 
-        LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u\n", __func__,
+        LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u, edge scale = %.3f\n", __func__,
                 hparams.dflash_conv_kernel_size, hparams.dflash_conv_group_size,
-                hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
+                hparams.dflash_selector_rank, hparams.dflash_selector_top_k, hparams.dflash_selector_edge_scale);
     }
 
     if (hparams.lilicorr_layers > 0) {
@@ -315,9 +334,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         const int64_t hc_dim          = hc_mult * n_embd;
         const int64_t hc_mix_dim      = (2 + hc_mult) * hc_mult;
 
-        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, 0);
-        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, 0);
-        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+        // V4.1 drafts carry no output hyper-connection head
+        const int hc_head_flags = hparams.dflash_dsv41 ? TENSOR_NOT_REQUIRED : 0;
+        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, hc_head_flags);
+        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, hc_head_flags);
+        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, hc_head_flags);
 
         for (int i = 0; i < n_layer; ++i) {
             auto & layer = layers[i];
@@ -545,7 +566,8 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
 
         if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
+            // the chain gathers a row of w1 with the result: a row of NaN must not give -1
+            prev = ggml_argmax_set_nonneg(ggml_argmax(ctx0, col));
         }
     }
 
@@ -691,6 +713,9 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
         ggml_tensor * cond  = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
         ggml_tensor * score = ggml_mul_mat(ctx0, successor, cond);
+        if (hparams.dflash_selector_edge_scale != 1.0f) {
+            score = ggml_scale(ctx0, score, hparams.dflash_selector_edge_scale);
+        }
         if (n_pred == 1) {
             score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
         }
@@ -1279,16 +1304,36 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // V4.1 rules (deepseek41.cpp): a sublayer computes the mix the NEXT one consumes, layer 0 starts
+    // from a one-hot that selects the first copy, and the last FFN mix collapses the copies at the end
+    const bool hc_lag = hparams.dflash_dsv41;
+    ggml_tensor * pre_mix = nullptr;
+    if (hc_lag) {
+        pre_mix = ggml_concat(ctx0,
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f),
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
+        cb(pre_mix, "hc_pre_init", -1);
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;
-        hc_pre attn_hc = build_hc_pre(inpL,
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+        ggml_tensor * attn_pre = nullptr;
+
+        ggml_tensor * cur = nullptr;
+        if (hc_lag) {
+            build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &attn_pre, &post, &comb, il);
+            cur = build_hc_pre(inpL, pre_mix, il);
+        } else {
+            cur = build_hc_pre(inpL,
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
-                il);
-        ggml_tensor * cur = attn_hc.cur;
+                &post, &comb, il);
+        }
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1296,16 +1341,20 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         cur = build_attention(model, inp_attn, cur, inp_pos, il);
 
-        inpL = build_hc_post(cur, residual, attn_hc.post, attn_hc.comb, il);
+        inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
-        hc_pre ffn_hc = build_hc_pre(inpL,
+        if (hc_lag) {
+            build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &pre_mix, &post, &comb, il);
+            cur = build_hc_pre(inpL, attn_pre, il);
+        } else {
+            cur = build_hc_pre(inpL,
                 layer.hc_ffn_fn,
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
-                il);
-        cur = ffn_hc.cur;
+                &post, &comb, il);
+        }
         cb(cur, "hc_ffn_pre", il);
 
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1334,11 +1383,17 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, ffn_hc.post, ffn_hc.comb, il);
+        inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "l_out", il);
     }
 
-    ggml_tensor * cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    ggml_tensor * cur = nullptr;
+    if (hc_lag) {
+        // the last FFN mix is the one nothing consumed; it does what V4's learned head does
+        cur = build_hc_pre(inpL, pre_mix, -1);
+    } else {
+        cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    }
     cb(cur, "hc_head", -1);
 
     // confidence head input: the reference scores the pre-norm collapsed hidden state

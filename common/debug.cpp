@@ -147,10 +147,6 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
 
-    if (ask) {
-        return true;  // Always retrieve data
-    }
-
     bool matches_filter = pimpl->tensor_filters.empty();
 
     if (!matches_filter) {
@@ -162,15 +158,22 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
+    if (ask) {
+        // with filters, only the matching nodes end a split: the rest of the graph runs as it does without the
+        // callback (fusions, multi-node kernels), so the observed values are the engine's own
+        return matches_filter;
+    }
+
     char src1_str[128] = { 0 };
     if (src1) {
         snprintf(src1_str, sizeof(src1_str), "%s{%s}", src1->name, common_ggml_ne_string(src1).c_str());
     }
 
     if (matches_filter) {
+        // a node without sources (ggml_arange, ggml_fill): nothing to describe on the left
         LOG("%s: %24s = (%s) %10s(%s{%s}, %s}) = {%s}\n", __func__, t->name, ggml_type_name(t->type),
-            ggml_op_desc(t), src0->name, common_ggml_ne_string(src0).c_str(), src1 ? src1_str : "",
-            common_ggml_ne_string(t).c_str());
+            ggml_op_desc(t), src0 ? src0->name : "(none)", src0 ? common_ggml_ne_string(src0).c_str() : "",
+            src1 ? src1_str : "", common_ggml_ne_string(t).c_str());
     }
 
     const bool is_host = ggml_backend_buffer_is_host(t->buffer);
@@ -179,6 +182,29 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         auto n_bytes = ggml_nbytes(t);
         pimpl->data.resize(n_bytes);
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
+    }
+
+    // LLAMA_DEBUG_FULL=<regex>: every value of the matching F32 tensors, one line per row (a full dump of a few
+    // small tensors, e.g. the routing probabilities of one layer)
+    // a comma-separated list of name substrings (no regex metacharacters: the value crosses shells and systemd)
+    static const char * full_env = getenv("LLAMA_DEBUG_FULL");
+    static const std::regex full_re([]() {
+        std::string pat = full_env ? full_env : "^$";
+        for (char & c : pat) { if (c == ',') { c = '|'; } }
+        return pat;
+    }());
+    if (full_env && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && std::regex_search(t->name, full_re)) {
+        const float * d = (const float *) (is_host ? t->data : (void *) pimpl->data.data());
+        const int64_t n_rows = ggml_nelements(t)/t->ne[0];
+        for (int64_t r = 0; r < n_rows; ++r) {
+            std::string line = "full: " + std::string(t->name) + " [" + std::to_string(r) + "]";
+            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), " %.6g", d[r*t->ne[0] + i]);
+                line += buf;
+            }
+            LOG("%s\n", line.c_str());
+        }
     }
 
     if (!ggml_is_quantized(t->type) && matches_filter) {

@@ -1656,7 +1656,7 @@ done:
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d (n_rs_seq=%u, pos_max=%d)\n", seq_id, p0, p1, llama_n_rs_seq(ctx), llama_memory_seq_pos_max(mem, seq_id)).c_str());
     }
 }
 
@@ -1752,9 +1752,19 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // the recurrent-state rollback must cover the longest draft any configured drafter can produce, not only the
+    // block drafter's: an ngram draft longer than n_rs_seq forces the server onto its checkpoint path every round
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq() > 0
+                                    ? (uint32_t) std::max<int32_t>(1, common_speculative_n_max(&params.speculative))
+                                    : 0u;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+    // speculative decoding alternates verify widths (n-gram drafts, block drafts, plain decode) from
+    // round to round; keep a few small graphs so the target does not rebuild and re-allocate on each switch
+    // speculative decoding alternates the verify width from round to round (n-gram drafts of 1..N
+    // tokens, the block draft's fixed width, plain decode); with one retained graph the context rebuilds
+    // and re-allocates on every switch, so keep enough graphs for all of them by default
+    cparams.n_graph_slots     = params.n_graph_slots > 0 ? params.n_graph_slots : (params.speculative.types.empty() ? 1 : 8);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

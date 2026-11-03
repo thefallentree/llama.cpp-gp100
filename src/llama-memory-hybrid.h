@@ -117,6 +117,8 @@ public:
     bool next()  override;
     bool apply() override;
 
+    void reapply_tokens() override;
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 

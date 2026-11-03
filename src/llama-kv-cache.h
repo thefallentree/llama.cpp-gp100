@@ -218,6 +218,9 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // the token ids of the ubatch's cells again (llama_memory_context_i::reapply_tokens)
+    void apply_ubatch_tokens(const slot_info & sinfo, const llama_ubatch & ubatch);
+
     //
     // input API
     //
@@ -303,6 +306,9 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
+
+    // scratch of seq_rm: the cells of the sequence in the removed range
+    std::vector<uint32_t> seq_rm_hits;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
@@ -392,6 +398,8 @@ public:
 
     bool next()  override;
     bool apply() override;
+
+    void reapply_tokens() override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "fn-prof.h"
 
 #include <algorithm>
 #include <cassert>
@@ -61,6 +62,8 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 //
 // llama_kv_cache
 //
+
+FN_PROF_DECL("kv");
 
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
@@ -259,8 +262,13 @@ llama_kv_cache::llama_kv_cache(
                 continue;
             }
 
-            if (filter && !filter(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
+            // A layer the filter rejected has no storage of its own, which is the case that most
+            // needs to borrow another layer's: it borrows when its source is in this cache. A layer
+            // this cache holds maps to its source as upstream does (KV-sharing layers without KV of
+            // their own: gemma4, Mistral Large 4); a rejected layer whose source lives elsewhere
+            // (the other half of an iSWA pair) is skipped.
+            if (filter && !filter(il) && map_layer_ids.find(il_reuse) == map_layer_ids.end()) {
+                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered, source %d not in this cache\n", __func__, il, il_reuse);
                 continue;
             }
 
@@ -314,7 +322,7 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE ||
                 model.arch == LLM_ARCH_MISTRAL_LARGE4) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
@@ -380,6 +388,12 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
         return;
     }
 
+    // the matrices only depend on their size: by default the layers whose cache shares a buffer type (a device) share
+    // one matrix per size, so the per-layer copies do not cost VRAM (Qwen3.8-Flash-Next: 1 MiB per full-attention
+    // layer and cache on every card of a tensor split); LLAMA_KV_ROT_PER_LAYER=1 allocates one per layer and cache
+    static const bool per_layer = getenv("LLAMA_KV_ROT_PER_LAYER") != nullptr && atoi(getenv("LLAMA_KV_ROT_PER_LAYER")) != 0;
+    std::map<std::pair<ggml_backend_buffer_type_t, uint32_t>, ggml_tensor *> shared;
+
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
     for (auto & layer : layers) {
         for (bool is_k : { true, false }) {
@@ -390,6 +404,13 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
             }
 
             const auto buft = ggml_backend_buffer_get_type(cache->buffer);
+            if (!per_layer) {
+                auto it = shared.find({buft, n_rot});
+                if (it != shared.end()) {
+                    (is_k ? layer.k_rot : layer.v_rot) = it->second;
+                    continue;
+                }
+            }
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };
@@ -402,6 +423,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
             auto * rot = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_rot, n_rot);
             ggml_format_name(rot, "cache_%s%s_rot_l%d", name_tag, is_k ? "k" : "v", layer.il);
             (is_k ? layer.k_rot : layer.v_rot) = rot;
+            shared[{buft, n_rot}] = rot;
         }
     }
 
@@ -457,18 +479,45 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        // nothing of this sequence lies in [p0, p1): skip the scan over all cells.  Speculative
+        // decoding calls this once per round with p0 just past the accepted tokens, usually
+        // removing nothing, and the scan costs ~0.3 ms per 128k cells.
+        if (p0 > cells.seq_pos_max(seq_id)) {
+            return true;
+        }
+
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
+        // the sequence's cells in [p0, p1) come from its ordered (pos, cell) set: a rejected draft token or the
+        // draft context's rows (every round) cost a few set steps, not a walk over the 262144 cells of a long
+        // context (~0.6 ms per cache, twice per context). LLAMA_KV_SEQ_RM_SCAN=1 keeps the walk.
+        static const bool scan_all = getenv("LLAMA_KV_SEQ_RM_SCAN") != nullptr && atoi(getenv("LLAMA_KV_SEQ_RM_SCAN")) != 0;
+        FN_PROF_T(t_rm0);
+        if (!scan_all) {
+            const auto & sp = cells.seq_pos_get(seq_id);
+            seq_rm_hits.clear();
+            for (auto it = sp.lower_bound({ p0, 0u }); it != sp.end() && it->first < p1; ++it) {
+                seq_rm_hits.push_back(it->second);
             }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+            for (const uint32_t i : seq_rm_hits) {
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    new_head = std::min(new_head, i);
                 }
             }
+            FN_PROF_ADD("kv.seq_rm(set)", t_rm0);
+        } else {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
+
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
+                }
+            }
+            FN_PROF_ADD("kv.seq_rm(scan)", t_rm0);
         }
 
         // If we freed up a slot, set head to it so searching can start there.
@@ -1145,6 +1194,33 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+void llama_kv_cache::apply_ubatch_tokens(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    if (other || !ubatch.token) {
+        return;
+    }
+
+    assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t i = s*sinfo.size() + ii;
+
+            auto & cells = v_cells[sinfo.strm[s]];
+
+            const auto idx = sinfo.idxs[s][ii];
+
+            const bool is_embd = ubatch.is_mixed() && ubatch.type[i];
+            if (is_embd || cells.is_empty(idx)) {
+                continue;
+            }
+
+            llama_kv_cell_ext ext = cells.ext_get(idx);
+            ext.tok = ubatch.token[i];
+            cells.ext_set(idx, ext);
+        }
+    }
+}
+
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -1317,10 +1393,23 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     const uint32_t n_pad = 256;
 
+    // temporary switch (LLAMA_KV_PAD_GEOM=N): sizes that double from N times the pad, so that a long generation rebuilds its graph a few times, not every 256 tokens
+    static const uint32_t geom = getenv("LLAMA_KV_PAD_GEOM") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_PAD_GEOM"))) : 0;
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad, GGML_PAD(cells.used_max_p1(), n_pad))), result);
+        // with one cell to spare the size changes in the same decode as the pool count of the indexer
+        // (llama-memory-hybrid-idx.cpp, kpool_pad): one new graph instead of two
+        uint32_t n = std::max(n_pad, GGML_PAD(cells.used_max_p1() + (geom ? 1 : 0), n_pad));
+        if (geom) {
+            uint32_t g = n_pad*geom;
+            while (g < n) {
+                g *= 2;
+            }
+            n = g;
+        }
+        result = std::max(std::min(cells.size(), n), result);
     }
 
     return result;
@@ -1854,8 +1943,8 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 bool llama_kv_cache::has_cell_ext() const {
-    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+    // M-RoPE needs the 2D position, the PLE and engram n-gram hashes need the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.engram_n_head > 0;
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
@@ -2872,6 +2961,12 @@ bool llama_kv_cache_context::apply() {
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
     return true;
+}
+
+void llama_kv_cache_context::reapply_tokens() {
+    if (!ubatches.empty()) {
+        kv->apply_ubatch_tokens(sinfos[i_cur], ubatches[i_cur]);
+    }
 }
 
 llama_memory_status llama_kv_cache_context::get_status() const {

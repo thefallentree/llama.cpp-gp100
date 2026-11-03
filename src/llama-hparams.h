@@ -78,6 +78,8 @@ struct llama_hparams {
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;
     uint32_t n_expert = 0;
+    uint32_t n_expert_hot = 0; // > 0: experts [n_expert_hot, n_expert) are stored in the *_exps_cold tensors
+    uint32_t n_expert_nextn = 0; // > 0: the nextn (MTP) blocks keep this many routed experts, e.g. an expert-pruned trunk with the vendor's draft block
     uint32_t n_rel_attn_bkts = 0;
     uint32_t n_value_expert      = 0; // MoVA value experts (K2 Horizon)
     uint32_t n_value_expert_used = 0;
@@ -283,6 +285,10 @@ struct llama_hparams {
     uint32_t lilicorr_layers         = 0;
     float    lilicorr_vector_eps     = 0.0f;
     float    lilicorr_logit_scale    = 0.0f;
+    float    dflash_selector_edge_scale = 1.0f;
+    // DSV4 draft with the V4.1 rules: hyper-connection mixes lag by one sublayer, the last FFN mix
+    // collapses the copies (no output_hc_* head), and only the low-rank q is normalized
+    bool     dflash_dsv41            = false;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
@@ -347,6 +353,30 @@ struct llama_hparams {
 
     // scale of the hyper-connection post gate (DeepSeek-V4 hardcodes 2.0)
     float    hc_magnitude = 0.0f;
+
+    // Engram (n-gram lookup table) for DeepSeek-V4.1
+    uint32_t engram_n_head          = 0;
+    uint32_t engram_key_length      = 0;
+    uint32_t engram_max_ngram_size  = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> engram_layer_ids;
+
+    // DeepSeek-V4.1 compresses KV on a few source layers and shares each stream with the layers
+    // that follow, so for every layer these hold the layer that published what it reads, or -1
+    // when it reads nothing. A layer whose entry is itself is a source. The KV cache needs these
+    // to alias a reader's storage onto its source's, so they live here rather than on the model.
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source;
+
+    bool dsv41_is_kv_source   (uint32_t il) const { return dsv41_kv_source[il]        == (int32_t) il; }
+    bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
+    bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
+
+    // Exact long-prompt layer skip (see llama_model_deepseek41::graph): the last layer that publishes a shared
+    // stream (compressed KV, index keys), or -1 when the layers after it cannot be skipped, and how many rows
+    // before the end of a prompt the layers after it need their own work for
+    int32_t  dsv41_skip_src  = -1;
+    uint32_t dsv41_skip_tail = 0;
 
     uint32_t ple_ngram_size      = 0;
     uint32_t ple_heads_per_ngram = 0;

@@ -327,6 +327,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("altup")  == std::string::npos;
     quantize &= name.find("laurel") == std::string::npos;
 
+    // DeepSeek-V4.1 engram gate scales: one value per channel, applied with ggml_mul, which has
+    // no quantized path. They are two vectors per engram layer, so keeping them costs nothing.
+    quantize &= name.find("engram_q.weight") == std::string::npos;
+    quantize &= name.find("engram_k.weight") == std::string::npos;
+
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
@@ -451,6 +456,10 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            // Q4_1_G64 is 64-wide. Tensors whose K is only 32-aligned (common
+            // on non-Qwen heads, some MoE experts, odd vocab) must not abort
+            // the whole file — demote to Q4_1 (same affine nibbles, 32-block).
+            case GGML_TYPE_Q4_1_G64: return_type = GGML_TYPE_Q4_1;  break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
@@ -775,11 +784,11 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
             }
         }
         if (!named) {
-            return params->token_embedding_type;
+            return tensor_type_fallback(qs, tensor, params->token_embedding_type);
         }
     }
     if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
-        return params->output_tensor_type;
+        return tensor_type_fallback(qs, tensor, params->output_tensor_type);
     }
 
     ggml_type new_type = default_type;
@@ -925,6 +934,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: return GGML_TYPE_Q4_0;
         case LLAMA_FTYPE_MOSTLY_Q4_1: return GGML_TYPE_Q4_1;
+        case LLAMA_FTYPE_MOSTLY_Q4_1_G64: return GGML_TYPE_Q4_1_G64;
         case LLAMA_FTYPE_MOSTLY_Q5_0: return GGML_TYPE_Q5_0;
         case LLAMA_FTYPE_MOSTLY_Q5_1: return GGML_TYPE_Q5_1;
         case LLAMA_FTYPE_MOSTLY_Q8_0: return GGML_TYPE_Q8_0;

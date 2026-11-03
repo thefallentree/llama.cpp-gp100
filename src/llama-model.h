@@ -349,6 +349,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold   = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
@@ -632,6 +635,12 @@ struct llama_layer {
     struct ggml_tensor * wqkv_z              = nullptr; // [wqkv | wqkv_gate] in one weight
     struct ggml_tensor * ssm_beta_alpha_cat  = nullptr; // [ssm_beta | ssm_alpha] in one weight, unlike the grouped ssm_beta_alpha
 
+    // Engram (n-gram keyed lookup table) for DeepSeek-V4.1
+    struct ggml_tensor * engram_embd    = nullptr;
+    struct ggml_tensor * engram_k       = nullptr;
+    struct ggml_tensor * engram_q       = nullptr;
+    struct ggml_tensor * engram_wkv     = nullptr;
+
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;
     struct ggml_tensor * ple_norm_key   = nullptr;
@@ -727,6 +736,9 @@ struct llama_hadamard {
 };
 
 struct llama_model {
+    // hot expert tensor -> tensor holding the remaining (cold) experts of the same weight
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> exps_cold;
+
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -807,6 +819,10 @@ struct llama_model {
     struct ggml_tensor * fc_s    = nullptr;
     struct ggml_tensor * fc_in_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+    mutable std::vector<int64_t> d2t_host; // its host copy, read once on demand (llama_model_d2t)
+
+    // the MTP graph implements the draft chain (llm_graph_params::chain)
+    bool draft_chain_supported() const;
 
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;

@@ -134,7 +134,15 @@ bool llama_batch_allocr::init(
     }
 
     if (has_state) {
-        state_vec = batch_inp.state;
+        // a large batch (the drafter's catch-up over a prompt batch: 3072 rows of 40 KB = 126 MB) is read where it is: the
+        // ubatches are split inside the decode call that owns batch_inp; small ones keep their own copy as before
+        if (n_tok > 64) {
+            state_vec.clear();
+            state_ptr = batch_inp.state.data();
+        } else {
+            state_vec = batch_inp.state;
+            state_ptr = state_vec.data();
+        }
     }
 
     //
@@ -305,7 +313,7 @@ bool llama_batch_allocr::init(
             /*.n_pos        =*/ n_pos_per_embd,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
-            /*.embd_state   =*/ state_vec.empty() ? nullptr : state_vec.data(),
+            /*.embd_state   =*/ const_cast<float *>(state_ptr),
             /*.pos          =*/ batch.pos,
             /*.n_seq_id     =*/ batch.n_seq_id,
             /*.seq_id       =*/ batch.seq_id,
@@ -582,7 +590,22 @@ void llama_batch_allocr::split_reset() {
     used.resize(get_n_tokens(), false);
 }
 
+void llama_batch_allocr::set_n_chain(uint32_t n_chain) {
+    this->n_chain = n_chain;
+}
+
+uint32_t llama_batch_allocr::ubatch_cap(uint32_t n_ubatch) const {
+    const uint32_t n_tokens = get_n_tokens();
+    if (n_chain == 0 || n_chain >= n_tokens) {
+        return n_ubatch;
+    }
+    const uint32_t n_first = n_tokens - n_chain;
+    return n_used < n_first ? std::min(n_ubatch, n_first - n_used) : 1;
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    n_ubatch = ubatch_cap(n_ubatch);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -617,6 +640,11 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+    n_ubatch = ubatch_cap(n_ubatch);
+    if (n_chain > 0 && n_ubatch <= n_keep_tail) {
+        n_keep_tail = 0;
+    }
+
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -788,6 +816,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+    n_ubatch = ubatch_cap(n_ubatch);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -838,6 +868,7 @@ void llama_batch_allocr::clear() {
     embd_vec    .clear();
     is_embd_vec .clear();
     state_vec   .clear();
+    state_ptr   = nullptr;
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -880,10 +911,17 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool mixed     = mixed_batch && n_embd_rows > 0 && n_embd_rows < n_tokens;
     const bool use_token = batch.token && !(mixed_batch && n_embd_rows == n_tokens);
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
-    const bool has_state = !state_vec.empty();
+    const bool has_state = state_ptr != nullptr;
+    // a large ubatch of consecutive rows (the drafter's catch-up: 512 rows of 40 KB) points into the rows themselves
+    // instead of a fresh 21 MB copy per ubatch (its page faults made the split ~90 ms per catch-up batch); the rows stay
+    // valid while the decode call that owns the batch runs
+    bool state_view = has_state && n_tokens > 64 && !idxs.empty();
+    for (size_t i = 1; state_view && i < idxs.size(); ++i) {
+        state_view = idxs[i] == idxs[0] + (int32_t) i;
+    }
 
     const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
-    const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
+    const int64_t n_state_all = has_state && !state_view ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -916,8 +954,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->type[i] = is_embd_vec[idxs[i]];
         }
 
-        if (has_state) {
-            memcpy(udata->embd_state.data() + i*n_embd_state, state_vec.data() + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
+        if (has_state && !state_view) {
+            memcpy(udata->embd_state.data() + i*n_embd_state, state_ptr + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -966,7 +1004,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
         /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
-        /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
+        /*.embd_state   =*/ !has_state ? nullptr : state_view ? const_cast<float *>(state_ptr + (int64_t) idxs[0]*n_embd_state) : udata->embd_state.data(),
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

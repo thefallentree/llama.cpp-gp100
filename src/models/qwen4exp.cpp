@@ -614,7 +614,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // the first part of a pipelined prefill has no outputs: an unused input would get no buffer
+    ggml_tensor * inp_out_ids = il_end == n_layer ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * res_hc = nullptr;
     if (il_begin == 0) {

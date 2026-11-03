@@ -430,21 +430,41 @@ mmid16_q2_0_gemm_p(
     uint4    rx[XI];
     float    rxs = 0.0f;
 
-    // the k-block's global loads into registers
-#define MMID16_LOAD(kb) do { \
+    // Running pointers per thread, advanced by one k-block per load (weights 18 B, activations 128 B, scales 4 B),
+    // with the slot predicates hoisted: the index form (expert row * nb01 + kb*18 etc. in every load) cost ~90
+    // integer instructions per k-block next to the 512 HFMA2 (SASS count); this form 23 fewer than that, -4.5% on
+    // the gate op and -3.9% on down at 1536 tokens (bench runs/fn-m2/qp7/ex/bench/mmid_bench.cu, variant P).
+    // wq[i] points at the k-block's 18-byte block + 4*lq: the codes are wq[i][1..2], the scale at wq[i] - 2*lq.
+    const uint16_t * wq[WI];
+    const uint4 *    xp[XI];
+    bool             xok[XI];
+#pragma unroll
+    for (int i = 0; i < WI; ++i) {
+        const int lr = (i*NT + tid) / 4; const int lq = (i*NT + tid) % 4;
+        wq[i] = (const uint16_t *) (wexp + (int64_t) (row0 + lr)*nb01 + 4*lq);
+    }
+#pragma unroll
+    for (int i = 0; i < XI; ++i) {
+        const int idx = i*NT + tid; const int col = idx / 8; const int part = idx % 8; const int c = c0 + col;
+        xok[i] = idx < TN*8 && c < cend;
+        xp[i]  = (const uint4 *) (xh + (int64_t) (xok[i] ? c : c0)*nkb*32) + part;
+    }
+    const bool    xsok = tid < TN && c0 + tid < cend;
+    const float * xsp  = xs + (int64_t) (xsok ? c0 + tid : c0)*nkb;
+
+    // the next k-block's global loads into registers
+#define MMID16_LOAD() do { \
         _Pragma("unroll") for (int i = 0; i < WI; ++i) { \
-            const int lr = (i*NT + tid) / 4; const int lq = (i*NT + tid) % 4; \
-            const char * blk = wexp + (int64_t) (row0 + lr)*nb01 + (int64_t) (kb)*18; \
-            const uint16_t * q16 = (const uint16_t *) (blk + 2 + 4*lq); \
-            rq[i] = (uint32_t) q16[0] | ((uint32_t) q16[1] << 16); \
-            rd[i] = __half2float(*((const half *) blk)); \
+            const int lq = (i*NT + tid) % 4; \
+            rq[i] = (uint32_t) wq[i][1] | ((uint32_t) wq[i][2] << 16); \
+            rd[i] = __half2float(*((const half *) (wq[i] - 2*lq))); \
+            wq[i] += 9; \
         } \
         _Pragma("unroll") for (int i = 0; i < XI; ++i) { \
-            const int idx = i*NT + tid; const int col = idx / 8; const int part = idx % 8; const int c = c0 + col; \
-            rx[i] = make_uint4(0, 0, 0, 0); \
-            if (idx < TN*8 && c < cend) { rx[i] = ((const uint4 *) (xh + ((int64_t) c*nkb + (kb))*32))[part]; } \
+            rx[i] = xok[i] ? *xp[i] : make_uint4(0, 0, 0, 0); \
+            xp[i] += 8; \
         } \
-        if (tid < TN) { const int c = c0 + tid; rxs = c < cend ? xs[(int64_t) c*nkb + (kb)] : 0.0f; } \
+        rxs = xsok ? *xsp : 0.0f; xsp++; \
     } while (0)
     // the registers decoded into shared memory
 #define MMID16_STORE() do { \
@@ -463,12 +483,12 @@ mmid16_q2_0_gemm_p(
         if (tid < TN) { xsc[tid] = rxs; } \
     } while (0)
 
-    MMID16_LOAD(0);
+    MMID16_LOAD();
     for (int kb = 0; kb < nkb; ++kb) {
         MMID16_STORE();
         __syncthreads();
         if (kb + 1 < nkb) {
-            MMID16_LOAD(kb + 1);
+            MMID16_LOAD();
         }
         half2 hacc[RPT][NJ];
 #pragma unroll

@@ -32,7 +32,6 @@ public:
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;
-    bool     is_overlap()     const; // V4 CSA: state holds 2*ratio rows of 2x width
     uint32_t get_state_size() const;
     uint32_t get_n_stream()   const;
     uint32_t get_n_rs_seq()   const;
@@ -150,9 +149,6 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
-    // layer whose compressed-KV storage `il` reads, -1 = no compressed KV
-    int32_t get_comp_read_layer(int32_t il) const;
-
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     void update_rs_for_ubatches(const std::vector<llama_ubatch> & ubatches);
@@ -171,12 +167,6 @@ private:
     // [n_seq_max] largest rollback whose snapshot the last ubatch of the seq wrote: snapshot d is
     // exact for d <= n tokens of the seq in that ubatch (d == n is the state before the ubatch)
     std::vector<uint32_t> rs_max;
-
-    // [n_layer] storage layer -> layer whose rows it holds (itself, or the source of a mirror)
-    std::vector<int32_t> comp_kv_src;
-
-    // [n_layer] layer -> layer whose compressed-KV storage it reads (itself, its V4.1 kv source or a mirror), -1 = none
-    std::vector<int32_t> comp_read;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -227,9 +217,6 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-
-    // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
-    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     size_t i_next = 0;
@@ -387,8 +374,6 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
-    int32_t get_comp_read_layer(int32_t il) const;
-
 private:
     size_t i_next = 0;
 
@@ -421,6 +406,4 @@ private:
     mutable comp_plan reserve_plan_lid;
 
     const llama_memory_status status;
-
-    const llama_kv_cache_dsv4 * kv = nullptr;
 };

@@ -1496,6 +1496,28 @@ private:
 
         peer_cfg = prefill_peer_config::from_env(model_tgt);
 
+        // also a peer of other servers' long prompts while idle (server-prefill-peer.h)
+        if (const char * port = getenv("LLAMA_PREFILL_PEER_SERVE")) {
+            const int lfd = prefill_peer_listen(atoi(port));
+            if (lfd < 0) {
+                SRV_ERR("prefill-peer: cannot listen on port %s\n", port);
+            } else {
+                SRV_WRN("prefill-peer: a peer on port %s while idle\n", port);
+                std::thread([this, lfd]() {
+                    while (true) {
+                        const int fd = prefill_peer_accept(lfd);
+                        if (fd < 0) {
+                            continue;
+                        }
+                        server_task task(SERVER_TASK_TYPE_PEER_PREFILL);
+                        task.id = queue_tasks.get_new_id();
+                        task.slot_action.id_slot = fd;
+                        queue_tasks.post(std::move(task), /*front*/ true);
+                    }
+                }).detach();
+            }
+        }
+
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
@@ -3102,6 +3124,29 @@ private:
 
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
+        // a head's prompt (server-prefill-peer.h): served only by an idle server, refused at once otherwise
+        if (task.type == SERVER_TASK_TYPE_PEER_PREFILL) {
+            const int fd = task.slot_action.id_slot;
+            bool busy = is_yielding;
+            for (auto & slot : slots) {
+                busy = busy || slot.is_processing();
+            }
+            if (busy) {
+                SRV_WRN("%s", "prefill-peer: busy, a head's prompt refused\n");
+                prefill_peer_refuse(fd);
+                return true;
+            }
+            // this server's own conversation goes to the host prompt cache first, as for another prompt
+            for (auto & slot : slots) {
+                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
+                slot.prompt_clear();
+            }
+            prefill_peer_serve_conn(fd, ctx_tgt, ctx_dft, spec.get());
+            return true;
+        }
+
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
@@ -3497,6 +3542,8 @@ private:
                     }
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_PEER_PREFILL:
+                break; // handled above
             case SERVER_TASK_TYPE_SET_LORA:
                 {
                     auto new_loras = construct_lora_list(task.set_lora);

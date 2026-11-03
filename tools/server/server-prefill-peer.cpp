@@ -195,39 +195,53 @@ prefill_peer_config prefill_peer_config::from_env(const llama_model * model) {
         prefill_peer_stage st;
         st.host = item.substr(0, colon);
         st.port = atoi(item.c_str() + colon + 1);
-        cfg.stages.push_back(st);
+        cfg.peers.push_back(st);
     }
-    const int n_parts = (int) cfg.stages.size() + 1;
-    std::vector<int> splits;
+    const int n_parts = (int) cfg.peers.size() + 1;
     if (getenv("LLAMA_PREFILL_PEER_SPLIT")) {
         for (const auto & x : string_split<std::string>(getenv("LLAMA_PREFILL_PEER_SPLIT"), ',')) {
-            splits.push_back(atoi(x.c_str()));
+            cfg.split_all.push_back(atoi(x.c_str()));
         }
     } else {
         for (int k = 1; k < n_parts; ++k) {
-            splits.push_back((n_layer*k + n_parts/2)/n_parts);
+            cfg.split_all.push_back((n_layer*k + n_parts/2)/n_parts);
         }
     }
-    if ((int) splits.size() != n_parts - 1) {
-        LOG_WRN("prefill-peer: %d peers need %d split layers, disabled\n", n_parts - 1, n_parts - 1);
+    cfg.split_one = getenv("LLAMA_PREFILL_PEER_SPLIT1") ? atoi(getenv("LLAMA_PREFILL_PEER_SPLIT1")) : n_layer/2;
+    bool ok = (int) cfg.split_all.size() == n_parts - 1 && cfg.split_one > 0 && cfg.split_one < n_layer;
+    for (int k = 0; ok && k < n_parts - 1; ++k) {
+        const int lo = k == 0 ? 0 : cfg.split_all[k - 1];
+        ok = cfg.split_all[k] > lo && cfg.split_all[k] < n_layer;
+    }
+    if (!ok) {
+        LOG_WRN("prefill-peer: bad LLAMA_PREFILL_PEER_SPLIT / SPLIT1 for %d peers and %d layers, disabled\n", n_parts - 1, n_layer);
         return {};
-    }
-    for (int k = 0; k < n_parts - 1; ++k) {
-        const int lo = k == 0 ? 0 : splits[k - 1];
-        if (splits[k] <= lo || splits[k] >= n_layer) {
-            LOG_WRN("prefill-peer: split layer %d out of order or range, disabled\n", splits[k]);
-            return {};
-        }
-        cfg.stages[k].layer_begin = splits[k];
     }
     if (getenv("LLAMA_PREFILL_PEER_MIN")) {
         cfg.min_tokens = atoi(getenv("LLAMA_PREFILL_PEER_MIN"));
     }
-    for (size_t k = 0; k < cfg.stages.size(); ++k) {
-        LOG_WRN("prefill-peer: peer %zu %s:%d from layer %d\n", k, cfg.stages[k].host.c_str(), cfg.stages[k].port, cfg.stages[k].layer_begin);
+    for (size_t k = 0; k < cfg.peers.size(); ++k) {
+        LOG_WRN("prefill-peer: peer %zu %s:%d, from layer %d in the whole chain\n", k, cfg.peers[k].host.c_str(), cfg.peers[k].port, cfg.split_all[k]);
     }
-    LOG_WRN("prefill-peer: head, layers [0, %d) here, prompts from %d tokens\n", cfg.split(), cfg.min_tokens);
+    LOG_WRN("prefill-peer: head, prompts from %d tokens; a single peer from layer %d\n", cfg.min_tokens, cfg.split_one);
     return cfg;
+}
+
+std::vector<std::vector<prefill_peer_stage>> prefill_peer_config::chains() const {
+    std::vector<std::vector<prefill_peer_stage>> res;
+    std::vector<prefill_peer_stage> all = peers;
+    for (size_t k = 0; k < all.size(); ++k) {
+        all[k].layer_begin = split_all[k];
+    }
+    res.push_back(all);
+    if (peers.size() > 1) {
+        for (const auto & p : peers) {
+            prefill_peer_stage st = p;
+            st.layer_begin = split_one;
+            res.push_back({ st });
+        }
+    }
+    return res;
 }
 
 namespace {
@@ -321,34 +335,44 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
         return false;
     };
 
-    const auto & first = cfg.stages[0];
-    const int fd = connect_to(first.host, first.port);
-    if (fd < 0) {
-        LOG_WRN("prefill-peer: cannot connect to %s:%d\n", first.host.c_str(), first.port);
-        return false;
-    }
-
     // the drafter's pending row and deferred rows as they are here, so the last stage's catch-up starts from them
     std::vector<uint8_t> spec_in;
     if (spec) {
         common_speculative_get_state(spec, seq_id, spec_in);
     }
 
-    if (!send_hello(fd, cfg.stages, tokens, n_split, n_ubatch, spec_in, width)) {
-        ::close(fd);
-        LOG_WRN("prefill-peer: the chain at %s:%d did not accept the prompt\n", first.host.c_str(), first.port);
+    // the whole chain, else one peer at a time (a busy peer refuses at once)
+    int fd = -1;
+    int split = -1;
+    for (const auto & chain : cfg.chains()) {
+        const int fdc = connect_to(chain[0].host, chain[0].port);
+        if (fdc < 0) {
+            LOG_WRN("prefill-peer: cannot connect to %s:%d\n", chain[0].host.c_str(), chain[0].port);
+            continue;
+        }
+        if (send_hello(fdc, chain, tokens, n_split, n_ubatch, spec_in, width)) {
+            fd    = fdc;
+            split = chain[0].layer_begin;
+            LOG_WRN("prefill-peer: %zu peer(s), layers [0, %d) here\n", chain.size(), split);
+            break;
+        }
+        ::close(fdc);
+        LOG_WRN("prefill-peer: a chain of %zu from %s:%d declined\n", chain.size(), chain[0].host.c_str(), chain[0].port);
+    }
+    if (fd < 0) {
         return false;
     }
 
     // the residual after the last local layer of every token comes out as the nextn embeddings
     llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-    llama_set_layer_range(ctx_tgt, 0, cfg.split());
+    llama_set_layer_range(ctx_tgt, 0, split);
 
     sender snd;
     snd.start(fd);
 
-    // whole batches per call, as the server decodes a prompt: the next ubatch's host side overlaps the previous one
-    const int32_t n_chunk = std::max<int32_t>(n_ubatch, ((int32_t) llama_n_batch(ctx_tgt) / n_ubatch) * n_ubatch);
+    // one ubatch per message: the chain fills and drains in one ubatch per stage (the ubatches are the ones the local
+    // path decodes; LLAMA_PREFILL_PEER_CHUNK=n sends n ubatches per message)
+    const int32_t n_chunk = n_ubatch * std::max(1, getenv("LLAMA_PREFILL_PEER_CHUNK") ? atoi(getenv("LLAMA_PREFILL_PEER_CHUNK")) : 1);
 
     common_batch batch(ctx_tgt);
     bool ok = true;
@@ -655,6 +679,47 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
 }
 
 } // namespace
+
+void prefill_peer_serve_conn(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec) {
+    tune_socket(fd);
+    serve_one(fd, ctx_tgt, ctx_dft, spec);
+    // nothing of the head's prompt stays behind
+    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+    if (ctx_dft) {
+        llama_memory_clear(llama_get_memory(ctx_dft), true);
+    }
+    ::close(fd);
+}
+
+void prefill_peer_refuse(int fd) {
+    const std::string busy = "busy";
+    std::vector<uint8_t> e(busy.begin(), busy.end());
+    send_val(fd, MSG_ERROR) && send_blob(fd, e);
+    ::shutdown(fd, SHUT_WR);
+    ::close(fd);
+}
+
+int prefill_peer_listen(int port) {
+    const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons((uint16_t) port);
+    if (::bind(lfd, (sockaddr *) &addr, sizeof(addr)) != 0 || ::listen(lfd, 4) != 0) {
+        ::close(lfd);
+        return -1;
+    }
+    return lfd;
+}
+
+int prefill_peer_accept(int lfd) {
+    return ::accept(lfd, nullptr, nullptr);
+}
 
 void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec) {
     const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);

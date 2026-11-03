@@ -2,6 +2,8 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvq-f16-sm60.cuh"
+#include "mmid-f16-sm60.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -95,6 +97,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
+    MMVQ_PARAMETERS_NVIDIA_PRE_TURING,
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
@@ -114,7 +117,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
-#elif __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+#elif defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ < GGML_CUDA_CC_TURING
+    return MMVQ_PARAMETERS_NVIDIA_PRE_TURING;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
 #else
     return MMVQ_PARAMETERS_GENERIC;
@@ -136,6 +141,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING) {
+        return MMVQ_PARAMETERS_NVIDIA_PRE_TURING;
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
@@ -450,7 +458,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_NVIDIA_PRE_TURING) {
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -593,9 +601,18 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_NVIDIA_PRE_TURING || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
+                // One output row per block re-reads the q8_1 activation row from L2 once per
+                // output row.  On pre-Turing NVIDIA (measured on a GP100) MMVQ is limited by
+                // those loads, not by DRAM bandwidth or instruction count, so several rows per
+                // block pay off.  Decode sweep, 9B Q4_0, llama-bench tg32:
+                //     rows 1 -> 46.9   2 -> 54.1 (+15.4%)   4 -> 57.7 (+23.0%)   8 -> 57.2 t/s
+                // Other architectures are not measured here and keep their value.
+                if (table_id == MMVQ_PARAMETERS_NVIDIA_PRE_TURING) {
+                    return 4;
+                }
                 if (small_k) {
                     return nwarps;
                 }
@@ -606,6 +623,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             case 2:
             case 3:
             case 4:
+                // Same reasoning for a few output columns (e.g. the verify batch of speculative decoding,
+                // ncols_dst = n_draft + 1): on a GP100 the Q8_0 output head at ncols_dst = 4 goes from
+                // 2.55 ms to 2.09 ms with 4 rows per block. At ncols_dst >= 5 the per-launch cost
+                // grows too slowly with width for the extra row reuse to pay off, so 2 stays.
+                if (table_id == MMVQ_PARAMETERS_NVIDIA_PRE_TURING) {
+                    return 4;
+                }
+                return 2;
             case 5:
             case 6:
             case 7:
@@ -1473,6 +1498,17 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    // sm_60 has no DP4A but full-rate HFMA2, so for Q4_1 a dedicated kernel that expands the
+    // nibbles straight to half2 with LOP3 magic constants beats emulating the int8 dot product.
+    if (!fusion && ggml_cuda_mmvq_f16_sm60_supported(src0, src1, ids, dst)) {
+        ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
+        return;
+    }
+    if (!fusion && ids && ggml_cuda_mmid_vec_f16_sm60_supported(src0, src1, ids, dst)) {
+        ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

@@ -1,5 +1,7 @@
 #include "llama-memory.h"
 
+thread_local llama_state_layer_filter g_state_layer_filter;
+
 #include "llama-ext.h"
 #include "llama-io.h"
 

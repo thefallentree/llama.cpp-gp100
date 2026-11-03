@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-graph.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <functional>
@@ -14,6 +15,20 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+
+// a sequence state restricted to some layers (llama_state_seq_*_layers): the memories write and read only the data
+// of the layers [il_lo, il_hi); data_only = a read checks the saved cells against the ones the sequence holds and
+// writes into those, instead of re-allocating them (the layers outside the range keep their data)
+struct llama_state_layer_filter {
+    bool    active    = false;
+    int32_t il_lo     = 0;
+    int32_t il_hi     = INT32_MAX;
+    bool    data_only = false;
+
+    bool skip(int32_t il) const { return active && (il < il_lo || il >= il_hi); }
+};
+
+extern thread_local llama_state_layer_filter g_state_layer_filter;
 
 struct llama_memory_params {
     // kv cache

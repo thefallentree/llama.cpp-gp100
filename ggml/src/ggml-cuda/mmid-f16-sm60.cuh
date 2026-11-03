@@ -11,17 +11,25 @@ void ggml_cuda_mmid_f16_sm60(ggml_backend_cuda_context & ctx, const ggml_tensor 
                              bool skip_cold = false, const char * cold_vram = nullptr);
 
 // Prompt batches of a hot/cold MoE read every cold expert, so all of them are copied to VRAM: by DMA on a second
-// stream, one MUL_MAT_ID ahead (two buffers), so the copy of the next op overlaps the GEMM of the current one.
-// prepare: before the graph (and before a CUDA graph capture), collects the graph's prompt-sized cold MUL_MAT_IDs
-//          and sizes the buffers; returns whether there are any.
-// start:   at the graph start, forks the copy stream from the compute stream and issues the first two copies.
-// run:     computes one of the ops from its prefetched buffer; returns false when the node is not one of them.
+// stream into a ring of slots (GGML_CUDA_COLD_PREFETCH_SLOTS, default 3) that runs on across the graphs of a ubatch:
+// the order of the cold ops repeats every ubatch, so the pieces of the next layer's ops are copied while this layer's
+// FFN and the next layer's attention compute (per layer ~20 ms of copies against ~40 ms of kernels; copied per graph
+// the three pieces of an FFN graph were serial with its three GEMMs, which waited 6-7 ms per layer).
+// prepare: before the graph (and before a CUDA graph capture), collects the graph's prompt-sized cold MUL_MAT_IDs,
+//          places them in the learned sequence and sizes the slots; returns whether the graph forks the copy stream
+//          (own ops, or pieces of later graphs to issue).
+// start:   at the graph start, forks the copy stream from the compute stream and issues the copies the ring has room for.
+// run:     computes one of the ops from its slot; returns false when the node is not one of them.
 // finish:  at the graph end, joins the copy stream back (a CUDA graph capture must end joined).
-// The copies only use stream-ordered calls, so a graph with them can be captured as a CUDA graph.
+// sync:    at the ubatch end (ggml_backend_cuda_synchronize): drops the filled slots after an expert exchange (the
+//          cold host data changed), reads the GGML_CUDA_COLD_PREFETCH_CHECK counter.
+// The copies only use stream-ordered calls, so a graph with them can be captured as a CUDA graph; a copy issued in
+// one graph is consumed in a later one without an event (the graphs of a stream serialize, each joins its copies).
 bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph);
 void ggml_cuda_cold_prefetch_start(ggml_backend_cuda_context & ctx);
 bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_cold_prefetch_finish(ggml_backend_cuda_context & ctx);
+void ggml_cuda_cold_prefetch_sync(ggml_backend_cuda_context & ctx, bool invalidate);
 void ggml_cuda_cold_prefetch_free(ggml_backend_cuda_context & ctx);
 // prompt-sized cold MUL_MAT_IDs (computed eagerly: the prefetch issues host-side copies and events)
 bool ggml_cuda_mmid_cold_prompt(const ggml_tensor * node);

@@ -1380,26 +1380,42 @@ struct ggml_cuda_moe_host_triple {
     const ggml_tensor * down = nullptr;
 };
 
-// prompt batches of a hot/cold MoE: the cold experts of the next MUL_MAT_ID are copied to VRAM on a second stream
-// while the current one computes (mmid-f16-sm60.cu)
+// prompt batches of a hot/cold MoE: the cold experts of the coming MUL_MAT_IDs are copied to VRAM on a second stream
+// while the current ops compute, through a ring of slots that runs on across the graphs of a ubatch (mmid-f16-sm60.cu)
 struct ggml_cuda_cold_prefetch {
+    // a piece = the cold experts of one op: its host data and size identify it across ubatches
+    struct piece { const char * host; size_t bytes; };
+    struct slot {
+        piece   key        = { nullptr, 0 };
+        bool    filled     = false;        // a copy of `key` is issued (in this graph or an earlier one) and not yet consumed
+        int64_t issued_in  = -1;           // the graph (serial) whose capture issued the copy: its ready event is waited on
+        int64_t freed_in   = -1;           // the graph whose GEMM consumed it last: its freed event gates a copy in the same graph
+        cudaEvent_t ready  = nullptr;
+        cudaEvent_t freed  = nullptr;
+        char *  buf        = nullptr;
+    };
     cudaStream_t copy     = nullptr;
-    char *       buf[2]   = { nullptr, nullptr };
-    size_t       cap      = 0;
-    cudaEvent_t  ready[2] = { nullptr, nullptr };
-    cudaEvent_t  freed[2] = { nullptr, nullptr };
     cudaEvent_t  fork     = nullptr;      // orders the copy stream after the graph start (and into a CUDA graph capture)
     cudaEvent_t  join     = nullptr;      // joins the copy stream back at the graph end
-    std::vector<const ggml_tensor *> ops; // the graph's prompt-sized cold MUL_MAT_IDs, in order
+    std::vector<slot> slots;              // GGML_CUDA_COLD_PREFETCH_SLOTS of them (default 3)
+    size_t       cap      = 0;            // bytes per slot
+    int          head     = 0;            // the slot of the next piece to consume
+    int          n_filled = 0;            // filled slots, from head on (FIFO in sequence order)
+    // the ubatch's piece sequence, learned from the ops as they come (the order repeats every ubatch), and the
+    // positions of the next piece to consume / to issue in it
+    std::vector<piece> seq;
+    int          seq_pos    = 0;
+    int          seq_issued = 0;
+    int64_t      ntok       = 0;          // tokens of the last prompt-sized cold op (the ubatch size of the sequence)
+    int64_t      graph_no   = 0;          // serial of the graph being computed
+    // this graph
+    std::vector<const ggml_tensor *> ops; // its prompt-sized cold MUL_MAT_IDs, in order
     int          next     = 0;            // the next of them to compute
-    bool         active   = false;        // buffers ready for this graph's ops
+    int          budget   = 0;            // pieces of later graphs this graph may still issue
+    bool         active   = false;        // the graph forks the copy stream (own ops or pieces to issue)
     bool         started  = false;        // the first copies are issued
-    // the ops' cold experts in staged ranges [e0, e1) (absolute expert ids), in order: one piece per op unless
-    // GGML_CUDA_COLD_PREFETCH_PIECE_MB splits them; piece s is copied into buf[s % 2]
-    struct piece { int op; int e0; int e1; };
-    std::vector<piece> pieces;
-    std::vector<int>   op_piece0;         // the first piece of each op
-    int          pnext    = 0;            // the next piece to compute
+    int *        check    = nullptr;      // GGML_CUDA_COLD_PREFETCH_CHECK=1: mismatch counter of the piece checks
+    int64_t      n_checked = 0;
 };
 
 // prompt batches of a Q2_K / Q3_K hot/cold layer: the cold experts an op touches are copied to a VRAM staging buffer on a

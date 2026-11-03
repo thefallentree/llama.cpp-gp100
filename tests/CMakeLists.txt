@@ -174,6 +174,8 @@ set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp
     llama-context/cases-kv.cpp
     llama-context/cases-rs.cpp
+    llama-context/cases-spec.cpp
+    llama-context/cases-dsv41.cpp
     llama-context/test-case.cpp
     llama-context/test-log.cpp
     llama-context/test-runner.cpp
@@ -292,6 +294,8 @@ set_tests_properties(test-llama-context PROPERTIES
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
+llama_build_and_test(test-ckpt-spread.cpp  LABEL behavior)
+llama_build_and_test(test-spec-dspark-cum.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
 llama_test_cmd(python3
@@ -365,6 +369,8 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
+# the ordering of an async copy between two devices against the destination's queued work (needs two devices, else skipped)
+llama_build(test-backend-copy-order.cpp LINK ggml)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 

@@ -40,16 +40,22 @@ struct prefill_peer_stage {
 };
 
 // the head's configuration from the environment; enabled() is false without LLAMA_PREFILL_PEER
-// LLAMA_PREFILL_PEER=host:port[,host:port...]: a chain of peers, the residual goes from each to the next;
-// LLAMA_PREFILL_PEER_SPLIT=l1[,l2...]: the first layer of each peer (default: the layers split evenly)
+// LLAMA_PREFILL_PEER=host:port[,host:port...]: the peers, used as one chain (the residual goes from each to the next);
+// a peer that is busy refuses, then the head tries each peer alone, then decodes the prompt itself.
+// LLAMA_PREFILL_PEER_SPLIT=l1[,l2...]: the first layer of each peer of the whole chain (default: even), and
+// LLAMA_PREFILL_PEER_SPLIT1=l: the first layer of a single peer (default n_layer/2)
 struct prefill_peer_config {
-    std::vector<prefill_peer_stage> stages;
+    std::vector<prefill_peer_stage> peers;    // layer_begin unused here
+    std::vector<int>                split_all; // the first layer of each peer when all of them take part
+    int                             split_one = -1;
     int min_tokens = 8192;
 
     static prefill_peer_config from_env(const llama_model * model);
 
-    bool enabled() const { return !stages.empty(); }
-    int  split()   const { return stages.empty() ? -1 : stages[0].layer_begin; }
+    bool enabled() const { return !peers.empty(); }
+
+    // the chains to try, best first
+    std::vector<std::vector<prefill_peer_stage>> chains() const;
 };
 
 // The head: decodes tokens [0, n_split) of seq_id with the peer. The memories of seq_id must be empty on entry and the
@@ -62,3 +68,11 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
 
 // The peer: serves heads one connection at a time, forever (returns only on a socket setup error).
 void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);
+
+// A serving server that is also a peer (LLAMA_PREFILL_PEER_SERVE=port): a thread accepts the heads' connections
+// (prefill_peer_listen, prefill_peer_accept) and hands each to the task loop, which serves it when the server is
+// idle (prefill_peer_serve_conn: its memories are taken over and left empty) or refuses it (prefill_peer_refuse).
+int  prefill_peer_listen(int port);
+int  prefill_peer_accept(int lfd);
+void prefill_peer_serve_conn(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);
+void prefill_peer_refuse(int fd);

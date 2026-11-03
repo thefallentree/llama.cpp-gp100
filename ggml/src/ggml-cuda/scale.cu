@@ -27,10 +27,30 @@ static __global__ void scale_f32(const T * x, T * dst, const float scale, const 
     dst[i_dst] = ggml_cuda_cast<T>(scale * ggml_cuda_cast<float>(x[i_src]) + bias);
 }
 
+// dense src and dst: no index decomposition (the common case: the hyper-connection and router scales of a decode step)
+template <typename T>
+static __global__ void scale_f32_flat(const T * x, T * dst, const float scale, const float bias, const int64_t nelements) {
+    ggml_cuda_pdl_lc();
+    const int64_t tid    = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    const int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
+
+    ggml_cuda_pdl_sync();
+    for (int64_t i = tid; i < nelements; i += stride) {
+        dst[i] = ggml_cuda_cast<T>(scale * ggml_cuda_cast<float>(x[i]) + bias);
+    }
+}
+
 template <typename T>
 static void scale_f32_cuda(const T * x, T * dst, const float scale, const float bias, const ggml_tensor * src0, const ggml_tensor * t, cudaStream_t stream) {
     const int64_t k  = ggml_nelements(src0);
     const size_t  ts = sizeof(T);
+
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(t)) {
+        const int64_t num_blocks = (k + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(scale_f32_flat<T>, launch_params, x, dst, scale, bias, k);
+        return;
+    }
     GGML_ASSERT(k <= std::numeric_limits<uint32_t>::max());
 
     const uint3 ne0 = init_fastdiv_values(src0->ne[0]);

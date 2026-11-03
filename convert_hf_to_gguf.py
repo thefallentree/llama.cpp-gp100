@@ -289,12 +289,9 @@ def main() -> None:
                     sys.exit(1)
                 from conversion.mistral4 import MistralLarge4DSparkModel
                 model_class = MistralLarge4DSparkModel
-            elif model_architecture not in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"):
-                logger.error("--dspark is only supported for DeepseekV4ForCausalLM, DeepseekV41ForCausalLM and Mistral Large 4")
+            elif model_architecture != "DeepseekV4ForCausalLM":
+                logger.error("--dspark is only supported for DeepseekV4ForCausalLM and Mistral Large 4")
                 sys.exit(1)
-            elif model_architecture == "DeepseekV41ForCausalLM":
-                from conversion.deepseek41 import DeepseekV41DSparkModel
-                model_class = DeepseekV41DSparkModel
             else:
                 from conversion.deepseek import DeepseekV4DSparkModel
                 model_class = DeepseekV4DSparkModel

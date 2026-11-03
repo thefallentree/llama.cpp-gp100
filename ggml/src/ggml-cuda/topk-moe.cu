@@ -76,7 +76,7 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * WARP_SIZE;
         const bool active = !use_limit || (idx < limit);
-        vals[i]           = active ? sqrtf(vals[i] > 20.0f ? vals[i] : logf(1.0f + expf(vals[i]))) : -INFINITY;
+        vals[i]           = active ? sqrtf(vals[i] > 20.0f ? vals[i] : log1pf(expf(vals[i]))) : -INFINITY;
     }
 }
 
@@ -480,6 +480,11 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     // or one of the non-power-of-2 expert counts of supported models
     const int n_expert = ids->nb[1] / ids->nb[0];
     if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 384 && n_expert != 576) {
+        return false;
+    }
+    // GGML_CUDA_TOPK_MOE_384=0 keeps the 384-expert router (DeepSeek-V4.1) unfused, as before #31288: the A/B control
+    static const bool fuse_384 = getenv("GGML_CUDA_TOPK_MOE_384") == nullptr || atoi(getenv("GGML_CUDA_TOPK_MOE_384")) != 0;
+    if (n_expert == 384 && !fuse_384) {
         return false;
     }
 

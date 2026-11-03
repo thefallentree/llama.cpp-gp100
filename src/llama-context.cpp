@@ -1645,10 +1645,20 @@ void llama_context::set_layer_range(int32_t il_begin, int32_t il_end) {
 
 void llama_context::set_hc_input(const float * data, llama_pos pos0, int64_t n_rows) {
     const int64_t width = model.hparams.n_embd_out();
+    if (n_rows < 0) {
+        // llama_set_embeddings_nextn_slot: pos0 is the slot (see llama_hc_input)
+        const int32_t slot = std::max<int32_t>(0, std::min<int32_t>(pos0, hc_in.nextn_n_slots - 1));
+        if (slot != hc_in.nextn_slot && hc_in.nextn_all != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+            const size_t slot_size = hc_in.nextn_all_size / hc_in.nextn_n_slots;
+            embd_nextn = buffer_view<float>{hc_in.nextn_all + (size_t) slot*slot_size, slot_size};
+        }
+        hc_in.nextn_slot = slot;
+        return;
+    }
     hc_in.width  = width;
     hc_in.pos0   = pos0;
     hc_in.n_rows = n_rows;
-    hc_in.data.assign(data, data + n_rows*width);
+    hc_in.data   = data; // the caller's buffer, read by the next llama_process (not copied)
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3046,6 +3056,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
+    // pipelined prefill (server-prefill-peer): the unmasked nextn rows are double-buffered (llama_hc_input::nextn_slot),
+    // and a head or peer reserves them at creation, so no pinned reallocation happens on the first ubatch of a prompt
+    {
+        static const bool    peer_env = getenv("LLAMA_PREFILL_PEER") || getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN");
+        static const int32_t n_slots  = std::max(1, getenv("LLAMA_PREFILL_PEER_NEXTN_SLOTS") ? atoi(getenv("LLAMA_PREFILL_PEER_NEXTN_SLOTS")) : (peer_env ? 2 : 1));
+        hc_in.nextn_n_slots        = n_slots;
+        hc_in.nextn_reserve_floats = peer_env ? (size_t) n_embd_out * n_batch * n_slots : 0;
+    }
+    const size_t nextn_slot_floats = embd_nextn.size;
+    const size_t nextn_floats      = (has_embd_nextn && !cparams.embeddings_nextn_masked) ? nextn_slot_floats * hc_in.nextn_n_slots : nextn_slot_floats;
+    const size_t nextn_alloc       = std::max(nextn_floats, hc_in.nextn_reserve_floats);
+
     for (bool enabled : cparams.embeddings_layer_inp) {
         if (enabled) {
             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
@@ -3066,7 +3088,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + nextn_alloc + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -3115,8 +3137,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
 
-    embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
-    offset += embd_nextn.size * sizeof(float);
+    if (has_embd_nextn) {
+        hc_in.nextn_all      = (float *) (base + offset);
+        hc_in.nextn_all_size = nextn_floats;
+        const int32_t slot   = (nextn_floats > nextn_slot_floats) ? std::min<int32_t>(hc_in.nextn_slot, hc_in.nextn_n_slots - 1) : 0;
+        embd_nextn = buffer_view<float>{hc_in.nextn_all + (size_t) slot*nextn_slot_floats, nextn_slot_floats};
+    } else {
+        hc_in.nextn_all      = nullptr;
+        hc_in.nextn_all_size = 0;
+        embd_nextn = buffer_view<float>{nullptr, 0};
+    }
+    offset += nextn_alloc * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -5218,6 +5249,10 @@ void llama_set_layer_range(llama_context * ctx, int32_t il_begin, int32_t il_end
 
 void llama_set_hc_input(llama_context * ctx, const float * data, llama_pos pos0, int64_t n_rows) {
     ctx->set_hc_input(data, pos0, n_rows);
+}
+
+void llama_set_embeddings_nextn_slot(llama_context * ctx, int32_t slot) {
+    ctx->set_hc_input(nullptr, slot, -1);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

@@ -177,10 +177,21 @@ void llm_graph_gather_tok_embd(const ggml_tensor * tok_embd, const int32_t * ids
 // the residual rows of a ubatch that starts past layer 0 (llama_set_hc_input): row r of data is the residual of
 // the token at position pos0 + r, width floats each
 struct llama_hc_input {
-    std::vector<float> data;
-    llama_pos          pos0   = 0;
-    int64_t            n_rows = 0;
-    int64_t            width  = 0;
+    // the caller's rows (not copied: valid until the llama_process that consumes them returns; pinned memory makes the
+    // H2D copy of llm_graph_input_hc_rows::set_input a DMA instead of a staged pageable copy)
+    const float * data   = nullptr;
+    llama_pos     pos0   = 0;
+    int64_t       n_rows = 0;
+    int64_t       width  = 0;
+
+    // the unmasked nextn output of a pipelined prefill is double-buffered (llama_set_embeddings_nextn_slot): the output
+    // buffer holds nextn_n_slots regions of n_embd_out x n_batch floats, nextn_slot is the one the next decode writes
+    // and llama_get_embeddings_nextn returns, so a sender thread can still read the previous one
+    int32_t  nextn_slot           = 0;
+    int32_t  nextn_n_slots        = 1;
+    size_t   nextn_reserve_floats = 0; // output_reserve always reserves at least this many floats for the nextn rows
+    float *  nextn_all            = nullptr;
+    size_t   nextn_all_size       = 0;
 };
 
 class llm_graph_input_hc_rows : public llm_graph_input_i {

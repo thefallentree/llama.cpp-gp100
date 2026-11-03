@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <functional>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -25,6 +27,12 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
+
+// DSpark: how many of the n leading drafts of a block to keep. conf[i * stride] is the confidence of draft i. The block
+// ends at the first draft whose own confidence is below p_min (0: no floor) or where the running product of the
+// confidences, this draft's included, drops below p_cum (0: no cut): a long window whose later drafts are likely to be
+// rejected is not verified whole. The cut only shortens the block, the kept drafts are the same tokens.
+size_t common_speculative_dspark_keep(const float * conf, size_t stride, size_t n, float p_min, float p_cum);
 
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
@@ -73,7 +81,7 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 
-    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash2 sample
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp, draft-dflash2 and draft-dspark sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
     // the target's temp and seed, read only when the drafter samples probabilistically
@@ -91,6 +99,14 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+// (optional) a hook the drafter calls from inside common_speculative_draft once the first decode of a draft is
+// launched and before it waits for it: the caller launches the target's next decode there (llama_decode_prepare),
+// so that its host side runs while the draft computes. Drafters that do not decode never call it.
+void common_speculative_set_launch_hook(common_speculative * spec, std::function<void()> hook);
+
+// the longest draft of the drafters that call the launch hook (MTP): the rows of the window launched there
+int32_t common_speculative_n_max_ahead(const common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

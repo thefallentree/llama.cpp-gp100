@@ -20,9 +20,9 @@ void llama_model_dflash::load_tensors_dflash2() {
 
     load_tensors_dflash2_conv();
 
-    LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u\n", __func__,
+    LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u, edge scale = %.3f\n", __func__,
             hparams.dflash_conv_kernel_size, hparams.dflash_conv_group_size,
-            hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
+            hparams.dflash_selector_rank, hparams.dflash_selector_top_k, hparams.dflash_selector_edge_scale);
 }
 
 void llama_model_dflash::load_tensors_dflash2_conv() {
@@ -172,6 +172,9 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
         ggml_tensor * cond  = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
         ggml_tensor * score = ggml_mul_mat(ctx0, successor, cond);
+        if (hparams.dflash_selector_edge_scale != 1.0f) {
+            score = ggml_scale(ctx0, score, hparams.dflash_selector_edge_scale);
+        }
         if (n_pred == 1) {
             score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
         }

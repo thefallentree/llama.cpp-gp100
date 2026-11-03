@@ -165,6 +165,41 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// one block fills n16 16-byte words and ntail bytes after them (the small fills of the prompt graphs: a memset node
+// waits on the copy engine's queue, a kernel does not)
+static __global__ void k_fill_bytes(uint4 * __restrict__ p, const uint32_t v4, const int n16, uint8_t * __restrict__ tail, const uint8_t v, const int ntail) {
+    for (int i = threadIdx.x; i < n16; i += blockDim.x) {
+        p[i] = make_uint4(v4, v4, v4, v4);
+    }
+    if (threadIdx.x < ntail) {
+        tail[threadIdx.x] = v;
+    }
+}
+
+static __global__ void k_fill_bytes_unaligned(uint8_t * __restrict__ p, const uint8_t v, const int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        p[i] = v;
+    }
+}
+
+void ggml_cuda_fill_async(void * ptr, uint8_t value, size_t n, cudaStream_t stream) {
+    if (n == 0) {
+        return;
+    }
+    static const bool memset_env = getenv("GGML_CUDA_FILL_MEMSET") != nullptr && atoi(getenv("GGML_CUDA_FILL_MEMSET")) != 0;
+    if (n > 65536 || memset_env) {
+        CUDA_CHECK(cudaMemsetAsync(ptr, value, n, stream));
+        return;
+    }
+    if (((uintptr_t) ptr) % 16 == 0) {
+        const int n16 = (int) (n / 16), ntail = (int) (n % 16);
+        k_fill_bytes<<<1, 256, 0, stream>>>((uint4 *) ptr, 0x01010101u * value, n16, (uint8_t *) ptr + (size_t) n16*16, value, ntail);
+    } else {
+        k_fill_bytes_unaligned<<<1, 256, 0, stream>>>((uint8_t *) ptr, value, (int) n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool ggml_cuda_env_flag(const char * name) {
     const char * env = getenv(name);
     return env != nullptr && std::atoi(env) != 0;

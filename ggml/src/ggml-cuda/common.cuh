@@ -1223,6 +1223,11 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// fills n bytes with value on the stream: a one-block kernel for n <= 64 KiB, cudaMemsetAsync above. A captured
+// cudaMemsetAsync becomes a memset node that the executor serves next to the copy engine's queue: in the prompt graphs
+// of the hot/cold MoE it waited 0.5-1 ms behind the cold-expert H2D pieces before every expert GEMM (PP1_PROGRESS.md)
+void ggml_cuda_fill_async(void * ptr, uint8_t value, size_t n, cudaStream_t stream);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1856,11 +1861,17 @@ struct ggml_backend_cuda_context {
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+            // GGML_CUDA_CUBLAS_WORKSPACE_MB=n sets the workspace (measurement: 0 = none, so cuBLAS cannot split K; its
+            // split-K GEMMs zero a per-tile semaphore array with a memset node that waits on the copy engine behind
+            // the cold-expert H2D pieces of a prompt graph: ~1 ms per split-K GEMM on a P100, see PP1_PROGRESS.md)
+            static const long ws_env = getenv("GGML_CUDA_CUBLAS_WORKSPACE_MB") != nullptr ? atol(getenv("GGML_CUDA_CUBLAS_WORKSPACE_MB")) : -1;
             if (cublas_workspace_sizes[device] == 0) {
                 const int cc = ggml_cuda_info().devices[device].cc;
-                cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
+                cublas_workspace_sizes[device] = ws_env >= 0 ? (size_t) ws_env * 1024 * 1024 : (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
             }
-            CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            if (cublas_workspace_sizes[device] > 0) {
+                CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            }
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
         }

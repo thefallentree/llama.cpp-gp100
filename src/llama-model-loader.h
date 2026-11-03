@@ -35,6 +35,16 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        // the array of the file this tensor is a part of (split_single): its data offset and the index of this
+        // tensor's first slice in it, so that gather_axis can address any slice of the array
+        size_t  base_offs = 0;
+        int64_t base_idx  = 0;
+
+        // gather_axis: the tensor's data is these slices of the file (absolute offsets, slice_bytes each), in this
+        // order, instead of the contiguous bytes at offs
+        std::vector<size_t> slice_offs;
+        size_t              slice_bytes = 0;
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -45,6 +55,7 @@ struct llama_model_loader {
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
+            base_offs = offs;
         }
     };
 
@@ -224,6 +235,38 @@ struct llama_model_loader {
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
+    // Moves the boundary between two tensors of the file that are one array cut in two along `axis` (the hot and the
+    // cold experts of a MoE layer): the first keeps n_first slices, the second gets the others. Call it before the
+    // tensors are created. False, and nothing changed, if the two are not stored one after the other.
+    bool resplit(const std::string & first, const std::string & second, int64_t n_first, int axis);
+
+    // Makes a tensor n_extra slices longer along `axis` than the file holds (spare slots of an expert cache): the
+    // created tensor and its buffer are the larger size, the file's bytes go to its first slices, the rest is left
+    // as allocated. Call it before the tensor is created. False if the tensor is not in the file.
+    bool pad_dim(const std::string & name, int axis, int64_t n_extra);
+
+    // Cuts one array of the file into two tensors along `axis` (the hot and the cold experts of a MoE layer when
+    // the file stores them as one tensor): `first` keeps n_first slices, a new tensor `second` is synthesized over
+    // the remaining slices of the same file bytes. Call it before the tensors are created. False, and nothing
+    // changed, if `first` is not in the file, `second` already is, or the cut is not inside the array.
+    bool split_single(const std::string & first, const std::string & second, int64_t n_first, int axis);
+    ggml_context_ptr ctx_synth; // metas of the tensors split_single synthesizes
+
+    // Loads a tensor's slices along `axis` from the file in another order: slot j of the tensor takes slice
+    // order[base_idx + j] of the file's array (the whole array, or the one split_single cut it from), so a MoE layer's
+    // experts come hot first at load without rewriting the file (fn_permute_inplace.py does the same in place).
+    // Call it after split_single / resplit and before pad_dim and the tensor's creation. Needs -lm none (no mmap).
+    // False, and nothing changed, if the tensor is not in the file or `order` does not cover its slots.
+    bool gather_axis(const std::string & name, int axis, const std::vector<int64_t> & order);
+
+    // Gives a tensor of the file another name (another converter's spelling of the same weight, e.g. the engram tensors of
+    // Unsloth's DeepSeek-V4.1 files). Call it before the tensor is created. False, and nothing changed, if `from` is not in
+    // the file or `to` already is.
+    bool rename_weight(const std::string & from, const std::string & to);
+
+    // the bytes the file holds for a tensor padded with pad_dim (ggml_nbytes otherwise)
+    std::map<std::string, size_t> n_bytes_file;
+
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 
     const struct ggml_tensor * check_tensor_dims(
@@ -270,3 +313,8 @@ struct llama_model_loader {
 
     void print_info() const;
 };
+
+// LLAMA_EXPERT_ORDER=FILE.json: {"3": [old expert ids in the new order], ...} (the order fn_permute_inplace.py rewrites a
+// file with): slot j of a layer takes expert order[j], so a stock file gets the hot-first order at load. Only this shape is
+// read: quoted integer keys, arrays of integers. Throws on a repeated or out-of-range expert or a short array.
+std::map<int, std::vector<int64_t>> llama_read_expert_order(const std::string & path, int64_t n_expert);

@@ -64,7 +64,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {
         load_hparams_dsv4(ml);
-        backbone = hparams.dsv4_hc_single_pass ? BACKBONE_DSV41 : BACKBONE_DSV4;
+        backbone = BACKBONE_DSV4;
     } else if (ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK, hparams.n_lora_kv, false)) {
         load_hparams_mistral_large4(ml);
         backbone = BACKBONE_MISTRAL_LARGE4;
@@ -115,8 +115,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     switch (backbone) {
         case BACKBONE_BASE:           load_tensors_layers_base();           break;
-        case BACKBONE_DSV4:
-        case BACKBONE_DSV41:          load_tensors_layers_dsv4();           break;
+        case BACKBONE_DSV4:           load_tensors_layers_dsv4();           break;
         case BACKBONE_MISTRAL_LARGE4: load_tensors_layers_mistral_large4(); break;
     }
 }
@@ -516,7 +515,6 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
             switch (backbone) {
                 case BACKBONE_BASE:           break;
                 case BACKBONE_DSV4:           return std::make_unique<graph_dsv4>(params);
-                case BACKBONE_DSV41:          return std::make_unique<graph_dsv41>(params);
                 case BACKBONE_MISTRAL_LARGE4: return std::make_unique<graph_mistral_large4>(params);
             }
             switch (variant) {

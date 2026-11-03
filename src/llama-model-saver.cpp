@@ -9,6 +9,7 @@
 #include "llama-hparams.h"
 #include "llama-model.h"
 #include "llama-vocab.h"
+#include "models/models.h"
 
 #include <cstdint>
 #include <string>
@@ -324,7 +325,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);
     add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
     add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.dsv4_compress_rope_base);
-    if (model->arch == LLM_ARCH_DEEPSEEK4 || hparams.dsv4_hc_mult > 0) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41 || hparams.dsv4_hc_mult > 0) {
         // the loader requires one compress ratio per layer, including nextn layers
         const std::vector<uint32_t> compress_ratios(
                 hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.begin() + hparams.n_layer_all);
@@ -338,6 +339,21 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE,           hparams.hc_magnitude);
     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,             hparams.hc_low_rank);
+    add_kv(LLM_KV_ENGRAM_HEAD_COUNT,                     hparams.engram_n_head);
+    add_kv(LLM_KV_ENGRAM_KEY_LENGTH,                     hparams.engram_key_length);
+    add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE,                 hparams.engram_max_ngram_size);
+    if (model->arch == LLM_ARCH_DEEPSEEK41) {
+        // the engram constants of V4.1 live in the model, only as many layer ids as there are engram layers
+        const auto * model41 = static_cast<const llama_model_deepseek41 *>(model);
+        add_kv(LLM_KV_ENGRAM_LAYER_IDS,   std::vector<uint32_t>(hparams.engram_layer_ids.begin(), hparams.engram_layer_ids.begin() + model41->engram_n_layer));
+        add_kv(LLM_KV_ENGRAM_PAD_ID,      model41->engram_pad_id);
+        add_kv(LLM_KV_ENGRAM_MULTIPLIERS, model41->engram_multipliers);
+        add_kv(LLM_KV_ENGRAM_PRIMES,      model41->engram_primes);
+        add_kv(LLM_KV_ENGRAM_OFFSETS,     model41->engram_offsets);
+        add_kv(LLM_KV_ENGRAM_TOKEN_MAP,   model41->engram_token_map);
+    } else {
+        add_kv(LLM_KV_ENGRAM_LAYER_IDS,                  hparams.engram_layer_ids, true);
+    }
 
     // the PLE group only means anything whole: write all of it or none
     if (hparams.ple_n_heads > 0) {

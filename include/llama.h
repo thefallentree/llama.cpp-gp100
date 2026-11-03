@@ -1158,6 +1158,12 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // Pipelined prefill (see src/llama-ext.h llama_set_layer_range): the unmasked nextn output rows are double-buffered
+    // when the context was created with LLAMA_PREFILL_PEER / _SERVE / _LISTEN set (2 slots of n_embd_out x n_batch
+    // floats, LLAMA_PREFILL_PEER_NEXTN_SLOTS); this selects the slot the next decode writes and
+    // llama_get_embeddings_nextn returns, so a sender can still read the previous ubatch's rows. Default 0.
+    LLAMA_API void llama_set_embeddings_nextn_slot(struct llama_context * ctx, int32_t slot);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

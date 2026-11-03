@@ -321,11 +321,25 @@ void llm_graph_input_hc_rows::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t width    = src->width;
 
+    GGML_ASSERT(src->data != nullptr && "llama_set_hc_input was not called");
+
+    // a cold prompt's rows are contiguous and in order (pos == pos0 + i): one copy straight from the caller's buffer
+    // (a DMA when it is pinned); otherwise gather them first
+    const int64_t r0 = (int64_t) ubatch->pos[0] - src->pos0;
+    bool contiguous = r0 >= 0 && r0 + n_tokens <= src->n_rows;
+    for (int64_t i = 1; contiguous && i < n_tokens; ++i) {
+        contiguous = (int64_t) ubatch->pos[i] - src->pos0 == r0 + i;
+    }
+    if (contiguous) {
+        ggml_backend_tensor_set(rows, src->data + r0*width, 0, (size_t) n_tokens*width*sizeof(float));
+        return;
+    }
+
     buf.resize((size_t) n_tokens*width);
     for (int64_t i = 0; i < n_tokens; ++i) {
         const int64_t r = (int64_t) ubatch->pos[i] - src->pos0;
         GGML_ASSERT(r >= 0 && r < src->n_rows && "llama_set_hc_input holds no row for this position");
-        memcpy(buf.data() + i*width, src->data.data() + r*width, width*sizeof(float));
+        memcpy(buf.data() + i*width, src->data + r*width, width*sizeof(float));
     }
     ggml_backend_tensor_set(rows, buf.data(), 0, buf.size()*sizeof(float));
 }

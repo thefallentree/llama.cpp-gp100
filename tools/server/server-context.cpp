@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <deque>
 #include <exception>
@@ -1515,6 +1516,14 @@ private:
                         queue_tasks.post(std::move(task), /*front*/ true);
                     }
                 }).detach();
+            }
+        }
+
+        // a head or a peer: the graph shapes of the layer ranges and the pinned buffers before the first prompt
+        if (getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN") || peer_cfg.enabled()) {
+            const char * w = getenv("LLAMA_PREFILL_PEER_WARM");
+            if (w == nullptr || strcmp(w, "0") != 0) {
+                prefill_peer_warmup(ctx_tgt, peer_cfg.enabled() ? &peer_cfg : nullptr);
             }
         }
 

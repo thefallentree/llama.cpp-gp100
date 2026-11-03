@@ -10,6 +10,11 @@
 // state and the drafter's pending row; the head writes them into its own memories and decodes the rest of the prompt
 // as usual.
 //
+// Protocol 3: the hello carries the head's result endpoint (an ephemeral listener and a token); every stage returns its
+// part of the state straight to the head as soon as it is done (the middle stages while the last one still computes),
+// the chain passes only an OK / error status back. The residual rows are sent from the context's double-buffered nextn
+// output (llama_set_embeddings_nextn_slot) and received into pinned slots that the graph input reads without a copy.
+//
 // head:  LLAMA_PREFILL_PEER=host:port, LLAMA_PREFILL_PEER_SPLIT=layer (default n_layer/2),
 //        LLAMA_PREFILL_PEER_MIN=tokens (default 8192: shorter prompts stay local); several peers form a chain
 //        (LLAMA_PREFILL_PEER=a:p,b:p LLAMA_PREFILL_PEER_SPLIT=16,32): each forwards its residual to the next
@@ -68,6 +73,12 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
 
 // The peer: serves heads one connection at a time, forever (returns only on a socket setup error).
 void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);
+
+// At load, before any prompt: one n_ubatch-token ubatch through each layer range this server can serve as a peer or
+// send from as a head (LLAMA_PREFILL_PEER_WARM=lo:hi,... overrides; 0 = none), and the pinned receive slots, so the
+// first ubatch of a prompt costs no graph build, buffer growth or pinned allocation. cfg may be null (a peer with no
+// LLAMA_PREFILL_PEER of its own: default ranges).
+void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cfg);
 
 // A serving server that is also a peer (LLAMA_PREFILL_PEER_SERVE=port): a thread accepts the heads' connections
 // (prefill_peer_listen, prefill_peer_accept) and hands each to the task loop, which serves it when the server is

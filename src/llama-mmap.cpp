@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <thread>
+#include <chrono>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -517,6 +519,33 @@ struct llama_mmap::impl {
         }
         for (const auto & range : lazy_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
+        }
+        // LLAMA_LAZY_WARM=S: S seconds after the mapping, read the lazy ranges into the page cache in the background (a
+        // detached thread asks for them 256 MiB at a time), so a table read at random (DeepSeek V4.1's engram) does not
+        // fault from the disk during the first prompts after a load; the delay keeps the reads out of the load's way.
+        // Off by default (unset or 0): it needs the page cache to hold the ranges
+        static const int lazy_warm_s = getenv("LLAMA_LAZY_WARM") != nullptr ? atoi(getenv("LLAMA_LAZY_WARM")) : 0;
+        if (lazy_warm_s > 0 && !lazy_ranges.empty()) {
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            const size_t fsize     = file->size();
+            std::thread([base = (char *) addr, ranges = lazy_ranges, page_size, fsize]() {
+                std::this_thread::sleep_for(std::chrono::seconds(lazy_warm_s));
+                const int64_t t0 = ggml_time_us();
+                size_t total = 0;
+                for (const auto & range : ranges) {
+                    const size_t beg = range.first & ~(page_size - 1);
+                    const size_t end = std::min((range.second + page_size - 1) & ~(page_size - 1), fsize);
+                    for (size_t b = beg; b < end; b += 256u*1024*1024) {
+                        const size_t n = std::min(end - b, (size_t) 256u*1024*1024);
+                        if (posix_madvise(base + b, n, POSIX_MADV_WILLNEED) != 0) {
+                            return; // the mapping is gone
+                        }
+                        total += n;
+                    }
+                }
+                LLAMA_LOG_WARN("llama_mmap: LLAMA_LAZY_WARM asked for %.1f GiB of lazy ranges in %.1f s\n",
+                        total/1024.0/1024.0/1024.0, (ggml_time_us() - t0)/1e6);
+            }).detach();
         }
         if (numa) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {

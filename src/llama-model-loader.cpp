@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-gguf-compat.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
@@ -11,7 +12,11 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
+#include <map>
+#include <sstream>
 #include <regex>
 #include <unordered_set>
 
@@ -43,6 +48,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_F8_E4M3:   name = LLAMA_FTYPE_PREFIX "F8_E4M3"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_1_G64:  name = LLAMA_FTYPE_PREFIX "Q4_1_G64"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1:      name = LLAMA_FTYPE_PREFIX "Q5_1"; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
@@ -416,6 +422,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
@@ -576,6 +583,9 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
         }
 
+        llama_gguf_compat compat;
+        llama_gguf_compat_apply(metadata, compat);
+
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
@@ -586,17 +596,31 @@ llama_model_loader::llama_model_loader(
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            // the offset is looked up by the name in the file, the weight is registered under ours
+            llama_tensor_weight weight(files.back().get(), 0, metadata, cur);
             std::string tensor_name = std::string(cur->name);
+            const auto it_rename = compat.tensor_rename.find(tensor_name);
+            if (it_rename != compat.tensor_rename.end()) {
+                tensor_name = it_rename->second;
+                ggml_set_name(cur, tensor_name.c_str());
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, weight);
+        }
+        const char * extra_gguf = getenv("LLAMA_EXTRA_GGUF");
+        if (extra_gguf != nullptr && extra_gguf[0] == '\0') {
+            extra_gguf = nullptr;
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        if (n_split > 1 && !compat.dialect.empty()) {
+            throw std::runtime_error(format("%s: split files are not supported for the %s dialect", __func__, compat.dialect.c_str()));
+        }
 
         // Load additional GGML contexts
         if (n_split > 1) {
@@ -625,6 +649,12 @@ llama_model_loader::llama_model_loader(
             // load other splits
             for (idx = 1; idx < n_split; idx++) {
                 const char * fname_split = splits[idx].c_str();
+
+                // LLAMA_EXTRA_GGUF stands in for a shard that is not there (e.g. another file's engram tables)
+                if (extra_gguf != nullptr && !std::filesystem::exists(fname_split)) {
+                    LLAMA_LOG_WARN("%s: split %d (%s) is missing: skipped, LLAMA_EXTRA_GGUF is set\n", __func__, idx, fname_split);
+                    continue;
+                }
 
                 struct gguf_init_params split_params = {
                     /*.no_alloc = */ true,
@@ -659,21 +689,55 @@ llama_model_loader::llama_model_loader(
                     }
                     n_elements += ggml_nelements(cur);
                     n_bytes    += ggml_nbytes(cur);
-                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), (uint16_t) (files.size() - 1), ctx_gguf.get(), cur));
                 }
             }
 
             get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
 
-            // sanity check
+            // sanity check (with LLAMA_EXTRA_GGUF a skipped shard leaves tensors to the extra files)
             {
                 const int n_tensors_loaded = (int) weights_map.size();
-                if (n_tensors != n_tensors_loaded) {
+                if (extra_gguf != nullptr ? n_tensors_loaded > n_tensors : n_tensors != n_tensors_loaded) {
                     throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
                 }
             }
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+        }
+
+        // LLAMA_EXTRA_GGUF=a.gguf,b.gguf: the tensors of more GGUF files join the model (their metadata is ignored), e.g. the
+        // engram table shards of another quant of the same model in place of a shard that was not downloaded
+        if (extra_gguf != nullptr) {
+            std::stringstream paths(extra_gguf);
+            std::string path;
+            while (std::getline(paths, path, ',')) {
+                if (path.empty()) {
+                    continue;
+                }
+                struct gguf_init_params extra_params = {
+                    /*.no_alloc = */ true,
+                    /*.ctx      = */ &ctx,
+                };
+                gguf_context_ptr ctx_gguf { gguf_init_from_file(path.c_str(), extra_params) };
+                if (!ctx_gguf) {
+                    throw std::runtime_error(format("%s: LLAMA_EXTRA_GGUF: failed to load %s", __func__, path.c_str()));
+                }
+                files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
+                contexts.emplace_back(ctx);
+                int n_added = 0;
+                for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                    const std::string tensor_name = cur->name;
+                    if (weights_map.find(tensor_name) != weights_map.end()) {
+                        throw std::runtime_error(format("LLAMA_EXTRA_GGUF: tensor '%s' of %s is already in the model", tensor_name.c_str(), path.c_str()));
+                    }
+                    n_elements += ggml_nelements(cur);
+                    n_bytes    += ggml_nbytes(cur);
+                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), (uint16_t) (files.size() - 1), ctx_gguf.get(), cur));
+                    n_added++;
+                }
+                LLAMA_LOG_WARN("%s: LLAMA_EXTRA_GGUF: %d tensors from %s\n", __func__, n_added, path.c_str());
+            }
         }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
@@ -760,6 +824,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;
             case GGML_TYPE_Q4_0:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;    break;
             case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
+            case GGML_TYPE_Q4_1_G64: ftype = LLAMA_FTYPE_MOSTLY_Q4_1_G64; break;
             case GGML_TYPE_Q5_0:    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;    break;
             case GGML_TYPE_Q5_1:    ftype = LLAMA_FTYPE_MOSTLY_Q5_1;    break;
             case GGML_TYPE_Q8_0:    ftype = LLAMA_FTYPE_MOSTLY_Q8_0;    break;
@@ -863,6 +928,158 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
     }
     return *weight;
+}
+
+bool llama_model_loader::resplit(const std::string & first, const std::string & second, const int64_t n_first, const int axis) {
+    const auto it_a = weights_map.find(first);
+    const auto it_b = weights_map.find(second);
+    if (it_a == weights_map.end() || it_b == weights_map.end() || axis < 1 || axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    llama_tensor_weight & a = it_a->second;
+    llama_tensor_weight & b = it_b->second;
+    ggml_tensor * ta = a.tensor;
+    ggml_tensor * tb = b.tensor;
+    const int64_t n_a   = ta->ne[axis];
+    const int64_t n_b   = tb->ne[axis];
+    const size_t  slice = ta->nb[axis];
+    bool ok = a.idx == b.idx && ta->type == tb->type && tb->nb[axis] == slice && n_first >= 1 && n_first < n_a + n_b &&
+              b.offs == a.offs + (size_t) n_a*slice;
+    for (int d = 0; d < GGML_MAX_DIMS && ok; ++d) {
+        ok = d == axis ? true : d < axis ? ta->ne[d] == tb->ne[d] : ta->ne[d] == 1 && tb->ne[d] == 1;
+    }
+    if (!ok) {
+        return false;
+    }
+    ta->ne[axis] = n_first;
+    tb->ne[axis] = n_a + n_b - n_first;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        ta->nb[d] = ta->nb[d - 1]*ta->ne[d - 1];
+        tb->nb[d] = tb->nb[d - 1]*tb->ne[d - 1];
+    }
+    b.offs = a.offs + (size_t) n_first*slice;
+    return true;
+}
+
+bool llama_model_loader::pad_dim(const std::string & name, const int axis, const int64_t n_extra) {
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end() || axis < 0 || axis >= GGML_MAX_DIMS || n_extra < 0) {
+        return false;
+    }
+    ggml_tensor * t = it->second.tensor;
+    if (n_bytes_file.find(name) == n_bytes_file.end()) {
+        n_bytes_file[name] = ggml_nbytes(t);
+    }
+    t->ne[axis] += n_extra;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        t->nb[d] = t->nb[d - 1]*t->ne[d - 1];
+    }
+    return true;
+}
+
+bool llama_model_loader::split_single(const std::string & first, const std::string & second, const int64_t n_first, const int axis) {
+    const auto it_a = weights_map.find(first);
+    if (it_a == weights_map.end() || weights_map.find(second) != weights_map.end() || axis < 1 || axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    llama_tensor_weight & a = it_a->second;
+    ggml_tensor * ta = a.tensor;
+    const int64_t n_a   = ta->ne[axis];
+    const size_t  slice = ta->nb[axis];
+    if (n_first < 1 || n_first >= n_a) {
+        return false;
+    }
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        if (ta->ne[d] != 1) {
+            return false;
+        }
+    }
+    if (!ctx_synth) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*1024,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_synth.reset(ggml_init(params));
+        if (!ctx_synth) {
+            return false;
+        }
+    }
+    int64_t ne[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        ne[d] = ta->ne[d];
+    }
+    ne[axis] = n_a - n_first;
+    ggml_tensor * tb = ggml_new_tensor(ctx_synth.get(), ta->type, GGML_MAX_DIMS, ne);
+    if (tb == nullptr) {
+        return false;
+    }
+    ggml_set_name(tb, second.c_str());
+    ta->ne[axis] = n_first;
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        ta->nb[d] = ta->nb[d - 1]*ta->ne[d - 1];
+    }
+    llama_tensor_weight b = a;
+    b.tensor   = tb;
+    b.offs     = a.offs + (size_t) n_first*slice;
+    b.base_idx = a.base_idx + n_first;
+    weights_map.emplace(second, b);
+    n_tensors++;   // done_getting_tensors counts the synthesized tensor like one of the file's
+    return true;
+}
+
+bool llama_model_loader::rename_weight(const std::string & from, const std::string & to) {
+    const auto it = weights_map.find(from);
+    if (it == weights_map.end() || weights_map.find(to) != weights_map.end() || to.size() >= GGML_MAX_NAME) {
+        return false;
+    }
+    llama_tensor_weight w = it->second;
+    weights_map.erase(it);
+    ggml_set_name(w.tensor, to.c_str());
+    weights_map.emplace(to, w);
+    const auto it_nb = n_bytes_file.find(from);
+    if (it_nb != n_bytes_file.end()) {
+        n_bytes_file[to] = it_nb->second;
+        n_bytes_file.erase(it_nb);
+    }
+    return true;
+}
+
+bool llama_model_loader::gather_axis(const std::string & name, const int axis, const std::vector<int64_t> & order) {
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end() || axis < 0 || axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    llama_tensor_weight & w = it->second;
+    const ggml_tensor * t = w.tensor;
+    if (!w.slice_offs.empty() || (axis == 0 && ggml_blck_size(t->type) != 1) || n_bytes_file.find(name) != n_bytes_file.end()) {
+        return false;
+    }
+    for (int d = axis + 1; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] != 1) {
+            return false;
+        }
+    }
+    if (use_mmap) {
+        throw std::runtime_error(format("%s: the expert order of '%s' needs the file read without mmap (-lm none)", __func__, name.c_str()));
+    }
+    const size_t  slice = t->nb[axis];
+    const int64_t n     = t->ne[axis];
+    const int64_t n_all = (int64_t) order.size();
+    if (w.base_idx + n > n_all || slice == 0) {
+        return false;
+    }
+    std::vector<size_t> offs(n);
+    for (int64_t j = 0; j < n; ++j) {
+        const int64_t src = order[w.base_idx + j];
+        if (src < 0 || src >= n_all) {
+            return false;
+        }
+        offs[j] = w.base_offs + (size_t) src*slice;
+    }
+    w.slice_offs  = std::move(offs);
+    w.slice_bytes = slice;
+    return true;
 }
 
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
@@ -1259,6 +1476,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+
+                        // host memory of a tensor-split device: one slice per device, like the tensors in its VRAM
+                        ggml_backend_buffer_type_t buft_split =
+                            ggml_backend_meta_device_host_split_buffer_type(buft_list->front().first, buft);
+                        if (buft_split != nullptr) {
+                            buft = buft_split;
+                        }
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1267,6 +1491,48 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             ggml_backend_buft_name(buft));
                     break;
                 }
+            }
+        }
+
+        // the engine's cold expert tensors (the part of a hot/cold split that stays in host memory) follow their
+        // layer's device: the pinned host memory next to a local GPU (CUDA_Host), the pinned memory on the server of
+        // an RPC device, so that the device computing the layer can reach them; an explicit override still wins
+        if (!buft && tn.str().find("_exps_cold") != std::string::npos && !buft_list->empty()) {
+            ggml_backend_dev_t dev = buft_list->front().first;
+            ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (host_buft == nullptr && dev != nullptr) {
+                // an RPC device advertises no host buffer type (the memory is not addressable here): ask its registry
+                // for the device object's own (device names are numbered across servers: never parse them)
+                if (ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC")) {
+                    typedef ggml_backend_buffer_type_t (*rpc_dev_host_buft_t)(ggml_backend_dev_t dev);
+                    auto fn = (rpc_dev_host_buft_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_device_host_buffer_type");
+                    if (fn) {
+                        host_buft = fn(dev);
+                    }
+                }
+            }
+            if (host_buft != nullptr) {
+                buft = host_buft;
+                ggml_backend_buffer_type_t buft_split = ggml_backend_meta_device_host_split_buffer_type(dev, buft);
+                if (buft_split != nullptr) {
+                    buft = buft_split;
+                }
+                static std::once_flag once;
+                std::call_once(once, [&] {
+                    LLAMA_LOG_WARN("%s: cold expert tensors follow their layer's device: %s -> %s (and so on per device)\n",
+                                   __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(buft));
+                });
+            }
+        }
+
+        // an override to the CUDA host buffer type ("-ot _exps_cold=CUDA_Host" resolves the name to one device's type): the
+        // cold experts still go to their own layer's device's type, which differs per NUMA node with
+        // GGML_CUDA_MOE_HOST_NUMA_POOLS=1 and is the same type otherwise
+        if (buft && !buft_list->empty() && tn.str().find("_exps_cold") != std::string::npos) {
+            ggml_backend_dev_t dev = buft_list->front().first;
+            ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (host_buft != nullptr && host_buft != buft && strcmp(ggml_backend_buft_name(host_buft), ggml_backend_buft_name(buft)) == 0) {
+                buft = host_buft;
             }
         }
 
@@ -1308,6 +1574,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
+        }
+
+        // a virtual model of the tests leaves out the optional tensors that start like an entry of test.absent_tensors
+        if (flags & TENSOR_NOT_REQUIRED) {
+            const int64_t kid = gguf_find_key(metadata, "test.absent_tensors");
+            if (kid >= 0) {
+                const std::string name = tn.str();
+                for (size_t i = 0; i < gguf_get_arr_n(metadata, kid); ++i) {
+                    if (name.rfind(gguf_get_arr_str(metadata, kid, i), 0) == 0) {
+                        return nullptr;
+                    }
+                }
+            }
         }
 
         // for tensors that are not required some of the dimensions can be invalid:
@@ -1707,8 +1986,40 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+        {
+            // a tensor padded past the file's data (pad_dim) reads what the file holds
+            const auto it_pad = n_bytes_file.find(ggml_get_name(cur));
+            if (it_pad != n_bytes_file.end()) {
+                n_size = std::min(n_size, it_pad->second);
+            }
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
+
+        if (!weight->slice_offs.empty()) {
+            // gather_axis: the slices of the file in the tensor's order (never mapped: gather_axis refuses mmap)
+            GGML_ASSERT(!from_mapping);
+            GGML_ASSERT(n_size == weight->slice_offs.size()*weight->slice_bytes);
+            const auto & file = files.at(weight->idx);
+            const bool  host  = ggml_backend_buffer_is_host(cur->buffer);
+            std::vector<no_init<uint8_t>> read_buf(host ? 0 : n_size);
+            uint8_t * dst = host ? (uint8_t *) cur->data : (uint8_t *) read_buf.data();
+            for (size_t j = 0; j < weight->slice_offs.size(); ++j) {
+                file->seek(weight->slice_offs[j], SEEK_SET);
+                file->read_raw(dst + j*weight->slice_bytes, weight->slice_bytes);
+            }
+            if (!host) {
+                ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+            }
+            if (check_tensors && !ggml_validate_row_data(cur->type, dst, n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            size_done += n_size;
+            if (n_size < ggml_nbytes(cur)) {
+                size_done += ggml_nbytes(cur) - n_size;
+            }
+            continue;
+        }
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1759,7 +2070,9 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                // Only for buffers that backend can write: a tensor on another device (an RPC device over the network)
+                // would otherwise go out as one synchronous set per chunk - a round trip per MB.
+                if (upload_backend && ggml_backend_supports_buft(upload_backend, ggml_backend_buffer_get_type(cur->buffer))) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1839,6 +2152,9 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+        if (n_size < ggml_nbytes(cur)) {
+            size_done += ggml_nbytes(cur) - n_size; // the padding counts as done (size_data holds the padded size)
+        }
     }
 
     // free temporary resources used for async uploads
@@ -1899,4 +2215,54 @@ void llama_model_loader::print_info() const {
     } else {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
+}
+
+std::map<int, std::vector<int64_t>> llama_read_expert_order(const std::string & path, const int64_t n_expert) {
+    std::ifstream f(path);
+    if (!f) {
+        throw std::runtime_error(format("LLAMA_EXPERT_ORDER: cannot read '%s'", path.c_str()));
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string text = ss.str();
+    std::map<int, std::vector<int64_t>> orders;
+    size_t pos = 0;
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        const size_t end = text.find('"', pos + 1);
+        if (end == std::string::npos) {
+            break;
+        }
+        const std::string key = text.substr(pos + 1, end - pos - 1);
+        pos = end + 1;
+        if (key.empty() || key.find_first_not_of("0123456789") != std::string::npos) {
+            continue;
+        }
+        const size_t open = text.find('[', pos);
+        const size_t close = open == std::string::npos ? std::string::npos : text.find(']', open);
+        if (close == std::string::npos) {
+            throw std::runtime_error(format("LLAMA_EXPERT_ORDER: layer %s: no array", key.c_str()));
+        }
+        std::vector<int64_t> order;
+        std::vector<bool> seen(n_expert, false);
+        std::string item;
+        std::stringstream items(text.substr(open + 1, close - open - 1));
+        while (std::getline(items, item, ',')) {
+            const size_t b = item.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) {
+                continue;
+            }
+            const int64_t e = atoll(item.c_str() + b);
+            if (e < 0 || e >= n_expert || seen[e]) {
+                throw std::runtime_error(format("LLAMA_EXPERT_ORDER: layer %s: expert %" PRId64 " out of range or repeated", key.c_str(), e));
+            }
+            seen[e] = true;
+            order.push_back(e);
+        }
+        if ((int64_t) order.size() != n_expert) {
+            throw std::runtime_error(format("LLAMA_EXPERT_ORDER: layer %s: %zu experts of %" PRId64, key.c_str(), order.size(), n_expert));
+        }
+        orders[atoi(key.c_str())] = std::move(order);
+        pos = close + 1;
+    }
+    return orders;
 }

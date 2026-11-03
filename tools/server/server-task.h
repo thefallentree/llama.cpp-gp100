@@ -34,6 +34,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_PEER_PREFILL, // a head's prompt for this server's layers (server-prefill-peer.h), fd in slot_action.id_slot
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common

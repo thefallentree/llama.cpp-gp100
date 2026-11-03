@@ -260,7 +260,12 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        // 44..98: unused (upstream grows from 44; this fork's own types sit far above, ids 99+, so they never collide;
+        // files written with the old ids 43/44 are migrated by runs/fn-m2/rel3_retype.py)
+        GGML_TYPE_Q4_1_G64 = 99,  // Q4_1 nibbles with one (d,m) per 64 weights (4.5 bpw)
+        GGML_TYPE_Q4_16   = 100, // 4-bit codes (value = d*(code - 8)) with one fp16 d per 16 weights (5 bpw): a
+                                 // Q3_K or Q2_0 tensor re-encoded exactly; the nibbles in the planar engine's order
+        GGML_TYPE_COUNT   = 101,
     };
 
     // [TAG_GGML_PREC]
@@ -413,6 +418,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_FLASH_ATTN_SEL,
 
         GGML_OP_UNARY,
 
@@ -493,6 +499,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_EXPERT_FIXED = 32, // ...hot experts tensor of a layer that the CUDA expert cache leaves alone
     };
 
     enum ggml_tri_type {
@@ -885,6 +892,10 @@ extern "C" {
     // argmax along rows
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // a must be GGML_OP_ARGMAX: a row without a finite maximum (all NaN) gives column 0 instead of -1 on every backend, for a consumer that indexes with the result
+    GGML_API struct ggml_tensor * ggml_argmax_set_nonneg(
             struct ggml_tensor  * a);
 
     // count number of equal elements in a and b
@@ -2517,6 +2528,24 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+    // attention of every token over its own selection of cache rows (sparse attention)
+    //
+    // q:   [n_embd, n_head, n_tokens]   f32
+    // k:   [n_embd, n_kv,   n_head_kv]  f16, q8_0 or q4_0, rows may be strided; head h reads kv head h/(n_head/n_head_kv)
+    // v:   [n_embd, n_kv,   n_head_kv]  f16, q8_0 or q4_0 (CUDA: f16/f16, q8_0/q8_0, q8_0/q4_0, q4_0/q4_0)
+    // sel: [n_sel,  n_tokens]           i32 rows of k and v per token; a row outside [0, n_kv) is skipped
+    // res: [n_embd, n_head, n_tokens]   f32
+    //
+    //   res[:, h, t] = sum_s softmax_s(scale*q[:, h, t] . k[:, sel[s, t], hk]) v[:, sel[s, t], hk]
+    //
+    // a token without a row in range gets zeros
+    GGML_API struct ggml_tensor * ggml_flash_attn_sel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * sel,
+            float                 scale);
 
     // custom operators
 

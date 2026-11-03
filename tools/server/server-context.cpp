@@ -3,6 +3,7 @@
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
+#include "server-ckpt-spread.h"
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
@@ -22,6 +23,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
+#include "../../src/llama-ext.h" // staging API: llama_set_prompt_end
 
 #include <algorithm>
 #include <cstddef>
@@ -289,6 +291,10 @@ struct server_slot {
     };
     tts_ctx tts;
 
+    // DeepSeek-V4.1 exact long-prompt layer skip (LLAMA_DSV41_LAYER_SKIP): the end position handed to
+    // llama_set_prompt_end for this prompt, -1 when the prompt is read in full
+    llama_pos prompt_skip_end = -1;
+
     // speculative decoding
     common_speculative * spec;
 
@@ -362,12 +368,15 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        // the drafter's deferred boundary, if it keeps one (restored together with the contexts)
+        cur->data.spec.clear();
+        common_speculative_get_state(spec, id, cur->data.spec);
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1092,6 +1101,18 @@ private:
 
     common_speculative_ptr spec;
 
+    // launch-ahead of the verification window (llama_decode_prepare): with one slot generating, the drafter's hook
+    // prepares the target's decode of the sampled token and n_draft_max placeholders while the draft still runs;
+    // decode() commits it with the draft (LLAMA_SPEC_AHEAD=0 disables it)
+    struct {
+        bool          enabled = true;
+        bool          active  = false;   // a window waits on the device for this update's commit
+        server_slot * slot    = nullptr;
+        int32_t       n_rows  = 0;       // the rows prepared: 1 + n_draft_max
+        llama_pos     pos0    = 0;
+        common_batch  batch;
+    } spec_ahead;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1592,6 +1613,8 @@ private:
             params_base.cache_ram_mib    = 0;
             params_base.cache_idle_slots = false;
         }
+        spec_ahead.batch   = common_batch(ctx_tgt);
+        spec_ahead.enabled = getenv("LLAMA_SPEC_AHEAD") == nullptr || atoi(getenv("LLAMA_SPEC_AHEAD")) != 0;
 
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
@@ -2723,6 +2746,27 @@ private:
         return true;
     }
 
+    // The buffers of erased checkpoints, reused by the next ones: a new checkpoint's 100+ MiB vector costs ~100 ms of
+    // page faults to allocate (Qwen3.8 at 262K: 112.6 MiB, ~107 ms before the 43 ms copy, twice per request), a reused one
+    // of the same size nothing. At most two are kept (LLAMA_CKPT_SPARE=n changes that, 0 = off).
+    std::list<common_prompt_checkpoint> ckpt_spare;
+
+    static size_t ckpt_spare_max() {
+        static const size_t n = getenv("LLAMA_CKPT_SPARE") != nullptr ? (size_t) std::max(0, atoi(getenv("LLAMA_CKPT_SPARE"))) : 2;
+        return n;
+    }
+
+    // erase a checkpoint of a slot, keeping its buffers for the next one
+    std::list<common_prompt_checkpoint>::iterator ckpt_retire(std::list<common_prompt_checkpoint> & list, std::list<common_prompt_checkpoint>::iterator it) {
+        auto next = std::next(it);
+        if (ckpt_spare.size() < ckpt_spare_max() && !it->data_tgt.empty()) {
+            ckpt_spare.splice(ckpt_spare.end(), list, it);
+        } else {
+            list.erase(it);
+        }
+        return next;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2738,7 +2782,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                it = ckpt_retire(slot.prompt.checkpoints, it);
                 continue;
             }
 
@@ -2747,13 +2791,56 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // Hybrid/recurrent (GDN) restore requires a checkpoint with
+            // pos_min < pos_min_thold or pos_min == 0. Evicting front()
+            // threw away that only usable restore point; later checkpoints
+            // have high pos_min and force a full prefill. Keep the lowest
+            // pos_min checkpoint and drop the oldest of the rest.
+            auto keep = slot.prompt.checkpoints.begin();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min < keep->pos_min) {
+                    keep = it;
+                }
+            }
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            auto victim = slot.prompt.checkpoints.end();
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            if (params_base.checkpoint_spread) {
+                // spread policy: drop the checkpoint whose removal leaves the smallest gap for its distance from the
+                // newest, never the root, the restore point kept above or the checkpoint added below
+                std::vector<int64_t> n_tokens;
+                n_tokens.reserve(slot.prompt.checkpoints.size());
+                int i_keep = -1;
+                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                    if (it == keep) {
+                        i_keep = (int) n_tokens.size();
+                    }
+                    n_tokens.push_back(it->n_tokens);
+                }
+                const int i_victim = server_ckpt_spread_victim(n_tokens, i_keep, slot.prompt.n_tokens() - n_tokens_cur);
+                if (i_victim >= 0) {
+                    victim = std::next(slot.prompt.checkpoints.begin(), i_victim);
+                }
+            }
+
+            if (victim == slot.prompt.checkpoints.end()) {
+                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                    if (it == keep) {
+                        continue;
+                    }
+                    if (victim == slot.prompt.checkpoints.end() || it->n_tokens < victim->n_tokens) {
+                        victim = it;
+                    }
+                }
+            }
+            if (victim == slot.prompt.checkpoints.end()) {
+                victim = keep;
+            }
+
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, keeping pos_min = %d)\n",
+                    victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024, keep->pos_min);
+
+            ckpt_retire(slot.prompt.checkpoints, victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2762,14 +2849,21 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    it = ckpt_retire(slot.prompt.checkpoints, it);
                 } else {
                     ++it;
                 }
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        if (!ckpt_spare.empty()) {
+            // the buffers keep their size: the state is as large as last time, so update_tgt's resize is free
+            slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(), ckpt_spare, ckpt_spare.begin());
+            slot.prompt.checkpoints.back().data_spec.clear();
+        } else {
+            slot.prompt.checkpoints.emplace_back();
+        }
+        auto & cur = slot.prompt.checkpoints.back();
 
         cur.id_task = id_task;
 
@@ -3639,7 +3733,20 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            if (spec_ahead.active && off == 0) {
+                // the prepared window takes the rows of its slot, at the head of the batch
+                int32_t n_slot = 0;
+                while (n_slot < batch.size() && batch.tokens[n_slot].id_slot == spec_ahead.slot->id &&
+                        batch.tokens[n_slot].i_embd < 0 && batch.tokens[n_slot].pos[0] == spec_ahead.pos0 + n_slot && n_slot < spec_ahead.n_rows) {
+                    n_slot++;
+                }
+                if (n_slot == 0) {
+                    spec_ahead_discard();
+                } else {
+                    n_tokens = n_slot;
+                }
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -3919,9 +4026,55 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            spec_ahead.active = false;
+            bool others = false;
+            iterate(slots, [&](server_slot & slot) {
+                others |= slot.is_processing() && &slot != drafting[0];
+            });
+            // (a target checkpoint after the draft would read the context while its window waits: not with those)
+            // (the padding rows of a window must stay within the rollback depth of a recurrent memory)
+            // (the drafter that launches the window is MTP: a longer n-gram draft never calls the hook and decodes as usual)
+            const int32_t n_rows_ahead = 1 + std::min(drafting[0]->get_n_draft_max(), common_speculative_n_max_ahead(spec.get()));
+            if (spec_ahead.enabled && drafting.size() == 1 && generating.size() == 1 && !others && drafting[0]->inp_embd.empty() &&
+                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                    (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_rows_ahead - 1 <= (int32_t) llama_n_rs_seq(ctx_tgt))) {
+                server_slot * slot   = drafting[0];
+                const int32_t n_rows = n_rows_ahead;
+                common_speculative_set_launch_hook(spec.get(), [this, slot, n_rows]() {
+                    auto & b = spec_ahead.batch;
+                    b.clear();
+                    const llama_pos pos0 = slot->prompt.tokens.pos_next();
+                    for (int32_t i = 0; i < n_rows; ++i) {
+                        b.add(slot->sampled, pos0 + i, slot->id, true);
+                    }
+                    const int32_t rc = llama_decode_prepare(ctx_tgt, b.get());
+                    if (rc == 0) {
+                        spec_ahead.active = true;
+                        spec_ahead.slot   = slot;
+                        spec_ahead.n_rows = n_rows;
+                        spec_ahead.pos0   = pos0;
+                    } else if (rc == 3) {
+                        // no gated window for this shape yet: the batch is decoded after the draft as usual
+                        SRV_DBG("%s", "no gated window for the verification decode yet\n");
+                    } else {
+                        SRV_WRN("launch-ahead of the verification window is off: llama_decode_prepare returned %d\n", rc);
+                        spec_ahead.enabled = false;
+                    }
+                });
+            } else {
+                common_speculative_set_launch_hook(spec.get(), nullptr);
+            }
+
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+
+            common_speculative_set_launch_hook(spec.get(), nullptr);
+
+            if (spec_ahead.active && spec_ahead.slot->state != SLOT_STATE_GENERATING) {
+                // the slot went away during the draft
+                spec_ahead_discard();
+            }
         }
 
         // make checkpoints if needed
@@ -4336,6 +4489,23 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // DeepSeek-V4.1 exact long-prompt layer skip: the layers past the last stream source only need their
+                        // work on the last rows of a prompt. The end handed over is n_ubatch + 8 rows before the real one, so
+                        // that the checkpoints at 4 and 4 + n_ubatch before the end still hold exact rings (see the
+                        // graph of llama_model_deepseek41). A prompt with less than a window of 1024 rows to save is read in full
+                        slot.prompt_skip_end = -1;
+                        if (!slot.task->tokens.has_mtmd) {
+                            const llama_pos end = slot.task->n_tokens() - (n_ubatch + 8);
+                            const int32_t  tail = llama_set_prompt_end(ctx_tgt, slot.id, end);
+                            if (tail > 0 && end - n_past >= tail + 1024) {
+                                slot.prompt_skip_end = end;
+                                SLT_INF(slot, "layer skip: the layers past the last stream source run on the last %d rows of %d, the %d rows from %d are skipped\n",
+                                        tail, slot.task->n_tokens(), end - tail - n_past, n_past);
+                            } else {
+                                llama_set_prompt_end(ctx_tgt, slot.id, -1);
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4358,6 +4528,11 @@ private:
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
+
+                    // the setting of the context is cleared once a ubatch outputs, and by a request that is not skipped
+                    if (slot.prompt_skip_end >= 0) {
+                        llama_set_prompt_end(ctx_tgt, slot.id, slot.prompt_skip_end);
+                    }
 
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
@@ -4584,6 +4759,11 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
+                    // the rings of the layers past the last stream source are only right in the last window of a skipped prompt
+                    if (do_checkpoint && slot.prompt_skip_end >= 0 && n_tokens_start < slot.prompt_skip_end - llama_model_n_swa(model_tgt)) {
+                        do_checkpoint = false;
+                    }
+
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
@@ -4663,6 +4843,21 @@ private:
         return true;
     }
 
+    // a prepared window (spec_ahead) that nothing commits: released with its placeholders, its rows leave the memory
+    void spec_ahead_discard() {
+        if (!spec_ahead.active) {
+            return;
+        }
+        std::vector<llama_token> toks(spec_ahead.n_rows, spec_ahead.slot->sampled);
+        const int32_t ret = llama_decode_commit(ctx_tgt, toks.data(), toks.size());
+        if (ret != 0) {
+            SRV_ERR("llama_decode_commit failed, ret = %d\n", ret);
+        }
+        llama_synchronize(ctx_tgt);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), spec_ahead.slot->id, spec_ahead.pos0, -1);
+        spec_ahead.active = false;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
@@ -4699,12 +4894,43 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
+        if (spec_ahead.active && off == 0) {
+            // the window prepared during the draft: its rows are the slot's, the ones past the draft are padding
+            // (the last token again) and leave the memory right away
+            const int32_t n_view = batch.view.size();
+            GGML_ASSERT(n_view >= 1 && n_view <= spec_ahead.n_rows);
+            GGML_ASSERT(batch.tokens[0].id_slot == spec_ahead.slot->id && batch.tokens[0].pos[0] == spec_ahead.pos0);
+            std::vector<llama_token> toks(spec_ahead.n_rows);
+            for (int32_t i = 0; i < spec_ahead.n_rows; ++i) {
+                toks[i] = i < n_view ? batch.tokens[i].token : toks[i - 1];
             }
-        });
+            spec_ahead.active = false;
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_decode_commit(ctx_tgt, toks.data(), toks.size());
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+            if (ret == 0 && n_view == 1 && n_view < spec_ahead.n_rows) {
+                // no draft: nothing verifies these rows, so they leave the memory now
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), spec_ahead.slot->id, spec_ahead.pos0 + n_view, -1);
+            }
+            // with a draft the padding rows stay until the accept step of post_decode, whose seq_rm [pos_next, end) removes them
+            // together with the rejected rows: a recurrent memory selects one rollback snapshot per decode, so a second
+            // partial removal before the next decode (padding first, then the rejected tail) is refused
+
+            if (ret != 0) {
+                SRV_ERR("llama_decode_commit failed, ret = %d\n", ret);
+                throw std::runtime_error("the prepared decode failed");
+            }
+        } else {
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
 
         if (ret != 0) {
             {

@@ -382,33 +382,66 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     const double t0 = now_ms();
     double t_compute = 0.0;
     common_batch batch(ctx_tgt);
-    std::vector<float> h;
     std::string err;
 
     // the next message is read while the previous ubatch computes: llama_process returns before the GPU is done,
     // the catch-up of the drafter reads the outputs (and waits for them) after the next receive
+    // a receiver thread reads the next ubatch while this one computes (a ubatch is ~25 ms on the 25GbE mesh)
+    struct rx_state {
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<ubatch_msg> q;
+        bool end = false, failed = false, stop = false;
+        std::string err;
+    } rx;
+    std::thread rx_th([&]() {
+        while (true) {
+            uint32_t m = 0;
+            ubatch_msg u;
+            bool good = recv_val(fd, m);
+            if (good && m == MSG_END) {
+                std::lock_guard<std::mutex> lk(rx.m);
+                rx.end = true;
+                rx.cv.notify_all();
+                return;
+            }
+            good = good && m == MSG_UBATCH && recv_val(fd, u.pos0) && recv_val(fd, u.n) && u.n > 0 && u.pos0 >= 0 && u.pos0 + u.n <= n_split;
+            if (good) {
+                u.h.resize((size_t) u.n*width);
+                good = recv_all(fd, u.h.data(), u.h.size()*sizeof(float));
+            }
+            std::unique_lock<std::mutex> lk(rx.m);
+            if (!good) {
+                rx.failed = true;
+                rx.cv.notify_all();
+                return;
+            }
+            rx.cv.wait(lk, [&]() { return rx.stop || rx.q.size() < 2; });
+            if (rx.stop) {
+                return;
+            }
+            rx.q.push_back(std::move(u));
+            rx.cv.notify_all();
+        }
+    });
+
     bool ok = true;
     while (ok) {
-        if (!recv_val(fd, msg)) {
-            ok = false;
-            break;
+        ubatch_msg u;
+        {
+            std::unique_lock<std::mutex> lk(rx.m);
+            rx.cv.wait(lk, [&]() { return !rx.q.empty() || rx.end || rx.failed; });
+            if (rx.q.empty()) {
+                ok = !rx.failed;
+                break;
+            }
+            u = std::move(rx.q.front());
+            rx.q.pop_front();
         }
-        if (msg == MSG_END) {
-            break;
-        }
-        int32_t pos0 = 0, n = 0;
-        if (msg != MSG_UBATCH || !recv_val(fd, pos0) || !recv_val(fd, n) || n <= 0 || pos0 < 0 || pos0 + n > n_split) {
-            ok = false;
-            err = "bad ubatch";
-            break;
-        }
-        h.resize((size_t) n*width);
-        if (!recv_all(fd, h.data(), h.size()*sizeof(float))) {
-            ok = false;
-            break;
-        }
+        rx.cv.notify_all();
+        const int32_t pos0 = u.pos0, n = u.n;
         const double tc = now_ms();
-        llama_set_hc_input(ctx_tgt, h.data(), pos0, n);
+        llama_set_hc_input(ctx_tgt, u.h.data(), pos0, n);
         batch.clear();
         for (int32_t i = 0; i < n; ++i) {
             batch.add(tokens[pos0 + i], pos0 + i, seq_id, false);
@@ -425,6 +458,15 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
         }
         t_compute += now_ms() - tc;
     }
+    {
+        std::lock_guard<std::mutex> lk(rx.m);
+        rx.stop = true;
+    }
+    rx.cv.notify_all();
+    if (!ok) {
+        ::shutdown(fd, SHUT_RD); // the receiver may sit in recv
+    }
+    rx_th.join();
     llama_set_layer_range(ctx_tgt, 0, -1);
     llama_synchronize(ctx_tgt);
     if (ctx_dft) {

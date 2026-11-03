@@ -4875,6 +4875,8 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     FN_PROF_T(t_sy1);
     ggml_cuda_expert_cache_update_async(*cuda_ctx);
     FN_PROF_ADD("cuda.sync.ec_update", t_sy1);
+    // an exchange rewrites cold experts on the host: the pieces copied ahead for the next graphs are stale
+    ggml_cuda_cold_prefetch_sync(*cuda_ctx, cuda_ctx->ec_pend);
 
     GGML_UNUSED(backend);
 }
@@ -7930,7 +7932,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (cold_prompt && prompt_graphs) {
                 // the first prompt graph of a ubatch size runs directly: the pool grows outside of a capture,
                 // where an allocation that runs out of memory can still flush the pool and retry
-                if (!cuda_ctx->prompt_graph_ntok.insert(cuda_ctx->cold_pf.ops[0]->ne[2]).second) {
+                if (!cuda_ctx->prompt_graph_ntok.insert(cuda_ctx->cold_pf.ntok).second) {
                     use_cuda_graph             = true;
                     cuda_graph_update_required = true;
                 }

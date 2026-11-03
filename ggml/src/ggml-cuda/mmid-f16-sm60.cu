@@ -1186,43 +1186,102 @@ static bool ggml_cuda_cold_prefetch_enabled() {
     return enabled;
 }
 
-static size_t cold_bytes(const ggml_tensor * node) {
-    int n_cold = 0;
-    ggml_cuda_mmid_cold(node, nullptr, &n_cold);
-    return (size_t) n_cold*node->src[0]->nb[2];
+// GGML_CUDA_COLD_PREFETCH_SLOTS=n: slots of the ring (n x the largest op's cold bytes: 63-69 MiB per card at 272 cold
+// experts of a 2560 x 640 Q2_0 slice); 2 = one op ahead within a graph (the depth before the ring ran across graphs)
+static int cold_n_slots() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_COLD_PREFETCH_SLOTS");
+        return std::max(2, e != nullptr ? atoi(e) : 3);
+    }();
+    return n;
 }
 
-// GGML_CUDA_COLD_PREFETCH_PIECE_MB=n: an op's cold experts are staged in pieces of up to n MiB (two piece buffers
-// instead of two op-sized ones: 2 x 63 MiB per card at 272 cold experts of a 2560 x 640 Q2_0 slice); 0 = whole ops
-static size_t cold_piece_bytes() {
+// GGML_CUDA_COLD_PREFETCH_AHEAD=n: pieces of later graphs a graph with cold ops of its own issues (after its GEMMs free
+// slots), default 1: the FFN graph of a layer copies the first piece of the next layer, the attention graph in between
+// (no cold ops, copy engine idle) the rest; a graph without own ops fills every free slot. 0 = no copies across graphs.
+static int cold_ahead_own() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_COLD_PREFETCH_AHEAD");
+        return std::max(0, e != nullptr ? atoi(e) : 1);
+    }();
+    return n;
+}
+
+// GGML_CUDA_COLD_COPY_CHUNK_MB=n: a piece is copied as ceil(bytes / n MiB) commands (the AllReduce chunks and the other
+// small copies interleave at that granularity instead of waiting behind a 7 ms piece); 0 = one command
+static size_t cold_chunk_bytes() {
     static const size_t bytes = [] {
-        const char * e = getenv("GGML_CUDA_COLD_PREFETCH_PIECE_MB");
-        return (size_t) std::max(0, e != nullptr ? atoi(e) : 0)*1048576;
+        const char * e = getenv("GGML_CUDA_COLD_COPY_CHUNK_MB");
+        return (size_t) std::max(0, e != nullptr ? atoi(e) : 8)*1048576;
     }();
     return bytes;
 }
 
-static size_t piece_bytes(const ggml_cuda_cold_prefetch & pf, const int s) {
-    const ggml_cuda_cold_prefetch::piece & pc = pf.pieces[s];
-    return (size_t) (pc.e1 - pc.e0)*pf.ops[pc.op]->src[0]->nb[2];
+static bool cold_check_enabled() {
+    static const bool f = getenv("GGML_CUDA_COLD_PREFETCH_CHECK") != nullptr && atoi(getenv("GGML_CUDA_COLD_PREFETCH_CHECK")) != 0;
+    return f;
 }
 
-// copy piece s into buffer s % 2
-static void cold_issue(ggml_cuda_cold_prefetch & pf, const int s, const bool wait_freed = true) {
-    if (s >= (int) pf.pieces.size()) {
+static ggml_cuda_cold_prefetch::piece cold_piece_of(const ggml_tensor * op) {
+    const char * host = nullptr;
+    int n_cold = 0;
+    ggml_cuda_mmid_cold(op, &host, &n_cold);
+    return { host, (size_t) n_cold*op->src[0]->nb[2] };
+}
+
+static bool operator==(const ggml_cuda_cold_prefetch::piece & a, const ggml_cuda_cold_prefetch::piece & b) {
+    return a.host == b.host && a.bytes == b.bytes;
+}
+
+// every 64th 16-byte word of a slot against the host piece (pinned, read over PCIe): a stale or torn slot counts
+static __global__ void cold_check_kernel(const uint4 * __restrict__ dev, const uint4 * __restrict__ host, const size_t n16, int * __restrict__ bad) {
+    const size_t i = ((size_t) blockIdx.x*blockDim.x + threadIdx.x)*64;
+    if (i >= n16) {
         return;
     }
-    const ggml_cuda_cold_prefetch::piece & pc = pf.pieces[s];
-    const ggml_tensor * op = pf.ops[pc.op];
-    const int b = s % 2;
-    const char * host = nullptr;
-    ggml_cuda_mmid_cold(op, &host, nullptr);
-    host += (size_t) (pc.e0 - op->src[0]->ne[2])*op->src[0]->nb[2];
-    if (wait_freed) {
-        CUDA_CHECK(cudaStreamWaitEvent(pf.copy, pf.freed[b], 0));
+    const uint4 a = dev[i];
+    const uint4 b = host[i];
+    if (a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w) {
+        atomicAdd(bad, 1);
     }
-    CUDA_CHECK(cudaMemcpyAsync(pf.buf[b], host, piece_bytes(pf, s), cudaMemcpyHostToDevice, pf.copy));
-    CUDA_CHECK(cudaEventRecord(pf.ready[b], pf.copy));
+}
+
+// forget the filled slots (bookkeeping only: a later copy into a slot is stream-ordered after every earlier copy and
+// read of it, as the graphs of one stream serialize and each graph joins its copy stream)
+static void cold_ring_reset(ggml_cuda_cold_prefetch & pf) {
+    for (auto & s : pf.slots) {
+        s.filled = false;
+    }
+    pf.n_filled   = 0;
+    pf.seq_issued = pf.seq_pos;
+}
+
+// copy piece seq[seq_issued] into the slot after the filled ones; the slot's last reader in this graph gates it
+static void cold_issue_next(ggml_cuda_cold_prefetch & pf) {
+    GGML_ASSERT(pf.n_filled < (int) pf.slots.size() && pf.seq_issued < (int) pf.seq.size());
+    const int si = (pf.head + pf.n_filled) % (int) pf.slots.size();
+    ggml_cuda_cold_prefetch::slot & s = pf.slots[si];
+    const ggml_cuda_cold_prefetch::piece & pc = pf.seq[pf.seq_issued];
+    if (s.freed_in == pf.graph_no) {
+        CUDA_CHECK(cudaStreamWaitEvent(pf.copy, s.freed, 0));
+    }
+    const size_t chunk = cold_chunk_bytes() > 0 ? cold_chunk_bytes() : pc.bytes;
+    for (size_t off = 0; off < pc.bytes; off += chunk) {
+        CUDA_CHECK(cudaMemcpyAsync(s.buf + off, pc.host + off, std::min(chunk, pc.bytes - off), cudaMemcpyHostToDevice, pf.copy));
+    }
+    CUDA_CHECK(cudaEventRecord(s.ready, pf.copy));
+    s.key       = pc;
+    s.filled    = true;
+    s.issued_in = pf.graph_no;
+    pf.n_filled++;
+    pf.seq_issued++;
+}
+
+static void cold_issue_ahead(ggml_cuda_cold_prefetch & pf) {
+    while (pf.budget > 0 && pf.n_filled < (int) pf.slots.size() && pf.seq_issued < (int) pf.seq.size()) {
+        cold_issue_next(pf);
+        pf.budget--;
+    }
 }
 
 bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
@@ -1230,15 +1289,13 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
     pf.active  = false;
     pf.started = false;
     pf.next    = 0;
-    pf.pnext   = 0;
+    pf.budget  = 0;
     pf.ops.clear();
-    pf.pieces.clear();
-    pf.op_piece0.clear();
     if (!ggml_cuda_cold_prefetch_enabled()) {
         return false;
     }
     static const int64_t cold_prefetch_min_tok = getenv("GGML_CUDA_COLD_PREFETCH_MIN_TOK") != nullptr ? atoll(getenv("GGML_CUDA_COLD_PREFETCH_MIN_TOK")) : 1024;
-    size_t need = 0;
+    size_t need = pf.cap;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         // the prompt batches the host tier takes (GGML_CUDA_MOE_HOST_PROMPT=1, up to its MAX_TOK) need no prefetch; the
@@ -1249,63 +1306,53 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
         if (ggml_cuda_mmid_cold_prompt(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
             !ggml_cuda_moe_host_takes_prompt((int) n->src[2]->ne[1]) && n->src[2]->ne[1] >= cold_prefetch_min_tok &&
             ggml_cuda_mmid_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)) {
-            const int op = (int) pf.ops.size();
             pf.ops.push_back(n);
-            pf.op_piece0.push_back((int) pf.pieces.size());
-            int n_cold = 0;
-            ggml_cuda_mmid_cold(n, nullptr, &n_cold);
-            const int    n_hot  = (int) n->src[0]->ne[2];
-            const size_t bytes  = cold_bytes(n);
-            const size_t pbytes = cold_piece_bytes();
-            const int    np     = pbytes > 0 && bytes > pbytes ? (int) ((bytes + pbytes - 1)/pbytes) : 1;
-            const int    per    = (n_cold + np - 1)/np;
-            for (int e0 = n_hot; e0 < n_hot + n_cold || e0 == n_hot; e0 += std::max(per, 1)) {
-                const int e1 = std::min(e0 + std::max(per, 1), n_hot + n_cold);
-                pf.pieces.push_back({ op, e0, e1 });
-                need = std::max(need, (size_t) (e1 - e0)*n->src[0]->nb[2]);
-                if (n_cold == 0) {
-                    break;
-                }
-            }
+            need = std::max(need, cold_piece_of(n).bytes);
         }
     }
-    if (pf.ops.empty()) {
+    if (pf.ops.empty() && (pf.seq_issued >= (int) pf.seq.size() || pf.cap == 0)) {
         return false;
     }
     ggml_cuda_set_device(ctx.device);
     if (pf.copy == nullptr) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&pf.copy, cudaStreamNonBlocking));
-        for (int b = 0; b < 2; ++b) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&pf.ready[b], cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventCreateWithFlags(&pf.freed[b], cudaEventDisableTiming));
-        }
         CUDA_CHECK(cudaEventCreateWithFlags(&pf.fork, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&pf.join, cudaEventDisableTiming));
+        pf.slots.resize(cold_n_slots());
+        for (auto & s : pf.slots) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&s.freed, cudaEventDisableTiming));
+        }
+        if (cold_check_enabled()) {
+            CUDA_CHECK(cudaMalloc((void **) &pf.check, sizeof(int)));
+            CUDA_CHECK(cudaMemset(pf.check, 0, sizeof(int)));
+        }
     }
     if (need > pf.cap) {
-        // a larger buffer is only needed at the first prompt: wait for the old one's copies and users
+        // larger buffers are only needed at the first prompt: wait for the old ones' copies and users
         CUDA_CHECK(cudaStreamSynchronize(pf.copy));
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
-        for (int b = 0; b < 2; ++b) {
-            if (pf.buf[b] != nullptr) {
-                CUDA_CHECK(cudaFree(pf.buf[b]));
-                pf.buf[b] = nullptr;
+        for (auto & s : pf.slots) {
+            if (s.buf != nullptr) {
+                CUDA_CHECK(cudaFree(s.buf));
+                s.buf = nullptr;
             }
         }
         pf.cap = 0;
-        for (int b = 0; b < 2; ++b) {
-            if (cudaMalloc((void **) &pf.buf[b], need) != cudaSuccess) {
+        cold_ring_reset(pf);
+        for (auto & s : pf.slots) {
+            if (cudaMalloc((void **) &s.buf, need) != cudaSuccess) {
                 (void) cudaGetLastError();
-                GGML_LOG_WARN("%s: no VRAM for the cold-expert prefetch (2 x %.1f MiB), staging per op\n", __func__, need/1048576.0);
-                for (int c = 0; c < 2; ++c) {
-                    if (pf.buf[c] != nullptr) {
-                        CUDA_CHECK(cudaFree(pf.buf[c]));
-                        pf.buf[c] = nullptr;
+                GGML_LOG_WARN("%s: no VRAM for the cold-expert prefetch (%d x %.1f MiB), staging per op\n", __func__, (int) pf.slots.size(), need/1048576.0);
+                for (auto & c : pf.slots) {
+                    if (c.buf != nullptr) {
+                        CUDA_CHECK(cudaFree(c.buf));
+                        c.buf = nullptr;
                     }
                 }
                 pf.ops.clear();
-                pf.pieces.clear();
-                pf.op_piece0.clear();
+                pf.seq.clear();
+                pf.seq_pos = pf.seq_issued = 0;
                 return false;
             }
         }
@@ -1313,12 +1360,59 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
         static bool once = false;
         if (!once) {
             once = true;
-            GGML_LOG_WARN("%s: dev%d cold-expert prefetch buffers 2 x %.1f MiB (%d ops, %d pieces)\n", __func__, ctx.device,
-                          need/1048576.0, (int) pf.ops.size(), (int) pf.pieces.size());
+            GGML_LOG_WARN("%s: dev%d cold-expert prefetch ring %d x %.1f MiB (%d ops in this graph, chunks of %.1f MiB, %d ahead)\n", __func__,
+                          ctx.device, (int) pf.slots.size(), need/1048576.0, (int) pf.ops.size(), cold_chunk_bytes()/1048576.0, cold_ahead_own());
         }
     }
-    pf.active = true;
-    return true;
+    // the graph's ops against the sequence: in place, or resynchronized (an ubatch boundary, a changed graph), or learned
+    if (!pf.ops.empty()) {
+        pf.ntok = pf.ops[0]->ne[2];
+        const ggml_cuda_cold_prefetch::piece first = cold_piece_of(pf.ops[0]);
+        bool in_place = pf.seq_pos < (int) pf.seq.size() && pf.seq[pf.seq_pos] == first;
+        if (!in_place) {
+            int j = 0;
+            while (j < (int) pf.seq.size() && !(pf.seq[j] == first)) {
+                j++;
+            }
+            if (j < (int) pf.seq.size()) {
+                pf.seq_pos = j;               // the sequence starts over (next ubatch) or skipped
+            } else if (pf.seq_pos < (int) pf.seq.size()) {
+                pf.seq.clear();               // an op the sequence does not know mid-way: a changed graph, learn it again
+                pf.seq_pos = 0;
+            }
+            cold_ring_reset(pf);
+        }
+        for (size_t k = 0; k < pf.ops.size(); ++k) {
+            const ggml_cuda_cold_prefetch::piece pc = cold_piece_of(pf.ops[k]);
+            const int at = pf.seq_pos + (int) k;
+            if (at == (int) pf.seq.size()) {
+                pf.seq.push_back(pc);
+            } else if (!(pf.seq[at] == pc)) {
+                // the tail of the known sequence differs from here on: cut it and learn the rest
+                pf.seq.resize(at);
+                pf.seq.push_back(pc);
+                if (pf.seq_issued > at) {
+                    cold_ring_reset(pf);
+                }
+            }
+        }
+        // the ring must hold exactly the next pieces of the sequence, in order
+        for (int k = 0; k < pf.n_filled; ++k) {
+            const auto & s = pf.slots[(pf.head + k) % (int) pf.slots.size()];
+            if (pf.seq_pos + k >= (int) pf.seq.size() || !(s.key == pf.seq[pf.seq_pos + k])) {
+                cold_ring_reset(pf);
+                break;
+            }
+        }
+        if (pf.seq_issued != pf.seq_pos + pf.n_filled) {
+            cold_ring_reset(pf);
+        }
+        pf.budget = cold_ahead_own();
+    } else {
+        pf.budget = (int) pf.slots.size();
+    }
+    pf.active = !pf.ops.empty() || (pf.n_filled < (int) pf.slots.size() && pf.seq_issued < (int) pf.seq.size());
+    return pf.active;
 }
 
 void ggml_cuda_cold_prefetch_start(ggml_backend_cuda_context & ctx) {
@@ -1326,12 +1420,19 @@ void ggml_cuda_cold_prefetch_start(ggml_backend_cuda_context & ctx) {
     if (!pf.active || pf.started) {
         return;
     }
-    // the copy stream follows everything issued before this graph, so the buffers are free (also when captured:
-    // a CUDA graph starts after the previous work on its stream, and the fork makes the copy stream part of it)
+    // the copy stream follows everything issued before this graph, so the slots nobody fills in this graph are free
+    // (also when captured: a CUDA graph starts after the previous work on its stream, and the fork makes the copy
+    // stream part of it)
     CUDA_CHECK(cudaEventRecord(pf.fork, ctx.stream()));
     CUDA_CHECK(cudaStreamWaitEvent(pf.copy, pf.fork, 0));
-    cold_issue(pf, 0, /*wait_freed =*/ false);
-    cold_issue(pf, 1, /*wait_freed =*/ false);
+    // the graph's own pieces that no earlier graph copied, as far as the slots go (the rest as the GEMMs free slots)
+    const int own_end = pf.seq_pos + (int) pf.ops.size();
+    while (pf.seq_issued < own_end && pf.n_filled < (int) pf.slots.size()) {
+        cold_issue_next(pf);
+    }
+    if (pf.ops.empty()) {
+        cold_issue_ahead(pf);
+    }
     pf.started = true;
 }
 
@@ -1344,6 +1445,7 @@ void ggml_cuda_cold_prefetch_finish(ggml_backend_cuda_context & ctx) {
     CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), pf.join, 0));
     pf.started = false;
     pf.active  = false;
+    pf.graph_no++;
 }
 
 bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1358,29 +1460,86 @@ bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (j == (int) pf.ops.size()) {
         return false;
     }
-    const int s_end = j + 1 < (int) pf.ops.size() ? pf.op_piece0[j + 1] : (int) pf.pieces.size();
-    for (; pf.pnext < pf.op_piece0[j]; pf.pnext++) {
-        // a piece of an op that was not computed: its buffer is free once its copy is done
-        CUDA_CHECK(cudaEventRecord(pf.freed[pf.pnext % 2], pf.copy));
-        cold_issue(pf, pf.pnext + 2);
+    // ops of this graph skipped (not computed): their pieces are consumed unread (the copies are stream-ordered
+    // before any later copy into the slot; the issuing below refills the ring)
+    for (; pf.next < j; pf.next++) {
+        GGML_ASSERT(pf.n_filled > 0);
+        pf.slots[pf.head].filled = false;
+        pf.head = (pf.head + 1) % (int) pf.slots.size();
+        pf.n_filled--;
+        pf.seq_pos++;
     }
     cudaStream_t stream = ctx.stream();
+    const ggml_cuda_cold_prefetch::piece pc = cold_piece_of(dst);
+    if (!(pf.n_filled > 0 && pf.slots[pf.head].key == pc)) {
+        // the ring holds something else (a graph that changed under the sequence): drop it, re-learn from here and copy
+        // this graph's remaining pieces now (their slots' last readers in this graph gate the copies)
+        static int n_warn = 0;
+        if (n_warn++ < 4) {
+            GGML_LOG_WARN("%s: dev%d cold-expert prefetch ring out of sequence at piece %d of %d: copying per op\n", __func__,
+                          ctx.device, pf.seq_pos, (int) pf.seq.size());
+        }
+        cold_ring_reset(pf);
+        pf.seq.resize(pf.seq_pos);
+        for (size_t k = j; k < pf.ops.size(); ++k) {
+            pf.seq.push_back(cold_piece_of(pf.ops[k]));
+        }
+        while (pf.seq_issued < (int) pf.seq.size() && pf.n_filled < (int) pf.slots.size()) {
+            cold_issue_next(pf);
+        }
+    }
+    ggml_cuda_cold_prefetch::slot & s = pf.slots[pf.head];
     mmid16_gemm_plan p(ctx);
-    // the cold experts come from the prefetched piece buffers: the setup must not stage them again (it did in qp1-qp3:
+    // the cold experts come from the prefetched slot: the setup must not stage them again (it did in qp1-qp3:
     // a second copy of every op's cold experts through UVA loads, +22% prefill time and +228 MiB of pool)
     mmid16_gemm_setup(ctx, p, dst->src[0], dst->src[1], dst->src[2], dst, /*skip_cold =*/ false, MMID16_COLD_BY_LAUNCH);
-    for (; pf.pnext < s_end; pf.pnext++) {
-        const int s = pf.pnext;
-        const int b = s % 2;
-        const ggml_cuda_cold_prefetch::piece & pc = pf.pieces[s];
-        CUDA_CHECK(cudaStreamWaitEvent(stream, pf.ready[b], 0));
-        // the first piece's launch takes the hot experts too
-        mmid16_gemm_launch(ctx, p, s == pf.op_piece0[j] ? 0 : pc.e0, pc.e1, pf.buf[b], pc.e0);
-        CUDA_CHECK(cudaEventRecord(pf.freed[b], stream));
-        cold_issue(pf, s + 2);
+    if (s.issued_in == pf.graph_no) {
+        // copied in this graph: wait for it (a copy of an earlier graph is done: that graph joined its copy stream)
+        CUDA_CHECK(cudaStreamWaitEvent(stream, s.ready, 0));
     }
+    if (pf.check != nullptr) {
+        const size_t n16 = pc.bytes/16;
+        cold_check_kernel<<<(unsigned) ((n16/64 + 255)/256), 256, 0, stream>>>((const uint4 *) s.buf, (const uint4 *) pc.host, n16, pf.check);
+        CUDA_CHECK(cudaGetLastError());
+        pf.n_checked++;
+    }
+    const int n_hot = (int) dst->src[0]->ne[2];
+    int n_cold = 0;
+    ggml_cuda_mmid_cold(dst, nullptr, &n_cold);
+    mmid16_gemm_launch(ctx, p, 0, n_hot + n_cold, s.buf, n_hot);
+    CUDA_CHECK(cudaEventRecord(s.freed, stream));
+    s.freed_in = pf.graph_no;
+    s.filled   = false;
+    pf.head    = (pf.head + 1) % (int) pf.slots.size();
+    pf.n_filled--;
+    pf.seq_pos++;
     pf.next = j + 1;
+    // the rest of this graph's own pieces first, then the ones ahead within the budget
+    const int own_end = pf.seq_pos + (int) pf.ops.size() - pf.next;
+    while (pf.seq_issued < own_end && pf.n_filled < (int) pf.slots.size()) {
+        cold_issue_next(pf);
+    }
+    if (pf.seq_issued >= own_end) {
+        cold_issue_ahead(pf);
+    }
     return true;
+}
+
+void ggml_cuda_cold_prefetch_sync(ggml_backend_cuda_context & ctx, const bool invalidate) {
+    ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
+    if (invalidate && pf.n_filled > 0) {
+        cold_ring_reset(pf);
+    }
+    if (pf.check != nullptr && pf.n_checked > 0) {
+        int bad = 0;
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMemcpy(&bad, pf.check, sizeof(int), cudaMemcpyDeviceToHost));
+        if (bad != 0) {
+            GGML_LOG_ERROR("%s: dev%d cold-expert prefetch: %d stale 16-byte words in %lld checked pieces\n", __func__, ctx.device, bad, (long long) pf.n_checked);
+            CUDA_CHECK(cudaMemset(pf.check, 0, sizeof(int)));
+        }
+        pf.n_checked = 0;
+    }
 }
 
 void ggml_cuda_cold_prefetch_free(ggml_backend_cuda_context & ctx) {
@@ -1388,16 +1547,19 @@ void ggml_cuda_cold_prefetch_free(ggml_backend_cuda_context & ctx) {
     if (pf.copy != nullptr) {
         cudaStreamSynchronize(pf.copy);
     }
-    for (int b = 0; b < 2; ++b) {
-        if (pf.buf[b] != nullptr) {
-            cudaFree(pf.buf[b]);
+    for (auto & s : pf.slots) {
+        if (s.buf != nullptr) {
+            cudaFree(s.buf);
         }
-        if (pf.ready[b] != nullptr) {
-            cudaEventDestroy(pf.ready[b]);
+        if (s.ready != nullptr) {
+            cudaEventDestroy(s.ready);
         }
-        if (pf.freed[b] != nullptr) {
-            cudaEventDestroy(pf.freed[b]);
+        if (s.freed != nullptr) {
+            cudaEventDestroy(s.freed);
         }
+    }
+    if (pf.check != nullptr) {
+        cudaFree(pf.check);
     }
     if (pf.fork != nullptr) {
         cudaEventDestroy(pf.fork);

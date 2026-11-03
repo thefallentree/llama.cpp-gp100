@@ -45,6 +45,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         variant = VARIANT_LILICORR;
         load_hparams_lilicorr(ml);
     }
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_EDGE_SCALE, hparams.dflash_selector_edge_scale, false);
+    // The selector's transition term is calibrated against the target head's
+    // unary logits.  A checkpoint may ship a scale; a serving stack may override
+    // it without touching the file.
+    if (const char * value = std::getenv("LLAMA_DFLASH_SELECTOR_EDGE_SCALE")) {
+        char * end = nullptr;
+        const float parsed = std::strtof(value, &end);
+        if (end != value && *end == '\0' && std::isfinite(parsed) && parsed >= 0.0f) {
+            hparams.dflash_selector_edge_scale = parsed;
+        } else {
+            LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_DFLASH_SELECTOR_EDGE_SCALE='%s'\n", __func__, value);
+        }
+    }
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");

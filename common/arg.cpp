@@ -236,6 +236,24 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // pinned host memory: CPU-resident weights that are offloaded for large batches copy faster from it
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
+    }
+    // the RPC devices' pinned memory on their server ("RPC<i>[host:port]_Host"): the cold experts of a remote layer
+    if (ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC")) {
+        typedef ggml_backend_buffer_type_t (*rpc_dev_host_buft_t)(ggml_backend_dev_t dev);
+        auto rpc_dev_host_buft_fn = (rpc_dev_host_buft_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_device_host_buffer_type");
+        // every server registers its devices under its own registry: walk the global device list (the function
+        // answers nullptr for a device that is not an RPC one)
+        for (size_t i = 0; rpc_dev_host_buft_fn && i < ggml_backend_dev_count(); ++i) {
+            auto * buft = rpc_dev_host_buft_fn(ggml_backend_dev_get(i));
+            if (buft) {
+                buft_list[ggml_backend_buft_name(buft)] = buft;
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -1691,6 +1709,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.checkpoint_min_step = value;
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-spread"},
+        "when the checkpoint list is full, evict the checkpoint whose removal leaves the smallest gap for its distance from the newest\n"
+        "(kept points thin out geometrically back from the end, so a client rewriting its history N tokens back re-reads about N tokens)\n"
+        "(default: evict the oldest, except the restore point with the lowest pos_min)",
+        [](common_params & params) {
+            params.checkpoint_spread = true;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_SPREAD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
@@ -4198,6 +4225,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--graph-slots"}, "N",
+        string_format("graphs kept for reuse per context (default: %d, 0 = auto: 8 with speculative decoding, 1 otherwise)", params.n_graph_slots),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_graph_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_GRAPH_SLOTS"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
@@ -4205,7 +4242,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
-        {"--spec-draft-n-ubatch"}, "N",
+        {"--spec-draft-n-ubatch", "--spec-draft-ubatch-size", "-ubd"}, "N",
         string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: %d - same as --n-ubatch)", params.speculative.draft.n_ubatch),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -4261,6 +4298,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-p-cum"}, "P",
+        string_format("DSpark: cut the draft block where the product of the drafts' confidences drops below P, 0 = off (default: %.2f)", (double)params.speculative.draft.p_cum),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.p_cum = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_CUM"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

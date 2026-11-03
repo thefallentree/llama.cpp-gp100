@@ -1009,7 +1009,7 @@ static void mmid16_gemm_setup(
 
     p.tile_expert.alloc(t_max);
     p.tile_col0.alloc(t_max);
-    CUDA_CHECK(cudaMemsetAsync(p.tile_expert.get(), 0xFF, t_max*sizeof(int32_t), stream));
+    ggml_cuda_fill_async(p.tile_expert.get(), 0xFF, t_max*sizeof(int32_t), stream); // a kernel, not a memset node (PP1 finding)
 
     int nthr = 32;
     while (nthr < ne02) {
@@ -1021,7 +1021,7 @@ static void mmid16_gemm_setup(
         const int64_t t_max2 = 2*ne02;
         p.tile_expert2.alloc(t_max2);
         p.tile_col02.alloc(t_max2);
-        CUDA_CHECK(cudaMemsetAsync(p.tile_expert2.get(), 0xFF, t_max2*sizeof(int32_t), stream));
+        ggml_cuda_fill_async(p.tile_expert2.get(), 0xFF, t_max2*sizeof(int32_t), stream);
         p.grid2 = dim3(ne01/MMID16_TM, t_max2, 1);
         mmid16_tiles<64, 1><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(),  p.tile_col0.get(),  ne02);
         mmid16_tiles<32, 2><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(), ne02);

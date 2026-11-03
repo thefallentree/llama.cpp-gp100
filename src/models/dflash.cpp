@@ -1495,7 +1495,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;
-        const hc_mixes attn_mix = build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, il);
+        const hc_mixes attn_mix = build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, false, il);
 
         ggml_tensor * cur;
         if (pre_prev == nullptr) {
@@ -1554,7 +1554,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
-        const hc_mixes ffn_mix = build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il);
+        const hc_mixes ffn_mix = build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, false, il);
         pre_prev = ffn_mix.pre;
 
         cur = build_hc_pre(inpL, attn_mix.pre, il);

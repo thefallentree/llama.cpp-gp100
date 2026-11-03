@@ -123,6 +123,22 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
+// Pipelined prefill over two nodes (qwen4exp): the next decodes run layers [il_begin, il_end) only (il_end < 0: to the
+// last layer; 0, -1 = the whole model again). From il_begin > 0 the residual of every token comes from
+// llama_set_hc_input instead of the embeddings; up to il_end < n_layer the residual after layer il_end - 1 is the
+// nextn embedding output (llama_get_embeddings_nextn, unmasked) and the graph has no head (no logits).
+LLAMA_API void llama_set_layer_range(struct llama_context * ctx, int32_t il_begin, int32_t il_end);
+
+// The residual rows for a decode that starts past layer 0: row r (n_embd_out floats) is the token at position pos0 + r.
+LLAMA_API void llama_set_hc_input(struct llama_context * ctx, const float * data, llama_pos pos0, int64_t n_rows);
+
+// A sequence's state restricted to the layers [il_lo, il_hi) (il_hi < 0: to the last). The set call writes only the
+// data of those layers into the cells the sequence already holds (same positions in the same order, as after the
+// same tokens were decoded into an empty memory): the other layers and the cell metadata stay as they are.
+LLAMA_API size_t llama_state_seq_get_size_layers(struct llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi);
+LLAMA_API size_t llama_state_seq_get_data_layers(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi);
+LLAMA_API size_t llama_state_seq_set_data_layers(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

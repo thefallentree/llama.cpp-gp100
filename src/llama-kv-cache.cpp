@@ -2519,6 +2519,9 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Get whole range at a time
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
+        if (g_state_layer_filter.skip((int32_t) il)) {
+            continue;
+        }
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
@@ -2543,6 +2546,9 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     if (!v_trans) {
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (g_state_layer_filter.skip((int32_t) il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -2572,6 +2578,9 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (g_state_layer_filter.skip((int32_t) il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -2608,6 +2617,50 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
+
+    if (dest_seq_id != -1 && g_state_layer_filter.data_only) {
+        // layer data only (llama_state_seq_set_data_layers): the saved cells must be the ones the sequence holds, in
+        // the same order with the same positions; they are kept as they are and only receive the data
+        if (sinfo_in) {
+            sinfo = *sinfo_in;
+        } else {
+            sinfo.s0 = strm;
+            sinfo.s1 = strm;
+            sinfo.resize(1);
+            sinfo.strm[0] = strm;
+            sinfo.idxs[0].clear();
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.is_empty(i) && cells.seq_has(i, dest_seq_id)) {
+                    sinfo.idxs[0].push_back(i);
+                }
+            }
+        }
+        if (sinfo.n_stream() != 1 || sinfo.idxs[0].size() != cell_count) {
+            LLAMA_LOG_ERROR("%s: layer data for %u cells, the sequence holds %zu\n", __func__, cell_count,
+                    sinfo.n_stream() == 1 ? sinfo.idxs[0].size() : (size_t) 0);
+            return false;
+        }
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            llama_pos pos;
+            uint32_t  n_seq_id;
+            io.read(&pos,      sizeof(pos));
+            io.read(&n_seq_id, sizeof(n_seq_id));
+            if (has_cell_ext()) {
+                llama_kv_cell_ext ext;
+                io.read(&ext, sizeof(ext));
+            }
+            for (uint32_t j = 0; j < n_seq_id; ++j) {
+                llama_seq_id seq_id;
+                io.read(&seq_id, sizeof(seq_id));
+            }
+            if (cells.pos_get(sinfo.idxs[0][i]) != pos) {
+                LLAMA_LOG_ERROR("%s: layer data: cell %u holds pos %d, the saved cell %u pos %d\n", __func__,
+                        sinfo.idxs[0][i], cells.pos_get(sinfo.idxs[0][i]), i, pos);
+                return false;
+            }
+        }
+        return true;
+    }
 
     if (dest_seq_id != -1) {
         // single sequence
@@ -2842,6 +2895,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
+        if (g_state_layer_filter.skip((int32_t) il)) {
+            continue;
+        }
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
@@ -2873,6 +2929,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     if (!this->v_trans) {
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (g_state_layer_filter.skip((int32_t) il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -2907,6 +2966,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         // For each layer, read the values for each cell (transposed)
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (g_state_layer_filter.skip((int32_t) il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 

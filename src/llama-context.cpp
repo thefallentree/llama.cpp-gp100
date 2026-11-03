@@ -1941,6 +1941,25 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_layer_range(int32_t il_begin, int32_t il_end) {
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    il_begin = std::max(0, il_begin);
+    if (il_end >= n_layer) {
+        il_end = -1;
+    }
+    GGML_ASSERT(il_end < 0 || il_begin < il_end);
+    cparams.layer_begin = il_begin;
+    cparams.layer_end   = il_end;
+}
+
+void llama_context::set_hc_input(const float * data, llama_pos pos0, int64_t n_rows) {
+    const int64_t width = model.hparams.n_embd_out();
+    hc_in.width  = width;
+    hc_in.pos0   = pos0;
+    hc_in.n_rows = n_rows;
+    hc_in.data.assign(data, data + n_rows*width);
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3942,6 +3961,7 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
     };
     params.prompt_skip    = prompt_skip_for(ubatch, n_outputs, gtype);
+    params.hc_in          = &hc_in;
     params.chain.in       = draft_chain.cur_in;
     params.chain.out      = draft_chain.cur_out;
     params.chain.tok      = draft_chain.tok;
@@ -5613,6 +5633,14 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
 
+void llama_set_layer_range(llama_context * ctx, int32_t il_begin, int32_t il_end) {
+    ctx->set_layer_range(il_begin, il_end);
+}
+
+void llama_set_hc_input(llama_context * ctx, const float * data, llama_pos pos0, int64_t n_rows) {
+    ctx->set_hc_input(data, pos0, n_rows);
+}
+
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     if (!ctx) {
         return nullptr;
@@ -5905,6 +5933,43 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     if (size > (64u << 20)) {
         LLAMA_LOG_WARN("%s: seq %d: %.1f MiB restored in %.1f ms\n", __func__, seq_id, n/1048576.0, (ggml_time_us() - t0)/1000.0);
     }
+    return n;
+}
+
+namespace {
+struct state_layer_filter_scope {
+    state_layer_filter_scope(int32_t il_lo, int32_t il_hi, bool data_only) {
+        g_state_layer_filter.active    = true;
+        g_state_layer_filter.il_lo     = il_lo;
+        g_state_layer_filter.il_hi     = il_hi < 0 ? INT32_MAX : il_hi;
+        g_state_layer_filter.data_only = data_only;
+    }
+    ~state_layer_filter_scope() {
+        g_state_layer_filter = llama_state_layer_filter{};
+    }
+};
+}
+
+size_t llama_state_seq_get_size_layers(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi) {
+    state_layer_filter_scope scope(il_lo, il_hi, false);
+    return ctx->state_seq_get_size(seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+}
+
+size_t llama_state_seq_get_data_layers(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi) {
+    ctx->synchronize();
+    state_layer_filter_scope scope(il_lo, il_hi, false);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_get_data(seq_id, dst, size, LLAMA_STATE_SEQ_FLAGS_NONE);
+    LLAMA_LOG_WARN("%s: seq %d layers [%d, %d): %.1f MiB saved in %.1f ms\n", __func__, seq_id, il_lo, il_hi, n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    return n;
+}
+
+size_t llama_state_seq_set_data_layers(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi) {
+    ctx->synchronize();
+    state_layer_filter_scope scope(il_lo, il_hi, true);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_set_data(seq_id, src, size, LLAMA_STATE_SEQ_FLAGS_NONE);
+    LLAMA_LOG_WARN("%s: seq %d layers [%d, %d): %.1f MiB restored in %.1f ms\n", __func__, seq_id, il_lo, il_hi, n/1048576.0, (ggml_time_us() - t0)/1000.0);
     return n;
 }
 

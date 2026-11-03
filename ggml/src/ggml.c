@@ -535,6 +535,15 @@ const char * ggml_commit(void) {
 // timing
 //
 
+
+// exported: libllama and the backends read them, and ggml's symbols are hidden by default (fn-prof.h)
+GGML_API int ggml_fn_prof_tag;
+GGML_API int64_t ggml_fn_probe_ns[4];
+int ggml_fn_prof_tag = 0; // temporary profiling tag (fn-prof.h)
+// temporary probe of a decode window on the first device (GGML_CUDA_FN_PROBE=1), host times in ns:
+// [0] its first kernel was seen, [1] its last kernel was seen, [2] the launch call began, [3] the launch call returned
+int64_t ggml_fn_probe_ns[4] = { 0, 0, 0, 0 };
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 static int64_t timer_freq, timer_start;
 static BOOL CALLBACK ggml_time_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
@@ -697,6 +706,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
+    },
+    [GGML_TYPE_Q4_1_G64] = {
+        .type_name                = "q4_1_g64",
+        .blck_size                = QK4_1_G64,
+        .type_size                = sizeof(block_q4_1_g64),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_1_g64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_g64_ref,
+    },
+    [GGML_TYPE_Q4_16] = {
+        .type_name                = "q4_16",
+        .blck_size                = QK4_16,
+        .type_size                = sizeof(block_q4_16),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_16,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_16_ref,
     },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
@@ -1101,6 +1126,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "FLASH_ATTN_SEL",
 
     "UNARY",
 
@@ -1118,7 +1144,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,6 +1243,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "flash_attn_sel(q, k, v, sel)",
 
     "unary(x)",
 
@@ -1234,7 +1261,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2575,6 +2602,14 @@ struct ggml_tensor * ggml_argmax(
     result->src[0] = a;
 
     return result;
+}
+
+struct ggml_tensor * ggml_argmax_set_nonneg(
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->op == GGML_OP_ARGMAX);
+
+    ggml_set_op_params_i32(a, 0, 1);
+    return a;
 }
 
 // ggml_count_equal
@@ -6491,9 +6526,11 @@ struct ggml_tensor * ggml_lightning_indexer(
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    // the mask: F16 [n_kv, n_tokens] added to the scores, or I32 [2, n_tokens] ranges (the keys [lo, hi) of a
+    // token are visible, the rest get -INFINITY): the second form replaces a 6 B x n_kv x n_tokens tensor
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(   mask->ne[0] == (mask->type == GGML_TYPE_I32 ? 2 : k->ne[2]));
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);
@@ -6708,6 +6745,45 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_flash_attn_sel
+
+struct ggml_tensor * ggml_flash_attn_sel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * sel,
+        float                 scale) {
+    GGML_ASSERT(  q->type == GGML_TYPE_F32);
+    GGML_ASSERT(  k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(  v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(sel->type == GGML_TYPE_I32);
+
+    const int64_t n_embd    = q->ne[0];
+    const int64_t n_head    = q->ne[1];
+    const int64_t n_tokens  = q->ne[2];
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_head_kv = k->ne[2];
+
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] == n_embd && k->ne[3] == 1);
+    GGML_ASSERT(v->ne[0] == n_embd && v->ne[1] == n_kv && v->ne[2] == n_head_kv && v->ne[3] == 1);
+    GGML_ASSERT(n_head_kv > 0 && n_head % n_head_kv == 0);
+    GGML_ASSERT(sel->ne[1] == n_tokens && sel->ne[2] == 1 && sel->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_head, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_FLASH_ATTN_SEL;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = sel;
 
     return result;
 }
@@ -8188,6 +8264,8 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_1_G64: result = quantize_q4_1_g64(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_16:    result = quantize_q4_16(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

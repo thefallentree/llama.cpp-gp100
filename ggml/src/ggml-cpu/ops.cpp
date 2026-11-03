@@ -677,6 +677,7 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_1_G64:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -1134,6 +1135,7 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_1_G64:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -1266,6 +1268,7 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_1_G64:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -4811,6 +4814,7 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_1_G64:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -5136,6 +5140,7 @@ void ggml_compute_forward_set(
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_1_G64:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -5362,6 +5367,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_1_G64:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -6123,6 +6129,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_1_G64:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -11723,6 +11730,97 @@ void ggml_compute_forward_top_k_mask(
     }
 }
 
+// ggml_compute_forward_flash_attn_sel
+
+// a (token, head) per task: the scores of the token's rows in range, their softmax, the weighted values
+void ggml_compute_forward_flash_attn_sel(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q   = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * v   = dst->src[2];
+    const ggml_tensor * sel = dst->src[3];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && sel->type == GGML_TYPE_I32);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type));
+    GGML_ASSERT(sel->nb[0] == sizeof(int32_t));
+
+    const ggml_type_traits * traits_k = ggml_get_type_traits(k->type);
+    const ggml_type_traits * traits_v = ggml_get_type_traits(v->type);
+
+    const int64_t n_embd    = q->ne[0];
+    const int64_t n_head    = q->ne[1];
+    const int64_t n_tokens  = q->ne[2];
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_head_kv = k->ne[2];
+    const int64_t n_sel     = sel->ne[0];
+    const int64_t gqa       = n_head/n_head_kv;
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * wdata = (float *) params->wdata + ith*(n_sel + 2*n_embd + 2*CACHE_LINE_SIZE_F32);
+    float * s     = wdata;             // the scores, then the weights
+    float * kf    = s  + n_sel;        // a key row
+    float * vf    = kf + n_embd;       // a value row
+
+    for (int64_t r = ith; r < n_tokens*n_head; r += nth) {
+        const int64_t t  = r/n_head;
+        const int64_t h  = r - t*n_head;
+        const int64_t hk = h/gqa;
+
+        const float *   qr  = (const float *)   ((const char *) q->data   + t*q->nb[2]   + h*q->nb[1]);
+        const int32_t * sr  = (const int32_t *) ((const char *) sel->data + t*sel->nb[1]);
+        float *         out = (float *)         ((char *)       dst->data + t*dst->nb[2] + h*dst->nb[1]);
+
+        float m = -INFINITY;
+        for (int64_t j = 0; j < n_sel; ++j) {
+            const int32_t c = sr[j];
+            if (c < 0 || c >= n_kv) {
+                s[j] = -INFINITY;
+                continue;
+            }
+            const char * kr = (const char *) k->data + c*k->nb[1] + hk*k->nb[2];
+            traits_k->to_float(kr, kf, n_embd);
+            float dot = 0.0f;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                dot += qr[i]*kf[i];
+            }
+            s[j] = scale*dot;
+            m = MAX(m, s[j]);
+        }
+
+        for (int64_t i = 0; i < n_embd; ++i) {
+            out[i] = 0.0f;
+        }
+        if (m == -INFINITY) {
+            continue;
+        }
+        float l = 0.0f;
+        for (int64_t j = 0; j < n_sel; ++j) {
+            const int32_t c = sr[j];
+            if (s[j] == -INFINITY) {
+                continue;
+            }
+            const float p = expf(s[j] - m);
+            l += p;
+            const char * vr = (const char *) v->data + c*v->nb[1] + hk*v->nb[2];
+            traits_v->to_float(vr, vf, n_embd);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                out[i] += p*vf[i];
+            }
+        }
+        const float inv = 1.0f/l;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            out[i] *= inv;
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(
@@ -12441,7 +12539,10 @@ void ggml_compute_forward_lightning_indexer(
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(   q->type == GGML_TYPE_F32);
     GGML_ASSERT(   w->type == GGML_TYPE_F32);
-    GGML_ASSERT(   m->type == GGML_TYPE_F16);
+    GGML_ASSERT(   m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_I32);
+
+    // I32 [2, n_tokens]: the keys [lo, hi) of a token are visible, the rest masked (see ggml_lightning_indexer)
+    const bool m_range = m->type == GGML_TYPE_I32;
 
     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
@@ -12487,6 +12588,7 @@ void ggml_compute_forward_lightning_indexer(
         for (int t = 0; t < n_tokens; ++t) {
             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
+            const int32_t     *   r_row = (int32_t *) m_row;
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
             for (int ik = ir0; ik < ir1; ++ik) {
                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
@@ -12505,7 +12607,7 @@ void ggml_compute_forward_lightning_indexer(
                     score += MAX(qk, 0.0f) * w_row[h];
                 }
                 // apply mask
-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                dst_row[ik] = score + (m_range ? (ik >= r_row[0] && ik < r_row[1] ? 0.0f : -INFINITY) : GGML_CPU_FP16_TO_FP32(m_row[ik]));
             }
         }
     }

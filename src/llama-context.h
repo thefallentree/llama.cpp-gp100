@@ -121,6 +121,10 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // pipelined prefill (llama_set_layer_range, llama_set_hc_input)
+    void set_layer_range(int32_t il_begin, int32_t il_end);
+    void set_hc_input(const float * data, llama_pos pos0, int64_t n_rows);
     int32_t set_prompt_end(llama_seq_id seq_id, llama_pos pos_end);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -522,6 +526,9 @@ private:
         bool          cur_in   = false;   // the ubatch being built reads the chain tensors
         bool          cur_out  = false;   // ... writes them
     } draft_chain;
+
+    // the residual rows of the ubatches that start past layer 0 (llama_set_hc_input)
+    llama_hc_input hc_in;
 
     void draft_chain_init();
 

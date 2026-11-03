@@ -1,3 +1,4 @@
+#include "server-prefill-peer.h"
 #include "server-context.h"
 #include <atomic>
 #include <thread>
@@ -1096,6 +1097,9 @@ private:
 
     common_speculative_init_result_ptr spec_init;
 
+    // pipelined prefill with a peer server (server-prefill-peer.h)
+    prefill_peer_config peer_cfg;
+
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -1487,6 +1491,8 @@ private:
                         n_ctx_capped, n_ctx_train);
             }
         }
+
+        peer_cfg = prefill_peer_config::from_env(model_tgt);
 
         slots.clear();
 
@@ -4549,6 +4555,30 @@ private:
                         }
                     }
 
+                    // a long cold prompt: its first part split by layers with the peer server (server-prefill-peer.h)
+                    if (peer_cfg.enabled() && p0 == 0 && batch.size() == 0 && slots.size() == 1 && !wait_shared &&
+                        !input_tokens.has_mtmd && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                        slot.task->n_tokens_shared == 0 && slot.prompt_skip_end < 0 && slot.task->n_tokens() >= peer_cfg.min_tokens &&
+                        slot.prompt.n_tokens() == 0 && slot.lora.empty()) {
+                        // the last 4 + n_ubatch tokens and more stay local: the checkpoints before the end are made there
+                        const int32_t n_prompt = slot.task->n_tokens();
+                        const int32_t n_split  = ((n_prompt - (4 + n_ubatch) - 1) / n_ubatch) * n_ubatch;
+                        if (n_split >= 2*n_ubatch) {
+                            std::vector<llama_token> toks(n_split);
+                            for (int32_t i = 0; i < n_split; ++i) {
+                                toks[i] = input_tokens[i];
+                            }
+                            prefill_peer_stats pst;
+                            if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_split, n_ubatch, pst)) {
+                                for (int32_t i = 0; i < n_split; ++i) {
+                                    slot.prompt.tokens.push_back(toks[i]);
+                                }
+                                slot.stats.n_prompt_processed += n_split;
+                                slot.stats.update_prompt_last();
+                            }
+                        }
+                    }
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be
@@ -5428,6 +5458,11 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
+    if (const char * port = getenv("LLAMA_PREFILL_PEER_LISTEN")) {
+        // a peer for another server's long prompts (server-prefill-peer.h): no tasks of its own
+        prefill_peer_serve(atoi(port), impl->ctx_tgt, impl->ctx_dft, impl->spec.get());
+        return;
+    }
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 

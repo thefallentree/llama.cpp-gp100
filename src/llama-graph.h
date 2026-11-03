@@ -174,6 +174,29 @@ bool llm_graph_tok_embd_host(const ggml_tensor * tok_embd);
 // rows ids[0..n) of tok_embd (llm_graph_tok_embd_host) as floats at dst, n_embd = tok_embd->ne[0] apart
 void llm_graph_gather_tok_embd(const ggml_tensor * tok_embd, const int32_t * ids, int64_t n, float * dst);
 
+// the residual rows of a ubatch that starts past layer 0 (llama_set_hc_input): row r of data is the residual of
+// the token at position pos0 + r, width floats each
+struct llama_hc_input {
+    std::vector<float> data;
+    llama_pos          pos0   = 0;
+    int64_t            n_rows = 0;
+    int64_t            width  = 0;
+};
+
+class llm_graph_input_hc_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_hc_rows(const llama_hc_input * src) : src(src) {}
+    virtual ~llm_graph_input_hc_rows() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    const llama_hc_input * src  = nullptr;
+    ggml_tensor *          rows = nullptr; // F32 [width, n_batch]
+    std::vector<float>     buf;
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input, fed from ubatch.embd_state
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
@@ -889,6 +912,9 @@ struct llm_graph_params {
     // the layers up to the last stream source, the layers after it are not built
     bool prompt_skip = false;
 
+    // the residual rows of a ubatch that starts past layer 0 (cparams.layer_begin > 0)
+    const llama_hc_input * hc_in = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -934,6 +960,10 @@ struct llm_graph_params {
         }
 
         if (prompt_skip != other.prompt_skip) {
+            return false;
+        }
+
+        if (cparams.layer_begin != other.cparams.layer_begin || cparams.layer_end != other.cparams.layer_end) {
             return false;
         }
 
@@ -1148,6 +1178,8 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+
+    const llama_hc_input * hc_in;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
     std::map<llama_seq_id, std::string>     sampler_keys;

@@ -238,6 +238,25 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
 }
 
+void llm_graph_input_hc_rows::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(src != nullptr && rows != nullptr && src->width == rows->ne[0]);
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t width    = src->width;
+
+    buf.resize((size_t) n_tokens*width);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const int64_t r = (int64_t) ubatch->pos[i] - src->pos0;
+        GGML_ASSERT(r >= 0 && r < src->n_rows && "llama_set_hc_input holds no row for this position");
+        memcpy(buf.data() + i*width, src->data.data() + r*width, width*sizeof(float));
+    }
+    ggml_backend_tensor_set(rows, buf.data(), 0, buf.size()*sizeof(float));
+}
+
+bool llm_graph_input_hc_rows::can_reuse(const llm_graph_params & params) {
+    return params.hc_in == src && rows->ne[1] == params.ubatch.n_tokens;
+}
+
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
@@ -1603,6 +1622,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    hc_in            (params.hc_in),
     samplers         (params.samplers),
     sampler_keys     (params.sampler_keys),
     cb_func          (params.cb),

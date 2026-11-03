@@ -582,16 +582,29 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 "the indexer cache must track the attention cache cell for cell");
     }
 
+    // pipelined prefill (llama_set_layer_range): this graph runs the layers [il_begin, il_end) only
+    const int il_begin = std::max(0, cparams.layer_begin);
+    const int il_end   = cparams.layer_end < 0 ? n_layer : std::min<int>(cparams.layer_end, n_layer);
+    GGML_ASSERT(il_begin < il_end);
+
+    bool has_ple = false;
+    for (int il = il_begin; il < il_end; ++il) {
+        has_ple = has_ple || hparams.is_ple(il);
+    }
+
     ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
+    if (hparams.ple_n_heads > 0 && has_ple) {
         ple_emb = build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
         ggml_build_forward_expand(gf, ple_emb);
     }
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
-    cb(inpL, "model.input_embed", -1);
-    ggml_build_forward_expand(gf, inpL);
+    ggml_tensor * inpL = nullptr;
+    if (il_begin == 0) {
+        inpL = build_inp_embd(model.tok_embd);
+        cb(inpL, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, inpL);
+    }
 
     // the QSA layers share one set of k-pool inputs
     // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
@@ -603,15 +616,28 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // the wide residual starts as hc identical copies of the embedding
-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
-    cb(res_hc, "hc_init", -1);
+    ggml_tensor * res_hc = nullptr;
+    if (il_begin == 0) {
+        // the wide residual starts as hc identical copies of the embedding
+        res_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(res_hc, "hc_init", -1);
+    } else {
+        // the residual after layer il_begin - 1, computed elsewhere (llama_set_hc_input)
+        GGML_ASSERT(hc_in != nullptr && "llama_set_layer_range past layer 0 needs llama_set_hc_input");
+        auto inp_hc = std::make_unique<llm_graph_input_hc_rows>(hc_in);
+        inp_hc->rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd*hc, n_tokens);
+        ggml_set_input(inp_hc->rows);
+        ggml_set_name(inp_hc->rows, "hc_rows_input");
+        res_hc = ggml_reshape_3d(ctx0, inp_hc->rows, n_embd, hc, n_tokens);
+        res->add_input(std::move(inp_hc));
+        cb(res_hc, "hc_init", -1);
+    }
     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
     ggml_build_forward_expand(gf, res_hc);
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_begin; il < il_end; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -667,6 +693,17 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+    }
+
+    if (il_end < n_layer) {
+        // the first part of a pipelined prefill: the residual goes to the next part as the nextn embeddings
+        res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        cb(res->t_h_nextn, "h_nextn", -1);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
+        res->t_embd   = nullptr;
+        res->t_logits = nullptr;
+        GGML_UNUSED(inp_out_ids);
+        return;
     }
 
     // the MTP head reads the hc-wide residual, before the final mixer

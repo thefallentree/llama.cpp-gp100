@@ -867,6 +867,48 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
 
+    if (seq_id != -1 && g_state_layer_filter.data_only) {
+        // layer data only (llama_state_seq_set_data_layers): into the row that holds the sequence's current state,
+        // the same row state_write() reads (with a pending rollback it lives in a snapshot plane)
+        int32_t cell = -1;
+        uint32_t n_cells = 0;
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].has_seq_id(seq_id)) {
+                cell = cell < 0 ? (int32_t) i : cell;
+                ++n_cells;
+            }
+        }
+        if (n_cells != cell_count || cell_count != 1) {
+            throw std::runtime_error(format("recurrent layer data for %u cells, the sequence holds %u", cell_count, n_cells));
+        }
+        llama_pos pos;
+        uint32_t  n_seq_id;
+        io.read(&pos,      sizeof(pos));
+        io.read(&n_seq_id, sizeof(n_seq_id));
+        for (uint32_t j = 0; j < n_seq_id; ++j) {
+            llama_seq_id sid;
+            io.read(&sid, sizeof(sid));
+        }
+        if (cells[cell].pos != pos) {
+            throw std::runtime_error(format("recurrent layer data at pos %d, the sequence is at %d", pos, cells[cell].pos));
+        }
+        const uint32_t rs_idx_cur = n_rs_seq != 0 ? rs_idx[seq_id] : 0;
+        const uint32_t row        = rs_idx_cur * size + (cells[cell].src >= 0 ? (uint32_t) cells[cell].src : (uint32_t) cell);
+        const uint32_t head_saved = head;
+        head = row;
+        bool ok = false;
+        try {
+            ok = state_read_data(io, cell_count);
+        } catch (...) {
+            ok = false;
+        }
+        head = head_saved;
+        if (!ok) {
+            throw std::runtime_error("failed to restore the recurrent layer data");
+        }
+        return;
+    }
+
     bool res = true;
 
     // save the head of the restored cells - could be needed to clear the state
@@ -923,6 +965,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     for (uint32_t il = 0; il < n_layer; ++il) {
         // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
         if (r_l[il] == nullptr) continue;
+        if (g_state_layer_filter.skip((int32_t) il)) continue;
 
         // Write R tensor type
         const int32_t r_type_i = (int32_t)r_l[il]->type;
@@ -956,6 +999,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
+            if (g_state_layer_filter.skip((int32_t) il)) continue;
 
             // Write S tensor type
             const int32_t s_type_i = (int32_t)s_l[il]->type;
@@ -979,6 +1023,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
+            if (g_state_layer_filter.skip((int32_t) il)) continue;
 
             const uint32_t n_embd_s = hparams.n_embd_s();
 
@@ -1130,6 +1175,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     for (uint32_t il = 0; il < n_layer; ++il) {
         // skip null layers
         if (r_l[il] == nullptr) continue;
+        if (g_state_layer_filter.skip((int32_t) il)) continue;
 
         // Read type of key
         int32_t r_type_i_ref;
@@ -1173,6 +1219,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers
             if (s_l[il] == nullptr) continue;
+            if (g_state_layer_filter.skip((int32_t) il)) continue;
 
             // Read type of value
             int32_t s_type_i_ref;
@@ -1203,6 +1250,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers
             if (s_l[il] == nullptr) continue;
+            if (g_state_layer_filter.skip((int32_t) il)) continue;
 
             const uint32_t n_embd_s = hparams.n_embd_s();
 

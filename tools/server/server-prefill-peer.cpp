@@ -237,13 +237,19 @@ struct rx_ring {
         }
     }
 
-    // a free slot, grown to n rows when needed (the caller holds the lock of the queue that tracks busy)
+    // a free slot, or -1; a message bigger than the slots (LLAMA_PREFILL_PEER_CHUNK) grows them, which waits until no
+    // slot is in use (the caller holds the lock of the queue that tracks busy and retries)
     int take(size_t rows) {
+        if (rows > rows_cap) {
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (busy[i]) {
+                    return -1;
+                }
+            }
+            prepare(model, width, rows);
+        }
         for (size_t i = 0; i < slots.size(); ++i) {
             if (!busy[i]) {
-                if (rows > rows_cap) {
-                    prepare(model, width, rows);
-                }
                 busy[i] = true;
                 return (int) i;
             }

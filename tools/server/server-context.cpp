@@ -4560,9 +4560,10 @@ private:
                         !input_tokens.has_mtmd && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         slot.task->n_tokens_shared == 0 && slot.prompt_skip_end < 0 && slot.task->n_tokens() >= peer_cfg.min_tokens &&
                         slot.prompt.n_tokens() == 0 && slot.lora.empty()) {
-                        // the last 4 + n_ubatch tokens and more stay local: the checkpoints before the end are made there
+                        // the last 4 + n_ubatch tokens stay local: the checkpoints before the end are made there, and the
+                        // batches are the ones the local path would decode (whole n_batch from 0, then up to the checkpoint)
                         const int32_t n_prompt = slot.task->n_tokens();
-                        const int32_t n_split  = ((n_prompt - (4 + n_ubatch) - 1) / n_ubatch) * n_ubatch;
+                        const int32_t n_split  = n_prompt - (4 + n_ubatch);
                         if (n_split >= 2*n_ubatch) {
                             std::vector<llama_token> toks(n_split);
                             for (int32_t i = 0; i < n_split; ++i) {

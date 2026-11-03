@@ -576,6 +576,38 @@ void ggml_cuda_fn_planes_optimize(ggml_backend_cuda_context & ctx, ggml_cgraph *
 // ---------------------------------------------------------------------------------------------------------------
 // planar weights: dequantize (prompt batches)
 
+// 16 dequantized values (integer q, scale s) as 16-byte stores: a thread's 16 outputs are 32 B (half/bf16) or 64 B
+// (float) contiguous, so scalar 2-byte stores made every warp store touch 32 sectors for 64 B of data (66-77 GB/s).
+// The same float products and the same conversions as before, only packed: the output is bit-identical.
+static __device__ __forceinline__ uint32_t fn_pack2(const half a, const half b) {
+    return (uint32_t) __half_as_ushort(a) | ((uint32_t) __half_as_ushort(b) << 16);
+}
+static __device__ __forceinline__ uint32_t fn_pack2(const nv_bfloat16 a, const nv_bfloat16 b) {
+    return (uint32_t) __bfloat16_as_ushort(a) | ((uint32_t) __bfloat16_as_ushort(b) << 16);
+}
+
+template <typename dst_t>
+static __device__ __forceinline__ void fn_store16(dst_t * __restrict__ yo, const float s, const int (&q)[16]) {
+    if constexpr (sizeof(dst_t) == 4) {
+        float4 * y4 = (float4 *) yo;
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            y4[v] = make_float4(s*(float) q[4*v], s*(float) q[4*v + 1], s*(float) q[4*v + 2], s*(float) q[4*v + 3]);
+        }
+    } else {
+        uint4 * y4 = (uint4 *) yo;
+#pragma unroll
+        for (int v = 0; v < 2; ++v) {
+            uint32_t p[4];
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                p[h] = fn_pack2(ggml_cuda_cast<dst_t>(s*(float) q[8*v + 2*h]), ggml_cuda_cast<dst_t>(s*(float) q[8*v + 2*h + 1]));
+            }
+            y4[v] = make_uint4(p[0], p[1], p[2], p[3]);
+        }
+    }
+}
+
 template <typename dst_t>
 static __global__ void fn_p8_dequantize(const uint4 * __restrict__ W, const half * __restrict__ D,
                                         const float * __restrict__ rowscale, const int tpr, const int64_t n16,
@@ -589,12 +621,12 @@ static __global__ void fn_p8_dequantize(const uint4 * __restrict__ W, const half
     const uint4   v = W[i];
     const float   s = __half2float(D[r*(tpr/2) + (k >> 1)])*rowscale[r];
     const uint32_t w[4] = { v.x, v.y, v.z, v.w };
-    dst_t * yo = y + i*16;
+    int q[16];
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
-        const int q = (int) ((w[j / 4] >> (8*(j % 4))) & 0xff) - 128;
-        yo[j] = ggml_cuda_cast<dst_t>(s*(float) q);
+        q[j] = (int) ((w[j / 4] >> (8*(j % 4))) & 0xff) - 128;
     }
+    fn_store16<dst_t>(y + i*16, s, q);
 }
 
 // the P4 layout: a word's low nibbles are its columns 0-3, its high nibbles 4-7; SB: the columns a scale covers
@@ -611,13 +643,13 @@ static __global__ void fn_p4_dequantize(const uint2 * __restrict__ W, const half
     const uint2   v = W[i];
     const float   s = __half2float(D[r*(tpr*16/SB) + k*16/SB])*rowscale[r];
     const uint32_t w[2] = { v.x, v.y };
-    dst_t * yo = y + i*16;
+    int q[16];
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
         const int c = j % 8;
-        const int q = (int) ((w[j / 8] >> (8*(c % 4) + 4*(c / 4))) & 0xf) - 8;
-        yo[j] = ggml_cuda_cast<dst_t>(s*(float) q);
+        q[j] = (int) ((w[j / 8] >> (8*(c % 4) + 4*(c / 4))) & 0xf) - 8;
     }
+    fn_store16<dst_t>(y + i*16, s, q);
 }
 
 void ggml_cuda_fn_dequantize(const ggml_tensor * src0, void * dst, const ggml_type dst_type, cudaStream_t stream) {

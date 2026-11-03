@@ -79,6 +79,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
     RPC_CMD_NONE,
+    RPC_CMD_ALLOC_HOST_BUFFER,   // a buffer of the device's host buffer type (pinned memory on the server; the engine's cold experts)
     RPC_CMD_COUNT,
 };
 
@@ -101,6 +102,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_INIT_TENSOR:       return "INIT_TENSOR";
         case RPC_CMD_GET_ALLOC_SIZE:    return "GET_ALLOC_SIZE";
         case RPC_CMD_HELLO:             return "HELLO";
+        case RPC_CMD_ALLOC_HOST_BUFFER: return "ALLOC_HOST_BUFFER";
         case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
         case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
         case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
@@ -296,6 +298,7 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+    bool        host = false;   // the device's host buffer type on the server (pinned memory next to its GPU)
 };
 
 class rpc_dispatcher;
@@ -519,6 +522,15 @@ public:
 
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output = nullptr, size_t output_size = 0);
+    // the server discards every cached graph when a buffer is freed (nodes may point into it): forget ours too, so
+    // the next compute serializes the graph again instead of asking for a uid the server no longer has.
+    // the uids are cleared and the command queued under the graph lock, so no graph_compute of another thread can
+    // register a uid between the two that the server's free would then drop
+    void free_buffer(std::shared_ptr<const void> request, size_t request_size) {
+        std::lock_guard<std::mutex> lock(graph_mutex);
+        graph_uids.clear();
+        send(RPC_CMD_FREE_BUFFER, request, request_size, nullptr, 0, nullptr, 0);
+    }
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -557,6 +569,7 @@ private:
 
     std::mutex graph_mutex;
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+    std::string      endpoint;
 
     rpc_msg_queue queue;
     socket_ptr    sock;
@@ -645,6 +658,7 @@ void rpc_dispatcher::busy_spin_release() {
 }
 
 bool rpc_dispatcher::start(const std::string & endpoint) {
+    this->endpoint = endpoint;
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
@@ -671,8 +685,49 @@ bool rpc_dispatcher::start(const std::string & endpoint) {
     return true;
 }
 
+// GGML_RPC_STATS=S: the dispatcher prints, every S seconds in which commands were sent and when it stops, the commands
+// it sent per kind: count, bytes out and in, and the time from sending a command to the end of its response (for a
+// command with a response this includes the server's wait for earlier asynchronous work, e.g. a GET_TENSOR after a
+// GRAPH_COMPUTE: the head's wait on the remote node), plus the time the dispatcher waited for the next command.
+static double rpc_stats_interval_s() {
+    static const double s = std::getenv("GGML_RPC_STATS") != nullptr ? std::atof(std::getenv("GGML_RPC_STATS")) : 0.0;
+    return s;
+}
+
+struct rpc_cmd_stats {
+    struct entry { uint64_t n = 0, bytes_out = 0, bytes_in = 0; double ms = 0.0; };
+    std::array<entry, RPC_CMD_COUNT> e;
+    double idle_ms = 0.0;
+    std::chrono::steady_clock::time_point t_print = std::chrono::steady_clock::now();
+
+    void print(const std::string & endpoint) {
+        double total = 0.0;
+        uint64_t n = 0;
+        for (const auto & x : e) { total += x.ms; n += x.n; }
+        if (n == 0) {
+            return;
+        }
+        const std::chrono::duration<double> span = std::chrono::steady_clock::now() - t_print;
+        GGML_LOG_WARN("rpc-stats %s: %.1f s, %llu commands, %.1f ms in commands, %.1f ms idle\n", endpoint.c_str(), span.count(),
+                      (unsigned long long) n, total, idle_ms);
+        for (int c = 0; c < RPC_CMD_COUNT; ++c) {
+            const auto & x = e[c];
+            if (x.n == 0) {
+                continue;
+            }
+            GGML_LOG_WARN("rpc-stats %s: %-18s n %8llu  out %10.1f MB  in %9.1f MB  %9.1f ms  %8.1f us/cmd\n", endpoint.c_str(),
+                          rpc_cmd_name((rpc_cmd) c), (unsigned long long) x.n, x.bytes_out/1e6, x.bytes_in/1e6, x.ms, 1000.0*x.ms/x.n);
+        }
+        e = {};
+        idle_ms = 0.0;
+        t_print = std::chrono::steady_clock::now();
+    }
+};
+
 void rpc_dispatcher::work() {
     auto last_cmd = std::chrono::steady_clock::now();
+    const double stats_s = rpc_stats_interval_s();
+    std::unique_ptr<rpc_cmd_stats> stats(stats_s > 0.0 ? new rpc_cmd_stats : nullptr);
     while (running) {
         rpc_msg_ptr msg_ptr;
         // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
@@ -702,11 +757,26 @@ void rpc_dispatcher::work() {
                 const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - t0;
                 LOG_DBG3("[%s] %s done in %.3f ms\n", __func__, rpc_cmd_name(msg_ptr->cmd), elapsed.count());
             }
+            if (stats) {
+                const auto t1 = std::chrono::steady_clock::now();
+                auto & x = stats->e[msg_ptr->cmd];
+                x.n++;
+                x.bytes_out += msg_ptr->input_size;
+                x.bytes_in  += msg_ptr->output_size;
+                x.ms        += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                stats->idle_ms += std::chrono::duration<double, std::milli>(t0 - last_cmd).count();
+                if (std::chrono::duration<double>(t1 - stats->t_print).count() >= stats_s) {
+                    stats->print(endpoint);
+                }
+            }
         } else {
             LOG_DBG3("[%s] sync barrier\n", __func__);
         }
         msg_ptr->completion.set_value();
         last_cmd = std::chrono::steady_clock::now();
+    }
+    if (stats) {
+        stats->print(endpoint);
     }
 }
 
@@ -744,7 +814,7 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto request = std::make_shared<rpc_msg_free_buffer_req>();
     request->remote_ptr = ctx->remote_ptr;
     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
-    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request), nullptr, 0, nullptr, 0);
+    ctx->dispatcher->free_buffer(request, sizeof(*request));
     delete ctx;
 }
 
@@ -1012,7 +1082,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (dispatcher == nullptr) {
         return nullptr;
     }
-    dispatcher->send(RPC_CMD_ALLOC_BUFFER, request, sizeof(*request), nullptr, 0, &response, sizeof(response));
+    dispatcher->send(buft_ctx->host ? RPC_CMD_ALLOC_HOST_BUFFER : RPC_CMD_ALLOC_BUFFER, request, sizeof(*request), nullptr, 0, &response, sizeof(response));
     if (response.remote_ptr != 0) {
         LOG_DBG("[%s] endpoint: %s, device: %u, size: %s -> remote_ptr: 0x%" PRIx64 ", remote_size: %s\n",
                 __func__, buft_ctx->endpoint.c_str(), buft_ctx->device, rpc_log_format_size(request->size).c_str(),
@@ -1078,12 +1148,19 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         const size_t min_size = ggml_nbytes(tensor);
 
         // Cache key for calls to read the alloc_size.
-        // We deliberately exclude src tensor dimensions from the key because:
-        // 1. For CPU backends, alloc_size = ggml_nbytes(output) regardless of src shapes
-        // 2. For GPU backends, the reservation graph uses max dimensions, so the
-        //    cached value from reservation is always >= any subsequent request
-        // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
-        //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
+        // The alloc_size of an op that may expand is a function of its sources, not of its output alone: a
+        // FLASH_ATTN_EXT converts K and V to f16 in room that follows its output, sized by K->ne[1], and layers of
+        // one graph share the output shape while their K lengths differ (DeepSeek V4: raw-only, compressed and
+        // top-k layers; the K length also grows with the context). A key of the output alone returned the size of
+        // whichever layer or context asked first, the compute buffer was too small for the later ones and the
+        // conversion wrote past its end ("illegal memory access" in FLASH_ATTN_EXT after a few thousand tokens of
+        // context). So the key holds the type, shape and strides of every source.
+        // A cache miss is one round trip to the server; the cache is per process and the shapes of a model repeat.
+        struct alloc_size_src_key {
+            uint32_t type;
+            uint32_t ne[GGML_MAX_DIMS];
+            uint64_t nb[GGML_MAX_DIMS];
+        };
         struct alloc_size_cache_key {
             uint32_t device;
             uint32_t type;
@@ -1091,6 +1168,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
             uint32_t ne[GGML_MAX_DIMS];
             uint64_t nb[GGML_MAX_DIMS];
+            alloc_size_src_key src[GGML_MAX_SRC];
         };
 
         alloc_size_cache_key key = {};
@@ -1101,6 +1179,17 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             key.ne[i] = (uint32_t)tensor->ne[i];
             key.nb[i] = (uint64_t)tensor->nb[i];
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * src = tensor->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+            key.src[j].type = src->type;
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                key.src[j].ne[i] = (uint32_t)src->ne[i];
+                key.src[j].nb[i] = (uint64_t)src->nb[i];
+            }
         }
 
         uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));
@@ -1379,6 +1468,52 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     return buft;
 }
 
+// the host buffer type of a remote device: pinned memory on the server, allocated with the device's own host buffer
+// type (CUDA_Host for a CUDA device), reachable by every backend of that server. The fork's engine keeps the cold
+// experts of a layer there (-ot "..._exps_cold=RPC0[host:port]_Host") and the remote CUDA backend runs its cold
+// path (host tier, expert cache) on them as on one node.
+ggml_backend_buffer_type_t ggml_backend_rpc_host_buffer_type(const char * endpoint, uint32_t device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::string buft_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]_Host";
+    static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
+    auto it = buft_map.find(buft_name);
+    if (it != buft_map.end()) {
+        return it->second;
+    }
+    auto dispatcher = get_dispatcher(endpoint);
+    size_t alignment = get_alignment(dispatcher, device);
+    size_t max_size = get_max_size(dispatcher, device);
+    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
+        /* .endpoint  = */ endpoint,
+        /* .device    = */ device,
+        /* .name      = */ buft_name,
+        /* .alignment = */ alignment,
+        /* .max_size  = */ max_size,
+        /* .host      = */ true,
+    };
+    auto reg = ggml_backend_rpc_add_server(endpoint);
+    ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
+        /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
+        /* .device  = */ ggml_backend_reg_dev_get(reg, device),
+        /* .context = */ buft_ctx
+    };
+    buft_map[buft_name] = buft;
+    return buft;
+}
+
+static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev);
+
+// the remote pinned type of an RPC device object: its endpoint and its index on that server (device names are
+// numbered across all servers, so they must not be parsed for the index)
+ggml_backend_buffer_type_t ggml_backend_rpc_device_host_buffer_type(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return nullptr;
+    }
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
+    return ggml_backend_rpc_host_buffer_type(ctx->endpoint.c_str(), ctx->device);
+}
+
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
     auto dispatcher = get_dispatcher(endpoint);
@@ -1448,6 +1583,7 @@ public:
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool alloc_host_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
@@ -1578,6 +1714,33 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     return true;
 }
 
+bool rpc_server::alloc_host_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response) {
+    uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        return false;
+    }
+    response.remote_ptr = 0;
+    response.remote_size = 0;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (buft == nullptr) {
+        LOG_WARN("[%s] device: %u has no host buffer type\n", __func__, dev_id);
+        return true;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
+    if (buffer != nullptr) {
+        response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
+        response.remote_size = buffer->size;
+        LOG_DBG("[%s] device: %u, size: %s -> remote_ptr: 0x%" PRIx64 ", remote_size: %s\n",
+                __func__, dev_id, rpc_log_format_size(request.size).c_str(), response.remote_ptr,
+                rpc_log_format_size(response.remote_size).c_str());
+        buffers.insert(buffer);
+    } else {
+        LOG_WARN("[%s] device: %u, size: %s -> failed\n", __func__, dev_id, rpc_log_format_size(request.size).c_str());
+    }
+    return true;
+}
+
 bool rpc_server::get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response) {
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
@@ -1624,11 +1787,12 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     }
     // Discard all cached graphs to avoid use-after-free in graph_recompute,
     // since their nodes may hold pointers to the buffer being freed. The client
-    // will have to re-serialize its graphs from now on.
+    // forgets its graph uids at the same point (rpc_dispatcher::free_buffer).
+    // The entries are erased, not only invalidated: the client counts its cached
+    // uids from zero again, and both sides must reach GRAPH_CACHE_MAX (and clear)
+    // at the same graph, or the client asks to recompute a uid the server dropped.
     for (auto & sgs : stored_graphs) {
-        for (auto & sg : sgs) {
-            sg.second.graph = nullptr;
-        }
+        sgs.clear();
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
@@ -2737,6 +2901,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_ALLOC_HOST_BUFFER: {
+                rpc_msg_alloc_buffer_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_alloc_buffer_rsp response;
+                if (!server.alloc_host_buffer(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_ALLOC_SIZE: {
                 rpc_msg_get_alloc_size_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -3088,7 +3266,7 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ true,
-        /* .host_buffer           = */ false,
+        /* .host_buffer           = */ false,   // kept off: the loader's chunked pinned upload path is for local devices
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ true,
         /* .mmap_support          = */ true,
@@ -3124,7 +3302,11 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     }
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
-    return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;
+    if (buft_ctx->endpoint != dev_ctx->endpoint) {
+        return false;
+    }
+    // a host buffer on the server is visible to all of its backends (pinned memory), a device buffer to its own
+    return buft_ctx->host || buft_ctx->device == dev_ctx->device;
 }
 
 static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
@@ -3162,7 +3344,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_props            = */ ggml_backend_rpc_device_get_props,
     /* .init_backend         = */ ggml_backend_rpc_device_init,
     /* .get_buffer_type      = */ ggml_backend_rpc_device_get_buffer_type,
-    /* .get_host_buffer_type = */ NULL,
+    /* .get_host_buffer_type = */ NULL,   // the remote pinned type is not host-accessible here: an explicit -ot target only
     /* .buffer_from_host_ptr = */ NULL,
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
@@ -3333,6 +3515,12 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_host_buffer_type") == 0) {
+        return (void *)ggml_backend_rpc_host_buffer_type;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_device_host_buffer_type") == 0) {
+        return (void *)ggml_backend_rpc_device_host_buffer_type;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;

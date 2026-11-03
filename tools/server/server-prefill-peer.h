@@ -11,7 +11,8 @@
 // as usual.
 //
 // head:  LLAMA_PREFILL_PEER=host:port, LLAMA_PREFILL_PEER_SPLIT=layer (default n_layer/2),
-//        LLAMA_PREFILL_PEER_MIN=tokens (default 8192: shorter prompts stay local)
+//        LLAMA_PREFILL_PEER_MIN=tokens (default 8192: shorter prompts stay local); several peers form a chain
+//        (LLAMA_PREFILL_PEER=a:p,b:p LLAMA_PREFILL_PEER_SPLIT=16,32): each forwards its residual to the next
 // peer:  LLAMA_PREFILL_PEER_LISTEN=port (the server runs only this loop, no tasks)
 
 #include "llama.h"
@@ -31,16 +32,24 @@ struct prefill_peer_stats {
     size_t bytes_state  = 0;
 };
 
-// the head's configuration from the environment; enabled() is false without LLAMA_PREFILL_PEER
-struct prefill_peer_config {
+// one peer of the chain: it runs the layers from layer_begin to the next peer's layer_begin (the last one: to the end)
+struct prefill_peer_stage {
     std::string host;
-    int         port      = 0;
-    int         split     = -1;
-    int         min_tokens = 8192;
+    int         port        = 0;
+    int         layer_begin = 0;
+};
+
+// the head's configuration from the environment; enabled() is false without LLAMA_PREFILL_PEER
+// LLAMA_PREFILL_PEER=host:port[,host:port...]: a chain of peers, the residual goes from each to the next;
+// LLAMA_PREFILL_PEER_SPLIT=l1[,l2...]: the first layer of each peer (default: the layers split evenly)
+struct prefill_peer_config {
+    std::vector<prefill_peer_stage> stages;
+    int min_tokens = 8192;
 
     static prefill_peer_config from_env(const llama_model * model);
 
-    bool enabled() const { return port > 0 && !host.empty(); }
+    bool enabled() const { return !stages.empty(); }
+    int  split()   const { return stages.empty() ? -1 : stages[0].layer_begin; }
 };
 
 // The head: decodes tokens [0, n_split) of seq_id with the peer. The memories of seq_id must be empty on entry and the

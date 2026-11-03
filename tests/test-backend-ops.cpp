@@ -13034,6 +13034,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F16, true));
         }
     }
+    // the 4-head prompt indexer over a long context (the CUDA GEMM path: n_kv >= 8192, n_batch >= 64), F16 and F32 keys,
+    // key counts off the 4-key vector and odd token counts, F16 mask rows and {lo, hi} ranges, 1 and 2 streams
+    for (int kv : { 8192, 16383, 20001 }) {
+        for (int bs : { 64, 203, 512 }) {
+            for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
+                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 8192, 300, 2, 2, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 8192, 300, 2, 1, GGML_TYPE_F16));
+
     // the range mask on the tile (prompt), vec and 64-head kernels
     for (int bs : { 24, 512 }) {
         for (int nh : { 4, 32, 64 }) {
@@ -13638,6 +13651,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the indexer of a decode window over the pools of a 64K and a 200K context
     for (int kv : { 16384, 65536 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 3, 1, 1, GGML_TYPE_F16));
+    }
+    // the prompt indexer of a 1536-token ubatch over the pools of a 64K, 128K and 256K context, and the drafter's 512-token
+    // pieces and the smaller batches around the GEMM path's threshold
+    for (int kv : { 16384, 32768, 65536 }) {
+        for (int bs : { 16, 32, 64, 128, 512, 1536 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F16, true));
+        }
     }
 
     // lightning_indexer

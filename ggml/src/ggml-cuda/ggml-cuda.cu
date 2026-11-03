@@ -2588,6 +2588,129 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <cublasLt.h>
+#include <dlfcn.h>
+#include <map>
+#include <tuple>
+
+// GGML_CUDA_CUBLASLT=1: the single (non-batched) cuBLAS GEMMs run through cublasLt with the in-place split-K reduction
+// masked out (GGML_CUDA_CUBLASLT_MASK, default COMPUTE_TYPE|OUTPUT_TYPE = 6). cuBLAS's split-K kernels zero a per-tile
+// semaphore array with a memset node before every call; in a captured prompt graph that node waits on the copy engine
+// behind the cold-expert H2D pieces (0.5-1 ms per GEMM on a P100, PP1_PROGRESS.md). With the other schemes the partials
+// go to the workspace and a kernel reduces them. libcublasLt is resolved by name: libcublas depends on it already.
+struct ggml_cuda_lt_fns {
+    bool ok = false;
+    decltype(&cublasLtMatmulDescCreate)            desc_create;
+    decltype(&cublasLtMatmulDescSetAttribute)      desc_set;
+    decltype(&cublasLtMatrixLayoutCreate)          layout_create;
+    decltype(&cublasLtMatmulPreferenceCreate)      pref_create;
+    decltype(&cublasLtMatmulPreferenceSetAttribute) pref_set;
+    decltype(&cublasLtMatmulPreferenceDestroy)     pref_destroy;
+    decltype(&cublasLtMatmulAlgoGetHeuristic)      heuristic;
+    decltype(&cublasLtMatmul)                      matmul;
+    ggml_cuda_lt_fns() {
+        void * h = dlopen("libcublasLt.so.12", RTLD_NOW | RTLD_GLOBAL);
+        if (h == nullptr) {
+            h = dlopen("libcublasLt.so", RTLD_NOW | RTLD_GLOBAL);
+        }
+        if (h == nullptr) {
+            GGML_LOG_WARN("%s: libcublasLt not found: %s\n", __func__, dlerror());
+            return;
+        }
+#define GGML_CUDA_LT_SYM(f, n) f = (decltype(f)) dlsym(h, n); if (f == nullptr) { GGML_LOG_WARN("%s: no %s\n", __func__, n); return; }
+        GGML_CUDA_LT_SYM(desc_create,   "cublasLtMatmulDescCreate");
+        GGML_CUDA_LT_SYM(desc_set,      "cublasLtMatmulDescSetAttribute");
+        GGML_CUDA_LT_SYM(layout_create, "cublasLtMatrixLayoutCreate");
+        GGML_CUDA_LT_SYM(pref_create,   "cublasLtMatmulPreferenceCreate");
+        GGML_CUDA_LT_SYM(pref_set,      "cublasLtMatmulPreferenceSetAttribute");
+        GGML_CUDA_LT_SYM(pref_destroy,  "cublasLtMatmulPreferenceDestroy");
+        GGML_CUDA_LT_SYM(heuristic,     "cublasLtMatmulAlgoGetHeuristic");
+        GGML_CUDA_LT_SYM(matmul,        "cublasLtMatmul");
+#undef GGML_CUDA_LT_SYM
+        ok = true;
+    }
+};
+
+struct ggml_cuda_lt_plan {
+    cublasLtMatmulDesc_t   desc  = nullptr;
+    cublasLtMatrixLayout_t adesc = nullptr, bdesc = nullptr, cdesc = nullptr;
+    cublasLtMatmulAlgo_t   algo;
+    size_t                 ws    = 0;
+    bool                   ok    = false;
+};
+
+static bool ggml_cuda_lt_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_CUBLASLT") != nullptr && atoi(getenv("GGML_CUDA_CUBLASLT")) != 0;
+    return enabled;
+}
+
+// C[m x n] = op(A)^T[m x k] * B[k x n] as cublasGemmEx(CUBLAS_OP_T, CUBLAS_OP_N, ...) does; false = not taken (the
+// caller runs the legacy call). The plan (descriptors, the heuristic's first algo) is cached per shape and device.
+static bool ggml_cuda_lt_gemm(ggml_backend_cuda_context & ctx, int m, int n, int k, const void * alpha,
+        const void * a, cudaDataType_t ta, int64_t lda, const void * b, cudaDataType_t tb, int64_t ldb,
+        const void * beta, void * c, cudaDataType_t tc, int64_t ldc, cublasComputeType_t comp) {
+    static ggml_cuda_lt_fns lt;
+    if (!lt.ok) {
+        return false;
+    }
+    static const uint32_t mask = getenv("GGML_CUDA_CUBLASLT_MASK") != nullptr ? (uint32_t) atoi(getenv("GGML_CUDA_CUBLASLT_MASK")) :
+            (uint32_t) (CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE | CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE);
+    cublasHandle_t handle = ctx.cublas_handle(); // creates the workspace too
+    void * ws = ctx.cublas_workspaces[ctx.device][ctx.curr_stream_no];
+    const size_t ws_size = ctx.cublas_workspace_sizes[ctx.device];
+    using key_t = std::tuple<int, int, int, int, int64_t, int64_t, int64_t, int, int, int, int>;
+    static std::map<key_t, ggml_cuda_lt_plan> plans[GGML_CUDA_MAX_DEVICES];
+    const key_t key(m, n, k, ctx.curr_stream_no, lda, ldb, ldc, (int) ta, (int) tb, (int) tc, (int) comp);
+    auto it = plans[ctx.device].find(key);
+    if (it == plans[ctx.device].end()) {
+        ggml_cuda_lt_plan p;
+        const cudaDataType_t scale = comp == CUBLAS_COMPUTE_16F ? CUDA_R_16F : CUDA_R_32F;
+        const cublasOperation_t opt = CUBLAS_OP_T, opn = CUBLAS_OP_N;
+        cublasLtMatmulPreference_t pref = nullptr;
+        cublasLtMatmulHeuristicResult_t res = {};
+        int n_res = 0;
+        bool ok = lt.desc_create(&p.desc, comp, scale) == CUBLAS_STATUS_SUCCESS &&
+                  lt.desc_set(p.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opt, sizeof(opt)) == CUBLAS_STATUS_SUCCESS &&
+                  lt.desc_set(p.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opn, sizeof(opn)) == CUBLAS_STATUS_SUCCESS &&
+                  lt.layout_create(&p.adesc, ta, k, m, lda) == CUBLAS_STATUS_SUCCESS &&
+                  lt.layout_create(&p.bdesc, tb, k, n, ldb) == CUBLAS_STATUS_SUCCESS &&
+                  lt.layout_create(&p.cdesc, tc, m, n, ldc) == CUBLAS_STATUS_SUCCESS &&
+                  lt.pref_create(&pref) == CUBLAS_STATUS_SUCCESS &&
+                  lt.pref_set(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size, sizeof(ws_size)) == CUBLAS_STATUS_SUCCESS &&
+                  lt.pref_set(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &mask, sizeof(mask)) == CUBLAS_STATUS_SUCCESS &&
+                  lt.heuristic((cublasLtHandle_t) handle, p.desc, p.adesc, p.bdesc, p.cdesc, p.cdesc, pref, 1, &res, &n_res) == CUBLAS_STATUS_SUCCESS &&
+                  n_res > 0 && res.state == CUBLAS_STATUS_SUCCESS;
+        if (pref != nullptr) {
+            lt.pref_destroy(pref);
+        }
+        if (ok) {
+            p.algo = res.algo;
+            p.ws   = res.workspaceSize;
+            p.ok   = true;
+        } else {
+            static int n_warn = 0;
+            if (n_warn++ < 4) {
+                GGML_LOG_WARN("%s: dev%d no cublasLt algo for m %d n %d k %d types %d/%d/%d comp %d (mask %u): legacy call\n",
+                              __func__, ctx.device, m, n, k, (int) ta, (int) tb, (int) tc, (int) comp, mask);
+            }
+        }
+        it = plans[ctx.device].emplace(key, p).first;
+    }
+    const ggml_cuda_lt_plan & p = it->second;
+    if (!p.ok) {
+        return false;
+    }
+    CUBLAS_CHECK(lt.matmul((cublasLtHandle_t) handle, p.desc, alpha, a, p.adesc, b, p.bdesc, beta, c, p.cdesc, c, p.cdesc,
+                           &p.algo, ws, ws_size, ctx.stream()));
+    return true;
+}
+#else
+static bool ggml_cuda_lt_enabled() { return false; }
+static bool ggml_cuda_lt_gemm(ggml_backend_cuda_context &, int, int, int, const void *, const void *, cudaDataType_t, int64_t,
+        const void *, cudaDataType_t, int64_t, const void *, void *, cudaDataType_t, int64_t, cublasComputeType_t) { return false; }
+#endif
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -2737,7 +2860,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    if (ne12 == 1 && ne13 == 1 && ggml_cuda_lt_enabled() &&
+        ggml_cuda_lt_gemm(ctx, ne01, ne11, ne10, alpha, src0_ptr, cu_data_type_a, s01, src1_ptr, cu_data_type_b, s11,
+                          beta, dst_ptr, cu_data_type, ldc, cu_compute_type)) {
+        // cublasLt without the in-place split-K reduction (no memset node per GEMM)
+    } else if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,

@@ -4617,14 +4617,29 @@ private:
 
                             {
                                 // erase any checkpoints with pos_max > pos_next, or that cover tokens not shared with the new prompt
+                                // (one that belongs to the conversation the slot is leaving goes back to its cache entry: a
+                                // continuation of that conversation restores from it)
+                                size_t n_back = 0;
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                        auto * origin = slot.prompt_origin;
+                                        if (origin != nullptr && !cur.empty() && cur.n_tokens <= origin->prompt.n_tokens() &&
+                                                (origin->prompt.checkpoints.empty() || origin->prompt.checkpoints.back().n_tokens < cur.n_tokens)) {
+                                            auto next = std::next(it);
+                                            origin->prompt.checkpoints.splice(origin->prompt.checkpoints.end(), slot.prompt.checkpoints, it);
+                                            it = next;
+                                            n_back++;
+                                        } else {
+                                            it = ckpt_retire(slot.prompt.checkpoints, it);
+                                        }
                                     } else {
                                         ++it;
                                     }
+                                }
+                                if (n_back > 0) {
+                                    SLT_DBG(slot, "%zu invalidated checkpoints back in the cache entry of their conversation\n", n_back);
                                 }
                             }
                         }

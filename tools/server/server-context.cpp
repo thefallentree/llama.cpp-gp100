@@ -27,6 +27,12 @@
 #include "base64.hpp"
 #include "../../src/llama-ext.h" // staging API: llama_set_prompt_end
 
+// LLAMA_SRV_TIMING=1: per-phase wall times of the slot switch (prompt cache save/load), checkpoints and every decode at WARN
+static bool srv_timing() {
+    static const bool v = getenv("LLAMA_SRV_TIMING") != nullptr && atoi(getenv("LLAMA_SRV_TIMING")) != 0;
+    return v;
+}
+
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
@@ -362,10 +368,13 @@ struct server_slot {
         }
 
         const int64_t t_start = ggml_time_us();
-
+        const int64_t t0 = t_start;
         common_speculative_catchup_join(spec); // the draft context may still catch up on the last prompt batch
+        const int64_t t1 = ggml_time_us();
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const int64_t t2 = ggml_time_us();
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -373,17 +382,30 @@ struct server_slot {
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        const int64_t t3 = ggml_time_us();
         if (cur == nullptr) {
+            if (srv_timing()) {
+                SLT_WRN(*this, "timing prompt_save: join %.1f size %.1f alloc %.1f ms (not saved: already cached / over limit)\n",
+                        (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3);
+            }
             return false;
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const int64_t t4 = ggml_time_us();
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        const int64_t t5 = ggml_time_us();
         // the drafter's deferred boundary, if it keeps one (restored together with the contexts)
         cur->data.spec.clear();
         common_speculative_get_state(spec, id, cur->data.spec);
+        if (srv_timing()) {
+            SLT_WRN(*this, "timing prompt_save: n_tokens %d ckpts %zu: join %.1f size %.1f alloc %.1f get_tgt %.1f (%.1f MiB) get_dft %.1f (%.1f MiB) spec %.1f ms\n",
+                    (int) prompt.tokens.size(), prompt.checkpoints.size(), (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3,
+                    (t4 - t3) / 1e3, cur_size_tgt / (1024.0 * 1024.0), (t5 - t4) / 1e3, cur_size_dft / (1024.0 * 1024.0),
+                    (ggml_time_us() - t5) / 1e3);
+        }
 
         SLT_TRC(*this, "prompt cache save took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
 
@@ -391,8 +413,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        const int64_t t0 = ggml_time_us();
         common_speculative_catchup_join(spec);
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id);
+        if (srv_timing()) {
+            SLT_WRN(*this, "timing prompt_load: %.1f ms -> n_tokens %d ckpts %zu res %d\n", (ggml_time_us() - t0) / 1e3,
+                    (int) prompt.tokens.size(), prompt.checkpoints.size(), (int) res);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1911,7 +1938,97 @@ private:
 
         prompt_cache->update();
 
-        SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            for (server_slot & slot : slots) {
+                if (task.id_slot != -1 && slot.id != task.id_slot) {
+                    continue;
+                }
+
+                // skip the slot if it is not available
+                if (slot.is_processing()) {
+                    SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+                    continue;
+                }
+
+                const auto & tokens = slot.prompt.tokens;
+
+                // skip the slot if it does not contains cached tokens
+                if (tokens.empty()) {
+                    SLT_TRC(slot, "%s", " - skipping, slot is empty\n");
+                    continue;
+                }
+
+                // fraction of the Longest Common Prefix length with respect to the input prompt length
+                const size_t lcp_len = tokens.get_common_prefix(task.tokens);
+                const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
+
+                // select the current slot if the criteria match
+                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+                    f_sim_best = f_sim_cur;
+
+                    ret = &slot;
+                }
+            }
+
+            if (ret != nullptr) {
+                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+
+                if (task.id_slot == -1) {
+                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                            f_sim_best, slot_prompt_similarity, f_keep);
+                }
+
+                // if we are about to lose a large portion of the existing context - save it in the prompt cache
+                if (f_keep < 0.5f) {
+                    update_cache = true;
+                }
+            }
+        }
+
+        // find an empty slot, or the one that has been least recently used
+        if (ret == nullptr) {
+            const auto free_slots = get_free_slots(1, -1);
+
+            if (!free_slots.empty()) {
+                ret = free_slots[0];
+
+                SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
+
+                update_cache = true;
+            }
+        }
+
+        if (ret) {
+            update_cache = update_cache && prompt_cache;
+
+            // cache prompts only for the tasks that reuse them
+            update_cache = update_cache && !task.is_stateless();
+
+            if (update_cache) {
+                SRV_TRC("%s", "updating prompt cache\n");
+
+                const int64_t t_start = ggml_time_us();
+
+                ret->prompt_save(*prompt_cache);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                    ret->prompt_clear();
+                }
+
+                const int64_t t_upd = ggml_time_us();
+                prompt_cache->update();
+
+                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                if (srv_timing()) {
+                    SRV_WRN("timing slot switch: save+load %.1f update %.1f ms (cache %zu prompts, %.1f MiB)\n",
+                            (t_upd - t_start) / 1e3, (ggml_time_us() - t_upd) / 1e3, prompt_cache->states.size(),
+                            prompt_cache->size() / (1024.0 * 1024.0));
+                }
+            }
+        }
+
+        return ret;
     }
 
     // return true if at least one slot has been cleared
@@ -2852,7 +2969,9 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        const int64_t t0 = ggml_time_us();
         common_speculative_catchup_join(spec.get()); // the checkpoint takes the draft context's state
+        const int64_t t1 = ggml_time_us();
         auto & cur = ckpt_new(slot, slot.prompt.n_tokens() - n_tokens_cur);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
@@ -2864,6 +2983,10 @@ private:
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        if (srv_timing()) {
+            SLT_WRN(slot, "timing checkpoint at n_tokens %" PRId64 ": join %.1f save %.1f ms (%.1f MiB)\n", cur.n_tokens,
+                    (t1 - t0) / 1e3, (ggml_time_us() - t1) / 1e3, (float) cur.size() / 1024 / 1024);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -4954,6 +5077,7 @@ private:
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
+        const int64_t t_pre = ggml_time_us();
 
         metrics_pre_decode();
 
@@ -5044,12 +5168,24 @@ private:
                     throw std::runtime_error("failed to process speculative batch");
                 }
             }
+            const int64_t t_dec = ggml_time_us();
+            int64_t t_proc = 0;
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                t_proc = ggml_time_us();
                 if (ret == 0 && has_output) {
                     llama_synchronize(ctx_tgt);
                 }
             });
+            if (srv_timing()) {
+                int n_prompt = 0;
+                for (int i = off; i < off + batch.view.size(); ++i) {
+                    n_prompt += batch.tokens[i].is_prompt ? 1 : 0;
+                }
+                SRV_WRN("timing decode: n %d (prompt %d) off %d out %d catchup_async %d: pre %.1f process %.1f sync %.1f ms\n",
+                        (int) batch.view.size(), n_prompt, off, (int) has_output, (int) catchup_async, (t_dec - t_pre) / 1e3,
+                        (t_proc - t_dec) / 1e3, (ggml_time_us() - t_proc) / 1e3);
+            }
         }
 
         if (ret != 0) {

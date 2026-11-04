@@ -1519,12 +1519,12 @@ private:
             }
         }
 
-        // a head or a peer: the graph shapes of the layer ranges and the pinned buffers before the first prompt
-        if (getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN") || peer_cfg.enabled()) {
-            const char * w = getenv("LLAMA_PREFILL_PEER_WARM");
-            if (w == nullptr || strcmp(w, "0") != 0) {
-                prefill_peer_warmup(ctx_tgt, peer_cfg.enabled() ? &peer_cfg : nullptr);
-            }
+        // a head or a peer: the graph shapes of the layer ranges and the pinned buffers before the first prompt. Opt-in
+        // (LLAMA_PREFILL_PEER_WARM=1 or lo:hi,...): the first prompt after a start pays ~1.2 s once without it, and with
+        // the cold-expert prefetch ring the warm-up's graphs left the decode 17 ms/step slower (PP7_PROGRESS.md)
+        if (const char * w = getenv("LLAMA_PREFILL_PEER_WARM"); w != nullptr && strcmp(w, "0") != 0 &&
+            (getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN") || peer_cfg.enabled())) {
+            prefill_peer_warmup(ctx_tgt, peer_cfg.enabled() ? &peer_cfg : nullptr);
         }
 
         slots.clear();

@@ -2017,7 +2017,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
 
     // a segment holds at most LLAMA_CACHE_SEG cells; a tail shorter than LLAMA_CACHE_SEG_MIN is re-saved with the next
     // delta instead of starting a new segment (a conversation of a hundred small turns stays a few dozen segments)
-    static const int32_t seg_max = getenv("LLAMA_CACHE_SEG")     != nullptr ? std::max(1024, atoi(getenv("LLAMA_CACHE_SEG")))    : 16384;
+    static const int32_t seg_max = getenv("LLAMA_CACHE_SEG")     != nullptr ? std::max(1024, atoi(getenv("LLAMA_CACHE_SEG")))    : 32768;
     static const int32_t seg_min = getenv("LLAMA_CACHE_SEG_MIN") != nullptr ? std::max(0,    atoi(getenv("LLAMA_CACHE_SEG_MIN"))) : 4096;
 
     server_prompt_cache_state * e = (*origin != nullptr && (*origin)->owner == id_slot) ? *origin : nullptr;

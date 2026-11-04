@@ -385,14 +385,12 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         if (mem_idx) {
             mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
             // a restore that rewrites cells does it behind the pool layout's back
-            if (!sinfos_attn.empty()) {
-                if (with_rows && seq_id >= 0) {
-                    // the rows section below says how far the pools are good (the coverage of earlier segments stays)
-                    mem_idx_stale[seq_id] = 0;
-                } else {
-                    mem_idx_stale_set(seq_id, 0);
-                }
+            if (!sinfos_attn.empty() && !(with_rows && seq_id >= 0)) {
+                mem_idx_stale_set(seq_id, 0);
             }
+            // with the rows section below the stale position stays what it is: 0 after the sequence was removed (the
+            // layout is rebuilt once, by the first segment), the end of the restored pools after an earlier segment
+            // (the layout update then appends the new cells instead of rebuilding from the sequence's first cell)
         }
 
         // the pooled rows that came with the state: the sequence re-pools only from where they stop

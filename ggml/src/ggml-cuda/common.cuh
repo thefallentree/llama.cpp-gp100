@@ -1416,6 +1416,12 @@ struct ggml_cuda_cold_prefetch {
     bool         started  = false;        // the first copies are issued
     int *        check    = nullptr;      // GGML_CUDA_COLD_PREFETCH_CHECK=1: mismatch counter of the piece checks
     int64_t      n_checked = 0;
+    // a graph with cold ops of its own ran since the last synchronize (ubatch end): only then may a graph without own
+    // ops copy pieces ahead (a decode step must never fill the ring: its graphs have no cold op to consume them, and
+    // the ring would be refilled every step)
+    bool         in_ubatch = false;
+    // statistics (printed at free)
+    int64_t      n_own_graphs = 0, n_ahead_graphs = 0, n_resync = 0, n_relearn = 0, n_trunc = 0, n_oos = 0, n_pieces = 0;
 };
 
 // prompt batches of a Q2_K / Q3_K hot/cold layer: the cold experts an op touches are copied to a VRAM staging buffer on a

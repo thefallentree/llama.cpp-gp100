@@ -641,11 +641,16 @@ static __global__ void lightning_indexer_kernel_tile(
 // order; the F16 modes round the queries (and in mode 2 the sums) to half.
 //   GGML_CUDA_LI_GEMM        0 = off (the tile kernel), 1 = SGEMM on F32 keys (default), 2 = HGEMM (F16 in/out/accumulate),
 //                            3 = F16 inputs, F32 accumulate and output
-//   GGML_CUDA_LI_GEMM_CHUNK  tokens per GEMM chunk (default 256: the temp is 4 x chunk x n_kv x 4 B)
+//   GGML_CUDA_LI_GEMM_CHUNK  tokens per GEMM chunk (default 256)
+//   GGML_CUDA_LI_GEMM_TEMP_MB  the pool temp that bounds the keys per GEMM block (default 32: 4 x chunk x kv_block x 4 B
+//                            <= 32 MiB, i.e. 8192 keys per block at 256 tokens; the widened F16 keys of a block add
+//                            kv_block x 512 B). One temp of [n_kv x chunk] per head (256 MiB at 65536 pooled keys) ran the
+//                            255K state out of VRAM in cudaGraphInstantiate (PP5_PROGRESS.md).
 //   GGML_CUDA_LI_GEMM_MIN_KV / _MIN_BATCH  the smallest n_kv / n_batch that take this path (default 8192 / 64)
 struct lightning_indexer_gemm_cfg {
     int mode;
     int chunk;
+    int temp_mb;
     int min_kv;
     int min_batch;
 };
@@ -659,6 +664,7 @@ static const lightning_indexer_gemm_cfg & lightning_indexer_gemm_config() {
         lightning_indexer_gemm_cfg c;
         c.mode      = geti("GGML_CUDA_LI_GEMM", 1);
         c.chunk     = std::max(8, geti("GGML_CUDA_LI_GEMM_CHUNK", 256));
+        c.temp_mb   = std::max(1, geti("GGML_CUDA_LI_GEMM_TEMP_MB", 32));
         c.min_kv    = geti("GGML_CUDA_LI_GEMM_MIN_KV", 8192);
         c.min_batch = std::max(1, geti("GGML_CUDA_LI_GEMM_MIN_BATCH", 64));
         return c;
@@ -671,15 +677,16 @@ template <typename T>
 static __global__ void __launch_bounds__(256)
 lightning_indexer_gemm_epilogue(
         const T * __restrict__ tmp, const float * W, const half * M, const int32_t * R, float * dst,
-        const int n_kv, const int ldt, const int64_t strideh, const int t0,
+        const int n_kv, const int s_off, const int n_blk, const int ldt, const int64_t strideh, const int t0,
         const size_t nb1, const size_t nbw1, const size_t nbm1) {
     constexpr int NH = 4;
     const int tc = blockIdx.y;
     const int t  = t0 + tc;
-    const int s0 = 4*((int) blockIdx.x*blockDim.x + threadIdx.x);
-    if (s0 >= n_kv) {
+    const int sb = 4*((int) blockIdx.x*blockDim.x + threadIdx.x); // key within the block
+    if (sb >= n_blk) {
         return;
     }
+    const int s0 = s_off + sb;                                     // absolute key
     const float * w  = (const float *) ((const char *) W + (size_t) t*nbw1);
     float wh[NH];
 #pragma unroll
@@ -689,7 +696,7 @@ lightning_indexer_gemm_epilogue(
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 #pragma unroll
     for (int h = 0; h < NH; ++h) {
-        const T * row = tmp + h*strideh + (int64_t) tc*ldt + s0;
+        const T * row = tmp + h*strideh + (int64_t) tc*ldt + sb;
         float v[4];
         if constexpr (std::is_same<T, float>::value) {
             const float4 f = *(const float4 *) row;
@@ -780,7 +787,12 @@ static void ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx,
     constexpr int D  = 128;
 
     const int chunk = std::min(cfg.chunk, n_batch);
-    const int ldt   = (n_kv + 3) & ~3; // 16-byte aligned temp rows
+    // keys per GEMM block: the temp of 4 heads x chunk tokens x block keys stays within GGML_CUDA_LI_GEMM_TEMP_MB
+    const size_t elt = cfg.mode == 2 ? sizeof(half) : sizeof(float);
+    int kv_block = (int) std::min<int64_t>(n_kv, ((int64_t) cfg.temp_mb*1048576)/((int64_t) NH*chunk*elt));
+    kv_block = std::max(256, kv_block & ~255);
+    kv_block = std::min(kv_block, (n_kv + 3) & ~3);
+    const int ldt   = (kv_block + 3) & ~3; // 16-byte aligned temp rows
     const int64_t strideh = (int64_t) chunk*ldt;
 
     // the temp: F32 for modes 1 and 3, F16 for mode 2
@@ -794,7 +806,7 @@ static void ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx,
         tmp_f32.alloc(NH*strideh);
     }
     if (cfg.mode == 1 && type_K == GGML_TYPE_F16) {
-        k_f32.alloc((size_t) n_kv*D);
+        k_f32.alloc((size_t) kv_block*D);
     }
     if (cfg.mode != 1) {
         q_f16.alloc((size_t) n_batch*NH*D);
@@ -811,24 +823,27 @@ static void ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx,
         const int32_t * r_s = R == nullptr ? nullptr : (const int32_t *) ((const char *) R + (size_t) (i_stream % nem3)*nbm3);
         float * dst_s = (float *) ((char *) dst + (size_t) i_stream*nb3);
 
-        // the A operand: [D x n_kv] column-major keys, op(A) = A^T
-        const void * a_ptr = k_s;
-        if (cfg.mode == 1 && type_K == GGML_TYPE_F16) {
-            ggml_get_to_fp32_cuda(GGML_TYPE_F16)(k_s, k_f32.get(), (int64_t) n_kv*D, stream);
-            a_ptr = k_f32.get();
-        }
         if (cfg.mode != 1) {
             ggml_get_to_fp16_cuda(GGML_TYPE_F32)(q_s, q_f16.get(), (int64_t) n_batch*NH*D, stream);
+        }
+
+        for (int s_off = 0; s_off < n_kv; s_off += kv_block) {
+        const int n_blk = std::min(kv_block, n_kv - s_off);
+        // the A operand: [D x n_blk] column-major keys of the block, op(A) = A^T
+        const void * a_ptr = k_s + (size_t) s_off*D*ggml_type_size(type_K);
+        if (cfg.mode == 1 && type_K == GGML_TYPE_F16) {
+            ggml_get_to_fp32_cuda(GGML_TYPE_F16)(a_ptr, k_f32.get(), (int64_t) n_blk*D, stream);
+            a_ptr = k_f32.get();
         }
 
         for (int t0 = 0; t0 < n_batch; t0 += chunk) {
             const int nt = std::min(chunk, n_batch - t0);
             for (int h = 0; h < NH; ++h) {
                 if (cfg.mode == 1) {
-                    // B = Q_h: [D x nt] column-major with the token stride, C = [n_kv x nt]
+                    // B = Q_h: [D x nt] column-major with the token stride, C = [n_blk x nt]
                     const float * b_ptr = (const float *) ((const char *) q_s + (size_t) t0*nbq2 + (size_t) h*nbq1);
                     CUBLAS_CHECK(cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                            n_kv, nt, D,
+                            n_blk, nt, D,
                             &one_f, (const float *) a_ptr, D,
                                     b_ptr, (int) (nbq2/sizeof(float)),
                             &zero_f, tmp_f32.get() + h*strideh, ldt));
@@ -836,14 +851,14 @@ static void ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx,
                     const half * b_ptr = q_f16.get() + (size_t) t0*NH*D + (size_t) h*D;
                     if (cfg.mode == 2) {
                         CUBLAS_CHECK(cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                                n_kv, nt, D,
+                                n_blk, nt, D,
                                 &one_h, a_ptr, CUDA_R_16F, D,
                                         b_ptr, CUDA_R_16F, NH*D,
                                 &zero_h, tmp_f16.get() + h*strideh, CUDA_R_16F, ldt,
                                 CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
                     } else {
                         CUBLAS_CHECK(cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                                n_kv, nt, D,
+                                n_blk, nt, D,
                                 &one_f, a_ptr, CUDA_R_16F, D,
                                         b_ptr, CUDA_R_16F, NH*D,
                                 &zero_f, tmp_f32.get() + h*strideh, CUDA_R_32F, ldt,
@@ -852,14 +867,15 @@ static void ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx,
                 }
             }
             const dim3 block(256, 1, 1);
-            const dim3 grid((unsigned) ((n_kv + 4*256 - 1)/(4*256)), (unsigned) nt, 1);
+            const dim3 grid((unsigned) ((n_blk + 4*256 - 1)/(4*256)), (unsigned) nt, 1);
             if (cfg.mode == 2) {
                 lightning_indexer_gemm_epilogue<half><<<grid, block, 0, stream>>>(
-                    tmp_f16.get(), w_s, m_s, r_s, dst_s, n_kv, ldt, strideh, t0, nb1, nbw1, nbm1);
+                    tmp_f16.get(), w_s, m_s, r_s, dst_s, n_kv, s_off, n_blk, ldt, strideh, t0, nb1, nbw1, nbm1);
             } else {
                 lightning_indexer_gemm_epilogue<float><<<grid, block, 0, stream>>>(
-                    tmp_f32.get(), w_s, m_s, r_s, dst_s, n_kv, ldt, strideh, t0, nb1, nbw1, nbm1);
+                    tmp_f32.get(), w_s, m_s, r_s, dst_s, n_kv, s_off, n_blk, ldt, strideh, t0, nb1, nbw1, nbm1);
             }
+        }
         }
     }
 }

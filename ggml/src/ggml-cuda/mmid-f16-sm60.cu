@@ -1366,6 +1366,7 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
     }
     // the graph's ops against the sequence: in place, or resynchronized (an ubatch boundary, a changed graph), or learned
     if (!pf.ops.empty()) {
+        const bool continuing = pf.in_ubatch; // a graph with cold ops ran since the last synchronize: the same ubatch
         pf.in_ubatch = true;
         pf.n_own_graphs++;
         pf.n_pieces += (int64_t) pf.ops.size();
@@ -1377,13 +1378,29 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
             while (j < (int) pf.seq.size() && !(pf.seq[j] == first)) {
                 j++;
             }
-            if (j < (int) pf.seq.size()) {
-                pf.seq_pos = j;               // the sequence starts over (next ubatch) or skipped
+            if (j < (int) pf.seq.size() && continuing && pf.seq_pos == (int) pf.seq.size() && j < pf.ub_start) {
+                // the ubatch runs past the end of the sequence into a piece that sits before the point where it started:
+                // the entries before that point are an older layer range's, learned before it (the load-time warm-up
+                // runs several ranges in a row). The sequence is one ubatch's order, so the stale prefix goes and the
+                // ubatch's pieces are appended. (Jumping to the earlier copy instead left the ubatch mid-sequence at its
+                // end, and every decode step then refilled the ring for nobody: +17 ms/step, finding 243.)
+                GGML_ASSERT(pf.seq_issued >= pf.ub_start);
+                pf.seq.erase(pf.seq.begin(), pf.seq.begin() + pf.ub_start);
+                pf.seq_pos    -= pf.ub_start;
+                pf.seq_issued -= pf.ub_start;
+                pf.ub_start    = 0;
+                pf.n_trunc++;
+            } else if (j < (int) pf.seq.size()) {
+                pf.seq_pos  = j;              // the sequence starts over (next ubatch) or skipped
+                pf.ub_start = j;
                 pf.n_resync++;
             } else if (pf.seq_pos < (int) pf.seq.size()) {
                 pf.seq.clear();               // an op the sequence does not know mid-way: a changed graph, learn it again
-                pf.seq_pos = 0;
+                pf.seq_pos  = 0;
+                pf.ub_start = 0;
                 pf.n_relearn++;
+            } else {
+                pf.ub_start = pf.seq_pos;     // appended at the end: a new ubatch's order starts here
             }
             cold_ring_reset(pf);
         }
@@ -1539,19 +1556,9 @@ void ggml_cuda_cold_prefetch_sync(ggml_backend_cuda_context & ctx, const bool in
     if (invalidate && pf.n_filled > 0) {
         cold_ring_reset(pf);
     }
-    if (pf.in_ubatch) {
-        // the ubatch ended: the sequence is one ubatch's piece order. A ubatch that ends mid-sequence (a shorter layer
-        // range than the one learned: the load-time warm-up runs several ranges, a pipeline head runs its first
-        // layers) cuts it there, or the next ubatch's resynchronization would land on an earlier copy of its
-        // first piece inside the concatenated ranges and leave seq_pos mid-sequence after it (then every decode step
-        // refilled the ring: 3 x 63 MiB per step, +17 ms; PP8_PROGRESS.md)
-        if (pf.seq_pos > 0 && pf.seq_pos < (int) pf.seq.size()) {
-            pf.seq.resize(pf.seq_pos);
-            pf.n_trunc++;
-        }
-        cold_ring_reset(pf);
-        pf.in_ubatch = false;
-    }
+    // a synchronize ends the ubatch as far as the graphs without cold ops are concerned (there is also one in the middle
+    // of a prompt ubatch, at layer 24: the attention graph after it does not copy ahead, the FFN graph does again)
+    pf.in_ubatch = false;
     if (pf.check != nullptr && pf.n_checked > 0) {
         int bad = 0;
         ggml_cuda_set_device(ctx.device);
@@ -1567,7 +1574,7 @@ void ggml_cuda_cold_prefetch_sync(ggml_backend_cuda_context & ctx, const bool in
 void ggml_cuda_cold_prefetch_free(ggml_backend_cuda_context & ctx) {
     ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
     if (pf.n_own_graphs > 0) {
-        GGML_LOG_WARN("cold-prefetch: dev%d graphs with cold ops %lld (%lld pieces), copy-ahead graphs %lld, resync %lld, relearn %lld, truncate %lld, out-of-sequence %lld, sequence %d\n",
+        GGML_LOG_WARN("cold-prefetch: dev%d graphs with cold ops %lld (%lld pieces), copy-ahead graphs %lld, resync %lld, relearn %lld, prefix-cut %lld, out-of-sequence %lld, sequence %d\n",
                       ctx.device, (long long) pf.n_own_graphs, (long long) pf.n_pieces, (long long) pf.n_ahead_graphs, (long long) pf.n_resync,
                       (long long) pf.n_relearn, (long long) pf.n_trunc, (long long) pf.n_oos, (int) pf.seq.size());
     }

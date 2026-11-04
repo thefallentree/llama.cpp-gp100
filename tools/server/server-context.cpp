@@ -4694,7 +4694,12 @@ private:
                     }
 
                     // a long cold prompt: its first part split by layers with the peer server (server-prefill-peer.h)
-                    if (peer_cfg.enabled() && p0 == 0 && batch.size() == 0 && slots.size() == 1 && !wait_shared &&
+                    // with several slots the pipeline (synchronous in update_slots) runs only while no other slot is processing
+                    bool others_idle = true;
+                    for (const auto & other : slots) {
+                        others_idle = others_idle && (&other == &slot || !other.is_processing());
+                    }
+                    if (peer_cfg.enabled() && p0 == 0 && batch.size() == 0 && others_idle && !wait_shared &&
                         !input_tokens.has_mtmd && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         slot.task->n_tokens_shared == 0 && slot.prompt_skip_end < 0 && slot.task->n_tokens() >= peer_cfg.min_tokens &&
                         slot.prompt.n_tokens() == 0 && slot.lora.empty()) {

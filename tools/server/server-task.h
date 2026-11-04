@@ -854,9 +854,14 @@ struct server_prompt_cache {
         }
     }
 
+    // the pool outlives the entries (declared first: destroyed last), their buffers go back to it
+    server_state_pool pool;
+
     std::list<server_prompt_cache_state> states;
 
-    server_state_pool pool;
+    ~server_prompt_cache() {
+        states.clear();
+    }
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

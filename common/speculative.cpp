@@ -4115,6 +4115,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .catchup     = */ nullptr,
     });
 
     const int32_t n_max_configured = common_speculative_n_max(&params);

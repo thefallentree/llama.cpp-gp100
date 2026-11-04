@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <string>
 #include <unordered_set>
@@ -708,9 +709,47 @@ struct server_prompt {
     }
 };
 
+// a state buffer of the prompt cache: pinned host memory when the model has a GPU (the device's host buffer type:
+// cudaMallocHost, so the per-layer copies of llama_state_seq_get/set_data run as DMAs instead of staged pageable
+// copies), plain memory otherwise; no zero fill, and the pages stay mapped: a buffer that served a loaded prompt goes
+// back to the cache's pool and the next save reuses it (a fresh 1.2 GB std::vector cost ~2 s of page faults per switch)
+struct server_state_buf {
+    uint8_t *             p   = nullptr;
+    size_t                n   = 0;
+    size_t                cap = 0;
+    ggml_backend_buffer_t buf = nullptr;
+
+    server_state_buf() = default;
+    server_state_buf(const server_state_buf &) = delete;
+    server_state_buf & operator=(const server_state_buf &) = delete;
+    server_state_buf(server_state_buf && o) noexcept { *this = std::move(o); }
+    server_state_buf & operator=(server_state_buf && o) noexcept {
+        if (this != &o) {
+            release();
+            p = o.p; n = o.n; cap = o.cap; buf = o.buf;
+            o.p = nullptr; o.n = o.cap = 0; o.buf = nullptr;
+        }
+        return *this;
+    }
+    ~server_state_buf() { release(); }
+
+    uint8_t *       data()           { return p; }
+    const uint8_t * data()     const { return p; }
+    size_t          size()     const { return n; }
+    size_t          capacity() const { return cap; }
+    bool            empty()    const { return n == 0; }
+    void            clear()          { n = 0; }
+
+    // allocate cap bytes from buft (nullptr = plain memory); false when no memory could be had
+    bool alloc(ggml_backend_buffer_type_t buft, size_t c);
+    // the size within the capacity
+    void resize(size_t m) { GGML_ASSERT(m <= cap); n = m; }
+    void release();
+};
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_buf     main;
+    server_state_buf     drft;
     std::vector<uint8_t> spec; // the drafter's per-sequence state (e.g. the deferred boundary), empty = none
 
     size_t size() const {
@@ -734,12 +773,25 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    // host_buft: the buffer type of the state buffers (a device's host buffer type for pinned memory; nullptr = plain)
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, ggml_backend_buffer_type_t host_buft = nullptr) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->host_buft    = host_buft;
     }
 
     std::list<server_prompt_cache_state> states;
+
+    ggml_backend_buffer_type_t host_buft = nullptr;
+
+    // the state buffers of loaded prompts, reused by the next saves (bounded: see pool_put)
+    std::vector<server_state_buf> pool;
+
+    // a buffer of at least n bytes: the best fit from the pool, else a new one (with headroom, so a growing
+    // conversation does not allocate at every save); false when no memory could be had
+    bool pool_get(server_state_buf & b, size_t n);
+    void pool_put(server_state_buf && b);
+    size_t pool_size() const;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -751,9 +803,14 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // move_checkpoints: the slot's checkpoints move into the new entry instead of being copied (the slot's prompt is
+    // replaced by load() or, when load() keeps it, gets back the checkpoints that still apply - see load())
+    server_prompt_cache_state * alloc(server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool move_checkpoints = false);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot);
+    // saved: the entry alloc() just made from the slot's prompt (nullptr = none); when no better cached prompt is found
+    // the slot keeps its prompt and gets copies of saved's checkpoints up to the common prefix with tokens_new (the
+    // later ones would be erased by the prompt reuse anyway)
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state * saved = nullptr);
 
     void update();
 };

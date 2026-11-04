@@ -2804,8 +2804,9 @@ private:
         return next;
     }
 
-    // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // a new checkpoint entry at n_tokens_new for the slot: makes room (evictions, a duplicate at the same n_tokens),
+    // reuses a spare's buffers; the caller fills it
+    common_prompt_checkpoint & ckpt_new(server_slot & slot, const int64_t n_tokens_new) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2854,7 +2855,7 @@ private:
                     }
                     n_tokens.push_back(it->n_tokens);
                 }
-                const int i_victim = server_ckpt_spread_victim(n_tokens, i_keep, slot.prompt.n_tokens() - n_tokens_cur);
+                const int i_victim = server_ckpt_spread_victim(n_tokens, i_keep, n_tokens_new);
                 if (i_victim >= 0) {
                     victim = std::next(slot.prompt.checkpoints.begin(), i_victim);
                 }
@@ -2881,15 +2882,12 @@ private:
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-        {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
-            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (it->n_tokens == n_tokens_new) {
-                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = ckpt_retire(slot.prompt.checkpoints, it);
-                } else {
-                    ++it;
-                }
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+            if (it->n_tokens == n_tokens_new) {
+                SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                it = ckpt_retire(slot.prompt.checkpoints, it);
+            } else {
+                ++it;
             }
         }
 
@@ -2904,6 +2902,13 @@ private:
 
         cur.id_task = id_task;
 
+        return cur;
+    }
+
+    // n_tokens_cur: the number of tokens added to the batch for the current slot
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        auto & cur = ckpt_new(slot, slot.prompt.n_tokens() - n_tokens_cur);
+
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
@@ -2916,6 +2921,20 @@ private:
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // the checkpoint a pipelined prefill assembled at ck.n_tokens (server-prefill-peer.h): what create_checkpoint would
+    // have made there before the local decode of the prompt's last n_ubatch tokens
+    void adopt_checkpoint(server_slot & slot, prefill_peer_ckpt & ck) {
+        auto & cur = ckpt_new(slot, ck.n_tokens);
+        cur.update_pos(ck.n_tokens, ck.pos_min, ck.pos_max);
+        cur.data_tgt.swap(ck.data_tgt);
+        cur.data_dft.swap(ck.data_dft);
+        cur.data_spec.swap(ck.data_spec);
+        SLT_TRC(slot,
+                "adopted context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
@@ -4626,22 +4645,33 @@ private:
                         !input_tokens.has_mtmd && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         slot.task->n_tokens_shared == 0 && slot.prompt_skip_end < 0 && slot.task->n_tokens() >= peer_cfg.min_tokens &&
                         slot.prompt.n_tokens() == 0 && slot.lora.empty()) {
-                        // the last 4 + n_ubatch tokens stay local: the checkpoints before the end are made there, and the
-                        // batches are the ones the local path would decode (whole n_batch from 0, then up to the checkpoint)
+                        // all but the last 4 tokens go through the pipeline, in the ubatches the local path would decode
+                        // (n_ubatch from 0, then the last n_ubatch before the 4); the checkpoint the local path makes
+                        // before those last n_ubatch tokens is assembled from the stages' snapshots at that position
                         const int32_t n_prompt = slot.task->n_tokens();
-                        const int32_t n_split  = n_prompt - (4 + n_ubatch);
-                        if (n_split >= 2*n_ubatch) {
+                        const int32_t n_split  = n_prompt - 4;
+                        const int32_t n_ckpt   = n_prompt - (4 + n_ubatch);
+                        const bool want_ckpt = params_base.n_ctx_checkpoints > 0 && (
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                                n_swa > 0);
+                        if (n_ckpt >= 2*n_ubatch) {
                             std::vector<llama_token> toks(n_split);
                             for (int32_t i = 0; i < n_split; ++i) {
                                 toks[i] = input_tokens[i];
                             }
                             prefill_peer_stats pst;
-                            if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_split, n_ubatch, pst)) {
+                            prefill_peer_ckpt  pck;
+                            if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_split, n_ubatch,
+                                                 want_ckpt ? n_ckpt : -1, &pck, pst)) {
                                 for (int32_t i = 0; i < n_split; ++i) {
                                     slot.prompt.tokens.push_back(toks[i]);
                                 }
                                 slot.stats.n_prompt_processed += n_split;
                                 slot.stats.update_prompt_last();
+                                if (!pck.data_tgt.empty()) {
+                                    adopt_checkpoint(slot, pck);
+                                }
                             }
                         }
                     }

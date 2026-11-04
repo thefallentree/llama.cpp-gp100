@@ -35,7 +35,9 @@ constexpr uint32_t MSG_ERROR  = 0x52454650; // "PFER"
 // protocol 3: the hello carries the head's result endpoint and a token; every stage returns its state directly to the
 // head on its own connection (the chain only passes an OK / error status back), the residual rows are sent from the
 // context's nextn buffer and received into pinned memory
-constexpr uint32_t PROTO_VERSION = 3;
+// protocol 4: the hello carries n_ckpt; the stages snapshot their recurrent rows (and the drafter) before the ubatch
+// that starts there and return the snapshot with the result
+constexpr uint32_t PROTO_VERSION = 4;
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -89,6 +91,24 @@ bool recv_blob(int fd, std::vector<uint8_t> & b) {
     }
     b.resize(n);
     return n == 0 || recv_all(fd, b.data(), n);
+}
+
+// LLAMA_PREFILL_PEER_RXBUF=0 leaves the head's receive buffers to grow with the prompts (page faults on every new size)
+bool rxbuf_on() {
+    static const bool on = getenv("LLAMA_PREFILL_PEER_RXBUF") == nullptr || atoi(getenv("LLAMA_PREFILL_PEER_RXBUF")) != 0;
+    return on;
+}
+
+// grow a persistent buffer to n bytes and touch its pages once, so a later recv into it pays no faults; clear() keeps
+// the capacity
+void prefault(std::vector<uint8_t> & b, size_t n) {
+    if (b.capacity() >= n) {
+        return;
+    }
+    b.clear();
+    b.shrink_to_fit();
+    b.resize(n);
+    b.clear();
 }
 
 bool send_string(int fd, const std::string & s) {
@@ -435,10 +455,10 @@ struct result_endpoint {
 
 // HELLO: the prompt, the stages from the receiver on (the receiver is stages[0]) and the result endpoint
 bool send_hello(int fd, const std::vector<prefill_peer_stage> & stages, const llama_token * tokens, int32_t n_split,
-                int32_t n_ubatch, const std::vector<uint8_t> & spec_in, int64_t width, const result_endpoint & ep) {
+                int32_t n_ubatch, int32_t n_ckpt, const std::vector<uint8_t> & spec_in, int64_t width, const result_endpoint & ep) {
     const uint32_t version = PROTO_VERSION;
     const uint32_t n_st    = stages.size();
-    bool ok = send_val(fd, MSG_HELLO) && send_val(fd, version) && send_val(fd, n_split) && send_val(fd, n_ubatch) &&
+    bool ok = send_val(fd, MSG_HELLO) && send_val(fd, version) && send_val(fd, n_split) && send_val(fd, n_ubatch) && send_val(fd, n_ckpt) &&
               send_all(fd, tokens, (size_t) n_split*sizeof(llama_token)) && send_blob(fd, spec_in) && send_val(fd, n_st);
     for (const auto & st : stages) {
         const int32_t port = st.port, lb = st.layer_begin;
@@ -457,12 +477,18 @@ struct stage_result {
     std::vector<uint8_t> data;
     std::vector<uint8_t> st_dft;
     std::vector<uint8_t> st_spec;
+    // the snapshot before the ubatch at n_ckpt: the layers' recurrent rows, from the last stage the drafter's partial
+    // state and pending rows (empty when the stage saw no ubatch starting at n_ckpt)
+    std::vector<uint8_t> ck_data;
+    std::vector<uint8_t> ck_dft;
+    std::vector<uint8_t> ck_spec;
     double  peer_ms = 0.0;
 };
 
 bool send_result(int fd, uint64_t token, const stage_result & r) {
     return send_val(fd, token) && send_val(fd, MSG_RESULT) && send_val(fd, r.il_lo) && send_val(fd, r.il_hi) &&
-           send_blob(fd, r.data) && send_blob(fd, r.st_dft) && send_blob(fd, r.st_spec) && send_val(fd, r.peer_ms);
+           send_blob(fd, r.data) && send_blob(fd, r.st_dft) && send_blob(fd, r.st_spec) &&
+           send_blob(fd, r.ck_data) && send_blob(fd, r.ck_dft) && send_blob(fd, r.ck_spec) && send_val(fd, r.peer_ms);
 }
 
 // after the token: one stage's result (the buffers of r keep their capacity across prompts)
@@ -472,7 +498,8 @@ bool recv_result(int fd, stage_result & r) {
         return false;
     }
     return recv_val(fd, r.il_lo) && recv_val(fd, r.il_hi) && recv_blob(fd, r.data) && recv_blob(fd, r.st_dft) &&
-           recv_blob(fd, r.st_spec) && recv_val(fd, r.peer_ms);
+           recv_blob(fd, r.st_spec) && recv_blob(fd, r.ck_data) && recv_blob(fd, r.ck_dft) && recv_blob(fd, r.ck_spec) &&
+           recv_val(fd, r.peer_ms);
 }
 
 // the status a stage passes back up the chain after its own result went to the head: OK, or an error text
@@ -504,14 +531,26 @@ std::vector<stage_result> & head_results() {
     return r;
 }
 
+// the recurrent rows of layers [il_lo, il_hi) of seq_id, into a buffer that keeps its capacity
+void snapshot_partial(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, std::vector<uint8_t> & out) {
+    out.resize(llama_state_seq_get_size_layers_ext(ctx, seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    out.resize(llama_state_seq_get_data_layers_ext(ctx, out.data(), out.size(), seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+}
+
 } // namespace
 
 bool prefill_peer_run(const prefill_peer_config & cfg,
                       llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
                       llama_seq_id seq_id, const llama_token * tokens, int32_t n_split, int32_t n_ubatch,
-                      prefill_peer_stats & stats) {
+                      int32_t n_ckpt, prefill_peer_ckpt * ckpt, prefill_peer_stats & stats) {
     const double t0 = now_ms();
     stats = {};
+    if (ckpt) {
+        *ckpt = {};
+    }
+    if (n_ckpt <= 0 || n_ckpt >= n_split || ckpt == nullptr) {
+        n_ckpt = -1;
+    }
 
     const int64_t width = llama_model_n_embd_out(llama_get_model(ctx_tgt));
 
@@ -557,11 +596,11 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
             continue;
         }
         ep.host = local_ip(fdc); // this host as the peers reach it
-        if (send_hello(fdc, chain, tokens, n_split, n_ubatch, spec_in, width, ep)) {
+        if (send_hello(fdc, chain, tokens, n_split, n_ubatch, n_ckpt, spec_in, width, ep)) {
             fd       = fdc;
             split    = chain[0].layer_begin;
             n_stages = chain.size();
-            LOG_WRN("prefill-peer: %zu peer(s), layers [0, %d) here; results to %s:%d (t=%" PRId64 ")\n", chain.size(), split, ep.host.c_str(), ep.port, wall_ms());
+            LOG_WRN("prefill-peer: %zu peer(s), layers [0, %d) here, %d tokens, checkpoint at %d; results to %s:%d (t=%" PRId64 ")\n", chain.size(), split, n_split, n_ckpt, ep.host.c_str(), ep.port, wall_ms());
             break;
         }
         ::close(fdc);
@@ -587,8 +626,12 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     common_batch batch(ctx_tgt);
     bool ok = true;
     int64_t i_msg = 0;
+    static std::vector<uint8_t> head_ck; // this node's layers' recurrent rows before the ubatch at n_ckpt
+    head_ck.clear();
+    double t_ck_ms = 0.0;
     for (int32_t off = 0; off < n_split && ok; off += n_chunk, ++i_msg) {
-        const int32_t n = std::min(n_chunk, n_split - off);
+        // the messages are cut at n_ckpt, so the stages see one ubatch that starts there (the local path's last one)
+        const int32_t n = std::min(n_chunk, (n_ckpt > off ? n_ckpt : n_split) - off);
         batch.clear();
         for (int32_t i = 0; i < n; ++i) {
             batch.add(tokens[off + i], off + i, seq_id, false);
@@ -600,6 +643,11 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
             break;
         }
         stats.t_wait_ms += now_ms() - tw0;
+        if (off == n_ckpt) {
+            const double tc0 = now_ms();
+            snapshot_partial(ctx_tgt, seq_id, 0, split, head_ck);
+            t_ck_ms += now_ms() - tc0;
+        }
         llama_set_embeddings_nextn_slot(ctx_tgt, (int32_t) (i_msg % n_slots));
         const double tl = now_ms();
         if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
@@ -724,9 +772,77 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     if (!ok) {
         return fail("no state from the peers");
     }
+
+    // the checkpoint at n_ckpt: the stages' snapshots are written over the recurrent rows (their positions adopted),
+    // the whole partial state read back as the checkpoint, then the final recurrent rows restored
+    if (n_ckpt > 0) {
+        const double tc0 = now_ms();
+        static std::vector<uint8_t> final_rs;
+        bool have = !head_ck.empty();
+        const stage_result * last = nullptr;
+        for (size_t k = 0; k < n_stages; ++k) {
+            have = have && !results[k].ck_data.empty();
+            if (!results[k].st_dft.empty() || !results[k].st_spec.empty()) {
+                last = &results[k];
+            }
+        }
+        if (!have) {
+            LOG_WRN("prefill-peer: no checkpoint at %d: a stage did not snapshot it\n", n_ckpt);
+        } else {
+            final_rs.resize(llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            final_rs.resize(llama_state_seq_get_data_ext(ctx_tgt, final_rs.data(), final_rs.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ADOPT_POS;
+            bool ck_ok = llama_state_seq_set_data_layers_ext(ctx_tgt, head_ck.data(), head_ck.size(), seq_id, 0, split, fl) == head_ck.size();
+            for (size_t k = 0; ck_ok && k < n_stages; ++k) {
+                const auto & r = results[k];
+                ck_ok = llama_state_seq_set_data_layers_ext(ctx_tgt, r.ck_data.data(), r.ck_data.size(), seq_id, r.il_lo, r.il_hi, fl) == r.ck_data.size();
+            }
+            if (ck_ok) {
+                ckpt->n_tokens = n_ckpt;
+                ckpt->pos_min  = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), seq_id);
+                ckpt->pos_max  = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id);
+                ckpt->data_tgt.resize(llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                ckpt->data_tgt.resize(llama_state_seq_get_data_ext(ctx_tgt, ckpt->data_tgt.data(), ckpt->data_tgt.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                if (last) {
+                    ckpt->data_dft  = last->ck_dft;
+                    ckpt->data_spec = last->ck_spec;
+                }
+            } else {
+                LOG_WRN("prefill-peer: no checkpoint at %d: a snapshot did not fit the local sequence\n", n_ckpt);
+                ckpt->data_tgt.clear();
+            }
+            // the final rows again, whatever happened above: without them the prompt is wrong
+            if (llama_state_seq_set_data_ext(ctx_tgt, final_rs.data(), final_rs.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != final_rs.size()) {
+                return fail("the final recurrent state did not restore after the checkpoint");
+            }
+        }
+        t_ck_ms += now_ms() - tc0;
+        LOG_WRN("prefill-peer: checkpoint at %d (pos %d..%d): %.1f MiB target, %.1f MiB drafter, assembled in %.0f ms (t=%" PRId64 ")\n",
+                n_ckpt, ckpt->pos_min, ckpt->pos_max, ckpt->data_tgt.size()/1048576.0, ckpt->data_dft.size()/1048576.0, t_ck_ms, wall_ms());
+    }
+
     stats.t_wait_ms    += t_split_done - tw + (now_ms() - t_restore_sum0) - t_restore;
     stats.t_restore_ms  = t_restore;
     stats.t_total_ms    = now_ms() - t0;
+
+    // the receive buffers grow once to what the longest prompt of this context would need (its pages touched now,
+    // between prompts, not by the receive of the next one)
+    if (rxbuf_on()) {
+        const double n_max = (double) llama_n_ctx(ctx_tgt)*1.05/n_split;
+        for (size_t k = 0; k < n_stages; ++k) {
+            auto & r = results[k];
+            const double tg0 = now_ms();
+            const size_t c0 = r.data.capacity() + r.st_dft.capacity();
+            // the layers' part was estimated at the warm-up (within a few %): regrow it only when that is far off
+            if (r.data.capacity() < (size_t) (r.data.size()*n_max*0.8)) {
+                prefault(r.data, (size_t) (r.data.size()*n_max));
+            }
+            prefault(r.st_dft, (size_t) (r.st_dft.size()*n_max));
+            if (r.data.capacity() + r.st_dft.capacity() != c0) {
+                LOG_WRN("prefill-peer: receive buffers of stage %zu grown to %.0f + %.0f MiB in %.0f ms\n", k, r.data.capacity()/1048576.0, r.st_dft.capacity()/1048576.0, now_ms() - tg0);
+            }
+        }
+    }
 
     LOG_WRN("prefill-peer: %d tokens in %.0f ms (%.0f tok/s): local %.0f ms, waits %.0f ms, peers %.0f ms, state %.1f MiB received in %.0f ms, restored in %.0f ms; handoff (split done -> here) %.0f ms (t=%" PRId64 ")\n",
             n_split, stats.t_total_ms, n_split*1000.0/stats.t_total_ms, stats.t_local_ms, stats.t_wait_ms, stats.peer_ms,
@@ -744,9 +860,9 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     const llama_seq_id seq_id = 0;
 
     uint32_t msg = 0, version = 0, n_st = 0;
-    int32_t  n_split = 0, n_ubatch = 0;
+    int32_t  n_split = 0, n_ubatch = 0, n_ckpt = -1;
     if (!recv_val(fd, msg) || msg != MSG_HELLO || !recv_val(fd, version) || version != PROTO_VERSION ||
-        !recv_val(fd, n_split) || !recv_val(fd, n_ubatch) || n_split <= 0 || n_ubatch <= 0) {
+        !recv_val(fd, n_split) || !recv_val(fd, n_ubatch) || !recv_val(fd, n_ckpt) || n_split <= 0 || n_ubatch <= 0) {
         LOG_WRN("prefill-peer: bad hello (version %u, this build speaks %u)\n", version, PROTO_VERSION);
         return;
     }
@@ -787,7 +903,7 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     if (!last) {
         fd_next = connect_to(stages[1].host, stages[1].port);
         std::vector<prefill_peer_stage> rest(stages.begin() + 1, stages.end());
-        if (fd_next < 0 || !send_hello(fd_next, rest, tokens.data(), n_split, n_ubatch, spec_in, width, ep)) {
+        if (fd_next < 0 || !send_hello(fd_next, rest, tokens.data(), n_split, n_ubatch, n_ckpt, spec_in, width, ep)) {
             LOG_WRN("prefill-peer: the next stage %s:%d did not accept the prompt\n", stages[1].host.c_str(), stages[1].port);
             if (fd_next >= 0) {
                 ::close(fd_next);
@@ -807,7 +923,7 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
         return;
     }
 
-    LOG_WRN("prefill-peer: %d tokens, layers [%d, %d) here%s (t=%" PRId64 ")\n", n_split, il_lo, il_hi, last ? " + the drafter" : "", wall_ms());
+    LOG_WRN("prefill-peer: %d tokens, layers [%d, %d) here%s, checkpoint at %d (t=%" PRId64 ")\n", n_split, il_lo, il_hi, last ? " + the drafter" : "", n_ckpt, wall_ms());
 
     llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
     llama_set_layer_range(ctx_tgt, il_lo, il_hi);
@@ -865,6 +981,13 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
         }
     });
 
+    // this stage's result; its buffers keep their capacity across prompts (no page faults on the get)
+    static stage_result own;
+    own.ck_data.clear();
+    own.ck_dft.clear();
+    own.ck_spec.clear();
+    double t_ck = 0.0;
+
     bool ok = true;
     int64_t i_msg = 0;
     while (ok) {
@@ -887,6 +1010,21 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
             ok = false;
             err = "the next stage is gone";
             break;
+        }
+        if (pos0 == n_ckpt && n_ckpt > 0) {
+            // the state before this ubatch: what the local path's checkpoint here holds of these layers
+            const double tk = now_ms();
+            snapshot_partial(ctx_tgt, seq_id, il_lo, il_hi, own.ck_data);
+            if (last) {
+                if (ctx_dft) {
+                    own.ck_dft.resize(llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                    own.ck_dft.resize(llama_state_seq_get_data_ext(ctx_dft, own.ck_dft.data(), own.ck_dft.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                }
+                if (spec) {
+                    common_speculative_get_state(spec, seq_id, own.ck_spec);
+                }
+            }
+            t_ck = now_ms() - tk;
         }
         const double tc = now_ms();
         llama_set_hc_input(ctx_tgt, u.h, pos0, n);
@@ -975,7 +1113,6 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     }
 
     // this stage's part of the state goes to the head now, on its own connection: the stages behind still compute
-    static stage_result own; // its buffers keep their capacity across prompts (no page faults on the get)
     double t_get = 0.0, t_send = 0.0;
     size_t own_bytes = 0;
     if (ok) {
@@ -996,7 +1133,7 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
             }
         }
         own.peer_ms = now_ms() - t0;
-        own_bytes   = own.data.size() + own.st_dft.size() + own.st_spec.size();
+        own_bytes   = own.data.size() + own.st_dft.size() + own.st_spec.size() + own.ck_data.size() + own.ck_dft.size() + own.ck_spec.size();
         t_get = now_ms() - tg;
         const double ts = now_ms();
         const int rfd = connect_to(ep.host, ep.port);
@@ -1033,8 +1170,8 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
         LOG_WRN("prefill-peer: prompt abandoned (%s)\n", err.c_str());
         return;
     }
-    LOG_WRN("prefill-peer: %d tokens done in %.0f ms (compute %.0f ms), own state %.1f MiB: get %.0f ms, sent to the head in %.0f ms (%.2f GB/s), last kernel -> sent %.0f ms (t=%" PRId64 ")\n",
-            n_split, own.peer_ms, t_compute, own_bytes/1048576.0, t_get, t_send, own_bytes/1e6/std::max(1.0, t_send), now_ms() - t_last, wall_ms());
+    LOG_WRN("prefill-peer: %d tokens done in %.0f ms (compute %.0f ms, checkpoint snapshot %.1f MiB in %.0f ms), own state %.1f MiB: get %.0f ms, sent to the head in %.0f ms (%.2f GB/s), last kernel -> sent %.0f ms (t=%" PRId64 ")\n",
+            n_split, own.peer_ms, t_compute, (own.ck_data.size() + own.ck_dft.size())/1048576.0, t_ck, own_bytes/1048576.0, t_get, t_send, own_bytes/1e6/std::max(1.0, t_send), now_ms() - t_last, wall_ms());
 }
 
 } // namespace
@@ -1078,7 +1215,9 @@ void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cf
 
     const llama_token tok = llama_vocab_bos(llama_model_get_vocab(model)) >= 0 ? llama_vocab_bos(llama_model_get_vocab(model)) : 0;
     common_batch batch(ctx_tgt);
-    for (const auto & [lo, hi] : ranges) {
+    size_t est_rx = 0;
+    for (const auto & range : ranges) {
+        const auto [lo, hi] = range;
         if (lo < 0 || lo >= n_layer || (hi >= 0 && hi <= lo)) {
             continue;
         }
@@ -1094,12 +1233,31 @@ void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cf
         }
         const int rc = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         llama_synchronize(ctx_tgt);
+        // a head's receive buffer for this stage: the state of the longest prompt (the per-token part scaled to n_ctx)
+        const size_t i_stage = &range - ranges.data();
+        if (rc == 0 && cfg && cfg->enabled() && i_stage < cfg->split_all.size() && rxbuf_on()) {
+            const int32_t hi_l = hi >= n_layer ? -1 : hi;
+            const size_t s_all = llama_state_seq_get_size_layers(ctx_tgt, 0, lo, hi_l);
+            const size_t s_rs  = llama_state_seq_get_size_layers_ext(ctx_tgt, 0, lo, hi_l, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            est_rx = std::max(est_rx, (size_t) ((double) (s_all - s_rs)/n_ubatch*llama_n_ctx(ctx_tgt)*1.05) + s_rs);
+        }
         llama_memory_clear(llama_get_memory(ctx_tgt), true);
         LOG_WRN("prefill-peer: warm-up of layers [%d, %d) with %d tokens: %.0f ms%s\n", lo, hi, n_ubatch, now_ms() - t1, rc == 0 ? "" : " FAILED");
     }
     llama_set_layer_range(ctx_tgt, 0, -1);
     llama_set_embeddings_nextn_slot(ctx_tgt, 0);
     llama_synchronize(ctx_tgt);
+    if (est_rx > 0) {
+        const double t1 = now_ms();
+        auto & results = head_results();
+        if (results.size() < cfg->split_all.size()) {
+            results.resize(cfg->split_all.size());
+        }
+        for (auto & r : results) {
+            prefault(r.data, est_rx);
+        }
+        LOG_WRN("prefill-peer: receive buffers of %zu stages pre-faulted to %.0f MiB in %.0f ms\n", results.size(), est_rx/1048576.0, now_ms() - t1);
+    }
     LOG_WRN("prefill-peer: warm-up done in %.0f ms\n", now_ms() - t0);
 }
 

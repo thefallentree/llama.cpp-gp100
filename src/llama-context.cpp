@@ -5973,39 +5973,59 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
 
 namespace {
 struct state_layer_filter_scope {
-    state_layer_filter_scope(int32_t il_lo, int32_t il_hi, bool data_only) {
+    state_layer_filter_scope(int32_t il_lo, int32_t il_hi, bool data_only, bool adopt_pos = false) {
         g_state_layer_filter.active    = true;
         g_state_layer_filter.il_lo     = il_lo;
         g_state_layer_filter.il_hi     = il_hi < 0 ? INT32_MAX : il_hi;
         g_state_layer_filter.data_only = data_only;
+        g_state_layer_filter.adopt_pos = adopt_pos;
     }
     ~state_layer_filter_scope() {
         g_state_layer_filter = llama_state_layer_filter{};
     }
 };
+
+// the fork-private flag stays in the filter, the memories see the standard ones
+llama_state_seq_flags state_mem_flags(llama_state_seq_flags flags) {
+    return flags & ~(llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_ADOPT_POS;
+}
+}
+
+size_t llama_state_seq_get_size_layers_ext(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags) {
+    state_layer_filter_scope scope(il_lo, il_hi, false);
+    return ctx->state_seq_get_size(seq_id, state_mem_flags(flags));
+}
+
+size_t llama_state_seq_get_data_layers_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    state_layer_filter_scope scope(il_lo, il_hi, false);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_get_data(seq_id, dst, size, state_mem_flags(flags));
+    LLAMA_LOG_WARN("%s: seq %d layers [%d, %d)%s: %.1f MiB saved in %.1f ms\n", __func__, seq_id, il_lo, il_hi,
+            (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ? " partial" : "", n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    return n;
+}
+
+size_t llama_state_seq_set_data_layers_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    state_layer_filter_scope scope(il_lo, il_hi, true, (flags & LLAMA_STATE_SEQ_FLAGS_ADOPT_POS) != 0);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_set_data(seq_id, src, size, state_mem_flags(flags));
+    LLAMA_LOG_WARN("%s: seq %d layers [%d, %d)%s: %.1f MiB restored in %.1f ms\n", __func__, seq_id, il_lo, il_hi,
+            (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ? " partial" : "", n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    return n;
 }
 
 size_t llama_state_seq_get_size_layers(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi) {
-    state_layer_filter_scope scope(il_lo, il_hi, false);
-    return ctx->state_seq_get_size(seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    return llama_state_seq_get_size_layers_ext(ctx, seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_NONE);
 }
 
 size_t llama_state_seq_get_data_layers(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi) {
-    ctx->synchronize();
-    state_layer_filter_scope scope(il_lo, il_hi, false);
-    const int64_t t0 = ggml_time_us();
-    const size_t  n  = ctx->state_seq_get_data(seq_id, dst, size, LLAMA_STATE_SEQ_FLAGS_NONE);
-    LLAMA_LOG_WARN("%s: seq %d layers [%d, %d): %.1f MiB saved in %.1f ms\n", __func__, seq_id, il_lo, il_hi, n/1048576.0, (ggml_time_us() - t0)/1000.0);
-    return n;
+    return llama_state_seq_get_data_layers_ext(ctx, dst, size, seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_NONE);
 }
 
 size_t llama_state_seq_set_data_layers(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi) {
-    ctx->synchronize();
-    state_layer_filter_scope scope(il_lo, il_hi, true);
-    const int64_t t0 = ggml_time_us();
-    const size_t  n  = ctx->state_seq_set_data(seq_id, src, size, LLAMA_STATE_SEQ_FLAGS_NONE);
-    LLAMA_LOG_WARN("%s: seq %d layers [%d, %d): %.1f MiB restored in %.1f ms\n", __func__, seq_id, il_lo, il_hi, n/1048576.0, (ggml_time_us() - t0)/1000.0);
-    return n;
+    return llama_state_seq_set_data_layers_ext(ctx, src, size, seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_NONE);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

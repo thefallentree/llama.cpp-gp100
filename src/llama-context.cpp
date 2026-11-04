@@ -1386,6 +1386,14 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
+int32_t llama_context::get_embeddings_nextn_slots() const {
+    if (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked || hc_in.nextn_all == nullptr || hc_in.nextn_n_slots < 2) {
+        return 1;
+    }
+    const size_t slot_floats = (size_t) model.hparams.n_embd_out() * cparams.n_batch;
+    return hc_in.nextn_all_size >= slot_floats * hc_in.nextn_n_slots ? hc_in.nextn_n_slots : 1;
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -3426,7 +3434,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // pipelined prefill (server-prefill-peer): the unmasked nextn rows are double-buffered (llama_hc_input::nextn_slot),
     // and a head or peer reserves them at creation, so no pinned reallocation happens on the first ubatch of a prompt
     {
-        static const bool    peer_env = getenv("LLAMA_PREFILL_PEER") || getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN");
+        // the async drafter catch-up (common_speculative_process_async) reads the previous batch's rows from the other slot
+        static const bool    catchup_env = getenv("LLAMA_SPEC_CATCHUP_ASYNC") == nullptr || atoi(getenv("LLAMA_SPEC_CATCHUP_ASYNC")) != 0;
+        static const bool    peer_env = getenv("LLAMA_PREFILL_PEER") || getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN") ||
+                                        (catchup_env && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked);
         static const int32_t n_slots  = std::max(1, getenv("LLAMA_PREFILL_PEER_NEXTN_SLOTS") ? atoi(getenv("LLAMA_PREFILL_PEER_NEXTN_SLOTS")) : (peer_env ? 2 : 1));
         hc_in.nextn_n_slots        = n_slots;
         hc_in.nextn_reserve_floats = peer_env ? (size_t) n_embd_out * n_batch * n_slots : 0;
@@ -5674,6 +5685,10 @@ void llama_set_hc_input(llama_context * ctx, const float * data, llama_pos pos0,
 
 void llama_set_embeddings_nextn_slot(llama_context * ctx, int32_t slot) {
     ctx->set_hc_input(nullptr, slot, -1);
+}
+
+int32_t llama_get_embeddings_nextn_slots(const llama_context * ctx) {
+    return ctx->get_embeddings_nextn_slots();
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

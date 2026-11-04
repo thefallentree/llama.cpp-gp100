@@ -97,6 +97,26 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// WP10: the drafter's catch-up of a prompt batch on a thread of the speculative context, while the caller goes on
+// with the target's next batch. h_tgt points at the target's unmasked nextn rows of this batch (row k for batch
+// index k): the caller keeps them unchanged until the job is done (llama_set_embeddings_nextn_slot and the wait
+// below), the drafter never touches ctx_tgt from the thread. Only the tokens of the batch are kept (no embd rows).
+// Every other entry point of the speculative context joins the pending jobs first. Returns the job number (>= 0) or
+// -1 when the batch cannot go async (no thread: LLAMA_SPEC_CATCHUP_ASYNC=0, embd rows, a previous job failed).
+int64_t common_speculative_process_async(common_speculative * spec, const common_batch & batch, const float * h_tgt);
+
+// waits until the async jobs up to and including number k are done; false when one of them failed
+bool common_speculative_catchup_wait(common_speculative * spec, int64_t k);
+
+// waits for every pending async job; false when one failed
+bool common_speculative_catchup_join(common_speculative * spec);
+
+// whether the async catch-up thread exists (LLAMA_SPEC_CATCHUP_ASYNC, default on when a draft context exists)
+bool common_speculative_catchup_async(const common_speculative * spec);
+
+// the number the next async job gets
+int64_t common_speculative_catchup_next(const common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

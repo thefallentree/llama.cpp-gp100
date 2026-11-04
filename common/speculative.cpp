@@ -11,7 +11,12 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -225,6 +230,11 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const common_batch & batch) = 0;
+
+    // common_speculative_process_async: the target's nextn rows of the batch being processed, given by the caller
+    // (the MTP drafter reads them instead of ctx_tgt's accessors, which would synchronize a context another thread
+    // computes with); null = the accessors
+    const float * h_tgt_rows = nullptr;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -2342,7 +2352,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             const int64_t t_e0 = timing ? ggml_time_us() : 0;
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const float * h_tgt = h_tgt_rows != nullptr ? h_tgt_rows : llama_get_embeddings_nextn(ctx_tgt);
             if (timing) { t_phase_us[0] += ggml_time_us() - t_e0; }
 
             // rows that still wait are of rejected draft tokens from this batch's position on
@@ -2520,11 +2530,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) h_rows * n_embd);
 
             for (int32_t i = 0; i < h_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
+                const float * h = h_tgt_rows != nullptr ? h_tgt_rows + (size_t) (h_offset + i) * n_embd
+                                                        : llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
-            std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
+            const float * h_last = h_tgt_rows != nullptr ? h_tgt_rows + (size_t) i_batch_end[seq_id] * n_embd
+                                                         : llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]);
+            std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
         }
         if (timing) { t_phase_us[3] += ggml_time_us() - t_r0; }
 
@@ -3267,6 +3280,35 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// WP10: the catch-up thread of a speculative context (common_speculative_process_async). One job = one prompt batch
+// of the target: its tokens and a pointer to the target's nextn rows of that batch. The thread spins for a while
+// after a job before it blocks (a thread woken from a condition variable runs slower for milliseconds on this box;
+// the jobs of a prompt come every target batch), the caller's waits spin too (the main thread spins on the GPU
+// anyway).
+struct common_speculative_catchup {
+    struct job {
+        int64_t seq;
+        std::vector<common_batch::token> tokens;
+        int32_t n_pos;
+        const float * h;
+    };
+
+    llama_context * ctx_dft = nullptr;
+
+    std::thread              thread;
+    std::mutex               m;
+    std::condition_variable  cv;
+    std::deque<job>          q;
+    std::atomic<int64_t>     n_submitted { 0 };  // the next job number
+    std::atomic<int64_t>     n_done      { -1 }; // every job up to this number is done (its draft context synchronized)
+    std::atomic<bool>        failed      { false };
+    std::atomic<bool>        stop        { false };
+    int64_t                  spin_us     = 50000;
+    // statistics
+    int64_t n_jobs = 0, t_run_us = 0, t_wait_us = 0; // t_wait_us: the caller's waits (on the caller's thread)
+    int64_t n_waits = 0;
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -3277,7 +3319,168 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    std::unique_ptr<common_speculative_catchup> catchup;
 };
+
+static void common_speculative_catchup_run(common_speculative * spec, common_speculative_catchup::job & j) {
+    common_batch batch;
+    batch.tokens = std::move(j.tokens);
+    batch.n_pos  = j.n_pos;
+    bool ok = true;
+    for (auto & impl : spec->impls) {
+        impl->h_tgt_rows = j.h;
+        ok = ok && impl->process(batch);
+        impl->h_tgt_rows = nullptr;
+    }
+    // the draft context's input copies of the rows must be complete before the caller writes them again
+    if (spec->catchup->ctx_dft != nullptr) {
+        llama_synchronize(spec->catchup->ctx_dft);
+    }
+    if (!ok) {
+        spec->catchup->failed.store(true, std::memory_order_release);
+    }
+}
+
+static void common_speculative_catchup_thread(common_speculative * spec) {
+    auto & c = *spec->catchup;
+    int64_t seq_next = 0;
+    while (!c.stop.load(std::memory_order_acquire)) {
+        // spin for a job
+        const int64_t t0 = ggml_time_us();
+        bool have = false;
+        while (!c.stop.load(std::memory_order_acquire)) {
+            if (c.n_submitted.load(std::memory_order_acquire) > seq_next) {
+                have = true;
+                break;
+            }
+            if (ggml_time_us() - t0 > c.spin_us) {
+                break;
+            }
+            std::this_thread::yield();
+        }
+        if (!have) {
+            std::unique_lock<std::mutex> lk(c.m);
+            c.cv.wait(lk, [&]() { return c.stop.load(std::memory_order_acquire) || c.n_submitted.load(std::memory_order_acquire) > seq_next; });
+            if (c.stop.load(std::memory_order_acquire)) {
+                break;
+            }
+        }
+        common_speculative_catchup::job j;
+        {
+            std::lock_guard<std::mutex> lk(c.m);
+            GGML_ASSERT(!c.q.empty());
+            j = std::move(c.q.front());
+            c.q.pop_front();
+        }
+        GGML_ASSERT(j.seq == seq_next);
+        const int64_t t1 = ggml_time_us();
+        if (!c.failed.load(std::memory_order_acquire)) {
+            common_speculative_catchup_run(spec, j);
+        }
+        c.t_run_us += ggml_time_us() - t1;
+        c.n_jobs++;
+        c.n_done.store(j.seq, std::memory_order_release);
+        seq_next++;
+    }
+}
+
+static void common_speculative_catchup_init(common_speculative * spec, llama_context * ctx_dft) {
+    const char * env = getenv("LLAMA_SPEC_CATCHUP_ASYNC");
+    if (ctx_dft == nullptr || (env != nullptr && atoi(env) == 0)) {
+        return;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return; // only the MTP drafter reads the target's rows through the pointer
+        }
+    }
+    auto c = std::make_unique<common_speculative_catchup>();
+    c->ctx_dft = ctx_dft;
+    if (getenv("LLAMA_SPEC_CATCHUP_SPIN_US") != nullptr) {
+        c->spin_us = atoll(getenv("LLAMA_SPEC_CATCHUP_SPIN_US"));
+    }
+    spec->catchup = std::move(c);
+    spec->catchup->thread = std::thread(common_speculative_catchup_thread, spec);
+    SPC_INF("%s", "async drafter catch-up thread started (LLAMA_SPEC_CATCHUP_ASYNC=0 disables it)\n");
+}
+
+bool common_speculative_catchup_async(const common_speculative * spec) {
+    return spec != nullptr && spec->catchup != nullptr;
+}
+
+int64_t common_speculative_catchup_next(const common_speculative * spec) {
+    return spec != nullptr && spec->catchup != nullptr ? spec->catchup->n_submitted.load(std::memory_order_acquire) : 0;
+}
+
+bool common_speculative_catchup_wait(common_speculative * spec, int64_t k) {
+    if (spec == nullptr || spec->catchup == nullptr) {
+        return true;
+    }
+    auto & c = *spec->catchup;
+    if (k < 0 || c.n_done.load(std::memory_order_acquire) >= k) {
+        return !c.failed.load(std::memory_order_acquire);
+    }
+    const int64_t t0 = ggml_time_us();
+    while (c.n_done.load(std::memory_order_acquire) < k) {
+        std::this_thread::yield();
+    }
+    c.t_wait_us += ggml_time_us() - t0;
+    c.n_waits++;
+    return !c.failed.load(std::memory_order_acquire);
+}
+
+bool common_speculative_catchup_join(common_speculative * spec) {
+    if (spec == nullptr || spec->catchup == nullptr) {
+        return true;
+    }
+    return common_speculative_catchup_wait(spec, spec->catchup->n_submitted.load(std::memory_order_acquire) - 1);
+}
+
+int64_t common_speculative_process_async(common_speculative * spec, const common_batch & batch, const float * h_tgt) {
+    if (spec == nullptr || spec->catchup == nullptr || h_tgt == nullptr || batch.size() <= 0 || batch.has_embd()) {
+        return -1;
+    }
+    auto & c = *spec->catchup;
+    if (c.failed.load(std::memory_order_acquire)) {
+        return -1;
+    }
+    common_speculative_catchup::job j;
+    const int64_t seq = c.n_submitted.load(std::memory_order_acquire);
+    j.seq    = seq;
+    j.tokens = batch.tokens;
+    j.n_pos  = batch.n_pos;
+    j.h      = h_tgt;
+    {
+        std::lock_guard<std::mutex> lk(c.m);
+        c.q.push_back(std::move(j));
+        c.n_submitted.store(seq + 1, std::memory_order_release);
+    }
+    c.cv.notify_one();
+    return seq;
+}
+
+static void common_speculative_catchup_free(common_speculative * spec) {
+    if (spec->catchup == nullptr) {
+        return;
+    }
+    auto & c = *spec->catchup;
+    common_speculative_catchup_join(spec);
+    {
+        std::lock_guard<std::mutex> lk(c.m);
+        c.stop.store(true, std::memory_order_release);
+    }
+    c.cv.notify_all();
+    if (c.thread.joinable()) {
+        c.thread.join();
+    }
+    if (c.n_jobs > 0) {
+        SPC_INF("async catch-up: %" PRId64 " jobs, %.1f ms each on the thread, %" PRId64 " caller waits of %.1f ms\n",
+                c.n_jobs, 1e-3*(double) c.t_run_us/(double) c.n_jobs, c.n_waits,
+                c.n_waits > 0 ? 1e-3*(double) c.t_wait_us/(double) c.n_waits : 0.0);
+    }
+    spec->catchup.reset();
+}
 
 static common_ngram_map get_common_ngram_map(
         common_speculative_type type,
@@ -3939,6 +4142,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 rates.size(), acceptance_length, string_join(rates_str, ", ").c_str());
     }
 
+    common_speculative_catchup_init(result.get(), params.draft.ctx_dft);
+
     return result.release();
 }
 
@@ -3946,6 +4151,8 @@ void common_speculative_free(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_catchup_free(spec);
 
     delete spec;
 }
@@ -3964,6 +4171,8 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    common_speculative_catchup_join(spec);
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
@@ -3977,6 +4186,8 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     if (spec == nullptr) {
         return result;
     }
+
+    common_speculative_catchup_join(spec);
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
@@ -4007,6 +4218,8 @@ void common_speculative_set_launch_hook(common_speculative * spec, std::function
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_catchup_join(spec);
     for (auto & impl : spec->impls) {
         impl->launch_hook = hook;
     }
@@ -4016,6 +4229,8 @@ void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_catchup_join(spec);
 
     auto & dparams = spec->dparams;
 
@@ -4103,6 +4318,8 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_catchup_join(spec);
+
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -4144,6 +4361,8 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
         return false;
     }
 
+    common_speculative_catchup_join(spec);
+
     for (auto & impl : spec->impls) {
         if (impl->get_state(seq_id, data)) {
             return true;
@@ -4157,6 +4376,8 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_catchup_join(spec);
 
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);

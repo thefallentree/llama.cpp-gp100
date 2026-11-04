@@ -1621,9 +1621,17 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    // LLAMA_GRAPH_SLOTS_DEBUG=2: the reason a graph is not reused, at WARN (M2)
+    static const int slots_debug = getenv("LLAMA_GRAPH_SLOTS_DEBUG") != nullptr ? atoi(getenv("LLAMA_GRAPH_SLOTS_DEBUG")) : 0;
+
     if (!this->params.allow_reuse(params)) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
+        }
+        if (slots_debug > 1) {
+            LLAMA_LOG_WARN("%s: no reuse: graph parameters (n_tokens %u -> %u, n_outputs %d -> %d, gtype %d -> %d)\n", __func__,
+                    this->params.ubatch.n_tokens, params.ubatch.n_tokens, (int) this->params.n_outputs, (int) params.n_outputs,
+                    (int) this->params.gtype, (int) params.gtype);
         }
 
         return false;
@@ -1640,6 +1648,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d (%s)\n", __func__, cur, typeid(*input).name());
+        }
+        if (!cur && slots_debug > 1) {
+            LLAMA_LOG_WARN("%s: no reuse: input %s\n", __func__, typeid(*input).name());
         }
 
         res = res && cur;

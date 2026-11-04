@@ -509,7 +509,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // context (~0.6 ms per cache, twice per context). LLAMA_KV_SEQ_RM_SCAN=1 keeps the walk.
         static const bool scan_all = getenv("LLAMA_KV_SEQ_RM_SCAN") != nullptr && atoi(getenv("LLAMA_KV_SEQ_RM_SCAN")) != 0;
         FN_PROF_T(t_rm0);
-        if (!scan_all) {
+        if (!scan_all && p0 <= cells.seq_pos_min(seq_id) && p1 > cells.seq_pos_max(seq_id)) {
+            // the whole sequence (a conversation switch): one walk over its cells
+            new_head = cells.seq_rm_all(seq_id);
+            FN_PROF_ADD("kv.seq_rm(all)", t_rm0);
+        } else if (!scan_all) {
             const auto & sp = cells.seq_pos_get(seq_id);
             seq_rm_hits.clear();
             for (auto it = sp.lower_bound({ p0, 0u }); it != sp.end() && it->first < p1; ++it) {

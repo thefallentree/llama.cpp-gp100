@@ -354,9 +354,11 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // the cache entry made from the slot's prompt (its checkpoints move there; see server_prompt_cache::load), nullptr = none
+    // move_checkpoints: only when the slot's prompt is about to be replaced or cleared (see server_prompt_cache::alloc)
+    server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool move_checkpoints = false) {
         if (prompt.tokens.size() == 0) {
-            return false;
+            return nullptr;
         }
 
         const int64_t t0 = ggml_time_us();
@@ -372,14 +374,14 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, move_checkpoints);
         const int64_t t3 = ggml_time_us();
         if (cur == nullptr) {
             if (srv_timing()) {
                 SLT_WRN(*this, "timing prompt_save: join %.1f size %.1f alloc %.1f ms (not saved: already cached / over limit)\n",
                         (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3);
             }
-            return false;
+            return nullptr;
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -398,13 +400,13 @@ struct server_slot {
                     (ggml_time_us() - t5) / 1e3);
         }
 
-        return true;
+        return cur;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, server_prompt_cache_state * saved = nullptr) {
         const int64_t t0 = ggml_time_us();
         common_speculative_catchup_join(spec);
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id, saved);
         if (srv_timing()) {
             SLT_WRN(*this, "timing prompt_load: %.1f ms -> n_tokens %d ckpts %zu res %d\n", (ggml_time_us() - t0) / 1e3,
                     (int) prompt.tokens.size(), prompt.checkpoints.size(), (int) res);
@@ -1696,7 +1698,13 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // state buffers in the GPU's pinned host memory (DMA-speed save/restore), plain memory when there is none
+            ggml_backend_dev_t dev0 = llama_model_get_device(model_tgt, 0);
+            ggml_backend_buffer_type_t host_buft = dev0 ? ggml_backend_dev_host_buffer_type(dev0) : nullptr;
+            if (getenv("LLAMA_CACHE_PINNED") != nullptr && atoi(getenv("LLAMA_CACHE_PINNED")) == 0) {
+                host_buft = nullptr;
+            }
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, host_buft);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1986,9 +1994,11 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // LLAMA_CACHE_MOVE_CKPT=0: the old deep copy of the checkpoints, for measurements
+                static const bool move_ckpt = getenv("LLAMA_CACHE_MOVE_CKPT") == nullptr || atoi(getenv("LLAMA_CACHE_MOVE_CKPT")) != 0;
+                auto * saved = ret->prompt_save(*prompt_cache, move_ckpt);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens, saved)) {
                     ret->prompt_clear();
                 }
 
@@ -3218,7 +3228,7 @@ private:
             }
             // this server's own conversation goes to the host prompt cache first, as for another prompt
             for (auto & slot : slots) {
-                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                if (prompt_cache && slot.prompt_save(*prompt_cache, /*move_checkpoints=*/ true)) {
                     prompt_cache->update();
                 }
                 slot.prompt_clear();

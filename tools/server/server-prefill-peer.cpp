@@ -1036,6 +1036,9 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
         snd.start(fd_next, width);
     }
     const int n_slots = nextn_slots();
+    // WP10: the last stage's drafter catch-up overlaps the next ubatch when the rows are double-buffered
+    const bool catchup_async = last && spec != nullptr && common_speculative_catchup_async(spec) &&
+                               llama_get_embeddings_nextn_slots(ctx_tgt) >= 2 && n_slots >= 2;
 
     const double t0 = now_ms();
     double t_compute = 0.0;
@@ -1114,6 +1117,14 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
             err = "the next stage is gone";
             break;
         }
+        // the last stage: the drafter's catch-up of message i_msg - 1 runs on its thread and reads the other slot; the
+        // one that read this slot (i_msg - n_slots) must be done (WP10, common_speculative_process_async); the
+        // checkpoint snapshot below needs the whole draft context, so every pending job joins first
+        if (last && catchup_async && !common_speculative_catchup_wait(spec, pos0 == n_ckpt && n_ckpt > 0 ? i_msg - 1 : i_msg - n_slots)) {
+            ok = false;
+            err = "drafter catch-up failed";
+            break;
+        }
         if (pos0 == n_ckpt && n_ckpt > 0) {
             // the state before this ubatch: what the local path's checkpoint here holds of these layers
             const double tk = now_ms();
@@ -1172,7 +1183,14 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
             continue;
         }
         const double td = now_ms();
-        if (spec && !common_speculative_process(spec, batch)) {
+        if (spec && catchup_async) {
+            const float * h = llama_get_embeddings_nextn(ctx_tgt); // waits for the ubatch: its rows are on the host
+            if (common_speculative_process_async(spec, batch, h) < 0) {
+                ok = false;
+                err = "drafter catch-up failed";
+                break;
+            }
+        } else if (spec && !common_speculative_process(spec, batch)) {
             ok = false;
             err = "drafter catch-up failed";
             break;
@@ -1182,6 +1200,10 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
             LOG_WRN("prefill-peer: ubatch %" PRId64 " (pos %d): waited %.0f ms, layers in %.0f ms, drafter %.0f ms (t=%" PRId64 ")\n", i_msg, pos0, t_qwait, td - tc, now_ms() - td, wall_ms());
         }
         i_msg++;
+    }
+    if (spec && catchup_async && !common_speculative_catchup_join(spec)) {
+        ok = false;
+        err = "drafter catch-up failed";
     }
     {
         std::lock_guard<std::mutex> lk(rx.m);

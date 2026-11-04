@@ -24,6 +24,7 @@ struct llama_state_layer_filter {
     int32_t il_lo     = 0;
     int32_t il_hi     = INT32_MAX;
     bool    data_only = false;
+    bool    adopt_pos = false; // a data-only read takes the saved recurrent position instead of requiring the sequence's own
 
     bool skip(int32_t il) const { return active && (il < il_lo || il >= il_hi); }
 };

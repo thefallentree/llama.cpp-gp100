@@ -890,7 +890,10 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
             io.read(&sid, sizeof(sid));
         }
         if (cells[cell].pos != pos) {
-            throw std::runtime_error(format("recurrent layer data at pos %d, the sequence is at %d", pos, cells[cell].pos));
+            if (!g_state_layer_filter.adopt_pos) {
+                throw std::runtime_error(format("recurrent layer data at pos %d, the sequence is at %d", pos, cells[cell].pos));
+            }
+            cells[cell].pos = pos;
         }
         const uint32_t rs_idx_cur = n_rs_seq != 0 ? rs_idx[seq_id] : 0;
         const uint32_t row        = rs_idx_cur * size + (cells[cell].src >= 0 ? (uint32_t) cells[cell].src : (uint32_t) cell);

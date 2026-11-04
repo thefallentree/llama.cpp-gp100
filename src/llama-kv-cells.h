@@ -528,7 +528,9 @@ public:
 
         pos[i] = p;
 
-        used.insert(i);
+        // cells are filled in index order nearly always (a restore: tens of thousands at once): the end hint makes
+        // that O(1) per insert, a wrong hint costs a normal insert
+        used.insert(used.end(), i);
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
@@ -640,7 +642,8 @@ private:
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
-        seq_pos[s].insert({ pos[i], i });
+        // positions grow: the end hint makes the append O(1), a wrong hint costs a normal insert
+        seq_pos[s].insert(seq_pos[s].end(), { pos[i], i });
 
         if (seq_bits[s].empty()) {
             seq_bits[s].assign((pos.size() + 63)/64, 0);

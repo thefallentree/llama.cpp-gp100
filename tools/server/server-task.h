@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <mutex>
+#include <thread>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -720,6 +722,7 @@ struct server_prompt {
 struct server_state_pool {
     ggml_backend_buffer_type_t buft = nullptr;
     size_t slab_size = 512ull*1024*1024;
+    size_t limit     = 0; // the cache's size limit: no slab is pinned ahead past it (0 = none)
 
     struct slab {
         ggml_backend_buffer_t buf = nullptr;
@@ -730,12 +733,23 @@ struct server_state_pool {
     std::vector<slab> slabs;
     size_t n_used = 0;
 
+    // a slab pinned on a thread ahead of need (LLAMA_CACHE_SLAB_PREFETCH=0 off)
+    std::thread       th;
+    std::mutex        mtx;
+    std::vector<slab> pending;
+    bool              prefetching = false;
+
     ~server_state_pool();
 
     // n bytes (rounded up to 256); the slab index in slab_out; nullptr when no memory could be had
     uint8_t * alloc(size_t n, int32_t & slab_out);
     void      free(int32_t slab, uint8_t * p, size_t n);
     size_t    capacity() const;
+
+    // slabs for bytes of state up front (LLAMA_CACHE_PREALLOC_MIB at the server start)
+    void prealloc(size_t bytes);
+    void prefetch();
+    bool new_slab(size_t cap, slab & s);
 
     static size_t round(size_t n) { return (n + 255) & ~(size_t) 255; }
 };
@@ -826,6 +840,18 @@ struct server_prompt_cache {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
         this->pool.buft    = host_buft;
+        this->pool.limit   = this->limit_size;
+        if (getenv("LLAMA_CACHE_SLAB_MIB") != nullptr) {
+            this->pool.slab_size = std::max<size_t>(64, (size_t) atoll(getenv("LLAMA_CACHE_SLAB_MIB"))) << 20;
+        }
+        // state slabs pinned before the first request: 4 GiB (a 110K-token conversation is ~2 GiB), capped by the limit
+        size_t prealloc_mib = getenv("LLAMA_CACHE_PREALLOC_MIB") != nullptr ? (size_t) atoll(getenv("LLAMA_CACHE_PREALLOC_MIB")) : 4096;
+        if (this->limit_size > 0) {
+            prealloc_mib = std::min<size_t>(prealloc_mib, this->limit_size >> 20);
+        }
+        if (prealloc_mib > 0) {
+            this->pool.prealloc(prealloc_mib << 20);
+        }
     }
 
     std::list<server_prompt_cache_state> states;

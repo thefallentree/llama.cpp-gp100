@@ -93,6 +93,94 @@ bool recv_blob(int fd, std::vector<uint8_t> & b) {
     return n == 0 || recv_all(fd, b.data(), n);
 }
 
+// a state buffer in pinned host memory (the GPU's host buffer type, cudaMallocHost; plain memory without a GPU): the
+// state get/set of the CUDA backend issues one cudaMemcpyAsync per layer chunk, which is a DMA from pinned memory and a
+// synchronous staged copy from pageable memory (1.3-1.7 GB/s measured for the state parts); no zero-fill on resize
+struct hbuf {
+    uint8_t * p   = nullptr;
+    size_t    n   = 0;
+    size_t    cap = 0;
+    ggml_backend_buffer_t buf = nullptr;
+
+    hbuf() = default;
+    hbuf(const hbuf &) = delete;
+    hbuf & operator=(const hbuf &) = delete;
+    hbuf(hbuf && o) noexcept { *this = std::move(o); }
+    hbuf & operator=(hbuf && o) noexcept {
+        if (this != &o) {
+            release();
+            p = o.p; n = o.n; cap = o.cap; buf = o.buf;
+            o.p = nullptr; o.n = o.cap = 0; o.buf = nullptr;
+        }
+        return *this;
+    }
+    ~hbuf() { release(); }
+
+    uint8_t *       data()           { return p; }
+    const uint8_t * data()     const { return p; }
+    size_t          size()     const { return n; }
+    size_t          capacity() const { return cap; }
+    bool            empty()    const { return n == 0; }
+    void            clear()          { n = 0; }
+
+    void reserve(size_t c) {
+        if (c <= cap) {
+            return;
+        }
+        ggml_backend_buffer_t nb = nullptr;
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (buft) {
+            nb = ggml_backend_buft_alloc_buffer(buft, c);
+        }
+        if (nb == nullptr) {
+            nb = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), c);
+        }
+        GGML_ASSERT(nb != nullptr && "prefill-peer: no host memory for a state buffer");
+        uint8_t * np = (uint8_t *) ggml_backend_buffer_get_base(nb);
+        if (n > 0) {
+            memcpy(np, p, n);
+        }
+        release();
+        buf = nb;
+        p   = np;
+        cap = c;
+    }
+
+    void resize(size_t m) {
+        reserve(m);
+        n = m;
+    }
+
+    void release() {
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+        }
+        buf = nullptr;
+        p   = nullptr;
+        n   = 0;
+        cap = 0;
+    }
+
+    std::vector<uint8_t> to_vector() const {
+        return std::vector<uint8_t>(p, p + n);
+    }
+};
+
+bool send_blob(int fd, const hbuf & b) {
+    const uint64_t n = b.size();
+    return send_val(fd, n) && (n == 0 || send_all(fd, b.data(), n));
+}
+
+bool recv_blob(int fd, hbuf & b) {
+    uint64_t n = 0;
+    if (!recv_val(fd, n) || n > (64ull << 30)) {
+        return false;
+    }
+    b.resize(n);
+    return n == 0 || recv_all(fd, b.data(), n);
+}
+
 // LLAMA_PREFILL_PEER_RXBUF=0 leaves the head's receive buffers to grow with the prompts (page faults on every new size)
 bool rxbuf_on() {
     static const bool on = getenv("LLAMA_PREFILL_PEER_RXBUF") == nullptr || atoi(getenv("LLAMA_PREFILL_PEER_RXBUF")) != 0;
@@ -101,19 +189,13 @@ bool rxbuf_on() {
 
 // grow a persistent buffer to n bytes and touch its pages once, so a later recv into it pays no faults; clear() keeps
 // the capacity
-void prefault(std::vector<uint8_t> & b, size_t n) {
-    if (b.capacity() >= n) {
-        return;
-    }
-    b.clear();
-    b.shrink_to_fit();
-    b.resize(n);
-    b.clear();
+void prefault(hbuf & b, size_t n) {
+    b.reserve(n); // pinned pages are mapped at the allocation
 }
 
 // a buffer whose size is only known after a prompt: grown once to the estimate for the longest prompt with 10% headroom,
 // so the estimate's drift between prompts never grows it again
-void grow_rx(std::vector<uint8_t> & b, size_t n_target) {
+void grow_rx(hbuf & b, size_t n_target) {
     if (b.capacity() < n_target) {
         prefault(b, (size_t) (n_target*1.1));
     }
@@ -488,13 +570,13 @@ bool send_hello(int fd, const std::vector<prefill_peer_stage> & stages, const ll
 struct stage_result {
     int32_t il_lo = 0;
     int32_t il_hi = -1;
-    std::vector<uint8_t> data;
-    std::vector<uint8_t> st_dft;
+    hbuf data;
+    hbuf st_dft;
     std::vector<uint8_t> st_spec;
     // the snapshot before the ubatch at n_ckpt: the layers' recurrent rows, from the last stage the drafter's partial
     // state and pending rows (empty when the stage saw no ubatch starting at n_ckpt)
-    std::vector<uint8_t> ck_data;
-    std::vector<uint8_t> ck_dft;
+    hbuf ck_data;
+    hbuf ck_dft;
     std::vector<uint8_t> ck_spec;
     double  peer_ms = 0.0;
 };
@@ -552,7 +634,7 @@ stage_result & own_result() {
 }
 
 // the recurrent rows of layers [il_lo, il_hi) of seq_id, into a buffer that keeps its capacity
-void snapshot_partial(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, std::vector<uint8_t> & out) {
+void snapshot_partial(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, hbuf & out) {
     out.resize(llama_state_seq_get_size_layers_ext(ctx, seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
     out.resize(llama_state_seq_get_data_layers_ext(ctx, out.data(), out.size(), seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 }
@@ -646,7 +728,7 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     common_batch batch(ctx_tgt);
     bool ok = true;
     int64_t i_msg = 0;
-    static std::vector<uint8_t> head_ck; // this node's layers' recurrent rows before the ubatch at n_ckpt
+    static hbuf head_ck; // this node's layers' recurrent rows before the ubatch at n_ckpt
     head_ck.clear();
     double t_ck_ms = 0.0;
     for (int32_t off = 0; off < n_split && ok; ++i_msg) {
@@ -799,7 +881,7 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     // the whole partial state read back as the checkpoint, then the final recurrent rows restored
     if (n_ckpt > 0) {
         const double tc0 = now_ms();
-        static std::vector<uint8_t> final_rs;
+        static hbuf final_rs;
         bool have = !head_ck.empty();
         const stage_result * last = nullptr;
         for (size_t k = 0; k < n_stages; ++k) {
@@ -826,7 +908,7 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
                 ckpt->data_tgt.resize(llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 ckpt->data_tgt.resize(llama_state_seq_get_data_ext(ctx_tgt, ckpt->data_tgt.data(), ckpt->data_tgt.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 if (last) {
-                    ckpt->data_dft  = last->ck_dft;
+                    ckpt->data_dft  = last->ck_dft.to_vector();
                     ckpt->data_spec = last->ck_spec;
                 }
             } else {

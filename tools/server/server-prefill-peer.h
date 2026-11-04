@@ -74,10 +74,10 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
 // The peer: serves heads one connection at a time, forever (returns only on a socket setup error).
 void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);
 
-// At load, before any prompt: one n_ubatch-token ubatch through each layer range this server can serve as a peer or
-// send from as a head (LLAMA_PREFILL_PEER_WARM=lo:hi,... overrides; 0 = none), and the pinned receive slots, so the
-// first ubatch of a prompt costs no graph build, buffer growth or pinned allocation. cfg may be null (a peer with no
-// LLAMA_PREFILL_PEER of its own: default ranges).
+// At load, before any prompt (opt-in: LLAMA_PREFILL_PEER_WARM=1, or lo:hi,... for explicit ranges): one n_ubatch-token
+// ubatch through each layer range this server can serve as a peer or send from as a head, and the pinned receive
+// slots, so the first prompt after a start pays no graph build, buffer growth or pinned allocation (~1.2 s once).
+// cfg may be null (a peer with no LLAMA_PREFILL_PEER of its own: default ranges).
 void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cfg);
 
 // A serving server that is also a peer (LLAMA_PREFILL_PEER_SERVE=port): a thread accepts the heads' connections

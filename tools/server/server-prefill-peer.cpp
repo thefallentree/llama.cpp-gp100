@@ -111,6 +111,20 @@ void prefault(std::vector<uint8_t> & b, size_t n) {
     b.clear();
 }
 
+// a buffer whose size is only known after a prompt: grown once to the estimate for the longest prompt with 10% headroom,
+// so the estimate's drift between prompts never grows it again
+void grow_rx(std::vector<uint8_t> & b, size_t n_target) {
+    if (b.capacity() < n_target) {
+        prefault(b, (size_t) (n_target*1.1));
+    }
+}
+
+// the state of the longest prompt of ctx from the state of n tokens: the per-token part scaled to n_ctx, the constant
+// part (n_const bytes: the recurrent rows and the like) once
+size_t state_estimate(const llama_context * ctx, size_t n_bytes, size_t n_const, int32_t n) {
+    return n_bytes <= n_const ? n_bytes : (size_t) ((double) (n_bytes - n_const)/n*llama_n_ctx(ctx)) + n_const;
+}
+
 bool send_string(int fd, const std::string & s) {
     std::vector<uint8_t> b(s.begin(), s.end());
     return send_blob(fd, b);
@@ -531,6 +545,12 @@ std::vector<stage_result> & head_results() {
     return r;
 }
 
+// a peer's result buffers persist (pre-faulted) across prompts
+stage_result & own_result() {
+    static stage_result r;
+    return r;
+}
+
 // the recurrent rows of layers [il_lo, il_hi) of seq_id, into a buffer that keeps its capacity
 void snapshot_partial(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, std::vector<uint8_t> & out) {
     out.resize(llama_state_seq_get_size_layers_ext(ctx, seq_id, il_lo, il_hi, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
@@ -828,18 +848,17 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     stats.t_total_ms    = now_ms() - t0;
 
     // the receive buffers grow once to what the longest prompt of this context would need (its pages touched now,
-    // between prompts, not by the receive of the next one)
+    // between prompts, not by the receive of the next one): the drafter's part here, the layers' part at the warm-up
+    // (the estimate from a short prompt overshoots it: the state has a constant part beyond the recurrent rows)
     if (rxbuf_on()) {
-        const double n_max = (double) llama_n_ctx(ctx_tgt)*1.05/n_split;
         for (size_t k = 0; k < n_stages; ++k) {
             auto & r = results[k];
             const double tg0 = now_ms();
             const size_t c0 = r.data.capacity() + r.st_dft.capacity();
-            // the layers' part was estimated at the warm-up (within a few %): regrow it only when that is far off
-            if (r.data.capacity() < (size_t) (r.data.size()*n_max*0.8)) {
-                prefault(r.data, (size_t) (r.data.size()*n_max));
+            if (r.data.capacity() == 0) {
+                grow_rx(r.data, state_estimate(ctx_tgt, r.data.size(), r.ck_data.size(), n_split));
             }
-            prefault(r.st_dft, (size_t) (r.st_dft.size()*n_max));
+            grow_rx(r.st_dft, state_estimate(ctx_tgt, r.st_dft.size(), r.ck_dft.size(), n_split));
             if (r.data.capacity() + r.st_dft.capacity() != c0) {
                 LOG_WRN("prefill-peer: receive buffers of stage %zu grown to %.0f + %.0f MiB in %.0f ms\n", k, r.data.capacity()/1048576.0, r.st_dft.capacity()/1048576.0, now_ms() - tg0);
             }
@@ -984,7 +1003,7 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     });
 
     // this stage's result; its buffers keep their capacity across prompts (no page faults on the get)
-    static stage_result own;
+    stage_result & own = own_result();
     own.ck_data.clear();
     own.ck_dft.clear();
     own.ck_spec.clear();
@@ -1174,6 +1193,18 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     }
     LOG_WRN("prefill-peer: %d tokens done in %.0f ms (compute %.0f ms, checkpoint snapshot %.1f MiB in %.0f ms), own state %.1f MiB: get %.0f ms, sent to the head in %.0f ms (%.2f GB/s), last kernel -> sent %.0f ms (t=%" PRId64 ")\n",
             n_split, own.peer_ms, t_compute, (own.ck_data.size() + own.ck_dft.size())/1048576.0, t_ck, own_bytes/1048576.0, t_get, t_send, own_bytes/1e6/std::max(1.0, t_send), now_ms() - t_last, wall_ms());
+    // the drafter's buffer grows once to the longest prompt's (the layers' at the warm-up)
+    if (rxbuf_on()) {
+        const double tg0 = now_ms();
+        const size_t c0 = own.data.capacity() + own.st_dft.capacity();
+        if (own.data.capacity() == 0) {
+            grow_rx(own.data, state_estimate(ctx_tgt, own.data.size(), own.ck_data.size(), n_split));
+        }
+        grow_rx(own.st_dft, state_estimate(ctx_tgt, own.st_dft.size(), own.ck_dft.size(), n_split));
+        if (own.data.capacity() + own.st_dft.capacity() != c0) {
+            LOG_WRN("prefill-peer: own state buffers grown to %.0f + %.0f MiB in %.0f ms\n", own.data.capacity()/1048576.0, own.st_dft.capacity()/1048576.0, now_ms() - tg0);
+        }
+    }
 }
 
 } // namespace
@@ -1217,7 +1248,7 @@ void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cf
 
     const llama_token tok = llama_vocab_bos(llama_model_get_vocab(model)) >= 0 ? llama_vocab_bos(llama_model_get_vocab(model)) : 0;
     common_batch batch(ctx_tgt);
-    size_t est_rx = 0;
+    size_t est_rx = 0, est_own = 0;
     for (const auto & range : ranges) {
         const auto [lo, hi] = range;
         if (lo < 0 || lo >= n_layer || (hi >= 0 && hi <= lo)) {
@@ -1235,13 +1266,18 @@ void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cf
         }
         const int rc = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         llama_synchronize(ctx_tgt);
-        // a head's receive buffer for this stage: the state of the longest prompt (the per-token part scaled to n_ctx)
-        const size_t i_stage = &range - ranges.data();
-        if (rc == 0 && cfg && cfg->enabled() && i_stage < cfg->split_all.size() && rxbuf_on()) {
+        // the state of the longest prompt for this range (the per-token part scaled to n_ctx): what this node receives
+        // from a stage of its chain as a head (est_rx), or gets and sends as a peer (est_own)
+        if (rc == 0 && rxbuf_on()) {
             const int32_t hi_l = hi >= n_layer ? -1 : hi;
             const size_t s_all = llama_state_seq_get_size_layers(ctx_tgt, 0, lo, hi_l);
             const size_t s_rs  = llama_state_seq_get_size_layers_ext(ctx_tgt, 0, lo, hi_l, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            est_rx = std::max(est_rx, (size_t) ((double) (s_all - s_rs)/n_ubatch*llama_n_ctx(ctx_tgt)*1.05) + s_rs);
+            const size_t est   = (size_t) (state_estimate(ctx_tgt, s_all, s_rs, n_ubatch)*1.05);
+            const size_t i_stage = &range - ranges.data();
+            if (cfg && cfg->enabled() && i_stage < cfg->split_all.size()) {
+                est_rx = std::max(est_rx, est);
+            }
+            est_own = std::max(est_own, est);
         }
         llama_memory_clear(llama_get_memory(ctx_tgt), true);
         LOG_WRN("prefill-peer: warm-up of layers [%d, %d) with %d tokens: %.0f ms%s\n", lo, hi, n_ubatch, now_ms() - t1, rc == 0 ? "" : " FAILED");
@@ -1249,16 +1285,19 @@ void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cf
     llama_set_layer_range(ctx_tgt, 0, -1);
     llama_set_embeddings_nextn_slot(ctx_tgt, 0);
     llama_synchronize(ctx_tgt);
-    if (est_rx > 0) {
+    if (est_rx > 0 || est_own > 0) {
         const double t1 = now_ms();
         auto & results = head_results();
-        if (results.size() < cfg->split_all.size()) {
-            results.resize(cfg->split_all.size());
+        if (est_rx > 0) {
+            if (results.size() < cfg->split_all.size()) {
+                results.resize(cfg->split_all.size());
+            }
+            for (auto & r : results) {
+                prefault(r.data, est_rx);
+            }
         }
-        for (auto & r : results) {
-            prefault(r.data, est_rx);
-        }
-        LOG_WRN("prefill-peer: receive buffers of %zu stages pre-faulted to %.0f MiB in %.0f ms\n", results.size(), est_rx/1048576.0, now_ms() - t1);
+        prefault(own_result().data, est_own);
+        LOG_WRN("prefill-peer: state buffers pre-faulted: %zu receive buffers of %.0f MiB, the own one %.0f MiB, in %.0f ms\n", results.size(), est_rx/1048576.0, est_own/1048576.0, now_ms() - t1);
     }
     LOG_WRN("prefill-peer: warm-up done in %.0f ms\n", now_ms() - t0);
 }

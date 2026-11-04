@@ -1805,6 +1805,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
 
+    const int64_t t_alloc = ggml_time_us();
     // check if we can allocate enough memory for the new state
     try {
         state_data_tgt.resize(state_size_tgt);
@@ -1821,6 +1822,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    const int64_t t_ckpt = ggml_time_us();
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
@@ -1831,11 +1833,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
     });
+    if (getenv("LLAMA_SRV_TIMING") != nullptr && atoi(getenv("LLAMA_SRV_TIMING")) != 0) {
+        SRV_WRN("timing cache alloc: vectors %.1f ms (%.1f MiB), tokens+checkpoints copy %.1f ms (%zu ckpts, %.1f MiB)\n",
+                (t_ckpt - t_alloc) / 1e3, (state_size_tgt + state_size_dft) / (1024.0 * 1024.0), (ggml_time_us() - t_ckpt) / 1e3,
+                prompt.checkpoints.size(), checkpoints_size / (1024.0 * 1024.0));
+    }
 
     return &states.back();
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot) {
+    const int64_t t_load = ggml_time_us();
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1870,6 +1878,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        const int64_t t_set = ggml_time_us();
         {
             auto & data = it_best->data.main;
 
@@ -1883,6 +1892,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             data.clear();
             data.shrink_to_fit();
+        }
+        if (getenv("LLAMA_SRV_TIMING") != nullptr && atoi(getenv("LLAMA_SRV_TIMING")) != 0) {
+            SRV_WRN("timing cache load: lcp search %.1f set_tgt+free %.1f ms\n", (t_set - t_load) / 1e3, (ggml_time_us() - t_set) / 1e3);
         }
 
         {

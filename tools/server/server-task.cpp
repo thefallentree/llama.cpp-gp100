@@ -12,6 +12,8 @@
 #include "../../src/llama-ext.h" // staging API: llama_state_seq_*_range
 
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <sstream>
 
 //
@@ -1742,7 +1744,15 @@ static bool srv_cache_timing() {
 }
 
 server_state_pool::~server_state_pool() {
+    if (th.joinable()) {
+        th.join();
+    }
     for (auto & s : slabs) {
+        if (s.buf) {
+            ggml_backend_buffer_free(s.buf);
+        }
+    }
+    for (auto & s : pending) {
         if (s.buf) {
             ggml_backend_buffer_free(s.buf);
         }
@@ -1757,11 +1767,88 @@ size_t server_state_pool::capacity() const {
     return res;
 }
 
+bool server_state_pool::new_slab(size_t cap, slab & s) {
+    ggml_backend_buffer_t buf = nullptr;
+    if (buft != nullptr) {
+        buf = ggml_backend_buft_alloc_buffer(buft, cap);
+    }
+    if (buf == nullptr) {
+        buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), cap);
+    }
+    if (buf == nullptr) {
+        return false;
+    }
+    s.buf  = buf;
+    s.base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    s.cap  = cap;
+    s.free_blocks.clear();
+    s.free_blocks[0] = cap;
+    return true;
+}
+
+void server_state_pool::prealloc(size_t bytes) {
+    const int64_t t0 = ggml_time_us();
+    size_t n = 0;
+    while (capacity() < bytes) {
+        slab s;
+        if (!new_slab(slab_size, s)) {
+            break;
+        }
+        slabs.push_back(std::move(s));
+        n++;
+    }
+    SRV_INF("prompt cache: %zu state slabs of %.0f MiB allocated up front in %.0f ms\n", n, slab_size / (1024.0*1024.0), (ggml_time_us() - t0) / 1e3);
+}
+
+// a slab is pinned on a thread while the pool still has room, so a save seldom waits for cudaMallocHost (0.4 s per 512 MiB)
+void server_state_pool::prefetch() {
+    static const bool off = getenv("LLAMA_CACHE_SLAB_PREFETCH") != nullptr && atoi(getenv("LLAMA_CACHE_SLAB_PREFETCH")) == 0;
+    if (off || (limit > 0 && capacity() >= limit)) {
+        return;
+    }
+    size_t largest = 0;
+    for (const auto & s : slabs) {
+        for (const auto & [_, sz] : s.free_blocks) {
+            largest = std::max(largest, sz);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (prefetching || !pending.empty() || largest >= slab_size / 2) {
+            return;
+        }
+        prefetching = true;
+    }
+    if (th.joinable()) {
+        th.join();
+    }
+    th = std::thread([this]() {
+        const int64_t t0 = ggml_time_us();
+        slab s;
+        const bool ok = new_slab(slab_size, s);
+        std::lock_guard<std::mutex> lk(mtx);
+        if (ok) {
+            pending.push_back(std::move(s));
+        }
+        prefetching = false;
+        SRV_DBG("prompt cache: a %.0f MiB state slab pinned ahead in %.0f ms (%s)\n", slab_size / (1024.0*1024.0), (ggml_time_us() - t0) / 1e3, ok ? "ok" : "failed");
+    });
+}
+
 uint8_t * server_state_pool::alloc(size_t n, int32_t & slab_out) {
     n = round(n);
     slab_out = -1;
     if (n == 0) {
         return nullptr;
+    }
+
+    // slabs pinned ahead join the pool
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (auto & s : pending) {
+            slabs.push_back(std::move(s));
+        }
+        pending.clear();
     }
 
     // first fit over the slabs
@@ -1777,31 +1864,34 @@ uint8_t * server_state_pool::alloc(size_t n, int32_t & slab_out) {
                 }
                 n_used  += n;
                 slab_out = (int32_t) si;
+                prefetch();
                 return s.base + off;
             }
         }
     }
 
-    // a new slab (pinned through the device's host buffer type, plain when there is none or it fails)
-    static const size_t slab_env = getenv("LLAMA_CACHE_SLAB_MIB") != nullptr ? (size_t) atoll(getenv("LLAMA_CACHE_SLAB_MIB")) << 20 : 0;
-    const size_t cap = std::max(slab_env > 0 ? slab_env : slab_size, n);
+    // a new slab (pinned through the device's host buffer type, plain when there is none or it fails); a prefetch in
+    // flight is waited for first
+    if (th.joinable()) {
+        th.join();
+        std::lock_guard<std::mutex> lk(mtx);
+        if (!pending.empty()) {
+            for (auto & s : pending) {
+                slabs.push_back(std::move(s));
+            }
+            pending.clear();
+            return alloc(n, slab_out);
+        }
+    }
+
+    const size_t cap = std::max(slab_size, n);
 
     const int64_t t0 = ggml_time_us();
-    ggml_backend_buffer_t buf = nullptr;
-    if (buft != nullptr) {
-        buf = ggml_backend_buft_alloc_buffer(buft, cap);
-    }
-    if (buf == nullptr) {
-        buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), cap);
-    }
-    if (buf == nullptr) {
+    slab s;
+    if (!new_slab(cap, s)) {
         return nullptr;
     }
-
-    slab s;
-    s.buf  = buf;
-    s.base = (uint8_t *) ggml_backend_buffer_get_base(buf);
-    s.cap  = cap;
+    s.free_blocks.clear();
     if (cap > n) {
         s.free_blocks[n] = cap - n;
     }
@@ -1812,6 +1902,7 @@ uint8_t * server_state_pool::alloc(size_t n, int32_t & slab_out) {
     SRV_WRN("prompt cache: allocated a %.1f MiB state slab in %.0f ms (%zu slabs, %.1f MiB, %.1f MiB in use)\n",
             cap / (1024.0*1024.0), (ggml_time_us() - t0) / 1e3, slabs.size(), capacity() / (1024.0*1024.0), n_used / (1024.0*1024.0));
 
+    prefetch();
     return slabs.back().base;
 }
 
@@ -1978,26 +2069,39 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
 
     // the entry's segments that still hold valid cells: [p0, min(p1, lcp)); a segment with too many cells past the
     // common prefix, or a short tail, is re-saved with the new cells
-    std::vector<server_state_seg> kept;
+    size_t n_keep = 0;
     if (e != nullptr) {
-        for (auto & seg : e->data.segs) {
+        const llama_pos n_prev = e->prompt.n_tokens();
+        for (const auto & seg : e->data.segs) {
             if (seg.p0 >= lcp) {
                 break;
             }
-            kept.push_back(std::move(seg));
+            n_keep++;
         }
-        e->data.segs.clear();
-        if (!kept.empty()) {
-            const auto & last = kept.back();
-            const llama_pos n_prev = e->prompt.n_tokens();
+        if (n_keep > 0) {
+            const auto & last = e->data.segs[n_keep - 1];
             const int64_t n_seg   = (int64_t) std::min<llama_pos>(last.p1, n_prev) - last.p0;
             const int64_t n_stale = (int64_t) std::min<llama_pos>(last.p1, n_prev) - lcp;
             if (n_stale > std::max<int64_t>(seg_min, n_seg / 4)) {
-                kept.pop_back();
-            } else if (last.p1 <= lcp && n_seg < seg_min) {
-                kept.pop_back();
+                n_keep--;
+            } else if (last.p1 <= lcp && n_seg < seg_min && n_keep > 1) {
+                n_keep--;
             }
         }
+        // nothing of the entry survives (the slot kept its cells, the new prompt shares only a short prefix: the
+        // other conversation of a --parallel 1 node): the entry stays as it is, this prompt gets one of its own
+        if (n_keep == 0) {
+            e->owner = -1;
+            e = nullptr;
+            *origin = nullptr;
+        }
+    }
+    std::vector<server_state_seg> kept;
+    if (e != nullptr) {
+        for (size_t i = 0; i < n_keep; ++i) {
+            kept.push_back(std::move(e->data.segs[i]));
+        }
+        e->data.segs.clear();
     }
     const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept.back().p1, lcp);
 

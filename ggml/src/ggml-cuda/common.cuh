@@ -1523,6 +1523,7 @@ struct ggml_cuda_cold_prefetch {
     // ops copy pieces ahead (a decode step must never fill the ring: its graphs have no cold op to consume them, and
     // the ring would be refilled every step)
     bool         in_ubatch = false;
+    int          ub_start  = 0;           // where in the sequence the current ubatch started
     // statistics (printed at free)
     int64_t      n_own_graphs = 0, n_ahead_graphs = 0, n_resync = 0, n_relearn = 0, n_trunc = 0, n_oos = 0, n_pieces = 0;
 };

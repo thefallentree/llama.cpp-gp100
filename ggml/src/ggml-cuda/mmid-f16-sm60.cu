@@ -1310,7 +1310,7 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
             need = std::max(need, cold_piece_of(n).bytes);
         }
     }
-    if (pf.ops.empty() && (pf.seq_issued >= (int) pf.seq.size() || pf.cap == 0)) {
+    if (pf.ops.empty() && (!pf.in_ubatch || pf.seq_issued >= (int) pf.seq.size() || pf.cap == 0)) {
         return false;
     }
     ggml_cuda_set_device(ctx.device);
@@ -1366,6 +1366,9 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
     }
     // the graph's ops against the sequence: in place, or resynchronized (an ubatch boundary, a changed graph), or learned
     if (!pf.ops.empty()) {
+        pf.in_ubatch = true;
+        pf.n_own_graphs++;
+        pf.n_pieces += (int64_t) pf.ops.size();
         pf.ntok = pf.ops[0]->ne[2];
         const ggml_cuda_cold_prefetch::piece first = cold_piece_of(pf.ops[0]);
         bool in_place = pf.seq_pos < (int) pf.seq.size() && pf.seq[pf.seq_pos] == first;
@@ -1376,9 +1379,11 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
             }
             if (j < (int) pf.seq.size()) {
                 pf.seq_pos = j;               // the sequence starts over (next ubatch) or skipped
+                pf.n_resync++;
             } else if (pf.seq_pos < (int) pf.seq.size()) {
                 pf.seq.clear();               // an op the sequence does not know mid-way: a changed graph, learn it again
                 pf.seq_pos = 0;
+                pf.n_relearn++;
             }
             cold_ring_reset(pf);
         }
@@ -1412,6 +1417,9 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
         pf.budget = (int) pf.slots.size();
     }
     pf.active = !pf.ops.empty() || (pf.n_filled < (int) pf.slots.size() && pf.seq_issued < (int) pf.seq.size());
+    if (pf.active && pf.ops.empty()) {
+        pf.n_ahead_graphs++;
+    }
     return pf.active;
 }
 
@@ -1475,6 +1483,7 @@ bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // the ring holds something else (a graph that changed under the sequence): drop it, re-learn from here and copy
         // this graph's remaining pieces now (their slots' last readers in this graph gate the copies)
         static int n_warn = 0;
+        pf.n_oos++;
         if (n_warn++ < 4) {
             GGML_LOG_WARN("%s: dev%d cold-expert prefetch ring out of sequence at piece %d of %d: copying per op\n", __func__,
                           ctx.device, pf.seq_pos, (int) pf.seq.size());
@@ -1530,6 +1539,19 @@ void ggml_cuda_cold_prefetch_sync(ggml_backend_cuda_context & ctx, const bool in
     if (invalidate && pf.n_filled > 0) {
         cold_ring_reset(pf);
     }
+    if (pf.in_ubatch) {
+        // the ubatch ended: the sequence is one ubatch's piece order. A ubatch that ends mid-sequence (a shorter layer
+        // range than the one learned: the load-time warm-up runs several ranges, a pipeline head runs its first
+        // layers) cuts it there, or the next ubatch's resynchronization would land on an earlier copy of its
+        // first piece inside the concatenated ranges and leave seq_pos mid-sequence after it (then every decode step
+        // refilled the ring: 3 x 63 MiB per step, +17 ms; PP8_PROGRESS.md)
+        if (pf.seq_pos > 0 && pf.seq_pos < (int) pf.seq.size()) {
+            pf.seq.resize(pf.seq_pos);
+            pf.n_trunc++;
+        }
+        cold_ring_reset(pf);
+        pf.in_ubatch = false;
+    }
     if (pf.check != nullptr && pf.n_checked > 0) {
         int bad = 0;
         ggml_cuda_set_device(ctx.device);
@@ -1544,6 +1566,11 @@ void ggml_cuda_cold_prefetch_sync(ggml_backend_cuda_context & ctx, const bool in
 
 void ggml_cuda_cold_prefetch_free(ggml_backend_cuda_context & ctx) {
     ggml_cuda_cold_prefetch & pf = ctx.cold_pf;
+    if (pf.n_own_graphs > 0) {
+        GGML_LOG_WARN("cold-prefetch: dev%d graphs with cold ops %lld (%lld pieces), copy-ahead graphs %lld, resync %lld, relearn %lld, truncate %lld, out-of-sequence %lld, sequence %d\n",
+                      ctx.device, (long long) pf.n_own_graphs, (long long) pf.n_pieces, (long long) pf.n_ahead_graphs, (long long) pf.n_resync,
+                      (long long) pf.n_relearn, (long long) pf.n_trunc, (long long) pf.n_oos, (int) pf.seq.size());
+    }
     if (pf.copy != nullptr) {
         cudaStreamSynchronize(pf.copy);
     }

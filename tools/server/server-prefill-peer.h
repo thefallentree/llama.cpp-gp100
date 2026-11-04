@@ -10,6 +10,11 @@
 // state and the drafter's pending row; the head writes them into its own memories and decodes the rest of the prompt
 // as usual.
 //
+// Protocol 4: the tail of the prompt goes through the pipeline too (all but the last 4 tokens); the hello carries the
+// position n_ckpt of the context checkpoint the local path makes before its last n_ubatch tokens, every stage snapshots
+// its layers' recurrent rows (the last one also the drafter) before the ubatch that starts there and returns the
+// snapshot with its result, and the head assembles the checkpoint from them.
+//
 // Protocol 3: the hello carries the head's result endpoint (an ephemeral listener and a token); every stage returns its
 // part of the state straight to the head as soon as it is done (the middle stages while the last one still computes),
 // the chain passes only an OK / error status back. The residual rows are sent from the context's double-buffered nextn
@@ -27,6 +32,16 @@
 #include <vector>
 
 struct common_speculative;
+
+// the context checkpoint at n_tokens the head assembles from the stages' snapshots (empty data_tgt: none)
+struct prefill_peer_ckpt {
+    int32_t   n_tokens = 0;
+    llama_pos pos_min  = 0;
+    llama_pos pos_max  = 0;
+    std::vector<uint8_t> data_tgt;
+    std::vector<uint8_t> data_dft;
+    std::vector<uint8_t> data_spec;
+};
 
 struct prefill_peer_stats {
     double t_total_ms   = 0.0; // the whole split part on the head
@@ -66,10 +81,12 @@ struct prefill_peer_config {
 // The head: decodes tokens [0, n_split) of seq_id with the peer. The memories of seq_id must be empty on entry and the
 // tokens plain text. On success the target and drafter memories hold the sequence up to n_split as if it had been
 // decoded here; on failure seq_id is removed from both memories again and the caller decodes the prompt locally.
+// n_ckpt > 0: the ubatches are cut at n_ckpt and ckpt receives the state at that position (partial: the recurrent rows,
+// the drafter's partial state and the drafter's pending rows), as a checkpoint made there before the local decode would.
 bool prefill_peer_run(const prefill_peer_config & cfg,
                       llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
                       llama_seq_id seq_id, const llama_token * tokens, int32_t n_split, int32_t n_ubatch,
-                      prefill_peer_stats & stats);
+                      int32_t n_ckpt, prefill_peer_ckpt * ckpt, prefill_peer_stats & stats);
 
 // The peer: serves heads one connection at a time, forever (returns only on a socket setup error).
 void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);

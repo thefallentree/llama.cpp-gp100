@@ -149,6 +149,14 @@ LLAMA_API size_t llama_state_seq_get_size_layers(struct llama_context * ctx, lla
 LLAMA_API size_t llama_state_seq_get_data_layers(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi);
 LLAMA_API size_t llama_state_seq_set_data_layers(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi);
 
+// The same restricted by flags (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY: the recurrent rows of those layers only). A set with
+// LLAMA_STATE_SEQ_FLAGS_ADOPT_POS takes the saved recurrent position instead of requiring the sequence's own: the head of
+// a pipelined prefill assembles a context checkpoint at an earlier position from the stages' snapshots this way.
+#define LLAMA_STATE_SEQ_FLAGS_ADOPT_POS 256
+LLAMA_API size_t llama_state_seq_get_size_layers_ext(struct llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags);
+LLAMA_API size_t llama_state_seq_get_data_layers_ext(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags);
+LLAMA_API size_t llama_state_seq_set_data_layers_ext(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

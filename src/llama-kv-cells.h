@@ -239,6 +239,33 @@ public:
         used.erase(i);
     }
 
+    // remove seq_id from every cell that carries it (M2: a conversation switch drops 100K+ cells; per-cell removal
+    // costs a log-time set erase each); returns the lowest cell that became empty, or size() when none did
+    uint32_t seq_rm_all(llama_seq_id seq_id) {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        uint32_t new_head = (uint32_t) pos.size();
+
+        for (const auto & [p, i] : seq_pos[seq_id]) {
+            GGML_UNUSED(p);
+            seq[i].reset(seq_id);
+
+            if (seq[i].none()) {
+                pos[i] = -1;
+                ext[i].reset();
+                shift[i] = 0;
+
+                used.erase(i);
+
+                new_head = std::min(new_head, i);
+            }
+        }
+
+        seq_pos[seq_id].clear();
+
+        return new_head;
+    }
+
     // note: call only if the cell has seq_id
     // return true if the cell becomes empty
     bool seq_rm(uint32_t i, llama_seq_id seq_id) {

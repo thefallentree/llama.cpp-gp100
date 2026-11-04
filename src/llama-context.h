@@ -90,6 +90,8 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    // the nextn output slots that llama_set_embeddings_nextn_slot can switch between (1 = no double buffer)
+    int32_t get_embeddings_nextn_slots() const;
 
     float * get_embeddings_layer_inp(uint32_t lid);
 

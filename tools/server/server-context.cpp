@@ -353,6 +353,8 @@ struct server_slot {
             return false;
         }
 
+        common_speculative_catchup_join(spec); // the draft context may still catch up on the last prompt batch
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -378,6 +380,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        common_speculative_catchup_join(spec);
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -1105,6 +1108,11 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // WP10: prompt batches of at least this many tokens hand their drafter catch-up to the speculative context's thread
+    // (LLAMA_SPEC_CATCHUP_MIN, default 256; smaller batches are decode rounds, whose catch-up is deferred anyway)
+    int32_t catchup_min_tokens = getenv("LLAMA_SPEC_CATCHUP_MIN") != nullptr ? atoi(getenv("LLAMA_SPEC_CATCHUP_MIN")) : 256;
+    bool    catchup_async      = false; // set per decode() call
 
     // launch-ahead of the verification window (llama_decode_prepare): with one slot generating, the drafter's hook
     // prepares the target's decode of the sampled token and n_draft_max placeholders while the draft still runs;
@@ -2904,6 +2912,7 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        common_speculative_catchup_join(spec.get()); // the checkpoint takes the draft context's state
         auto & cur = ckpt_new(slot, slot.prompt.n_tokens() - n_tokens_cur);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
@@ -2925,6 +2934,7 @@ private:
     // the checkpoint a pipelined prefill assembled at ck.n_tokens (server-prefill-peer.h): what create_checkpoint would
     // have made there before the local decode of the prompt's last n_ubatch tokens
     void adopt_checkpoint(server_slot & slot, prefill_peer_ckpt & ck) {
+        common_speculative_catchup_join(spec.get());
         auto & cur = ckpt_new(slot, ck.n_tokens);
         cur.update_pos(ck.n_tokens, ck.pos_min, ck.pos_max);
         cur.data_tgt.swap(ck.data_tgt);
@@ -3052,6 +3062,7 @@ private:
         }
         // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
         if (ctx_dft != nullptr && !checkpoints.empty() && !checkpoints.back().data_dft.empty()) {
+            common_speculative_catchup_join(spec.get());
             const bool ok = checkpoints.back().load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
             if (!ok) {
@@ -3077,6 +3088,7 @@ private:
         std::vector<uint8_t> data_dft;
         std::vector<uint8_t> data_spec;
         if (ctx_dft != nullptr) {
+            common_speculative_catchup_join(spec.get());
             data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
             llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
@@ -3131,6 +3143,7 @@ private:
             return 0;
         }
         if (!data_dft.empty()) {
+            common_speculative_catchup_join(spec.get());
             if (ctx_dft == nullptr ||
                 llama_state_seq_set_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != data_dft.size()) {
                 if (ctx_dft != nullptr) {
@@ -4503,6 +4516,7 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
+                                        common_speculative_catchup_join(spec.get());
                                         if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
                                             !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                                             if (it->id_task != -1) {
@@ -4652,6 +4666,7 @@ private:
                             }
                             prefill_peer_stats pst;
                             prefill_peer_ckpt  pck;
+                            common_speculative_catchup_join(spec.get());
                             if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_split, n_ubatch,
                                                  want_ckpt ? n_ckpt : -1, &pck, pst)) {
                                 for (int32_t i = 0; i < n_split; ++i) {
@@ -5012,6 +5027,10 @@ private:
                 toks[i] = i < n_view ? batch.tokens[i].token : toks[i - 1];
             }
             spec_ahead.active = false;
+            catchup_async     = false; // the commit's rows go through the sync path
+            if (spec) {
+                common_speculative_catchup_join(spec.get());
+            }
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_decode_commit(ctx_tgt, toks.data(), toks.size());
                 if (ret == 0 && has_output) {
@@ -5031,6 +5050,30 @@ private:
                 throw std::runtime_error("the prepared decode failed");
             }
         } else {
+            // WP10: the drafter's catch-up of a prompt batch runs on its own thread while this batch computes; it reads
+            // the target's nextn rows from the slot the previous batch wrote, so this batch writes the other slot and
+            // waits only for the catch-up of the batch before that (the slot it overwrites). Anything else joins.
+            catchup_async = spec && common_speculative_catchup_async(spec.get()) && batch.view.size() >= catchup_min_tokens &&
+                            batch.view.has_token() && !batch.view.has_embd();
+            if (spec) {
+                bool ok = true;
+                if (catchup_async) {
+                    const int32_t n_slots = llama_get_embeddings_nextn_slots(ctx_tgt);
+                    const int64_t j       = common_speculative_catchup_next(spec.get());
+                    if (n_slots >= 2) {
+                        ok = common_speculative_catchup_wait(spec.get(), j - n_slots);
+                        llama_set_embeddings_nextn_slot(ctx_tgt, (int32_t) (j % n_slots));
+                    } else {
+                        ok = common_speculative_catchup_join(spec.get());
+                    }
+                } else {
+                    ok = common_speculative_catchup_join(spec.get());
+                }
+                if (!ok) {
+                    SRV_ERR("%s", "the drafter's catch-up failed\n");
+                    throw std::runtime_error("failed to process speculative batch");
+                }
+            }
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
                 if (ret == 0 && has_output) {
@@ -5098,7 +5141,13 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
+                if (catchup_async) {
+                    // the rows are on the host once the target is synchronized (llama_get_embeddings_nextn does that)
+                    const float * h = llama_get_embeddings_nextn(ctx_tgt);
+                    ok = common_speculative_process_async(spec.get(), batch.view, h) >= 0;
+                } else {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                }
             });
 
             if (!ok) {

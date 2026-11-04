@@ -181,6 +181,9 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// the number of unmasked nextn output slots (llama_set_embeddings_nextn_slot): 1 when the rows are not double-buffered
+LLAMA_API int32_t llama_get_embeddings_nextn_slots(const struct llama_context * ctx);
+
 // DeepSeek-V4.1 exact long-prompt layer skip. Tells the context that the prompt of seq_id ends at pos_end (the position
 // after its last token): a ubatch of that sequence that has no output and lies wholly before pos_end minus the returned
 // number of rows only runs the layers up to the last compressed-stream source (and of that one only what it publishes

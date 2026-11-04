@@ -1045,9 +1045,10 @@ void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cf
     const int n_ubatch = llama_n_ubatch(ctx_tgt);
     const int64_t width = llama_model_n_embd_out(model);
 
-    // LLAMA_PREFILL_PEER_WARM=lo:hi,... (0 = none); default: every layer range this server can serve or send from
+    // LLAMA_PREFILL_PEER_WARM=lo:hi,... or 1 = every layer range this server can serve or send from
     std::vector<std::pair<int, int>> ranges;
-    if (const char * w = getenv("LLAMA_PREFILL_PEER_WARM")) {
+    const char * w = getenv("LLAMA_PREFILL_PEER_WARM");
+    if (w != nullptr && strchr(w, ':') != nullptr) {
         for (const auto & item : string_split<std::string>(w, ',')) {
             const auto colon = item.find(':');
             if (colon != std::string::npos) {

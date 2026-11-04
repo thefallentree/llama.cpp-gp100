@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "../../src/llama-ext.h" // staging API: llama_state_seq_*_range
 
 #include <cstring>
 #include <sstream>
@@ -1734,103 +1735,148 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
-bool server_state_buf::alloc(ggml_backend_buffer_type_t buft, size_t c) {
+
+static bool srv_cache_timing() {
+    static const bool v = getenv("LLAMA_SRV_TIMING") != nullptr && atoi(getenv("LLAMA_SRV_TIMING")) != 0;
+    return v;
+}
+
+server_state_pool::~server_state_pool() {
+    for (auto & s : slabs) {
+        if (s.buf) {
+            ggml_backend_buffer_free(s.buf);
+        }
+    }
+}
+
+size_t server_state_pool::capacity() const {
+    size_t res = 0;
+    for (const auto & s : slabs) {
+        res += s.cap;
+    }
+    return res;
+}
+
+uint8_t * server_state_pool::alloc(size_t n, int32_t & slab_out) {
+    n = round(n);
+    slab_out = -1;
+    if (n == 0) {
+        return nullptr;
+    }
+
+    // first fit over the slabs
+    for (size_t si = 0; si < slabs.size(); ++si) {
+        auto & s = slabs[si];
+        for (auto it = s.free_blocks.begin(); it != s.free_blocks.end(); ++it) {
+            if (it->second >= n) {
+                const size_t off  = it->first;
+                const size_t rest = it->second - n;
+                s.free_blocks.erase(it);
+                if (rest > 0) {
+                    s.free_blocks[off + n] = rest;
+                }
+                n_used  += n;
+                slab_out = (int32_t) si;
+                return s.base + off;
+            }
+        }
+    }
+
+    // a new slab (pinned through the device's host buffer type, plain when there is none or it fails)
+    static const size_t slab_env = getenv("LLAMA_CACHE_SLAB_MIB") != nullptr ? (size_t) atoll(getenv("LLAMA_CACHE_SLAB_MIB")) << 20 : 0;
+    const size_t cap = std::max(slab_env > 0 ? slab_env : slab_size, n);
+
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_buffer_t buf = nullptr;
+    if (buft != nullptr) {
+        buf = ggml_backend_buft_alloc_buffer(buft, cap);
+    }
+    if (buf == nullptr) {
+        buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), cap);
+    }
+    if (buf == nullptr) {
+        return nullptr;
+    }
+
+    slab s;
+    s.buf  = buf;
+    s.base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    s.cap  = cap;
+    if (cap > n) {
+        s.free_blocks[n] = cap - n;
+    }
+    slabs.push_back(std::move(s));
+    n_used  += n;
+    slab_out = (int32_t) slabs.size() - 1;
+
+    SRV_WRN("prompt cache: allocated a %.1f MiB state slab in %.0f ms (%zu slabs, %.1f MiB, %.1f MiB in use)\n",
+            cap / (1024.0*1024.0), (ggml_time_us() - t0) / 1e3, slabs.size(), capacity() / (1024.0*1024.0), n_used / (1024.0*1024.0));
+
+    return slabs.back().base;
+}
+
+void server_state_pool::free(int32_t slab, uint8_t * p, size_t n) {
+    n = round(n);
+    if (slab < 0 || p == nullptr || n == 0) {
+        return;
+    }
+    GGML_ASSERT((size_t) slab < slabs.size());
+    auto & s = slabs[slab];
+    GGML_ASSERT(p >= s.base && p + n <= s.base + s.cap);
+
+    size_t off = p - s.base;
+    n_used -= n;
+
+    // coalesce with the neighbours
+    auto next = s.free_blocks.lower_bound(off);
+    if (next != s.free_blocks.end() && next->first == off + n) {
+        n += next->second;
+        s.free_blocks.erase(next);
+    }
+    if (!s.free_blocks.empty()) {
+        auto prev = s.free_blocks.lower_bound(off);
+        if (prev != s.free_blocks.begin()) {
+            --prev;
+            if (prev->first + prev->second == off) {
+                off = prev->first;
+                n  += prev->second;
+                s.free_blocks.erase(prev);
+            }
+        }
+    }
+    s.free_blocks[off] = n;
+}
+
+bool server_state_buf::alloc(server_state_pool & pl, size_t c) {
+    if (c <= cap && pool == &pl) {
+        n = c;
+        return true;
+    }
     release();
     if (c == 0) {
         return true;
     }
-    if (buft != nullptr) {
-        buf = ggml_backend_buft_alloc_buffer(buft, c);
-    }
-    if (buf == nullptr) {
-        buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), c);
-    }
-    if (buf == nullptr) {
+    int32_t si = -1;
+    uint8_t * q = pl.alloc(c, si);
+    if (q == nullptr) {
         return false;
     }
-    p   = (uint8_t *) ggml_backend_buffer_get_base(buf);
-    cap = c;
-    n   = 0;
+    pool = &pl;
+    slab = si;
+    p    = q;
+    cap  = c;
+    n    = c;
     return true;
 }
 
 void server_state_buf::release() {
-    if (buf != nullptr) {
-        ggml_backend_buffer_free(buf);
+    if (pool != nullptr && p != nullptr) {
+        pool->free(slab, p, cap);
     }
-    buf = nullptr;
-    p   = nullptr;
-    n   = cap = 0;
-}
-
-// LLAMA_CACHE_POOL=0: the old behaviour for measurements - a fresh zero-filled plain buffer per save, freed at the load
-static bool cache_pool_on() {
-    static const bool on = getenv("LLAMA_CACHE_POOL") == nullptr || atoi(getenv("LLAMA_CACHE_POOL")) != 0;
-    return on;
-}
-
-bool server_prompt_cache::pool_get(server_state_buf & b, size_t n) {
-    b.release();
-    if (n == 0) {
-        return true;
-    }
-    if (!cache_pool_on()) {
-        if (!b.alloc(nullptr, n)) {
-            return false;
-        }
-        memset(b.data(), 0, n);
-        b.resize(n);
-        return true;
-    }
-    // the smallest pooled buffer that fits
-    size_t best = pool.size();
-    for (size_t i = 0; i < pool.size(); ++i) {
-        if (pool[i].capacity() >= n && (best == pool.size() || pool[i].capacity() < pool[best].capacity())) {
-            best = i;
-        }
-    }
-    if (best < pool.size()) {
-        b = std::move(pool[best]);
-        pool.erase(pool.begin() + best);
-        b.resize(n);
-        return true;
-    }
-    // 1/8 headroom: a conversation grows by a few hundred tokens per turn, the next save fits again
-    const int64_t t0 = ggml_time_us();
-    if (!b.alloc(host_buft, n + n/8)) {
-        return false;
-    }
-    b.resize(n);
-    SRV_WRN("prompt cache: allocated a %.1f MiB state buffer in %.0f ms (pool %zu buffers, %.1f MiB)\n",
-            b.capacity() / (1024.0*1024.0), (ggml_time_us() - t0) / 1e3, pool.size(), pool_size() / (1024.0*1024.0));
-    return true;
-}
-
-void server_prompt_cache::pool_put(server_state_buf && b) {
-    if (b.capacity() == 0 || !cache_pool_on()) {
-        b.release();
-        return;
-    }
-    b.clear();
-    pool.push_back(std::move(b));
-    // bounded: the pool keeps the buffers of at most two loaded prompts (main + draft each = 4); the smallest leave first
-    while (pool.size() > 4) {
-        size_t victim = 0;
-        for (size_t i = 1; i < pool.size(); ++i) {
-            if (pool[i].capacity() < pool[victim].capacity()) {
-                victim = i;
-            }
-        }
-        pool.erase(pool.begin() + victim);
-    }
-}
-
-size_t server_prompt_cache::pool_size() const {
-    size_t res = 0;
-    for (const auto & b : pool) {
-        res += b.capacity();
-    }
-    return res;
+    pool = nullptr;
+    slab = -1;
+    p    = nullptr;
+    n    = cap = 0;
 }
 
 size_t server_prompt_cache::size() const {
@@ -1853,29 +1899,152 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, bool move_checkpoints) {
-    // first check if the current state is contained fully in the cache
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::evictable() {
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->owner < 0) {
+            return it;
+        }
+    }
+    return states.end();
+}
+
+void server_prompt_cache::release(server_prompt_cache_state * e) {
+    if (e != nullptr) {
+        e->owner = -1;
+    }
+}
+
+// LLAMA_CACHE_DELTA=0: every save is a new full entry (measurement switch)
+static bool cache_delta_on() {
+    static const bool on = getenv("LLAMA_CACHE_DELTA") == nullptr || atoi(getenv("LLAMA_CACHE_DELTA")) != 0;
+    return on;
+}
+
+server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state ** origin, bool move_checkpoints) {
+    const int64_t t0 = ggml_time_us();
+    const int32_t n = (int32_t) prompt.tokens.size();
+
+    // a segment holds at most LLAMA_CACHE_SEG cells; a tail shorter than LLAMA_CACHE_SEG_MIN is re-saved with the next
+    // delta instead of starting a new segment (a conversation of a hundred small turns stays a few dozen segments)
+    static const int32_t seg_max = getenv("LLAMA_CACHE_SEG")     != nullptr ? std::max(1024, atoi(getenv("LLAMA_CACHE_SEG")))    : 16384;
+    static const int32_t seg_min = getenv("LLAMA_CACHE_SEG_MIN") != nullptr ? std::max(0,    atoi(getenv("LLAMA_CACHE_SEG_MIN"))) : 4096;
+
+    server_prompt_cache_state * e = (*origin != nullptr && (*origin)->owner == id_slot) ? *origin : nullptr;
+    if (!cache_delta_on() && e != nullptr) {
+        // the old behaviour: the previous entry of the conversation goes, a full one is made
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (&*it == e) {
+                states.erase(it);
+                break;
+            }
+        }
+        e = nullptr;
+        *origin = nullptr;
+    }
+    if (e == nullptr) {
+        *origin = nullptr;
+    }
+
+    const int lcp = e != nullptr ? e->prompt.tokens.get_common_prefix(prompt.tokens) : 0;
+
+    // nothing new since the entry was saved: the checkpoints go back in, that is all
+    if (e != nullptr && lcp == n && e->prompt.n_tokens() == n) {
+        if (move_checkpoints) {
+            e->prompt.checkpoints = std::move(prompt.checkpoints);
+            prompt.checkpoints.clear();
+        } else {
+            e->prompt.checkpoints = prompt.checkpoints;
+        }
+        SRV_DBG("prompt cache: entry of slot %d unchanged (%d tokens), checkpoints back\n", id_slot, n);
+        return e;
+    }
+
+    // first check if the current state is contained fully in another entry of the cache
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (&*it == e) {
+            continue;
+        }
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cur_lcp_len == n) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            if (e != nullptr) {
+                e->owner = -1;
+                *origin = nullptr;
+            }
             return nullptr;
         }
     }
+
+    // the entry's segments that still hold valid cells: [p0, min(p1, lcp)); a segment with too many cells past the
+    // common prefix, or a short tail, is re-saved with the new cells
+    std::vector<server_state_seg> kept;
+    if (e != nullptr) {
+        for (auto & seg : e->data.segs) {
+            if (seg.p0 >= lcp) {
+                break;
+            }
+            kept.push_back(std::move(seg));
+        }
+        e->data.segs.clear();
+        if (!kept.empty()) {
+            const auto & last = kept.back();
+            const llama_pos n_prev = e->prompt.n_tokens();
+            const int64_t n_seg   = (int64_t) std::min<llama_pos>(last.p1, n_prev) - last.p0;
+            const int64_t n_stale = (int64_t) std::min<llama_pos>(last.p1, n_prev) - lcp;
+            if (n_stale > std::max<int64_t>(seg_min, n_seg / 4)) {
+                kept.pop_back();
+            } else if (last.p1 <= lcp && n_seg < seg_min) {
+                kept.pop_back();
+            }
+        }
+    }
+    const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept.back().p1, lcp);
+
+    // the new segments: [keep_end, n) in chunks of seg_max, the last one open-ended (cells past n go with it)
+    struct chunk { llama_pos a, b; size_t sz_tgt, sz_dft; };
+    std::vector<chunk> chunks;
+    for (llama_pos a = keep_end; a < n; a += seg_max) {
+        const llama_pos b = (a + seg_max >= n) ? INT32_MAX : a + seg_max;
+        chunks.push_back({a, b, 0, 0});
+    }
+    if (chunks.empty()) {
+        // n == keep_end: the tail was trimmed only; one open-ended chunk for whatever cells sit past it
+        chunks.push_back({keep_end, INT32_MAX, 0, 0});
+    }
+
+    size_t state_size_new = 0;
+    for (auto & c : chunks) {
+        c.sz_tgt = llama_state_seq_get_size_range(ctx_tgt, id_slot, c.a, c.b);
+        c.sz_dft = ctx_dft ? llama_state_seq_get_size_range(ctx_dft, id_slot, c.a, c.b) : 0;
+        state_size_new += c.sz_tgt + c.sz_dft;
+    }
+    const size_t sz_recr = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    state_size_new += sz_recr;
 
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
         checkpoints_size += ckpt.size();
     }
+    state_size_new += checkpoints_size;
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    size_t size_kept = 0;
+    for (const auto & seg : kept) {
+        size_kept += seg.size();
+    }
+
+    const int64_t t1 = ggml_time_us();
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (limit_size > 0 && state_size_new + size_kept > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+                (state_size_new + size_kept) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        if (e != nullptr) {
+            e->data.segs = std::move(kept);
+            e->owner = -1;
+            *origin = nullptr;
+        }
         return nullptr;
     }
 
@@ -1883,7 +2052,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (&*it != e && it->owner < 0 && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1893,22 +2062,35 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
     }
 
     if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
+        // make room before allocating the new buffers to avoid breaching the limit
+        while (size() + state_size_new > limit_size) {
+            auto it = evictable();
+            if (it == states.end()) {
+                break;
+            }
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+                    it->size() / (1024.0 * 1024.0));
+            states.erase(it);
         }
     }
 
-    server_state_buf state_data_tgt;
-    server_state_buf state_data_dft;
+    if (e == nullptr) {
+        states.push_back({});
+        e = &states.back();
+    }
+    e->owner = id_slot;
+    e->data.segs = std::move(kept);
 
-    const int64_t t_alloc = ggml_time_us();
-    // check if we can allocate enough memory for the new state
-    if (!pool_get(state_data_tgt, state_size_tgt) || !pool_get(state_data_dft, state_size_dft)) {
+    auto fail = [&]() {
         SRV_ERR("%s", "failed to allocate memory for prompt cache state\n");
+
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (&*it == e) {
+                states.erase(it);
+                break;
+            }
+        }
+        *origin = nullptr;
 
         limit_size = std::max<size_t>(1, 0.4*size());
 
@@ -1916,37 +2098,66 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
 
         update();
 
-        return nullptr;
+        return (server_prompt_cache_state *) nullptr;
+    };
+
+    const int64_t t2 = ggml_time_us();
+    size_t n_saved = 0;
+    for (const auto & c : chunks) {
+        server_state_seg seg;
+        seg.p0 = c.a;
+        seg.p1 = c.b;
+        if (!seg.main.alloc(pool, c.sz_tgt) || !seg.drft.alloc(pool, c.sz_dft)) {
+            return fail();
+        }
+        if (c.sz_tgt > 0 && llama_state_seq_get_data_range(ctx_tgt, seg.main.data(), c.sz_tgt, id_slot, c.a, c.b) != c.sz_tgt) {
+            SRV_ERR("%s", "failed to save the target state\n");
+            return fail();
+        }
+        if (c.sz_dft > 0 && llama_state_seq_get_data_range(ctx_dft, seg.drft.data(), c.sz_dft, id_slot, c.a, c.b) != c.sz_dft) {
+            SRV_ERR("%s", "failed to save the draft state\n");
+            return fail();
+        }
+        n_saved += seg.size();
+        e->data.segs.push_back(std::move(seg));
+    }
+    const int64_t t3 = ggml_time_us();
+
+    if (!e->data.recr.alloc(pool, sz_recr)) {
+        return fail();
+    }
+    if (sz_recr > 0 && llama_state_seq_get_data_ext(ctx_tgt, e->data.recr.data(), sz_recr, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != sz_recr) {
+        SRV_ERR("%s", "failed to save the recurrent state\n");
+        return fail();
+    }
+    const int64_t t4 = ggml_time_us();
+
+    // the drafter's deferred boundary, if it keeps one (restored together with the contexts)
+    e->data.spec.clear();
+    if (spec) {
+        common_speculative_get_state(spec, id_slot, e->data.spec);
     }
 
-    const int64_t t_ckpt = ggml_time_us();
-    std::list<common_prompt_checkpoint> checkpoints;
+    e->prompt.tokens = prompt.tokens.clone();
     if (move_checkpoints) {
-        checkpoints = std::move(prompt.checkpoints);
+        e->prompt.checkpoints = std::move(prompt.checkpoints);
         prompt.checkpoints.clear();
     } else {
-        checkpoints = prompt.checkpoints;
+        e->prompt.checkpoints = prompt.checkpoints;
     }
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ std::move(checkpoints),
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-    });
-    if (getenv("LLAMA_SRV_TIMING") != nullptr && atoi(getenv("LLAMA_SRV_TIMING")) != 0) {
-        SRV_WRN("timing cache alloc: buffers %.1f ms (%.1f MiB), tokens + checkpoints %s %.1f ms (%zu ckpts, %.1f MiB)\n",
-                (t_ckpt - t_alloc) / 1e3, (state_size_tgt + state_size_dft) / (1024.0 * 1024.0), move_checkpoints ? "move" : "copy",
-                (ggml_time_us() - t_ckpt) / 1e3, states.back().prompt.checkpoints.size(), checkpoints_size / (1024.0 * 1024.0));
+    *origin = e;
+
+    if (srv_cache_timing()) {
+        SRV_WRN("timing cache save: slot %d n_tokens %d lcp %d kept %zu segs (to %d) new %zu segs: sizes %.1f alloc %.1f segs %.1f (%.1f MiB) recr %.1f (%.1f MiB) rest %.1f ms (cache %zu prompts, %.1f MiB, pool %.1f MiB)\n",
+                id_slot, n, lcp, e->data.segs.size() - chunks.size(), keep_end, chunks.size(), (t1 - t0) / 1e3, (t2 - t1) / 1e3,
+                (t3 - t2) / 1e3, n_saved / (1024.0 * 1024.0), (t4 - t3) / 1e3, sz_recr / (1024.0 * 1024.0), (ggml_time_us() - t4) / 1e3,
+                states.size(), size() / (1024.0 * 1024.0), pool.capacity() / (1024.0 * 1024.0));
     }
 
-    return &states.back();
+    return e;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state * saved) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state * saved, server_prompt_cache_state ** origin) {
     const int64_t t_load = ggml_time_us();
     int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1959,6 +2170,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        // an entry another slot holds is in use there
+        if (it->owner >= 0 && it->owner != id_slot) {
+            continue;
+        }
+
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1980,73 +2196,101 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
-        const int64_t t_set = ggml_time_us();
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            pool_put(std::move(data));
+    if (it_best == states.end()) {
+        if (saved != nullptr) {
+            // the slot keeps its prompt and cells: the checkpoints save() moved into the entry come back (the prompt
+            // reuse erases the ones past the common prefix; a recurrent model needs the earlier ones); the entry stays
+            // the slot's, so the next save is a delta again
+            prompt.checkpoints = std::move(saved->prompt.checkpoints);
+            saved->prompt.checkpoints.clear();
+            saved->owner = id_slot;
+            *origin = saved;
+            SRV_DBG("prompt cache: the slot keeps its prompt (%d of %d tokens shared), %zu checkpoints back\n",
+                    lcp_best, (int) prompt.tokens.size(), prompt.checkpoints.size());
         }
-        if (getenv("LLAMA_SRV_TIMING") != nullptr && atoi(getenv("LLAMA_SRV_TIMING")) != 0) {
-            SRV_WRN("timing cache load: lcp search %.1f set_tgt+free %.1f ms\n", (t_set - t_load) / 1e3, (ggml_time_us() - t_set) / 1e3);
+        return true;
+    }
+
+    auto & e = *it_best;
+    SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+    SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+
+    // the whole cached prompt is a prefix of the new one
+    if (lcp_best == (int) it_best->prompt.tokens.size()) {
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+    }
+
+    auto fail = [&](const char * what) {
+        SRV_ERR("failed to restore the cached prompt: %s\n", what);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
         }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                pool_put(std::move(data));
-            }
+        if (saved != nullptr && saved != &e) {
+            saved->owner = -1;
         }
-
-        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
-
-        // the whole cached prompt is a prefix of the new one
-        if (lcp_best == (int) it_best->prompt.tokens.size()) {
-            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
-        }
-
-        // the drafter's state belongs to the restored prompt too; an empty state clears what the previous prompt left
-        if (spec) {
-            common_speculative_set_state(spec, id_slot, it_best->data.spec);
-        }
-
-        prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
-    } else if (saved != nullptr && prompt.checkpoints.empty()) {
-        // the slot keeps its prompt: the checkpoints alloc() moved into saved come back as far as the new prompt shares
-        // them (the prompt reuse erases the ones past the common prefix; a recurrent model needs the earlier ones)
-        const int64_t t0 = ggml_time_us();
-        size_t n_back = 0;
-        for (const auto & ckpt : saved->prompt.checkpoints) {
-            if (ckpt.n_tokens <= lcp_best) {
-                prompt.checkpoints.push_back(ckpt);
-                n_back++;
+        *origin = nullptr;
+        return false;
+    };
+
+    const int64_t t_set = ggml_time_us();
+
+    // the slot's cells go (the ones of a just-saved prompt stay as ghost cells for its next restore), the segments
+    // come in order: a segment's cells past the next one's start are the stale tail of an earlier turn
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+    if (ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+    }
+
+    const int32_t n_e = e.prompt.n_tokens();
+    for (size_t i = 0; i < e.data.segs.size(); ++i) {
+        auto & seg = e.data.segs[i];
+
+        if (!seg.main.empty() && llama_state_seq_set_data_range(ctx_tgt, seg.main.data(), seg.main.size(), id_slot) != seg.main.size()) {
+            return fail("target segment");
+        }
+        if (!seg.drft.empty()) {
+            GGML_ASSERT(ctx_dft);
+            if (llama_state_seq_set_data_range(ctx_dft, seg.drft.data(), seg.drft.size(), id_slot) != seg.drft.size()) {
+                return fail("draft segment");
             }
         }
-        SRV_WRN("prompt cache: the slot keeps its prompt (%d of %d tokens shared), %zu of %zu checkpoints copied back in %.0f ms\n",
-                lcp_best, (int) prompt.tokens.size(), n_back, saved->prompt.checkpoints.size(), (ggml_time_us() - t0) / 1e3);
+
+        const llama_pos next_p0 = i + 1 < e.data.segs.size() ? e.data.segs[i + 1].p0 : n_e;
+        if (seg.p1 > next_p0) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, next_p0, -1);
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, next_p0, -1);
+            }
+        }
+    }
+    const int64_t t_recr = ggml_time_us();
+
+    if (!e.data.recr.empty() && llama_state_seq_set_data_ext(ctx_tgt, e.data.recr.data(), e.data.recr.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != e.data.recr.size()) {
+        return fail("recurrent state");
+    }
+
+    // the drafter's state belongs to the restored prompt too; an empty state clears what the previous prompt left
+    if (spec) {
+        common_speculative_set_state(spec, id_slot, e.data.spec);
+    }
+
+    prompt.tokens      = e.prompt.tokens.clone();
+    prompt.checkpoints = std::move(e.prompt.checkpoints);
+    e.prompt.checkpoints.clear();
+
+    if (saved != nullptr && saved != &e) {
+        saved->owner = -1;
+    }
+    e.owner = id_slot;
+    *origin = &e;
+
+    if (srv_cache_timing()) {
+        SRV_WRN("timing cache load: slot %d n_tokens %d: lcp search %.1f segs %zu %.1f recr %.1f ms (%.1f MiB)\n", id_slot, n_e,
+                (t_set - t_load) / 1e3, e.data.segs.size(), (t_recr - t_set) / 1e3, (ggml_time_us() - t_recr) / 1e3, e.size() / (1024.0 * 1024.0));
     }
 
     return true;
@@ -2054,10 +2298,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+        while (size() > limit_size) {
+            auto it = evictable();
+            if (it == states.end()) {
+                break;
+            }
+            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            states.erase(it);
         }
     }
 
@@ -2068,11 +2316,15 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
+        while (n_tokens() > limit_tokens_cur) {
+            auto it = evictable();
+            if (it == states.end()) {
+                break;
+            }
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, it->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            states.erase(it);
         }
     }
 

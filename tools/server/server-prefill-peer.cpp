@@ -629,12 +629,14 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     static std::vector<uint8_t> head_ck; // this node's layers' recurrent rows before the ubatch at n_ckpt
     head_ck.clear();
     double t_ck_ms = 0.0;
-    for (int32_t off = 0; off < n_split && ok; off += n_chunk, ++i_msg) {
+    for (int32_t off = 0; off < n_split && ok; ++i_msg) {
         // the messages are cut at n_ckpt, so the stages see one ubatch that starts there (the local path's last one)
         const int32_t n = std::min(n_chunk, (n_ckpt > off ? n_ckpt : n_split) - off);
+        const int32_t pos0 = off;
+        off += n;
         batch.clear();
         for (int32_t i = 0; i < n; ++i) {
-            batch.add(tokens[off + i], off + i, seq_id, false);
+            batch.add(tokens[pos0 + i], pos0 + i, seq_id, false);
         }
         // the slot this ubatch writes was read by the sender n_slots messages ago: wait for that send
         const double tw0 = now_ms();
@@ -643,7 +645,7 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
             break;
         }
         stats.t_wait_ms += now_ms() - tw0;
-        if (off == n_ckpt) {
+        if (pos0 == n_ckpt) {
             const double tc0 = now_ms();
             snapshot_partial(ctx_tgt, seq_id, 0, split, head_ck);
             t_ck_ms += now_ms() - tc0;
@@ -664,7 +666,7 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
             LOG_WRN("prefill-peer: first ubatch out after %.0f ms (t=%" PRId64 ")\n", now_ms() - t0, wall_ms());
         }
         ubatch_msg msg;
-        msg.pos0 = off;
+        msg.pos0 = pos0;
         msg.n    = n;
         msg.h    = h;
         ok = snd.push(msg);

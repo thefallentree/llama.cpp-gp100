@@ -711,15 +711,43 @@ struct server_prompt {
     }
 };
 
-// a state buffer of the prompt cache: pinned host memory when the model has a GPU (the device's host buffer type:
-// cudaMallocHost, so the per-layer copies of llama_state_seq_get/set_data run as DMAs instead of staged pageable
-// copies), plain memory otherwise; no zero fill, and the pages stay mapped: a buffer that served a loaded prompt goes
-// back to the cache's pool and the next save reuses it (a fresh 1.2 GB std::vector cost ~2 s of page faults per switch)
+// M2: the host prompt cache keeps a conversation as the segments of its attention cells (position ranges, saved once:
+// a later save of the same conversation appends only the new cells) plus its recurrent state (fixed size, refreshed at
+// every save) in pinned host memory from a slab pool (a few big cudaMallocHost allocations, first-fit, never freed: the
+// one-off pinning of a bigger buffer cost 0.2-2.5 s and happened 39 times in an hour). The llama side keeps the cells
+// of a saved segment in the GPU cache as ghost cells, so restoring the conversation that was just switched out copies
+// nothing (llama_state_seq_set_data_range).
+
+// pinned (the GPU's host buffer type) or plain slabs with a first-fit free list per slab
+struct server_state_pool {
+    ggml_backend_buffer_type_t buft = nullptr;
+    size_t slab_size = 512ull*1024*1024;
+
+    struct slab {
+        ggml_backend_buffer_t buf = nullptr;
+        uint8_t * base = nullptr;
+        size_t    cap  = 0;
+        std::map<size_t, size_t> free_blocks; // offset -> size, coalesced
+    };
+    std::vector<slab> slabs;
+    size_t n_used = 0;
+
+    ~server_state_pool();
+
+    // n bytes (rounded up to 256); the slab index in slab_out; nullptr when no memory could be had
+    uint8_t * alloc(size_t n, int32_t & slab_out);
+    void      free(int32_t slab, uint8_t * p, size_t n);
+    size_t    capacity() const;
+
+    static size_t round(size_t n) { return (n + 255) & ~(size_t) 255; }
+};
+
 struct server_state_buf {
-    uint8_t *             p   = nullptr;
-    size_t                n   = 0;
-    size_t                cap = 0;
-    ggml_backend_buffer_t buf = nullptr;
+    server_state_pool * pool = nullptr;
+    int32_t   slab = -1;
+    uint8_t * p    = nullptr;
+    size_t    n    = 0;
+    size_t    cap  = 0;
 
     server_state_buf() = default;
     server_state_buf(const server_state_buf &) = delete;
@@ -728,8 +756,8 @@ struct server_state_buf {
     server_state_buf & operator=(server_state_buf && o) noexcept {
         if (this != &o) {
             release();
-            p = o.p; n = o.n; cap = o.cap; buf = o.buf;
-            o.p = nullptr; o.n = o.cap = 0; o.buf = nullptr;
+            pool = o.pool; slab = o.slab; p = o.p; n = o.n; cap = o.cap;
+            o.pool = nullptr; o.slab = -1; o.p = nullptr; o.n = o.cap = 0;
         }
         return *this;
     }
@@ -742,26 +770,46 @@ struct server_state_buf {
     bool            empty()    const { return n == 0; }
     void            clear()          { n = 0; }
 
-    // allocate cap bytes from buft (nullptr = plain memory); false when no memory could be had
-    bool alloc(ggml_backend_buffer_type_t buft, size_t c);
-    // the size within the capacity
+    // a buffer of c bytes from the pool (reused in place when the capacity already fits); false when no memory could be had
+    bool alloc(server_state_pool & pool, size_t c);
     void resize(size_t m) { GGML_ASSERT(m <= cap); n = m; }
     void release();
 };
 
-struct server_prompt_data {
-    server_state_buf     main;
-    server_state_buf     drft;
-    std::vector<uint8_t> spec; // the drafter's per-sequence state (e.g. the deferred boundary), empty = none
+// the attention cells with positions [p0, p1) of the target (and of the drafter, when there is one)
+struct server_state_seg {
+    llama_pos p0 = 0;
+    llama_pos p1 = 0;
+
+    server_state_buf main;
+    server_state_buf drft;
 
     size_t size() const {
-        return main.size() + drft.size() + spec.size();
+        return main.size() + drft.size();
+    }
+};
+
+struct server_prompt_data {
+    std::vector<server_state_seg> segs; // in position order, tiling [0, n_tokens) (the last one may reach past it)
+    server_state_buf recr;              // the target's recurrent state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+    std::vector<uint8_t> spec;          // the drafter's per-sequence state (e.g. the deferred boundary), empty = none
+
+    size_t size() const {
+        size_t res = recr.size() + spec.size();
+        for (const auto & seg : segs) {
+            res += seg.size();
+        }
+        return res;
     }
 };
 
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+
+    // the slot whose prompt this entry is (loaded into it, or saved from it and still held): its next save appends
+    // the new cells only; an owned entry is neither evicted nor loaded into another slot
+    int32_t owner = -1;
 
     size_t size() const {
         size_t res = data.size();
@@ -779,21 +827,12 @@ struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, ggml_backend_buffer_type_t host_buft = nullptr) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
-        this->host_buft    = host_buft;
+        this->pool.buft    = host_buft;
     }
 
     std::list<server_prompt_cache_state> states;
 
-    ggml_backend_buffer_type_t host_buft = nullptr;
-
-    // the state buffers of loaded prompts, reused by the next saves (bounded: see pool_put)
-    std::vector<server_state_buf> pool;
-
-    // a buffer of at least n bytes: the best fit from the pool, else a new one (with headroom, so a growing
-    // conversation does not allocate at every save); false when no memory could be had
-    bool pool_get(server_state_buf & b, size_t n);
-    void pool_put(server_state_buf && b);
-    size_t pool_size() const;
+    server_state_pool pool;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -805,16 +844,25 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    // move_checkpoints: the slot's checkpoints move into the new entry instead of being copied (the slot's prompt is
-    // replaced by load() or, when load() keeps it, gets back the checkpoints that still apply - see load())
-    server_prompt_cache_state * alloc(server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool move_checkpoints = false);
+    // save the slot's prompt: onto the entry it owns (*origin: the new cells only, the recurrent state refreshed), else
+    // as a new entry. The slot's checkpoints move into the entry (move_checkpoints) or are copied. Returns the entry
+    // (now owned by the slot) or nullptr when nothing was saved (already cached, over the limit, no memory); *origin
+    // follows.
+    server_prompt_cache_state * save(server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state ** origin, bool move_checkpoints);
 
-    // saved: the entry alloc() just made from the slot's prompt (nullptr = none); when no better cached prompt is found
-    // the slot keeps its prompt and gets copies of saved's checkpoints up to the common prefix with tokens_new (the
-    // later ones would be erased by the prompt reuse anyway)
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state * saved = nullptr);
+    // restore the cached prompt that best matches tokens_new into the slot (its current cells are removed first), or
+    // keep the slot's prompt when none is better: then the checkpoints of saved (the entry save() just made from it)
+    // come back. *origin = the entry the slot's prompt is now.
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state * saved, server_prompt_cache_state ** origin);
+
+    // the slot no longer holds the entry's cells (prompt_clear)
+    void release(server_prompt_cache_state * e);
 
     void update();
+
+private:
+    // the oldest entry no slot owns, states.end() when every entry is owned
+    std::list<server_prompt_cache_state>::iterator evictable();
 };
 
 // used exclusively by router mode

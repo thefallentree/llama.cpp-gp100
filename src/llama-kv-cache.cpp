@@ -7,6 +7,7 @@
 #include "fn-prof.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -145,6 +146,18 @@ llama_kv_cache::llama_kv_cache(
     v_cells.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
+    }
+
+    // M2: ghost cells (see ghost_t); a cache that shares cells with another one keeps none
+    {
+        const char * e = getenv("LLAMA_KV_GHOSTS");
+        ghost_max = other ? 0 : (e != nullptr ? atoi(e) : 64);
+        ghost_max = std::max(0, ghost_max);
+        if (ghost_max > 0) {
+            ghosts.resize(ghost_max);
+            cell_ghost.assign((size_t) n_stream*kv_size, -1);
+            n_ghost_cells.assign(n_stream, 0);
+        }
     }
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -451,6 +464,8 @@ void llama_kv_cache::clear(bool data) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
+
+    ghost_drop_all();
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -922,6 +937,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
     auto * sched = lctx->get_sched();
 
+    if (!sc_info.empty() || do_shift) {
+        // cell data is rewritten in place: no ghost survives
+        ghost_drop_all();
+    }
+
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
 
@@ -1099,20 +1119,29 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
-
-        // if we have enough unused cells before the current head ->
-        //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
-            head_cur = 0;
-        }
+        const uint32_t strm = seq_to_stream[seq_id];
 
         if (n_tokens > cells.size()) {
             LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
             return { };
         }
 
+        // ghost cells (free, but holding the data of a saved state) are handed out last: when the search fails
+        // without them the oldest ghost of the stream is retired and the search runs again
+        const int32_t * cg = cell_ghost.empty() ? nullptr : cell_ghost.data() + (size_t) strm*cells.size();
+
+      search_again:
+        uint32_t head_cur = v_heads[strm];
+
+        // if we have enough unused cells before the current head ->
+        //   better to start searching from the beginning of the cache, hoping to fill it
+        if (head_cur > cells.get_used() + (cg ? n_ghost_cells[strm] : 0) + 2*n_tokens) {
+            head_cur = 0;
+        }
+
         uint32_t n_tested = 0;
+
+        res.idxs[s].clear();
 
         // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
         // for non-continuous slots, we test the tokens one by one
@@ -1140,7 +1169,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
                 //    - mask SWA, using current max pos for that sequence in the cache
                 //                always insert in the cell with minimum pos
-                bool can_use = cells.is_empty(idx);
+                bool can_use = cells.is_empty(idx) && (cg == nullptr || cg[idx] < 0);
 
                 if (!can_use && cells.seq_count(idx) == 1) {
                     const llama_pos pos_cell = cells.pos_get(idx);
@@ -1179,6 +1208,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
 
             if (n_tested >= cells.size()) {
+                if (cg != nullptr && ghost_evict_oldest(strm)) {
+                    goto search_again;
+                }
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -1244,6 +1276,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             auto & cells = v_cells[sinfo.strm[s]];
 
             const auto idx = sinfo.idxs[s][ii];
+
+            ghost_touch(sinfo.strm[s], idx);
 
             if (!cells.is_empty(idx)) {
                 assert(cells.seq_count(idx) == 1);
@@ -2349,6 +2383,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && g_state_layer_filter.in_range(cells.pos_get(i));
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
@@ -2388,9 +2423,28 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             continue;
         }
 
+        // the ghost id of this blob (see ghost_t); the layer-filtered states of the prefill peers keep their format
+        if (state_with_ghost(flags)) {
+            uint64_t gid = 0;
+            if (ghost_max > 0 && !io.is_dummy()) {
+                gid = ghost_next++;
+                ghost_record(s, cr, gid);
+            }
+            io.write(&gid, sizeof(gid));
+        }
+
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }
+}
+
+bool llama_kv_cache::state_with_ghost(llama_state_seq_flags flags) const {
+    return !g_state_layer_filter.active && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+}
+
+static bool state_timing() {
+    static const bool v = getenv("LLAMA_STATE_TIMING") != nullptr && atoi(getenv("LLAMA_STATE_TIMING")) != 0;
+    return v;
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -2449,15 +2503,36 @@ const slot_info_vec_t *   sinfos_in) {
 
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
+        uint64_t gid = 0;
+        if (state_with_ghost(flags)) {
+            io.read(&gid, sizeof(gid));
+        }
+
         slot_info sinfo;
 
-        bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        const int64_t t0 = ggml_time_us();
+        bool ghost_hit = false;
 
+        bool res = true;
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, gid, &ghost_hit);
+
+        const int64_t t1 = ggml_time_us();
         try {
-            res = res && state_read_data(io, strm, cell_count, sinfo);
+            res = res && state_read_data(io, strm, cell_count, sinfo, ghost_hit);
         } catch (...) {
             res = false;
+        }
+        if (state_timing()) {
+            uint32_t n_runs = 0;
+            if (!sinfo.empty()) {
+                for (size_t i = 1; i < sinfo.idxs[0].size(); ++i) {
+                    n_runs += sinfo.idxs[0][i] != sinfo.idxs[0][i - 1] + 1;
+                }
+                n_runs += !sinfo.idxs[0].empty();
+            }
+            LLAMA_LOG_WARN("kv-state read %s: strm %u cells %u runs %u ghost %s meta %.1f data-queue %.1f ms\n",
+                    layers.empty() ? "-" : ggml_get_name(layers[0].k), strm, cell_count, n_runs,
+                    gid == 0 ? "none" : ghost_hit ? "HIT" : "miss", (t1 - t0)/1e3, (ggml_time_us() - t1)/1e3);
         }
 
         if (!res) {
@@ -2614,9 +2689,13 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, uint64_t ghost_id, bool * ghost_hit) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
+
+    if (ghost_hit) {
+        *ghost_hit = false;
+    }
 
     if (dest_seq_id != -1 && g_state_layer_filter.data_only) {
         // layer data only (llama_state_seq_set_data_layers): the saved cells must be the ones the sequence holds, in
@@ -2669,7 +2748,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        seq_rm(dest_seq_id, -1, -1);
+        // a range state appends its cells to what the sequence holds
+        if (!g_state_layer_filter.range_active) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2721,7 +2803,33 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             ubatch.seq_id[i]   = &dest_seq_id;
         }
 
-        if (sinfo_in) {
+        // the blob's ghost: its cells, still free and still holding its data, take the tokens back without a copy
+        int32_t g = ghost_id != 0 ? ghost_find(ghost_id, strm) : -1;
+        if (g >= 0) {
+            const auto & gi = ghosts[g].idxs;
+            bool ok = gi.size() == cell_count;
+            if (ok && sinfo_in) {
+                // a mirrored cache must land on the mirrored layout
+                ok = !sinfo_in->empty() && sinfo_in->n_stream() == 1 && sinfo_in->idxs[0] == gi;
+            }
+            for (uint32_t i = 0; ok && i < cell_count; ++i) {
+                ok = cells.is_empty(gi[i]);
+            }
+            if (!ok) {
+                g = -1;
+            }
+        }
+
+        if (g >= 0) {
+            sinfo.s0 = strm;
+            sinfo.s1 = strm;
+            sinfo.resize(1);
+            sinfo.strm[0] = strm;
+            sinfo.idxs[0] = ghosts[g].idxs;
+            if (ghost_hit) {
+                *ghost_hit = true;
+            }
+        } else if (sinfo_in) {
             // this cache mirrors another one, so it takes that cache's layout instead of searching for its own cells
             if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count) {
                 LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
@@ -2757,7 +2865,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+        ghost_restoring = g;
         apply_ubatch(sinfo, ubatch);
+        ghost_restoring = -1;
 
         // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
         // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
@@ -2836,8 +2946,17 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
-bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, bool skip_data) {
     auto & cells = v_cells[strm];
+
+    // a ghost hit: the cells hold the data already, the stream is only walked
+    auto read_tensor = [&](ggml_tensor * t, size_t off, size_t size) {
+        if (skip_data) {
+            io.skip_tensor(size);
+        } else {
+            io.read_tensor(t, off, size);
+        }
+    };
 
     // batch the scatter reads per contiguous run of destination indices
     // from inclusive, to exclusive - same convention as cell_ranges_t
@@ -2922,7 +3041,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         for (const auto & r : runs) {
-            io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
+            read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
         }
     }
 
@@ -2959,7 +3078,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             }
 
             for (const auto & r : runs) {
-                io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
+                read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
             }
         }
     } else {
@@ -3006,7 +3125,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                 for (const auto & r : runs) {
                     const size_t dst_offset = ((size_t) r.from + j * cells.size()) * v_size_el;
-                    io.read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
+                    read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
                 }
             }
         }
@@ -3043,6 +3162,169 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id) {
     state_clear(seq_id, strm, sinfo);
 }
 
+//
+// M2: ghost cells
+//
+
+void llama_kv_cache::ghost_record(uint32_t strm, const cell_ranges_t & cr, uint64_t id) const {
+    // a free slot, else the oldest ghost goes
+    int32_t g = -1;
+    for (int32_t i = 0; i < ghost_max; ++i) {
+        if (ghosts[i].id == 0) {
+            g = i;
+            break;
+        }
+    }
+    if (g < 0) {
+        g = 0;
+        for (int32_t i = 1; i < ghost_max; ++i) {
+            if (ghosts[i].seq < ghosts[g].seq) {
+                g = i;
+            }
+        }
+        ghost_drop(g);
+    }
+
+    auto & gh = ghosts[g];
+    gh.id   = id;
+    gh.seq  = ++ghost_seq;
+    gh.strm = strm;
+    gh.idxs.clear();
+    for (const auto & range : cr.data) {
+        for (uint32_t i = range.first; i < range.second; ++i) {
+            gh.idxs.push_back(i);
+        }
+    }
+
+    // a cell belongs to its newest ghost (the data it holds now)
+    int32_t * cg = cell_ghost.data() + (size_t) strm*v_cells[strm].size();
+    for (const uint32_t i : gh.idxs) {
+        if (cg[i] >= 0 && cg[i] != g) {
+            // the older ghost no longer describes this cell
+            ghost_drop(cg[i]);
+        }
+        cg[i] = g;
+    }
+    n_ghost_cells[strm] += (uint32_t) gh.idxs.size();
+}
+
+int32_t llama_kv_cache::ghost_find(uint64_t id, uint32_t strm) const {
+    for (int32_t i = 0; i < ghost_max; ++i) {
+        if (ghosts[i].id == id && ghosts[i].strm == strm) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool llama_kv_cache::ghost_valid(uint64_t id) const {
+    for (int32_t i = 0; i < ghost_max; ++i) {
+        if (ghosts[i].id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_kv_cache::ghost_drop(int32_t g) const {
+    auto & gh = ghosts[g];
+    if (gh.id == 0) {
+        return;
+    }
+    int32_t * cg = cell_ghost.data() + (size_t) gh.strm*v_cells[gh.strm].size();
+    uint32_t n = 0;
+    for (const uint32_t i : gh.idxs) {
+        if (cg[i] == g) {
+            cg[i] = -1;
+            n++;
+        }
+    }
+    n_ghost_cells[gh.strm] -= n;
+    gh.id = 0;
+    gh.idxs.clear();
+}
+
+void llama_kv_cache::ghost_drop_all() const {
+    for (int32_t i = 0; i < ghost_max; ++i) {
+        ghost_drop(i);
+    }
+}
+
+bool llama_kv_cache::ghost_evict_oldest(uint32_t strm) const {
+    int32_t g = -1;
+    for (int32_t i = 0; i < ghost_max; ++i) {
+        if (ghosts[i].id != 0 && ghosts[i].strm == strm && (g < 0 || ghosts[i].seq < ghosts[g].seq)) {
+            g = i;
+        }
+    }
+    if (g < 0) {
+        return false;
+    }
+    LLAMA_LOG_DEBUG("%s: retiring ghost %" PRIu64 " (%zu cells) for new tokens\n", __func__, ghosts[g].id, ghosts[g].idxs.size());
+    ghost_drop(g);
+    return true;
+}
+
+//
+// M2: K rows of every layer as a state section (the indexer's pooled-key table)
+//
+
+size_t llama_kv_cache::k_row_size(int32_t il_cache) const {
+    const auto & layer = layers[il_cache];
+    return ggml_row_size(layer.k->type, hparams.n_embd_k_gqa(layer.il));
+}
+
+void llama_kv_cache::state_write_rows(llama_io_write_i & io, uint32_t strm, uint32_t row0, uint32_t n) const {
+    const uint32_t n_layer = layers.size();
+    io.write(&n_layer, sizeof(n_layer));
+    io.write(&n, sizeof(n));
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        auto * k = layers[il].k_stream[strm];
+        const uint64_t row_size = k_row_size(il);
+        io.write(&row_size, sizeof(row_size));
+        GGML_ASSERT((row0 + n) * row_size <= ggml_nbytes(k));
+        if (n > 0) {
+            io.write_tensor(k, (size_t) row0 * row_size, (size_t) n * row_size);
+        }
+    }
+}
+
+bool llama_kv_cache::state_read_rows(llama_io_read_i & io, uint32_t strm, uint32_t row0, uint32_t n) {
+    uint32_t n_layer_ref, n_ref;
+    io.read(&n_layer_ref, sizeof(n_layer_ref));
+    io.read(&n_ref, sizeof(n_ref));
+    if (n_layer_ref != layers.size() || n_ref != n) {
+        LLAMA_LOG_ERROR("%s: rows section mismatch (%u layers, %u rows; expected %zu, %u)\n", __func__, n_layer_ref, n_ref, layers.size(), n);
+        return false;
+    }
+    for (uint32_t il = 0; il < n_layer_ref; ++il) {
+        auto * k = layers[il].k_stream[strm];
+        uint64_t row_size_ref;
+        io.read(&row_size_ref, sizeof(row_size_ref));
+        if (row_size_ref != k_row_size(il)) {
+            LLAMA_LOG_ERROR("%s: row size mismatch (layer %u)\n", __func__, il);
+            return false;
+        }
+        if ((row0 + n) * row_size_ref > ggml_nbytes(k)) {
+            LLAMA_LOG_ERROR("%s: rows [%u, %u) exceed the table\n", __func__, row0, row0 + n);
+            return false;
+        }
+        if (n > 0) {
+            io.read_tensor(k, (size_t) row0 * row_size_ref, (size_t) n * row_size_ref);
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::set_rows_host(uint32_t strm, int32_t il_cache, uint32_t row0, uint32_t n, const void * data) {
+    auto * k = layers[il_cache].k_stream[strm];
+    const size_t row_size = k_row_size(il_cache);
+    GGML_ASSERT((row0 + n) * row_size <= ggml_nbytes(k));
+    if (n > 0) {
+        ggml_backend_tensor_set(k, data, (size_t) row0 * row_size, (size_t) n * row_size);
+    }
+}
+
 // the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
 void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo) {
     if (seq_id == -1) {
@@ -3060,6 +3342,10 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     const auto & cells = v_cells[strm];
 
     const uint32_t cell_count = sinfo.size();
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        ghost_touch(strm, sinfo.idxs[0][i]);
+    }
 
     const bool is_contiguous = sinfo.is_contiguous();
 

@@ -243,6 +243,9 @@ void llama_memory_hybrid_idx::mem_idx_stale_set(llama_seq_id seq_id, llama_pos p
         for (auto & p : mem_idx_stale) {
             p = std::min(p, p0);
         }
+        for (auto & p : kpool_restored_to) {
+            p = std::min(p, p0);
+        }
 
         return;
     }
@@ -250,6 +253,7 @@ void llama_memory_hybrid_idx::mem_idx_stale_set(llama_seq_id seq_id, llama_pos p
     GGML_ASSERT(seq_id < (llama_seq_id) LLAMA_MAX_SEQ);
 
     mem_idx_stale[seq_id] = std::min(mem_idx_stale[seq_id], p0);
+    kpool_restored_to[seq_id] = std::min(kpool_restored_to[seq_id], p0);
 }
 
 // An edit at or below the first position moves pos_min, which regroups the whole sequence.
@@ -349,6 +353,16 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     if (mem_idx) {
         mem_idx->state_write(io, seq_id, flags);
     }
+
+    if (pool_rows_in_state(flags)) {
+        pool_rows_write(io, seq_id);
+    }
+}
+
+bool llama_memory_hybrid_idx::pool_rows_in_state(llama_state_seq_flags flags) const {
+    static const bool off = getenv("LLAMA_KPOOL_STATE") != nullptr && atoi(getenv("LLAMA_KPOOL_STATE")) == 0;
+    return mem_pool != nullptr && !off && !g_state_layer_filter.active &&
+           !(flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -367,11 +381,30 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         get_mem_recr()->state_read(io, seq_id, flags);
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
+        const bool with_rows = pool_rows_in_state(flags);
         if (mem_idx) {
             mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
             // a restore that rewrites cells does it behind the pool layout's back
             if (!sinfos_attn.empty()) {
-                mem_idx_stale_set(seq_id, 0);
+                if (with_rows && seq_id >= 0) {
+                    // the rows section below says how far the pools are good (the coverage of earlier segments stays)
+                    mem_idx_stale[seq_id] = 0;
+                } else {
+                    mem_idx_stale_set(seq_id, 0);
+                }
+            }
+        }
+
+        // the pooled rows that came with the state: the sequence re-pools only from where they stop
+        if (with_rows) {
+            llama_pos clean_to = 0;
+            if (!pool_rows_read(io, seq_id, clean_to)) {
+                throw std::runtime_error("failed to restore the indexer pool rows");
+            }
+            if (seq_id >= 0 && !sinfos_attn.empty()) {
+                kpool_restored_to[seq_id] = clean_to;
+                mem_idx_stale[seq_id]     = clean_to;
+                LLAMA_LOG_DEBUG("%s: seq %d pools restored up to position %d\n", __func__, seq_id, clean_to);
             }
         }
 
@@ -1197,3 +1230,100 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 }
+
+// M2: the pools of the sequence whose last position lies in the saved range and whose rows are valid (not staled): their index
+// range [k0, k0 + n) and the rows of the pooled table; a whole-context state (seq_id < 0) carries none
+void llama_memory_hybrid_idx::pool_rows_write(llama_io_write_i & io, llama_seq_id seq_id) const {
+    uint32_t k0 = 0;
+    uint32_t n  = 0;
+    uint32_t strm = 0;
+
+    if (seq_id >= 0) {
+        // the layout as of the cells now (state_write is const: the layout is a cache of the cells)
+        const auto & lay = const_cast<llama_memory_hybrid_idx *>(this)->kpool_layout_update();
+        const auto & sq  = lay.seqs[seq_id];
+        const uint32_t kpool = get_kpool();
+        const llama_pos stale = mem_idx_stale[seq_id];
+        const auto & f = g_state_layer_filter;
+
+        strm = sq.strm;
+        // a pool goes with the range holding its last position (its earlier members are restored before it, the
+        // segments of a conversation come back in order), and only while its row is valid (not staled)
+        uint32_t k1 = 0;
+        for (uint32_t k = 0; k < sq.pools.size(); ++k) {
+            const llama_pos p_hi = sq.cells[sq.pools[k] + kpool - 1].first;
+            const bool inside = f.in_range(p_hi) && p_hi < stale;
+            if (!inside) {
+                if (n == 0) {
+                    k0 = k + 1;
+                    continue;
+                }
+                break;
+            }
+            k1 = k + 1;
+            n  = k1 - k0;
+        }
+        if (n == 0) {
+            k0 = 0;
+        }
+    }
+
+    io.write(&k0, sizeof(k0));
+    io.write(&n,  sizeof(n));
+    const uint32_t row0 = n > 0 ? kpool_slot(seq_id, k0) - strm*mem_pool->get_size() : 0;
+    mem_pool->state_write_rows(io, strm, row0, n);
+}
+
+// clean_to: the position up to which the sequence's pools are restored from its start (0 = none)
+bool llama_memory_hybrid_idx::pool_rows_read(llama_io_read_i & io, llama_seq_id seq_id, llama_pos & clean_to) {
+    uint32_t k0, n;
+    io.read(&k0, sizeof(k0));
+    io.read(&n,  sizeof(n));
+
+    clean_to = seq_id >= 0 ? kpool_restored_to[seq_id] : 0;
+
+    if (seq_id < 0) {
+        if (n != 0) {
+            LLAMA_LOG_ERROR("%s: a whole-context state carries no pool rows\n", __func__);
+            return false;
+        }
+        return mem_pool->state_read_rows(io, 0, 0, 0);
+    }
+
+    const auto & lay = kpool_layout_update();
+    const auto & sq  = lay.seqs[seq_id];
+    const uint32_t kpool = get_kpool();
+
+    if ((size_t) k0 + n > sq.pools.size()) {
+        LLAMA_LOG_ERROR("%s: pools [%u, %u) saved, the sequence has %zu\n", __func__, k0, k0 + n, sq.pools.size());
+        return false;
+    }
+
+    const uint32_t row0 = n > 0 ? kpool_slot(seq_id, k0) - sq.strm*mem_pool->get_size() : 0;
+    if (!mem_pool->state_read_rows(io, sq.strm, row0, n)) {
+        return false;
+    }
+
+    if (n > 0) {
+        // the members of the restored pools: the cells the tokens were placed in now
+        if (mem_cells) {
+            std::vector<float> members((size_t) n*kpool);
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t j = sq.pools[k0 + i];
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    members[(size_t) i*kpool + k] = (float) sq.cells[j + k].second;
+                }
+            }
+            mem_cells->set_rows_host(sq.strm, 0, row0, n, members.data());
+        }
+
+        const llama_pos p_start = sq.cells[sq.pools[k0]].first;
+        const llama_pos p_end   = sq.cells[sq.pools[k0 + n - 1] + kpool - 1].first + 1;
+        if (k0 == 0 || clean_to >= p_start) {
+            clean_to = std::max(clean_to, p_end);
+        }
+    }
+
+    return true;
+}
+

@@ -4184,6 +4184,8 @@ class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
 
+    bool is_dummy() const override { return true; }
+
     void write(const void * /* src */, size_t size) override {
         size_written += size;
     }
@@ -4329,6 +4331,15 @@ public:
         buf_size -= size;
     }
 
+    void skip_tensor(size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+    }
+
     void discard() override {
         rinfos.clear();
     }
@@ -4390,6 +4401,11 @@ public:
         temp_buffer.resize(size);
         read(temp_buffer.data(), size);
         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+    }
+
+    void skip_tensor(size_t size) override {
+        temp_buffer.resize(size);
+        read(temp_buffer.data(), size);
     }
 
     size_t n_bytes() override {
@@ -4694,6 +4710,11 @@ public:
         rinfos.push_back({tensor, ptr, size, offset});
     }
 
+    void skip_tensor(size_t size) override {
+        GGML_UNUSED(size);
+        throw std::runtime_error("ghost cells are not supported by a device-side state");
+    }
+
     void discard() override {
         rinfos.clear();
         buf_size = 0;
@@ -4816,10 +4837,20 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const int64_t t0 = ggml_time_us();
+        const size_t  n  = state_seq_read_data(*io, seq_id, flags);
+        const int64_t t1 = ggml_time_us();
+        io.reset(); // the queued tensor copies run here
+        static const bool timing = getenv("LLAMA_STATE_TIMING") != nullptr && atoi(getenv("LLAMA_STATE_TIMING")) != 0;
+        if (timing) {
+            LLAMA_LOG_WARN("%s: seq %d: parse %.1f ms, copies %.1f ms (%.1f MiB)\n", __func__, seq_id, (t1 - t0)/1e3, (ggml_time_us() - t1)/1e3, n/1048576.0);
+        }
+        return n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
-        io->discard();
+        if (io) {
+            io->discard();
+        }
         return 0;
     }
 }
@@ -5964,6 +5995,12 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
     return ctx->state_seq_get_size(seq_id, flags);
 }
 
+// LLAMA_STATE_TIMING=1: every sequence state save/restore logs its phases (M2)
+static bool state_timing_on() {
+    static const bool v = getenv("LLAMA_STATE_TIMING") != nullptr && atoi(getenv("LLAMA_STATE_TIMING")) != 0;
+    return v;
+}
+
 // a sequence state above 64 MiB (a long prompt's save or restore) logs its time: the cost of a conversation switch
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
@@ -6028,6 +6065,46 @@ size_t llama_state_seq_set_data_layers_ext(llama_context * ctx, const uint8_t * 
     const size_t  n  = ctx->state_seq_set_data(seq_id, src, size, state_mem_flags(flags));
     LLAMA_LOG_WARN("%s: seq %d layers [%d, %d)%s: %.1f MiB restored in %.1f ms\n", __func__, seq_id, il_lo, il_hi,
             (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ? " partial" : "", n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    return n;
+}
+
+namespace {
+struct state_range_scope {
+    state_range_scope(llama_pos pos_lo, llama_pos pos_hi) {
+        g_state_layer_filter.range_active = true;
+        g_state_layer_filter.pos_lo       = pos_lo;
+        g_state_layer_filter.pos_hi       = pos_hi;
+    }
+    ~state_range_scope() {
+        g_state_layer_filter = llama_state_layer_filter{};
+    }
+};
+}
+
+size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi) {
+    state_range_scope scope(pos_lo, pos_hi);
+    return ctx->state_seq_get_size(seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+}
+
+size_t llama_state_seq_get_data_range(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi) {
+    ctx->synchronize();
+    state_range_scope scope(pos_lo, pos_hi);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_get_data(seq_id, dst, size, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (size > (64u << 20) || state_timing_on()) {
+        LLAMA_LOG_WARN("%s: seq %d [%d, %d): %.1f MiB saved in %.1f ms\n", __func__, seq_id, pos_lo, pos_hi, n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
+    return n;
+}
+
+size_t llama_state_seq_set_data_range(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id) {
+    ctx->synchronize();
+    state_range_scope scope(0, INT32_MAX);
+    const int64_t t0 = ggml_time_us();
+    const size_t  n  = ctx->state_seq_set_data(seq_id, src, size, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (size > (64u << 20) || state_timing_on()) {
+        LLAMA_LOG_WARN("%s: seq %d: %.1f MiB restored in %.1f ms\n", __func__, seq_id, n/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
     return n;
 }
 

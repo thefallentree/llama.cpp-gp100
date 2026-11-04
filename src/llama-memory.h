@@ -27,6 +27,15 @@ struct llama_state_layer_filter {
     bool    adopt_pos = false; // a data-only read takes the saved recurrent position instead of requiring the sequence's own
 
     bool skip(int32_t il) const { return active && (il < il_lo || il >= il_hi); }
+
+    // a range state (llama_state_seq_*_range): the attention cells with a position in [pos_lo, pos_hi) only, no
+    // recurrent state; a read appends the cells to the sequence instead of replacing it (M2: the prompt cache saves a
+    // conversation's new cells only)
+    bool      range_active = false;
+    llama_pos pos_lo       = 0;
+    llama_pos pos_hi       = INT32_MAX;
+
+    bool in_range(llama_pos p) const { return !range_active || (p >= pos_lo && p < pos_hi); }
 };
 
 extern thread_local llama_state_layer_filter g_state_layer_filter;

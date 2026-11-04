@@ -155,6 +155,14 @@ private:
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
 
+    // M2: the pooled-key rows travel with the state (the pools fully inside the saved position range, in pool order),
+    // so a restore does not re-pool the whole sequence (255K cells: 125 MiB gathered, a main-scheduler graph).
+    // kpool_restored_to[s] = the position up to which the restored rows cover the sequence from its start.
+    bool pool_rows_in_state(llama_state_seq_flags flags) const;
+    void pool_rows_write(llama_io_write_i & io, llama_seq_id seq_id) const;
+    bool pool_rows_read (llama_io_read_i  & io, llama_seq_id seq_id, llama_pos & clean_to);
+    std::array<llama_pos, LLAMA_MAX_SEQ> kpool_restored_to{};
+
     // the position an edit at p0 stales the sequence from
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 

@@ -157,6 +157,15 @@ LLAMA_API size_t llama_state_seq_get_size_layers_ext(struct llama_context * ctx,
 LLAMA_API size_t llama_state_seq_get_data_layers_ext(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags);
 LLAMA_API size_t llama_state_seq_set_data_layers_ext(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_lo, int32_t il_hi, llama_state_seq_flags flags);
 
+// M2: a range state: the attention cells of the sequence with a position in [pos_lo, pos_hi) (the indexer cells and
+// the pooled rows of the pools inside the range with them), no recurrent state. A set appends the cells to the
+// sequence as they are (positions saved), so a conversation is restored as its saved ranges in order, followed by
+// its recurrent state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY). The cells of a saved range stay in the cache as "ghost"
+// cells after the sequence is removed: a set of the same data finds them and copies nothing (LLAMA_KV_GHOSTS=0 off).
+LLAMA_API size_t llama_state_seq_get_size_range(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi);
+LLAMA_API size_t llama_state_seq_get_data_range(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi);
+LLAMA_API size_t llama_state_seq_set_data_range(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

@@ -354,8 +354,12 @@ struct server_slot {
 
     server_prompt prompt;
 
-    // the cache entry made from the slot's prompt (its checkpoints move there; see server_prompt_cache::load), nullptr = none
-    // move_checkpoints: only when the slot's prompt is about to be replaced or cleared (see server_prompt_cache::alloc)
+    // the prompt cache entry this slot's prompt is (loaded from it, or saved into it): its next save appends only the
+    // new cells (server_prompt_cache::save); nullptr = none
+    server_prompt_cache_state * prompt_origin = nullptr;
+
+    // save the slot's prompt into the cache (a delta onto prompt_origin when it has one); the entry, nullptr = not saved
+    // move_checkpoints: only when the slot's prompt is about to be replaced or cleared (see server_prompt_cache::save)
     server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool move_checkpoints = false) {
         if (prompt.tokens.size() == 0) {
             return nullptr;
@@ -365,39 +369,10 @@ struct server_slot {
         common_speculative_catchup_join(spec); // the draft context may still catch up on the last prompt batch
         const int64_t t1 = ggml_time_us();
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-        const int64_t t2 = ggml_time_us();
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, move_checkpoints);
-        const int64_t t3 = ggml_time_us();
-        if (cur == nullptr) {
-            if (srv_timing()) {
-                SLT_WRN(*this, "timing prompt_save: join %.1f size %.1f alloc %.1f ms (not saved: already cached / over limit)\n",
-                        (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3);
-            }
-            return nullptr;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const int64_t t4 = ggml_time_us();
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-        const int64_t t5 = ggml_time_us();
-        // the drafter's deferred boundary, if it keeps one (restored together with the contexts)
-        cur->data.spec.clear();
-        common_speculative_get_state(spec, id, cur->data.spec);
+        auto * cur = prompt_cache.save(prompt, ctx_tgt, ctx_dft, spec, id, &prompt_origin, move_checkpoints);
         if (srv_timing()) {
-            SLT_WRN(*this, "timing prompt_save: n_tokens %d ckpts %zu: join %.1f size %.1f alloc %.1f get_tgt %.1f (%.1f MiB) get_dft %.1f (%.1f MiB) spec %.1f ms\n",
-                    (int) prompt.tokens.size(), prompt.checkpoints.size(), (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3,
-                    (t4 - t3) / 1e3, cur_size_tgt / (1024.0 * 1024.0), (t5 - t4) / 1e3, cur_size_dft / (1024.0 * 1024.0),
-                    (ggml_time_us() - t5) / 1e3);
+            SLT_WRN(*this, "timing prompt_save: n_tokens %d: join %.1f save %.1f ms (%s)\n", (int) prompt.tokens.size(),
+                    (t1 - t0) / 1e3, (ggml_time_us() - t1) / 1e3, cur != nullptr ? "saved" : "not saved: already cached / over limit");
         }
 
         return cur;
@@ -406,7 +381,7 @@ struct server_slot {
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, server_prompt_cache_state * saved = nullptr) {
         const int64_t t0 = ggml_time_us();
         common_speculative_catchup_join(spec);
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id, saved);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id, saved, &prompt_origin);
         if (srv_timing()) {
             SLT_WRN(*this, "timing prompt_load: %.1f ms -> n_tokens %d ckpts %zu res %d\n", (ggml_time_us() - t0) / 1e3,
                     (int) prompt.tokens.size(), prompt.checkpoints.size(), (int) res);
@@ -424,6 +399,12 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        // the cache entry stays (for a later restore), it is no longer this slot's
+        if (prompt_origin != nullptr) {
+            prompt_origin->owner = -1;
+            prompt_origin = nullptr;
+        }
     }
 
     std::vector<common_adapter_lora_info> lora;

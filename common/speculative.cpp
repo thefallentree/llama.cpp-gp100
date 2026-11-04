@@ -3519,7 +3519,9 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the drafter alternates between injecting target features (embd ubatches) and drafting (token ubatches);
     // with a single cached graph every call would rebuild it, so keep a few
-    cparams.n_graph_slots = 8; // the shapes of the catch-up batches, the draft steps and the short prompts
+    // the shapes of the catch-up batches (every small-prompt window size the target uses), the draft steps and the
+    // short prompts: 8 slots missed 2-3 times per agent turn (65 ms of scheduler allocation each, M1), 16 hold them
+    cparams.n_graph_slots = getenv("LLAMA_DFT_GRAPH_SLOTS") != nullptr ? std::max(1, atoi(getenv("LLAMA_DFT_GRAPH_SLOTS"))) : 16;
 
     std::string model_path;
     if (has_draft) {

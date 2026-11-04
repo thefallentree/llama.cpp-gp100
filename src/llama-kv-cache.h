@@ -29,6 +29,12 @@ public:
         std::vector<uint32_t> sdst;
     };
 
+    struct cell_ranges_t {
+        uint32_t strm;
+
+        std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
+    };
+
     // for each ubatch, create a slot_info that contains information about where the ubatch should be inserted in the
     //   KV cells. for example, cell indices for each token, such that: token[i] -> goes to cells[idxs[i]]
     struct slot_info {
@@ -186,6 +192,17 @@ public:
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
+    // M2: rows [row0, row0 + n) of every layer's K tensor of stream strm, as a state section (the indexer's pooled-key
+    // table of llama_memory_hybrid_idx: its rows belong to pools, not to cells)
+    void   state_write_rows(llama_io_write_i & io, uint32_t strm, uint32_t row0, uint32_t n) const;
+    bool   state_read_rows (llama_io_read_i  & io, uint32_t strm, uint32_t row0, uint32_t n);
+    // write n rows of the K tensor of cache layer il_cache (index into the cache's layers) of stream strm from host data
+    void   set_rows_host(uint32_t strm, int32_t il_cache, uint32_t row0, uint32_t n, const void * data);
+    size_t k_row_size(int32_t il_cache) const;
+
+    // M2: the cells of the last state_read of this id are still the ghost of that blob (see ghost_t)
+    bool ghost_valid(uint64_t id) const;
+
     //
     // graph_build API
     //
@@ -310,6 +327,41 @@ private:
     // scratch of seq_rm: the cells of the sequence in the removed range
     std::vector<uint32_t> seq_rm_hits;
 
+    // M2: ghost cells. Every state_write of a sequence records the cells it wrote (a ghost: the blob's id, written into
+    // the blob, and its cells). When the sequence is removed those cells keep their data until something writes them,
+    // so a state_read of the same blob (the server's prompt cache bringing back the conversation that was switched
+    // out) puts the cells back as they were and skips the copies. find_slot hands ghost cells out last and retires
+    // the oldest ghost when nothing else is free. LLAMA_KV_GHOSTS = ghosts kept per cache (default 64, 0 = off).
+    struct ghost_t {
+        uint64_t id   = 0;      // 0 = free slot
+        uint64_t seq  = 0;      // creation order
+        uint32_t strm = 0;
+        std::vector<uint32_t> idxs;
+    };
+    mutable std::vector<ghost_t>  ghosts;         // [ghost_max]
+    mutable std::vector<int32_t>  cell_ghost;     // [n_stream*size]: the ghost holding the cell's data, -1 = none
+    mutable std::vector<uint32_t> n_ghost_cells;  // per stream
+    mutable uint64_t ghost_next = 1;
+    mutable uint64_t ghost_seq  = 0;
+    int32_t  ghost_max       = 0;
+    int32_t  ghost_restoring = -1;  // the ghost whose cells apply_ubatch may refill without retiring it
+
+    bool    state_with_ghost(llama_state_seq_flags flags) const;
+    void    ghost_record(uint32_t strm, const cell_ranges_t & cr, uint64_t id) const;
+    int32_t ghost_find(uint64_t id, uint32_t strm) const;
+    void    ghost_drop(int32_t g) const;
+    void    ghost_drop_all() const;
+    bool    ghost_evict_oldest(uint32_t strm) const;
+    // cell idx of stream strm is being written: its ghost (if not the one being restored) is gone
+    void    ghost_touch(uint32_t strm, uint32_t idx) {
+        if (!cell_ghost.empty()) {
+            const int32_t g = cell_ghost[(size_t) strm*cell_ghost.size()/n_stream + idx];
+            if (g >= 0 && g != ghost_restoring) {
+                ghost_drop(g);
+            }
+        }
+    }
+
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
@@ -348,18 +400,13 @@ private:
                llm_graph_result * res,
                   llama_context * lctx) const;
 
-    struct cell_ranges_t {
-        uint32_t strm;
-
-        std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
-    };
-
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
-    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+    // ghost_id: the blob's ghost id (0 = none); ghost_hit is set when its cells still hold the data (no copies needed)
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, uint64_t ghost_id = 0, bool * ghost_hit = nullptr);
+    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, bool skip_data = false);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
 };

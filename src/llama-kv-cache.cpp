@@ -1207,7 +1207,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
 
             if (n_tested >= cells.size()) {
-                if (cg != nullptr && ghost_evict_oldest(strm)) {
+                // the non-contiguous search (the caller's fallback) retires the oldest ghost and tries again; the
+                // contiguous one fails over to it instead of breaking ghosts for a contiguous run
+                if (!cont && cg != nullptr && ghost_evict_oldest(strm)) {
                     goto search_again;
                 }
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);

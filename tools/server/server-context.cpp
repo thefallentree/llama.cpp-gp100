@@ -1980,6 +1980,22 @@ private:
             }
         }
 
+        // unified KV: the cells are shared, so a task that cannot fit next to the slots now processing (their prompts and
+        // what they may still generate) waits for one of them instead of failing every slot with "context size exceeded"
+        if (ret != nullptr && params_base.kv_unified && !task.is_stateless() && task.id_slot == -1) {
+            int64_t n_busy = 0;
+            for (const auto & slot : slots) {
+                if (slot.is_processing()) {
+                    n_busy += slot.prompt.n_tokens() + std::max(0, slot.n_predict_max - (int) slot.stats.n_gen);
+                }
+            }
+            const int64_t n_need = (int64_t) task.tokens.size() + std::max(0, task.params.n_predict);
+            if (n_busy > 0 && n_busy + n_need > (int64_t) n_ctx) {
+                SRV_DBG("unified KV: task with %" PRId64 " tokens does not fit next to %" PRId64 " busy (n_ctx %d), deferred\n", n_need, n_busy, n_ctx);
+                return nullptr;
+            }
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -2034,6 +2050,10 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
+                // its conversation goes to the host prompt cache (a later request restores it instead of re-processing)
+                if (prompt_cache && slot.prompt_save(*prompt_cache, /*move_checkpoints=*/ true)) {
+                    prompt_cache->update();
+                }
                 slot.prompt_clear();
 
                 res = true;
@@ -2956,9 +2976,18 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int64_t t0 = ggml_time_us();
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+        // the state at n_tokens is a function of the tokens before it: a valid checkpoint already there (typically the one a
+        // continuation just restored from, 4 tokens before the previous prompt's end) needs no second save
+        for (const auto & ck : slot.prompt.checkpoints) {
+            if (ck.n_tokens == n_tokens_new && !ck.empty() && ck.pos_min == pos_min && ck.pos_max == pos_max) {
+                SLT_DBG(slot, "checkpoint at n_tokens = %" PRId64 " exists, not saved again\n", n_tokens_new);
+                return;
+            }
+        }
         common_speculative_catchup_join(spec.get()); // the checkpoint takes the draft context's state
         const int64_t t1 = ggml_time_us();
-        auto & cur = ckpt_new(slot, slot.prompt.n_tokens() - n_tokens_cur);
+        auto & cur = ckpt_new(slot, n_tokens_new);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -4940,11 +4969,17 @@ private:
                         do_checkpoint = false;
                     }
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together: the two end offsets (4 + n_ubatch and 4 before
+                    // the end: the restore points of a continuation) are always made; a user-message start or a chunk near
+                    // the end gets one only when the last checkpoint is more than LLAMA_CKPT_NEAR tokens back (a divergence
+                    // there restores that one and re-processes at most that many tokens; a small agent turn otherwise paid
+                    // three 113 MiB saves per request)
+                    static const int64_t ckpt_near = getenv("LLAMA_CKPT_NEAR") != nullptr ? atoll(getenv("LLAMA_CKPT_NEAR")) : 256;
+                    const int64_t n_to_end = (int64_t) slot.task->n_tokens() - n_tokens_start;
+                    const bool is_end_offset = n_to_end == 4 || n_to_end == 4 + n_ubatch;
                     do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            slot.prompt.checkpoints.empty() || is_end_offset ||
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + std::max<int64_t>(params_base.checkpoint_min_step, ckpt_near));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

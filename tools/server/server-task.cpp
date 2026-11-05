@@ -2096,6 +2096,23 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             *origin = nullptr;
         }
     }
+    // M3: the drafter's cells of the last kept segment end where its drafter part ended (d1, it lags the target): a kept
+    // segment whose drafter part would not reach its own start goes too (a drafter that lagged a whole segment)
+    if (e != nullptr && ctx_dft != nullptr) {
+        while (n_keep > 0) {
+            const auto & last = e->data.segs[n_keep - 1];
+            const llama_pos d_end = std::min<llama_pos>({last.p1, lcp, last.d1});
+            if (d_end > last.d0) {
+                break;
+            }
+            n_keep--;
+        }
+        if (n_keep == 0) {
+            e->owner = -1;
+            e = nullptr;
+            *origin = nullptr;
+        }
+    }
     std::vector<server_state_seg> kept;
     if (e != nullptr) {
         for (size_t i = 0; i < n_keep; ++i) {
@@ -2104,25 +2121,32 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         e->data.segs.clear();
     }
     const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept.back().p1, lcp);
+    // where the new drafter part starts: the kept drafter cells reach only d1 of the last kept segment
+    const llama_pos keep_end_dft = kept.empty() ? 0 : std::min<llama_pos>(keep_end, kept.back().d1);
 
     // the new segments: [keep_end, n) in chunks of seg_max, the last one open-ended (cells past n go with it)
-    struct chunk { llama_pos a, b; size_t sz_tgt, sz_dft; };
+    struct chunk { llama_pos a, b, ad; size_t sz_tgt, sz_dft; };
     std::vector<chunk> chunks;
     for (llama_pos a = keep_end; a < n; a += seg_max) {
         const llama_pos b = (a + seg_max >= n) ? INT32_MAX : a + seg_max;
-        chunks.push_back({a, b, 0, 0});
+        chunks.push_back({a, b, a, 0, 0});
     }
     if (chunks.empty()) {
         // n == keep_end: the tail was trimmed only; one open-ended chunk for whatever cells sit past it
-        chunks.push_back({keep_end, INT32_MAX, 0, 0});
+        chunks.push_back({keep_end, INT32_MAX, keep_end, 0, 0});
     }
+    chunks.front().ad = keep_end_dft;
 
     size_t state_size_new = 0;
     for (auto & c : chunks) {
         c.sz_tgt = llama_state_seq_get_size_range(ctx_tgt, id_slot, c.a, c.b);
-        c.sz_dft = ctx_dft ? llama_state_seq_get_size_range(ctx_dft, id_slot, c.a, c.b) : 0;
+        c.sz_dft = ctx_dft ? llama_state_seq_get_size_range(ctx_dft, id_slot, c.ad, c.b) : 0;
         state_size_new += c.sz_tgt + c.sz_dft;
     }
+    // the drafter's cells now end here (its last position + 1)
+    // (a drafter without cells has nothing to lose: no limit then)
+    const llama_pos dft_pm  = ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id_slot) : -1;
+    const llama_pos dft_end = dft_pm >= 0 ? dft_pm + 1 : INT32_MAX;
     const size_t sz_recr = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     state_size_new += sz_recr;
 
@@ -2211,6 +2235,8 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         server_state_seg seg;
         seg.p0 = c.a;
         seg.p1 = c.b;
+        seg.d0 = c.ad;
+        seg.d1 = std::min<llama_pos>(c.b, dft_end);
         if (!seg.main.alloc(pool, c.sz_tgt) || !seg.drft.alloc(pool, c.sz_dft)) {
             return fail();
         }
@@ -2218,7 +2244,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             SRV_ERR("%s", "failed to save the target state\n");
             return fail();
         }
-        if (c.sz_dft > 0 && llama_state_seq_get_data_range(ctx_dft, seg.drft.data(), c.sz_dft, id_slot, c.a, c.b) != c.sz_dft) {
+        if (c.sz_dft > 0 && llama_state_seq_get_data_range(ctx_dft, seg.drft.data(), c.sz_dft, id_slot, c.ad, c.b) != c.sz_dft) {
             SRV_ERR("%s", "failed to save the draft state\n");
             return fail();
         }
@@ -2363,12 +2389,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        const llama_pos next_p0 = i + 1 < e.data.segs.size() ? e.data.segs[i + 1].p0 : n_e;
+        const bool has_next = i + 1 < e.data.segs.size();
+        const llama_pos next_p0 = has_next ? e.data.segs[i + 1].p0 : n_e;
+        const llama_pos next_d0 = has_next ? e.data.segs[i + 1].d0 : n_e;
         if (seg.p1 > next_p0) {
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, next_p0, -1);
-            if (ctx_dft) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, next_p0, -1);
-            }
+        }
+        // the drafter's part of the next segment may start earlier (d0 <= p0: the cells this one lacked)
+        if (ctx_dft && seg.p1 > next_d0) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, next_d0, -1);
         }
     }
     const int64_t t_recr = ggml_time_us();

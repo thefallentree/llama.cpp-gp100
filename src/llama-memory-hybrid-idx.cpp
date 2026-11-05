@@ -1307,8 +1307,15 @@ bool llama_memory_hybrid_idx::pool_rows_read(llama_io_read_i & io, llama_seq_id 
     const uint32_t kpool = get_kpool();
 
     if ((size_t) k0 + n > sq.pools.size()) {
-        LLAMA_LOG_ERROR("%s: pools [%u, %u) saved, the sequence has %zu\n", __func__, k0, k0 + n, sq.pools.size());
-        return false;
+        // M3: the restored cells do not group into the saved pools (a hole in the sequence): the rows are skipped and
+        // the sequence re-pools from its restored clean prefix on, instead of failing the whole restore
+        LLAMA_LOG_WARN("%s: pools [%u, %u) saved, the sequence has %zu: rows skipped, re-pooled from %d\n", __func__, k0, k0 + n,
+                sq.pools.size(), clean_to);
+        if (!mem_pool->state_skip_rows(io)) {
+            return false;
+        }
+        mem_idx_stale_set(seq_id, clean_to);
+        return true;
     }
 
     const uint32_t row0 = n > 0 ? kpool_slot(seq_id, k0) - sq.strm*mem_pool->get_size() : 0;

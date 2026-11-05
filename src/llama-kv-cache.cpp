@@ -2706,6 +2706,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     if (dest_seq_id != -1 && g_state_layer_filter.data_only) {
         // layer data only (llama_state_seq_set_data_layers): the saved cells must be the ones the sequence holds, in
         // the same order with the same positions; they are kept as they are and only receive the data
+        // M3: without a given layout the saved cells are matched by position, not by cell order: the sender's cells
+        // are in position order (a fresh memory), while this sequence may wrap around cells held by others (ghost cells)
+        std::unordered_map<llama_pos, uint32_t> pos_idx;
         if (sinfo_in) {
             sinfo = *sinfo_in;
         } else {
@@ -2716,13 +2719,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             sinfo.idxs[0].clear();
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 if (!cells.is_empty(i) && cells.seq_has(i, dest_seq_id)) {
-                    sinfo.idxs[0].push_back(i);
+                    pos_idx[cells.pos_get(i)] = i;
                 }
             }
         }
-        if (sinfo.n_stream() != 1 || sinfo.idxs[0].size() != cell_count) {
-            LLAMA_LOG_ERROR("%s: layer data for %u cells, the sequence holds %zu\n", __func__, cell_count,
-                    sinfo.n_stream() == 1 ? sinfo.idxs[0].size() : (size_t) 0);
+        const size_t n_held = sinfo_in ? (sinfo.n_stream() == 1 ? sinfo.idxs[0].size() : (size_t) 0) : pos_idx.size();
+        if (sinfo.n_stream() != 1 || n_held != cell_count) {
+            LLAMA_LOG_ERROR("%s: layer data for %u cells, the sequence holds %zu\n", __func__, cell_count, n_held);
             return false;
         }
         for (uint32_t i = 0; i < cell_count; ++i) {
@@ -2737,6 +2740,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             for (uint32_t j = 0; j < n_seq_id; ++j) {
                 llama_seq_id seq_id;
                 io.read(&seq_id, sizeof(seq_id));
+            }
+            if (!sinfo_in) {
+                const auto it = pos_idx.find(pos);
+                if (it == pos_idx.end()) {
+                    LLAMA_LOG_ERROR("%s: layer data: the saved cell %u pos %d is not in the sequence\n", __func__, i, pos);
+                    return false;
+                }
+                sinfo.idxs[0].push_back(it->second);
             }
             if (cells.pos_get(sinfo.idxs[0][i]) != pos) {
                 LLAMA_LOG_ERROR("%s: layer data: cell %u holds pos %d, the saved cell %u pos %d\n", __func__,

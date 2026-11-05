@@ -104,3 +104,5 @@ int  prefill_peer_listen(int port);
 int  prefill_peer_accept(int lfd);
 void prefill_peer_serve_conn(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);
 void prefill_peer_refuse(int fd);
+// true while this server is a head (prefill_peer_run): the listener refuses hellos itself then (M3: two heads deadlocked)
+bool prefill_peer_head_active();

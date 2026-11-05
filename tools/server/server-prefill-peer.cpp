@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
@@ -561,10 +562,27 @@ bool send_hello(int fd, const std::vector<prefill_peer_stage> & stages, const ll
         ok = ok && send_string(fd, st.host) && send_val(fd, port) && send_val(fd, lb);
     }
     ok = ok && send_string(fd, ep.host) && send_val(fd, ep.port) && send_val(fd, ep.token);
+    // M3: the answer comes from the peer's task loop at once (served or refused); a peer that does not answer is itself
+    // blocked (a head waiting for us: two heads asking each other was a deadlock of the whole cluster), so the wait is
+    // bounded (LLAMA_PREFILL_PEER_HELLO_MS, default 10000) and the prompt is decoded here instead
+    static const int hello_ms = getenv("LLAMA_PREFILL_PEER_HELLO_MS") ? std::max(100, atoi(getenv("LLAMA_PREFILL_PEER_HELLO_MS"))) : 10000;
+    timeval tv = { hello_ms / 1000, (hello_ms % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     uint32_t msg = 0;
     int64_t  width_peer = 0;
-    return ok && recv_val(fd, msg) && msg == MSG_OK && recv_val(fd, width_peer) && width_peer == width;
+    const bool res = ok && recv_val(fd, msg) && msg == MSG_OK && recv_val(fd, width_peer) && width_peer == width;
+    timeval tv0 = { 0, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+    return res;
 }
+
+// M3: set while this server is a head (prefill_peer_run): its task loop cannot answer a hello then, so the listener refuses
+std::atomic<int> g_head_active{0};
+
+struct head_active_guard {
+    head_active_guard()  { g_head_active.fetch_add(1); }
+    ~head_active_guard() { g_head_active.fetch_sub(1); }
+};
 
 // one stage's state as it returns it to the head: its layers' part, and from the last stage the drafter's state
 struct stage_result {
@@ -645,6 +663,7 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
                       llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
                       llama_seq_id seq_id, const llama_token * tokens, int32_t n_split, int32_t n_ubatch,
                       int32_t n_ckpt, prefill_peer_ckpt * ckpt, prefill_peer_stats & stats) {
+    head_active_guard head_guard;
     const double t0 = now_ms();
     stats = {};
     if (ckpt) {
@@ -1415,6 +1434,10 @@ void prefill_peer_serve_conn(int fd, llama_context * ctx_tgt, llama_context * ct
         llama_memory_clear(llama_get_memory(ctx_dft), true);
     }
     ::close(fd);
+}
+
+bool prefill_peer_head_active() {
+    return g_head_active.load() > 0;
 }
 
 void prefill_peer_refuse(int fd) {

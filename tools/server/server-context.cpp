@@ -1528,6 +1528,12 @@ private:
                         if (fd < 0) {
                             continue;
                         }
+                        // M3: a head's task loop is inside its own prefill-peer run and would answer only after it
+                        if (prefill_peer_head_active()) {
+                            SRV_WRN("%s", "prefill-peer: a head itself, a head's prompt refused\n");
+                            prefill_peer_refuse(fd);
+                            continue;
+                        }
                         server_task task(SERVER_TASK_TYPE_PEER_PREFILL);
                         task.id = queue_tasks.get_new_id();
                         task.slot_action.id_slot = fd;

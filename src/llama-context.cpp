@@ -11,6 +11,8 @@ static int     fn_prof_n_window[2] = { 0, 0 };
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -5926,6 +5928,28 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+llama_pos llama_memory_seq_pos_gap(llama_context * ctx, llama_seq_id seq_id, llama_pos p0) {
+    llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
+    const llama_kv_cache * kv = dynamic_cast<const llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        if (const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    if (kv == nullptr || seq_id < 0) {
+        return -1;
+    }
+    const auto & sp = kv->get_cells(seq_id).seq_pos_get(seq_id);
+    llama_pos expect = p0;
+    for (auto it = sp.lower_bound({p0, 0u}); it != sp.end(); ++it) {
+        if (it->first > expect) {
+            break;
+        }
+        expect = it->first + 1;
+    }
+    return expect;
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

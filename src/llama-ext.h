@@ -166,6 +166,10 @@ LLAMA_API size_t llama_state_seq_get_size_range(struct llama_context * ctx, llam
 LLAMA_API size_t llama_state_seq_get_data_range(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi);
 LLAMA_API size_t llama_state_seq_set_data_range(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id);
 
+// M3: the first position >= p0 that the sequence's attention cells do not hold (the end of its contiguous run from p0);
+// pos_max + 1 when there is no hole, p0 when p0 itself is missing; -1 when the memory has no attention cache
+LLAMA_API llama_pos llama_memory_seq_pos_gap(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

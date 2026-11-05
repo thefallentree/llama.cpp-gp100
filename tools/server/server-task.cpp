@@ -2099,6 +2099,14 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     // M3: the drafter's cells of the last kept segment end where its drafter part ended (d1, it lags the target): a kept
     // segment whose drafter part would not reach its own start goes too (a drafter that lagged a whole segment)
     if (e != nullptr && ctx_dft != nullptr) {
+        // an earlier kept segment whose drafter part has a hole becomes the last kept one (the delta re-saves from there)
+        for (size_t i = 0; i + 1 < n_keep; ++i) {
+            const auto & seg = e->data.segs[i];
+            if (seg.d1 < seg.p1) {
+                n_keep = i + 1;
+                break;
+            }
+        }
         while (n_keep > 0) {
             const auto & last = e->data.segs[n_keep - 1];
             const llama_pos d_end = std::min<llama_pos>({last.p1, lcp, last.d1});
@@ -2146,7 +2154,6 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     // the drafter's cells now end here (its last position + 1)
     // (a drafter without cells has nothing to lose: no limit then)
     const llama_pos dft_pm  = ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id_slot) : -1;
-    const llama_pos dft_end = dft_pm >= 0 ? dft_pm + 1 : INT32_MAX;
     const size_t sz_recr = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     state_size_new += sz_recr;
 
@@ -2236,7 +2243,14 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         seg.p0 = c.a;
         seg.p1 = c.b;
         seg.d0 = c.ad;
-        seg.d1 = std::min<llama_pos>(c.b, dft_end);
+        // the drafter's cells of this chunk end at its first hole (a deferred catch-up can leave one mid-sequence that a
+        // later turn fills: the next delta must re-save the drafter from there)
+        if (dft_pm < 0) {
+            seg.d1 = INT32_MAX;
+        } else {
+            const llama_pos gap = llama_memory_seq_pos_gap(ctx_dft, id_slot, c.ad);
+            seg.d1 = gap < 0 ? c.b : std::min<llama_pos>(c.b, gap);
+        }
         if (!seg.main.alloc(pool, c.sz_tgt) || !seg.drft.alloc(pool, c.sz_dft)) {
             return fail();
         }

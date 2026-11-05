@@ -913,6 +913,20 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_slot_used) - 1, n_slot_max})});
 
+    // LLAMA_GRAPH_SLOTS_DEBUG=2: the pools re-pooled by this ubatch (a count above the bound changes the graph shape: M2)
+    static const int slots_debug = getenv("LLAMA_GRAPH_SLOTS_DEBUG") != nullptr ? atoi(getenv("LLAMA_GRAPH_SLOTS_DEBUG")) : 0;
+    if (slots_debug > 1 && st.n_new > bound) {
+        std::string pools_s;
+        for (size_t i = 0; i < st.new_pools.size() && i < 8; ++i) {
+            const auto & sq = lay.seqs[st.new_pools[i].first];
+            const uint32_t j = sq.pools[st.new_pools[i].second];
+            pools_s += " " + std::to_string(st.new_pools[i].second) + "@" + std::to_string(sq.cells[j].first);
+        }
+        LLAMA_LOG_WARN("%s: ubatch %u tokens at pos %d: n_new %u (bound %u) stale_from %d, pools%s%s\n", __func__, ubatch.n_tokens,
+                ubatch.n_tokens > 0 ? ubatch.pos[0] : -1, st.n_new, bound, (int) mem_idx_stale_batch[ubatch.seq_id[0][0]], pools_s.c_str(),
+                st.new_pools.size() > 8 ? " ..." : "");
+    }
+
     // temporary (LLAMA_KPOOL_DEBUG=1): when the sizes of the graph change
     static const bool debug = getenv("LLAMA_KPOOL_DEBUG") != nullptr;
     if (debug) {

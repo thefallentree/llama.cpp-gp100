@@ -793,6 +793,12 @@ struct server_state_seg {
     llama_pos p0 = 0;
     llama_pos p1 = 0;
 
+    // M3: the drafter's part starts at d0 <= p0 and held cells up to d1 when it was saved (the MTP drafter lags the target:
+    // its cells for the last token(s) of a turn come with the next turn, so a kept segment ends early in the drafter and the
+    // next delta must start there, or the restored drafter sequence has a hole and its pools no longer match)
+    llama_pos d0 = 0;
+    llama_pos d1 = INT32_MAX;
+
     server_state_buf main;
     server_state_buf drft;
 

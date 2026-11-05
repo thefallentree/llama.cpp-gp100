@@ -196,6 +196,7 @@ public:
     // table of llama_memory_hybrid_idx: its rows belong to pools, not to cells)
     void   state_write_rows(llama_io_write_i & io, uint32_t strm, uint32_t row0, uint32_t n) const;
     bool   state_read_rows (llama_io_read_i  & io, uint32_t strm, uint32_t row0, uint32_t n);
+    bool   state_skip_rows (llama_io_read_i  & io);
     // write n rows of the K tensor of cache layer il_cache (index into the cache's layers) of stream strm from host data
     void   set_rows_host(uint32_t strm, int32_t il_cache, uint32_t row0, uint32_t n, const void * data);
     size_t k_row_size(int32_t il_cache) const;

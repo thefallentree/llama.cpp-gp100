@@ -3159,6 +3159,29 @@ bool llama_kv_cache::state_read_rows(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
+// M3: consume a rows section without applying it (the rows no longer match the restored layout)
+bool llama_kv_cache::state_skip_rows(llama_io_read_i & io) {
+    uint32_t n_layer_ref, n_ref;
+    io.read(&n_layer_ref, sizeof(n_layer_ref));
+    io.read(&n_ref, sizeof(n_ref));
+    if (n_layer_ref != layers.size()) {
+        LLAMA_LOG_ERROR("%s: rows section mismatch (%u layers; expected %zu)\n", __func__, n_layer_ref, layers.size());
+        return false;
+    }
+    for (uint32_t il = 0; il < n_layer_ref; ++il) {
+        uint64_t row_size_ref;
+        io.read(&row_size_ref, sizeof(row_size_ref));
+        if (row_size_ref != k_row_size(il)) {
+            LLAMA_LOG_ERROR("%s: row size mismatch (layer %u)\n", __func__, il);
+            return false;
+        }
+        if (n_ref > 0) {
+            io.skip_tensor((size_t) n_ref * row_size_ref);
+        }
+    }
+    return true;
+}
+
 void llama_kv_cache::set_rows_host(uint32_t strm, int32_t il_cache, uint32_t row0, uint32_t n, const void * data) {
     auto * k = layers[il_cache].k_stream[strm];
     const size_t row_size = k_row_size(il_cache);

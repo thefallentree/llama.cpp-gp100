@@ -144,19 +144,42 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
     ggml_tensor * cur;
-    ggml_tensor * inpL;
+    ggml_tensor * inpL = nullptr;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // pipelined prefill (llama_set_layer_range, server-prefill-peer.h): this graph runs the layers [il_begin, il_end)
+    // only; past layer 0 the residual comes in through llama_set_hc_input, and up to il_end < n_layer the residual
+    // after layer il_end - 1 goes out as the nextn embeddings
+    const int il_begin = std::max(0, cparams.layer_begin);
+    const int il_end   = cparams.layer_end < 0 ? n_layer : std::min<int>(cparams.layer_end, n_layer);
+    GGML_ASSERT(il_begin < il_end);
 
-    cb(inpL, "model.input_embed", -1);
+    if (il_begin == 0) {
+        inpL = build_inp_embd(model.tok_embd);
+        cb(inpL, "model.input_embed", -1);
+    }
 
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // the first part of a pipelined prefill has no outputs: an unused input would get no buffer
+    ggml_tensor * inp_out_ids = il_end == n_layer ? build_inp_out_ids() : nullptr;
+
+    if (il_begin > 0) {
+        // the residual after layer il_begin - 1, computed elsewhere (llama_set_hc_input)
+        GGML_ASSERT(hc_in != nullptr && "llama_set_layer_range past layer 0 needs llama_set_hc_input");
+        auto inp_hc = std::make_unique<llm_graph_input_hc_rows>(hc_in);
+        inp_hc->rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp_hc->rows);
+        ggml_set_name(inp_hc->rows, "hc_rows_input");
+        inpL = inp_hc->rows;
+        res->add_input(std::move(inp_hc));
+        cb(inpL, "model.input_hc", -1);
+    }
+    // make sure the input is in the same graph split as the first layer (-sm tensor)
+    ggml_build_forward_expand(gf, inpL);
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_begin; il < il_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -205,6 +228,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Input for next layer
         inpL = cur;
     }
+
+    if (il_end < n_layer) {
+        // the first part of a pipelined prefill: the residual goes to the next part as the nextn embeddings
+        res->t_h_nextn = inpL;
+        cb(res->t_h_nextn, "h_nextn", -1);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
+        res->t_embd   = nullptr;
+        res->t_logits = nullptr;
+        return;
+    }
+
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

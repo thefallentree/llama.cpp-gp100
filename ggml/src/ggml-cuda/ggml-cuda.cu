@@ -4147,7 +4147,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_mul_mat_id_generic(ctx, dst);
     if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
             src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S ||
-            src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ1_S) {
+            src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ1_S ||
+            src0->type == GGML_TYPE_IQ1_M) {
         // the same oracle on the generic path, to compare the two numerics (GGML_CUDA_MMID_KQ_SM60=0, GGML_CUDA_MMID_IQ_SM60=0)
         ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ false, "generic");
     }

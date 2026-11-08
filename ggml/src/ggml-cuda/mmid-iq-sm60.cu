@@ -1,4 +1,4 @@
-// IQ2_S / IQ3_XXS / IQ3_S / IQ2_XXS / IQ2_XS / IQ1_S MUL_MAT_ID mat-vec for decode batches on sm_60 (GP100): the hot pairs of Project Maya's files.
+// IQ2_S / IQ3_XXS / IQ3_S / IQ2_XXS / IQ2_XS / IQ1_S / IQ1_M MUL_MAT_ID mat-vec for decode batches on sm_60 (GP100): the hot pairs of Project Maya's files.
 //
 // GP100 has no DP4A, so the generic mmvq kernels emulate every int8 dot product and every __vcmpne4 / __vsub4 of the sign
 // decode. Here a grid word's bytes stay where they are: masked into half subnormals, OR'ed with the half2 sign masks of a
@@ -18,7 +18,7 @@
 
 #include <atomic>
 
-// IQ_T: 0 = IQ2_S, 1 = IQ3_XXS, 2 = IQ3_S, 3 = IQ2_XXS, 4 = IQ2_XS, 5 = IQ1_S. A pair c = (token t, used expert s) per blockIdx.y; a pair whose expert is not in w
+// IQ_T: 0 = IQ2_S, 1 = IQ3_XXS, 2 = IQ3_S, 3 = IQ2_XXS, 4 = IQ2_XS, 5 = IQ1_S, 6 = IQ1_M. A pair c = (token t, used expert s) per blockIdx.y; a pair whose expert is not in w
 // (e >= n_hot) is skipped by the whole block.
 template <int IQ_T>
 static __global__ void __launch_bounds__(WARP_SIZE*KQ_NWARPS, 8)
@@ -27,9 +27,9 @@ mmid_iq_vec(
         const int32_t * __restrict__ ids, float * __restrict__ dst, const int nsb, const int ne01, const int64_t nb01, const int64_t nb02,
         const int ne11, const int n_used, const int si1, const int n_hot, const int64_t dst_nb1, const int64_t dst_nb2) {
 #if defined(FP16_AVAILABLE)
-    // the half2 sign masks by sign byte (IQ2_S, IQ3_S) or by the 7-bit sign index (IQ3_XXS, IQ2_XXS, IQ2_XS); IQ1_S has no signs
+    // the half2 sign masks by sign byte (IQ2_S, IQ3_S) or by the 7-bit sign index (IQ3_XXS, IQ2_XXS, IQ2_XS); IQ1_S and IQ1_M have no signs
     constexpr bool sgn7 = IQ_T == 1 || IQ_T == 3 || IQ_T == 4;
-    constexpr int  n_sgn = IQ_T == 5 ? 0 : sgn7 ? 128 : 256;
+    constexpr int  n_sgn = IQ_T >= 5 ? 0 : sgn7 ? 128 : 256;
     __shared__ uint4 sgn[256];
     const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
     for (int i = tid; i < n_sgn; i += WARP_SIZE*KQ_NWARPS) {
@@ -40,7 +40,7 @@ mmid_iq_vec(
     }
     const void * grid = IQ_T == 0 ? (const void *) iq2s_grid   : IQ_T == 1 ? (const void *) iq3xxs_grid :
                         IQ_T == 2 ? (const void *) iq3s_grid   : IQ_T == 3 ? (const void *) iq2xxs_grid :
-                        IQ_T == 4 ? (const void *) iq2xs_grid  :             (const void *) iq1s_grid_gpu;
+                        IQ_T == 4 ? (const void *) iq2xs_grid  :             (const void *) iq1s_grid_gpu;   // IQ1_S, IQ1_M
     float sum;
     int t, s, row0;
     if (!iq_vec_lane<IQ_T>(w, x, ids, blockIdx.x, blockIdx.y, threadIdx.y, threadIdx.x, nsb, ne01, nb01, nb02,
@@ -66,6 +66,7 @@ static int mmid_iq_type(const ggml_type t) {
         case GGML_TYPE_IQ2_XXS: return 3;
         case GGML_TYPE_IQ2_XS:  return 4;
         case GGML_TYPE_IQ1_S:   return 5;
+        case GGML_TYPE_IQ1_M:   return 6;
         default:                return -1;
     }
 }
@@ -90,7 +91,7 @@ bool ggml_cuda_mmid_vec_iq_sm60_supported(
     if (src0->ne[0] % 256 != 0 || src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1] || src1->ne[2] != ids->ne[1]) {
         return false;
     }
-    // the blocks (82 / 98 / 110 / 66 / 74 / 50 bytes) are read 2-byte aligned and realigned into words
+    // the blocks (82 / 98 / 110 / 66 / 74 / 50 / 56 bytes) are read 2-byte aligned and realigned into words
     if (src0->nb[0] != ggml_type_size(src0->type) || src0->nb[1] % 2 != 0 || src0->nb[2] % 2 != 0 || (uintptr_t) src0->data % 2 != 0) {
         return false;
     }
@@ -156,7 +157,8 @@ void ggml_cuda_mmid_vec_iq_sm60(
         case 2:  MMID_IQ_LAUNCH(2); break;
         case 3:  MMID_IQ_LAUNCH(3); break;
         case 4:  MMID_IQ_LAUNCH(4); break;
-        default: MMID_IQ_LAUNCH(5); break;
+        case 5:  MMID_IQ_LAUNCH(5); break;
+        default: MMID_IQ_LAUNCH(6); break;
     }
 #undef MMID_IQ_LAUNCH
     CUDA_CHECK(cudaGetLastError());

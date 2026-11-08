@@ -76,9 +76,9 @@ inline size_t mh_mailbox_layout(mh_mailbox * m, int cap_tok, int cap_pairs, int 
 }
 
 // The weight types of a slot's gate/up (wtype) and down (wtype_down) tensors. 0 is the GPU's own Q2_0 blocks of 64 (the old
-// kernels); the others run the k kernels (any gate/up and down combination of 1..10, wtype 1 with a down of 1 or 2 also on
+// kernels); the others run the k kernels (any gate/up and down combination of 1..12, wtype 1 with a down of 1 or 2 also on
 // the old kernels): Q2_K / Q3_K super-blocks (glm5-next, deepseek41), Q4_0 (glm5-next's NextN block), the i-quants of Project
-// Maya's files (IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S for GLM; IQ1_S, IQ2_XXS for DeepSeek).
+// Maya's files (IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S for GLM; IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS for DeepSeek).
 enum {
     MH_W_Q2_0   = 0,
     MH_W_Q2K    = 1,
@@ -92,7 +92,8 @@ enum {
     MH_W_Q4K    = 9,    // glm5-next Maya-M's NextN block (Q3_K gate/up, Q4_K down)
     MH_W_IQ2XS  = 10,   // the IST-DAS sets of DeepSeek
     MH_W_MXFP4  = 11,   // Unsloth's UD-Q2_K_XL / UD-IQ2_XXS DeepSeek-V4.1 down experts on some layers
-    MH_NW       = 12,
+    MH_W_IQ1M   = 12,   // ISTA-DASLab's DeepSeek-V4.1 GSQ sets (gate/up/down on many layers)
+    MH_NW       = 13,
 };
 
 // One hot/cold MoE layer: the cold experts in host memory.

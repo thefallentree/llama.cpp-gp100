@@ -48,6 +48,7 @@ static inline bool ggml_cuda_moe_host_ktype(ggml_type t) {
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_MXFP4:   // Unsloth's DeepSeek-V4.1 UD-Q2_K_XL down experts on some layers (host k kernel)

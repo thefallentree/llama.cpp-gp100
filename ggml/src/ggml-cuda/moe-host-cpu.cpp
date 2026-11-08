@@ -1174,6 +1174,7 @@ static bool pick_kkernels(kdot_fn * kd, kfrom_fn & from, kquant_fn & quant, cons
     kd[MH_W_Q4K]    = kdot_q4k_avx2<2>;
     kd[MH_W_IQ2XS]  = kdot_iq2xs_avx2<2>;
     kd[MH_W_MXFP4]  = kdot_mxfp4_avx2<2>;
+    kd[MH_W_IQ1M]   = kdot_iq1m_avx2<2>;
     name  = "AVX2";
     if (has512 && !(force != nullptr && strcmp(force, "avx2") == 0)) {
         kd[MH_W_Q2K] = kdot_q2k_avx512<2>;
@@ -1184,6 +1185,7 @@ static bool pick_kkernels(kdot_fn * kd, kfrom_fn & from, kquant_fn & quant, cons
             kd[MH_W_IQ3XXS] = kdot_iq3xxs_avx512<2>;
             kd[MH_W_IQ3S]   = kdot_iq3s_avx512<2>;
             kd[MH_W_IQ1S]   = kdot_iq1s_avx512<2>;
+            kd[MH_W_IQ1M]   = kdot_iq1m_avx512<2>;
         }
         name = "AVX-512";
     }

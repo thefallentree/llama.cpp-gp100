@@ -1050,6 +1050,20 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
     llama_set_layer_range(ctx_tgt, il_lo, il_hi);
 
+    // DeepSeek-V4.1's exact long-prompt layer skip, decided as the head decides it for this prompt (server-context.cpp:
+    // the end handed over is n_ubatch + 8 rows before the prompt's, n_split + 4; read in full unless 1024 rows go
+    // beyond the tail). The skip is exact, so a stage that decides otherwise than the head still gives the same state;
+    // llama_context::prompt_skip_for applies it only to a stage that fits it. Other models: no tail, a no-op.
+    {
+        const llama_pos end  = (llama_pos) n_split + 4 - (n_ubatch + 8);
+        const int32_t   tail = llama_set_prompt_end(ctx_tgt, seq_id, end);
+        if (tail > 0 && end >= tail + 1024) {
+            LOG_WRN("prefill-peer: layer skip: the layers past the last stream source run on the last %d rows of %d\n", tail, n_split + 4);
+        } else {
+            llama_set_prompt_end(ctx_tgt, seq_id, -1);
+        }
+    }
+
     sender snd;
     if (!last) {
         snd.start(fd_next, width);
@@ -1238,6 +1252,7 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
         ring.busy.assign(ring.busy.size(), false);
     }
     llama_set_layer_range(ctx_tgt, 0, -1);
+    llama_set_prompt_end(ctx_tgt, seq_id, -1);
     llama_set_embeddings_nextn_slot(ctx_tgt, 0);
     llama_synchronize(ctx_tgt);
     if (ctx_dft) {

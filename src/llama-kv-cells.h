@@ -299,6 +299,7 @@ public:
         }
 
         seq_pos[seq_id].clear();
+        std::fill(seq_bits[seq_id].begin(), seq_bits[seq_id].end(), 0);
 
         return new_head;
     }

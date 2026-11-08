@@ -611,6 +611,13 @@ private:
     void decode_extract(const llm_graph_result * res, const llama_ubatch & ubatch, uint32_t n_outputs_all, int64_t & n_outputs_prev, int64_t & n_tokens_prev, int64_t t_d0, int64_t t_d4);
     // the end of a decode: the output mappings
     void decode_finish(uint32_t n_outputs_all, int64_t t_d0);
+    // the target context whose layer input device buffer the decode being finished reads (DFlash device copies, #31506)
+    llama_context * inject_src_cur     = nullptr;
+    ggml_backend_t  inject_backend_cur = nullptr;
+    // the h_nextn device buffer written by the decode being finished and the state source it reads (#31927)
+    bool            write_h_nextn_cur = false;
+    llama_context * state_src_cur     = nullptr;
+    ggml_backend_t  state_backend_cur = nullptr;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

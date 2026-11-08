@@ -1360,8 +1360,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     if (!res && slots_debug > 1) {
         LLAMA_LOG_WARN("%s: no reuse: k_idxs %d/%u kq_mask %d (n_kv %d -> %u) n_rs %d -> %u n_seqs %d/%u head %u -> %u rs_z %d -> %d\n", __func__,
                 (int) inp_attn->self_k_idxs->ne[0], params.ubatch.n_tokens,
-                (int) can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams),
-                (int) inp_attn->self_kq_mask->ne[0], mctx->get_attn()->get_n_kv(),
+                (int) can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams),
+                (int) inp_attn->self_attn_mask.n_kv, mctx->get_attn()->get_n_kv(),
                 (int) inp_rs->s_copy->ne[0], mctx->get_recr()->get_n_rs(), (int) inp_rs->s_copy_main->ne[0], params.ubatch.n_seqs,
                 inp_rs->head, mctx->get_recr()->get_head(), (int) inp_rs->rs_z, (int) mctx->get_recr()->get_rs_z());
     }

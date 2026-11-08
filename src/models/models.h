@@ -1483,7 +1483,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     int engram_index(int il) const;
 
     struct graph : public llama_model_deepseek4::graph {
-        graph(const llama_model & model, const llm_graph_params & params);
+        graph(const llm_graph_params & params);
 
         // gather the n-gram rows of layer il: [engram_key_length * n_hash_cols, n_tokens]
         ggml_tensor * build_inp_engram(

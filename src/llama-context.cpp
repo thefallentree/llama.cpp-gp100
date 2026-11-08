@@ -2992,6 +2992,9 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
             inject_src->synchronize();
         }
     }
+    // decode_finish records the reader event (a launched-ahead decode finishes in llama_decode_commit)
+    inject_src_cur     = inject_src;
+    inject_backend_cur = inject_backend;
     if (layer_inp_dev && ev_layer_inp_read && ev_layer_inp_read_recorded) {
         // do not overwrite rows the reader has not consumed yet
         ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
@@ -3012,6 +3015,10 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
     if (write_h_nextn && ev_h_nextn_read_recorded) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
+    // decode_finish records the h_nextn events (a launched-ahead decode finishes in llama_decode_commit)
+    write_h_nextn_cur = write_h_nextn;
+    state_src_cur     = state_src;
+    state_backend_cur = state_backend;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -3315,25 +3322,30 @@ void llama_context::decode_finish(uint32_t n_outputs_all, int64_t t_d0) {
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
     }
-    if (write_h_nextn) {
+    if (write_h_nextn_cur) {
         ggml_backend_event_record(ev_h_nextn_written.get(), h_nextn_backend);
         ev_h_nextn_written_recorded = true;
+        write_h_nextn_cur = false;
     }
-    if (state_src) {
-        if (state_backend) {
-            ggml_backend_event_record(state_src->ev_h_nextn_read.get(), state_backend);
-            state_src->ev_h_nextn_read_recorded = true;
+    if (state_src_cur) {
+        if (state_backend_cur) {
+            ggml_backend_event_record(state_src_cur->ev_h_nextn_read.get(), state_backend_cur);
+            state_src_cur->ev_h_nextn_read_recorded = true;
         } else {
             synchronize();
         }
+        state_src_cur     = nullptr;
+        state_backend_cur = nullptr;
     }
-    if (inject_src) {
-        if (inject_backend) {
-            ggml_backend_event_record(inject_src->ev_layer_inp_read.get(), inject_backend);
-            inject_src->ev_layer_inp_read_recorded = true;
+    if (inject_src_cur) {
+        if (inject_backend_cur) {
+            ggml_backend_event_record(inject_src_cur->ev_layer_inp_read.get(), inject_backend_cur);
+            inject_src_cur->ev_layer_inp_read_recorded = true;
         } else {
             synchronize();
         }
+        inject_src_cur     = nullptr;
+        inject_backend_cur = nullptr;
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3980,6 +3992,7 @@ llm_graph_params llama_context::graph_params(
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
                     ggml_backend_sched_t   sched) const {
+    llm_graph_params params = {
         /*.model       =*/ &model,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,

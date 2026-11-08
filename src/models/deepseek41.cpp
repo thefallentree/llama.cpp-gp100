@@ -519,7 +519,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // Engram n-gram hash: each token gathers n_cols rows of this layer's table.
@@ -1046,7 +1046,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     }
 
     // an index source picks the positions; the layers in between attend to the same ones
-    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+    ggml_tensor * raw_mask = inp_attn->self_attn_mask.raw;
 
     if (hparams.dsv41_is_index_source(il)) {
         ggml_tensor * top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
@@ -1115,7 +1115,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         cb(kq_mask, "kq_mask", il);
     }
 
-    out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
+    out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks,
             nullptr, n_kv_max, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
@@ -1125,8 +1125,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     return build_attention_tail(model, out, inp_pos, nt, il);
 }
 
-llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llama_model_deepseek4::graph(params) {
+llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
+    llama_model_deepseek4::graph(params, no_build{}) {
     if (!model.exps_cold.empty()) {
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             // a split hot tensor needs a cold tensor that is split the same way
@@ -1187,7 +1187,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * inp_out_ids = skip ? nullptr : build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
-    ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
+    ggml_build_forward_expand(gf, inp_attn->self_attn_mask.raw);
 
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);

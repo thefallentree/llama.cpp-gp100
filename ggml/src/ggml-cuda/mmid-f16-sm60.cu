@@ -923,7 +923,7 @@ static void mmid16_gemm_setup(
 
     const int si1  = ids->nb[1]/sizeof(int32_t);
     const int sis1 = src1->nb[2]/src1->nb[1];
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, p.ids_src1.get(), p.ids_dst.get(), p.bounds.get(),
+    ggml_cuda_launch_mm_ids_bounds_helper((const int32_t *) ids->data, p.ids_src1.get(), p.ids_dst.get(), p.bounds.get(),
         ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
 
     if (n_cold > 0 && skip_cold) {

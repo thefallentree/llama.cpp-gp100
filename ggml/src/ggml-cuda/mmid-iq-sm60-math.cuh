@@ -1,4 +1,4 @@
-// Per-lane math of the sm_60 IQ2_S / IQ3_XXS / IQ3_S / IQ2_XXS / IQ2_XS / IQ1_S MUL_MAT_ID mat-vec (mmid-iq-sm60.cu), on the activation records of
+// Per-lane math of the sm_60 IQ2_S / IQ3_XXS / IQ3_S / IQ2_XXS / IQ2_XS / IQ1_S / IQ1_M MUL_MAT_ID mat-vec (mmid-iq-sm60.cu), on the activation records of
 // mmid-kq-sm60-math.cuh (the same converted rows as the Q2_K / Q3_K lanes, shared between gate and up through the cache).
 // No includes: a CPU test compiles this file against an emulation of half2, uint4, __byte_perm and __funnelshift_r.
 //
@@ -347,8 +347,72 @@ IQ_DEV float iq1s_lane(const char * __restrict__ row, const int nsb, const int l
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// IQ1_M: 56 bytes = qs[32] (grid index low bytes, a byte per 8 weights), qh[16] (a nibble per 8 weights: 3 index high bits, the
+// delta's sign in bit 3), scales[4] u16 (a 3-bit scale per 16 weights: sub-block i = word i >> 2, bits 3*(i & 3); the fp16
+// super-scale d in the four top nibbles); weight = d*(2s + 1)*(grid + delta), grid in {-1, 0, 1} (iq1s_grid_gpu, as IQ1_S),
+// delta = +-IQ1M_DELTA per 8 weights. The delta goes into the grid bytes: 16*(grid + 1), plus 32*IQ1M_DELTA where the sign bit
+// is clear, is 16*(grid + delta) + 16*(1 + IQ1M_DELTA) <= 36, a half subnormal; the bias leaves as one product with the 16
+// weights' activation sum (the record's X_k of the part), in float. One half2 accumulator per 16 weights (its scale).
+#ifndef IQ1M_DELTA
+#define IQ1M_DELTA 0.125f
+#endif
+IQ_DEV float iq1m_lane(const char * __restrict__ row, const int nsb, const int l, const char * __restrict__ x,
+        const uint32_t * __restrict__ grid) {
+    const int   p0 = 2*(l >> 1);
+    const int   k0 = 2*(l & 1);
+    const char * blk = row;
+    const char * rec = x;
+    const uint4    m0   = make_uint4(0u, 0u, 0u, 0u);
+    const uint32_t dadd = (uint32_t) (32.0f*IQ1M_DELTA)*0x01010101u;
+    const float    bias = 1.0f + IQ1M_DELTA;
+    float sum = 0.0f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint32_t s01 = iq_ld32(blk + 48);
+        const uint32_t s23 = iq_ld32(blk + 52);
+        const uint32_t d16 = ((s01 >> 12) & 0x000Fu) | ((s01 >> 24) & 0x00F0u) | ((s23 >> 4) & 0x0F00u) | ((s23 >> 16) & 0xF000u);
+        const float    d   = __half22float2(kq_h2(d16)).x;
+        const uint32_t scw = (uint32_t) *((const uint16_t *) (blk + 48 + 2*l));   // the scales of ib32 2l, 2l + 1
+        const uint4    xp0 = ((const uint4 *) (rec + 512))[p0];
+        const uint4    xp1 = ((const uint4 *) (rec + 512))[p0 + 1];
+        float t = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            const int      k   = k0 + kk;
+            const int      ib  = 2*l + kk;
+            const uint32_t qw  = iq_ld32(blk + 4*ib);
+            const uint32_t qh  = (uint32_t) *((const uint16_t *) (blk + 32 + 2*ib));
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                half2 acc = kq_h2(0u);
+#pragma unroll
+                for (int e2 = 0; e2 < 2; ++e2) {
+                    const int      j  = 2*h + e2;
+                    const uint4    xa = ((const uint4 *) rec)[(2*k + e2)*4 + p0 + h];
+                    const uint32_t gw = IQ_LDG32(grid + (((qw >> (8*j)) & 0xFFu) | (((qh >> (4*j)) & 7u) << 8)));
+                    const uint32_t dv = ((qh >> (4*j + 3)) & 1u) ? 0u : dadd;
+                    acc = iq_group8(acc, ((gw << 4) & 0xF0F0F0F0u) | dv, (gw & 0xF0F0F0F0u) | dv, m0, xa);
+                }
+                // a product is (u*2^-24)*(x*2^(15 - 2k)), u = 16*(grid + delta + bias): the sum of (grid + delta + bias)*x
+                const float2 a  = __half22float2(acc);
+                const float  sv = (a.x + a.y)*(float) (32 << (2*k));
+                // X_k of part p0 + h: half (k >> 1) of word x (k even) or y (k odd)
+                const uint32_t wx = h ? ((k & 1) ? xp1.y : xp1.x) : ((k & 1) ? xp0.y : xp0.x);
+                const float2   xx = __half22float2(kq_h2(wx));
+                const float    X  = (k >> 1) ? xx.y : xx.x;
+                const float    dl = (float) (2u*((scw >> (6*kk + 3*h)) & 7u) + 1u);
+                t = fmaf(dl, fmaf(-bias, X, sv), t);
+            }
+        }
+        sum = fmaf(d*__uint_as_float(xp0.z), t, sum);
+        blk += 56;
+        rec += KQ_REC_BYTES;
+    }
+    return sum;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // the mat-vec: a block is (rows, slot c = t*n_used + s) with KQ_NWARPS warps of 8 rows (4 lanes per row), as kq_vec_lane.
-// IQ_T: 0 = IQ2_S, 1 = IQ3_XXS, 2 = IQ3_S, 3 = IQ2_XXS, 4 = IQ2_XS, 5 = IQ1_S. False: the block has nothing to do (the expert
+// IQ_T: 0 = IQ2_S, 1 = IQ3_XXS, 2 = IQ3_S, 3 = IQ2_XXS, 4 = IQ2_XS, 5 = IQ1_S, 6 = IQ1_M. False: the block has nothing to do (the expert
 // is not in w: the host tier computes it).
 template <int IQ_T>
 IQ_DEV bool iq_vec_lane(const char * __restrict__ w, const char * __restrict__ x, const int32_t * __restrict__ ids,
@@ -371,6 +435,7 @@ IQ_DEV bool iq_vec_lane(const char * __restrict__ w, const char * __restrict__ x
           IQ_T == 2 ? iq3s_lane(wr, nsb, lane & 3, xr, sgn, (const uint32_t *) grid) :
           IQ_T == 3 ? iq2xxs_lane(wr, nsb, lane & 3, xr, sgn, (const uint64_t *) grid) :
           IQ_T == 4 ? iq2xs_lane(wr, nsb, lane & 3, xr, sgn, (const uint64_t *) grid) :
-                      iq1s_lane(wr, nsb, lane & 3, xr, (const uint32_t *) grid);
+          IQ_T == 5 ? iq1s_lane(wr, nsb, lane & 3, xr, (const uint32_t *) grid) :
+                      iq1m_lane(wr, nsb, lane & 3, xr, (const uint32_t *) grid);
     return true;
 }

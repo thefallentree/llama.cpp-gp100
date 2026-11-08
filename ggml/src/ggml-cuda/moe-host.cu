@@ -623,6 +623,7 @@ static int mh_wtype(ggml_type t) {
         case GGML_TYPE_Q4_K:    return MH_W_Q4K;
         case GGML_TYPE_IQ2_XS:  return MH_W_IQ2XS;
         case GGML_TYPE_MXFP4:   return MH_W_MXFP4;
+        case GGML_TYPE_IQ1_M:   return MH_W_IQ1M;
         default:                return MH_W_Q2_0;
     }
 }

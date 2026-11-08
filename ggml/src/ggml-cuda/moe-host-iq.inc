@@ -1,5 +1,5 @@
 // The "k" kernels of the i-quant cold experts (Project Maya's GLM-5.3-Flash and DeepSeek-V4.1-Flash quants): IQ2_XXS, IQ2_S,
-// IQ3_XXS, IQ3_S and IQ1_S gate/up/down rows against one activation row in k blocks (kact_block, see moe-host-cpu.cpp).
+// IQ3_XXS, IQ3_S, IQ1_S and IQ1_M gate/up/down rows against one activation row in k blocks (kact_block, see moe-host-cpu.cpp).
 // Included inside the anonymous namespace of moe-host-cpu.cpp, in the MH_X86 section, after kdot_q40_avx2.
 //
 // Every i-quant block is 256 weights = 8 groups of 32, and the k activation block keeps each group of 32 contiguous, so a
@@ -10,6 +10,7 @@
 //   IQ3_XXS 98 bytes: d, qs[64] grid bytes, 8 x u32 (as IQ2_XXS)                                   w = d*0.25*(2s+1)*grid*sign
 //   IQ3_S  110 bytes: d, qs[64], qh[8], signs[32], scales[4] (a nibble per group)                  w = d*(2s+1)*grid*sign
 //   IQ1_S   50 bytes: d, qs[32], qh[8] x u16 (3 index bits x4, scale bits 12..14, delta sign bit 15) w = d*(2s+1)*(grid + delta)
+//   IQ1_M   56 bytes: qs[32], qh[16] (3 index bits + delta sign bit per 8), scales[4] x u16 (3 bits per 16, d in the top nibbles)
 // The grids are ggml's (ggml-common.h) and the arithmetic is ggml's vec_dot (generic) with the activation of the k block,
 // float rounding aside.
 
@@ -233,6 +234,73 @@ MH_IQ_AVX2 static void kdot_iq1s_avx2(const uint8_t * const * w, const kact_bloc
             const __m256  d   = _mm256_set1_ps(_cvtsh_ss(iq_ld16(p)));
             acc[r] = _mm256_fmadd_ps(sb, d, acc[r]);
             cor[r] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_mul_ps(lsf, fv), asb), d, cor[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = kh256(acc[r]) - kh256(cor[r]);
+    }
+}
+
+// IQ1_M: the grid of IQ1_S, but the delta's sign is per 8 weights and the scale per 16, so the delta goes into the bytes:
+// 8*(grid + 1) + (the sign bit clear ? 16*IQ1M_DELTA : 0) = 8*(grid + delta) + 8*(1 + IQ1M_DELTA), at most 18, unsigned for
+// vpmaddubsw. The bias 8*(1 + delta) leaves as the scale words times the activation sums of 16 (bs) by one vpmaddwd per row.
+// The scale words of a row (sub-block i = 2g + h: word i >> 2, bits 3*(i & 3)) are a vector for that, scalars per group.
+MH_IQ_AVX2 static inline __m256i iq1m_ls16_avx2(const uint8_t * sc) {
+    const __m256i w4 = _mm256_castsi128_si256(_mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *) sc)));
+    const __m256i sh = _mm256_setr_epi32(0, 3, 6, 9, 0, 3, 6, 9);
+    const __m256i m7 = _mm256_set1_epi32(7);
+    const __m256i lo = _mm256_and_si256(_mm256_srlv_epi32(_mm256_permutevar8x32_epi32(w4, _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1)), sh), m7);
+    const __m256i hi = _mm256_and_si256(_mm256_srlv_epi32(_mm256_permutevar8x32_epi32(w4, _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3)), sh), m7);
+    const __m256i l  = _mm256_permute4x64_epi64(_mm256_packus_epi32(lo, hi), 0xD8);   // words 0..15 in sub-block order
+    return _mm256_add_epi16(_mm256_slli_epi16(l, 1), _mm256_set1_epi16(1));
+}
+
+// the fp16 super-scale of a block from the top nibbles of its 4 scale words
+static inline float iq1m_d(const uint8_t * sc) {
+    const uint16_t s0 = iq_ld16(sc), s1 = iq_ld16(sc + 2), s2 = iq_ld16(sc + 4), s3 = iq_ld16(sc + 6);
+    return GGML_FP16_TO_FP32((ggml_fp16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000)));
+}
+
+template <int NR>
+MH_IQ_AVX2 static void kdot_iq1m_avx2(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m128i qsh  = _mm_setr_epi32(0, 4, 8, 12);
+    const __m128i m7   = _mm_set1_epi32(7);
+    const __m256i one  = _mm256_set1_epi8(1);
+    const __m256i dbit = _mm256_setr_epi64x(0x8, 0x80, 0x800, 0x8000);
+    const __m256i dadd = _mm256_set1_epi8((char) (16.0f*IQ1M_DELTA));
+    const float   bias = 8.0f*(1.0f + IQ1M_DELTA);
+    __m256 acc[NR], cor[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm256_setzero_ps();
+        cor[r] = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        const __m256i bsv = _mm256_load_si256((const __m256i *) ab.bs);
+        const __m256  asv = _mm256_load_ps(ab.asg);
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p  = w[r] + (size_t) k*56;
+            const uint8_t * qs = p, * qhp = p + 32, * sc = p + 48;
+            __m256 sb = _mm256_setzero_ps();
+#pragma GCC unroll 8
+            for (int g = 0; g < 8; ++g) {
+                const __m256i y   = _mm256_load_si256((const __m256i *) (ab.q + MH_IQ_YOFF(g)));
+                const uint32_t qh = iq_ld16(qhp + 2*g);
+                const __m128i hi  = _mm_slli_epi32(_mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32((int) qh), qsh), m7), 8);
+                const __m128i idx = _mm_or_si128(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int) iq_ld32(qs + 4*g))), hi);
+                const __m256i grid = _mm256_i32gather_epi64((const long long *) iq1s_grid, idx, 8);
+                // a qword of 16*delta bytes where its sign bit is clear
+                const __m256i dv  = _mm256_and_si256(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_set1_epi64x(qh), dbit), _mm256_setzero_si256()), dadd);
+                const __m256i u   = _mm256_add_epi8(_mm256_slli_epi16(_mm256_add_epi8(grid, one), 3), dv);
+                const uint32_t s6 = (uint32_t) iq_ld16(sc + 2*(g >> 1)) >> (6*(g & 1));
+                const __m256i scl = _mm256_set_m128i(_mm_set1_epi16((short) (2*((s6 >> 3) & 7) + 1)), _mm_set1_epi16((short) (2*(s6 & 7) + 1)));
+                const __m256i pr  = _mm256_madd_epi16(_mm256_maddubs_epi16(u, y), scl);
+                sb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pr), _mm256_broadcast_ss(ab.asg + g), sb);
+            }
+            const float  d  = iq1m_d(sc)*0.125f;
+            const __m256 cg = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(iq1m_ls16_avx2(sc), bsv)), asv);
+            acc[r] = _mm256_fmadd_ps(sb, _mm256_set1_ps(d), acc[r]);
+            cor[r] = _mm256_fmadd_ps(cg, _mm256_set1_ps(d*bias), cor[r]);
         }
     }
     for (int r = 0; r < NR; ++r) {
@@ -495,6 +563,63 @@ MH_IQ_AVX512 static void kdot_iq1s_avx512(const uint8_t * const * w, const kact_
             const float   d   = _cvtsh_ss(iq_ld16(p));
             acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(d), acc[r]);
             cor[r] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_mul_ps(lsf, fv), asb), _mm256_set1_ps(d), cor[r]);
+        }
+    }
+    for (int r = 0; r < NR; ++r) {
+        out[r] = _mm512_reduce_add_ps(acc[r]) - kh256(cor[r]);
+    }
+}
+
+// IQ1_M as kdot_iq1m_avx2, a pair of groups (j, j + 4) per step: the delta bytes by a qword mask (vptestnmq of the group's
+// qh word against the 4 sign bits), the scale words as IQ2_S's (16 words in sub-block order)
+template <int NR>
+MH_IQ_AVX512 static void kdot_iq1m_avx512(const uint8_t * const * w, const kact_block * a, int nsb, float * out) {
+    const __m256i qsh  = _mm256_setr_epi32(0, 4, 8, 12, 0, 4, 8, 12);
+    const __m256i m7   = _mm256_set1_epi32(7);
+    const __m512i one  = _mm512_set1_epi8(1);
+    const __m512i dbit = _mm512_setr_epi64(0x8, 0x80, 0x800, 0x8000, 0x8, 0x80, 0x800, 0x8000);
+    const __m512i dadd = _mm512_set1_epi8((char) (16.0f*IQ1M_DELTA));
+    const float   bias = 8.0f*(1.0f + IQ1M_DELTA);
+    const __m512i wps[4] = { iq_wperm(0, 1, 8, 9), iq_wperm(2, 3, 10, 11), iq_wperm(4, 5, 12, 13), iq_wperm(6, 7, 14, 15) };
+    const __m512i qperm[4] = {
+        _mm512_setr_epi64(0, 0, 0, 0, 4, 4, 4, 4), _mm512_setr_epi64(1, 1, 1, 1, 5, 5, 5, 5),
+        _mm512_setr_epi64(2, 2, 2, 2, 6, 6, 6, 6), _mm512_setr_epi64(3, 3, 3, 3, 7, 7, 7, 7) };
+    __m512 acc[NR];
+    __m256 cor[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = _mm512_setzero_ps();
+        cor[r] = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < nsb; ++k) {
+        const kact_block & ab = a[k];
+        iq_act512 A;
+        iq_load_act512(ab, A);
+        const __m256i bsv = _mm256_load_si256((const __m256i *) ab.bs);
+        const __m256  asv = _mm256_load_ps(ab.asg);
+        for (int r = 0; r < NR; ++r) {
+            const uint8_t * p  = w[r] + (size_t) k*56;
+            const uint8_t * qs = p, * qhp = p + 32, * sc = p + 48;
+            const __m256i qhv  = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) qhp));   // the qh word of group g
+            const __m512i qh64 = _mm512_cvtepu32_epi64(qhv);
+            const __m256i ls16 = iq1m_ls16_avx2(sc);
+            const __m512i ls512 = _mm512_castsi256_si512(ls16);
+            __m512 sb = _mm512_setzero_ps();
+#pragma GCC unroll 4
+            for (int j = 0; j < 4; ++j) {
+                const int ga = j, gb = j + 4;
+                const __m256i qpair = _mm256_permutevar8x32_epi32(qhv, _mm256_setr_epi32(ga, ga, ga, ga, gb, gb, gb, gb));
+                const __m256i hi  = _mm256_slli_epi32(_mm256_and_si256(_mm256_srlv_epi32(qpair, qsh), m7), 8);
+                const __m256i idx = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_unpacklo_epi32(_mm_cvtsi32_si128((int) iq_ld32(qs + 4*ga)), _mm_cvtsi32_si128((int) iq_ld32(qs + 4*gb)))), hi);
+                const __m512i grid = _mm512_i32gather_epi64(idx, (const void *) iq1s_grid, 8);
+                const __mmask8 dm = _mm512_testn_epi64_mask(_mm512_permutexvar_epi64(qperm[j], qh64), dbit);
+                const __m512i u   = _mm512_add_epi8(_mm512_slli_epi16(_mm512_add_epi8(grid, one), 3), _mm512_maskz_mov_epi64(dm, dadd));
+                const __m512i pr  = _mm512_madd_epi16(_mm512_maddubs_epi16(u, A.y[j]), _mm512_permutexvar_epi16(wps[j], ls512));
+                sb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(pr), A.as[j], sb);
+            }
+            const float  d  = iq1m_d(sc)*0.125f;
+            const __m256 cg = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(ls16, bsv)), asv);
+            acc[r] = _mm512_fmadd_ps(sb, _mm512_set1_ps(d), acc[r]);
+            cor[r] = _mm256_fmadd_ps(cg, _mm256_set1_ps(d*bias), cor[r]);
         }
     }
     for (int r = 0; r < NR; ++r) {

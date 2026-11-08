@@ -251,6 +251,19 @@ static void dsv4_state_dst_stream_range(
     s0 = 0;
 }
 
+// the layers of a state: all of them, or those of a layer-filtered state (llama_state_seq_*_layers: the prefill peers)
+template <typename T>
+static std::vector<T> dsv4_state_layers(const std::vector<T> & ids) {
+    std::vector<T> res;
+    res.reserve(ids.size());
+    for (const T il : ids) {
+        if (!g_state_layer_filter.skip((int32_t) il)) {
+            res.push_back(il);
+        }
+    }
+    return res;
+}
+
 static void dsv4_state_write_tensor_streams(
         llama_io_write_i & io,
         ggml_tensor      * tensor,
@@ -348,7 +361,7 @@ static void dsv4_state_write_k_cache(
 
     const uint32_t version = DSV4_K_CACHE_STATE_VER;
     const uint32_t kv_size = kv->get_size();
-    const auto layer_ids = kv->get_layer_ids();
+    const auto layer_ids = dsv4_state_layers(kv->get_layer_ids());
     const uint32_t n_layer = layer_ids.size();
 
     if (n_rows > kv_size) {
@@ -400,7 +413,7 @@ static void dsv4_state_read_k_cache(
     uint32_t s0;
     dsv4_state_dst_stream_range(kv->get_n_stream(), seq_id, ns, s0);
 
-    const auto layer_ids = kv->get_layer_ids();
+    const auto layer_ids = dsv4_state_layers(kv->get_layer_ids());
     if (n_layer_ref != layer_ids.size()) {
         throw std::runtime_error("DSV4 K-cache layer count mismatch");
     }
@@ -1105,7 +1118,10 @@ void llama_dsv4_comp_state::state_write(
     }
 
     const uint32_t version      = DSV4_COMP_STATE_VER;
-    const uint32_t n_layer      = layers.size();
+    uint32_t       n_layer      = 0;
+    for (const auto & layer : layers) {
+        n_layer += g_state_layer_filter.skip((int32_t) layer.il) ? 0 : 1;
+    }
 
     io.write(&version,      sizeof(version));
     io.write(&ratio,        sizeof(ratio));
@@ -1115,6 +1131,9 @@ void llama_dsv4_comp_state::state_write(
     io.write(&n_layer,      sizeof(n_layer));
 
     for (const auto & layer : layers) {
+        if (g_state_layer_filter.skip((int32_t) layer.il)) {
+            continue;
+        }
         io.write(&layer.il, sizeof(layer.il));
 
         dsv4_state_write_tensor_streams(io, layer.kv,    state_size, state_size, s0, ns, &stream_ids);
@@ -1145,7 +1164,11 @@ void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id
     if (ratio_ref != ratio || state_size_ref != state_size || n_embd_state_ref != n_embd_state) {
         throw std::runtime_error("DSV4 compressor state metadata mismatch");
     }
-    if (n_layer_ref != layers.size()) {
+    uint32_t n_layer = 0;
+    for (const auto & layer : layers) {
+        n_layer += g_state_layer_filter.skip((int32_t) layer.il) ? 0 : 1;
+    }
+    if (n_layer_ref != n_layer) {
         throw std::runtime_error("DSV4 compressor state layer count mismatch");
     }
 
@@ -1153,6 +1176,9 @@ void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id
     dsv4_state_dst_stream_range(n_stream, seq_id, ns, s0);
 
     for (const auto & layer : layers) {
+        if (g_state_layer_filter.skip((int32_t) layer.il)) {
+            continue;
+        }
         uint32_t il_ref;
         io.read(&il_ref, sizeof(il_ref));
         if (il_ref != layer.il) {
@@ -1729,8 +1755,13 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
     kv_raw->state_read(io, seq_id, flags);
 
+    // a layer-filtered read (the prefill peers' layers into the head's sequence) keeps the other layers' rows
+    const bool filtered = g_state_layer_filter.active;
+
     if (!partial_only) {
-        clear_compressed(seq_id, true);
+        if (!filtered) {
+            clear_compressed(seq_id, true);
+        }
 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
@@ -1741,7 +1772,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     hca_state->state_read(io, seq_id, flags);
     lid_state->state_read(io, seq_id, flags);
 
-    if (seq_id >= 0) {
+    if (filtered) {
+        // the rollback slots are the head's own (a layer-filtered state is written from slot rs_idx of the sender)
+    } else if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
         rs_idx[seq_id] = 0;
         rs_max[seq_id] = 0;

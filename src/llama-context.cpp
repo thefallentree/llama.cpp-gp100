@@ -1915,8 +1915,19 @@ bool llama_context::prompt_skip_for(const llama_ubatch & ubatch, uint32_t n_out,
     if (prompt_end.empty() || n_out != 0 || gtype != LLM_GRAPH_TYPE_DEFAULT || hp.dsv41_skip_src < 0) {
         return false;
     }
-    if (cparams.embeddings || cparams.embeddings_nextn) {
+    if (cparams.embeddings) {
         return false;
+    }
+    if (cparams.embeddings_nextn) {
+        // a stage of a pipelined prefill (llama_set_layer_range) skips like the whole model would: a stage that sends
+        // its residual on must end at the last stream source or before it (it runs in full: the skip starts at the
+        // source), the last stage must start there or before it; anything else reads its nextn rows in full
+        const int32_t src = hp.dsv41_skip_src;
+        const bool ranged = cparams.layer_begin > 0 || cparams.layer_end >= 0;
+        const bool fits   = cparams.layer_end >= 0 ? cparams.layer_end <= src : cparams.layer_begin <= src;
+        if (!ranged || !fits) {
+            return false;
+        }
     }
     if (ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 || ubatch.pos == nullptr || ubatch.output == nullptr) {
         return false;

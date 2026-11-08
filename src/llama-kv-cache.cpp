@@ -2717,8 +2717,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             sinfo.resize(1);
             sinfo.strm[0] = strm;
             sinfo.idxs[0].clear();
+            // the writer leaves out the cells the window masks (state_write), so they are not matched here either
+            const llama_pos pos_max = cells.seq_pos_max(dest_seq_id);
             for (uint32_t i = 0; i < cells.size(); ++i) {
-                if (!cells.is_empty(i) && cells.seq_has(i, dest_seq_id)) {
+                if (!cells.is_empty(i) && cells.seq_has(i, dest_seq_id) &&
+                    !llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), pos_max)) {
                     pos_idx[cells.pos_get(i)] = i;
                 }
             }

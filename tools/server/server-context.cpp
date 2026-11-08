@@ -4742,7 +4742,7 @@ private:
                     }
                     if (peer_cfg.enabled() && p0 == 0 && batch.size() == 0 && others_idle && !wait_shared &&
                         !input_tokens.has_mtmd && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
-                        slot.task->n_tokens_shared == 0 && slot.prompt_skip_end < 0 && slot.task->n_tokens() >= peer_cfg.min_tokens &&
+                        slot.task->n_tokens_shared == 0 && slot.task->n_tokens() >= peer_cfg.min_tokens &&
                         slot.prompt.n_tokens() == 0 && slot.lora.empty()) {
                         // all but the last 4 tokens go through the pipeline, in the ubatches the local path would decode
                         // (n_ubatch from 0, then the last n_ubatch before the 4); the checkpoint the local path makes
@@ -4750,7 +4750,10 @@ private:
                         const int32_t n_prompt = slot.task->n_tokens();
                         const int32_t n_split  = n_prompt - 4;
                         const int32_t n_ckpt   = n_prompt - (4 + n_ubatch);
-                        const bool want_ckpt = params_base.n_ctx_checkpoints > 0 && (
+                        // LLAMA_PREFILL_PEER_CKPT=0: no assembled checkpoint (DeepSeek-V4.1: its partial state holds the raw window
+                        // and the compressor states at the end of the prompt, the stages' snapshots cannot be put back into it)
+                        static const bool peer_ckpt = getenv("LLAMA_PREFILL_PEER_CKPT") == nullptr || atoi(getenv("LLAMA_PREFILL_PEER_CKPT")) != 0;
+                        const bool want_ckpt = peer_ckpt && params_base.n_ctx_checkpoints > 0 && (
                                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                                 n_swa > 0);

@@ -84,6 +84,15 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EXPERT_HOT_COUNT, hparams.n_expert_hot, false);
 
+    // pipelined prefill (llama_set_layer_range): what passes between two layers is the hc-wide stream plus the pending
+    // hc mix of the last FFN (pre_mix, hc floats per token: the next attention collapses the copies with it, and it is
+    // computed from a value inside the previous layer), so the residual rows that go from stage to stage are
+    // n_embd*hc + hc wide. Without an MTP block nothing else reads this width (DeepSeek-V4.1's drafter, DSpark, reads
+    // the layer-input taps of n_embd); a model with one keeps n_embd*hc for its MTP graph.
+    if (hparams.n_layer_nextn == 0) {
+        hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd + hparams.dsv4_hc_mult;
+    }
+
     // Unsloth's DeepSeek-V4.1 GGUFs (their converter, unslothai/llama.cpp#289) spell the engram metadata with the PLE keys of
     // qwen4exp: ple.layers / ngram_size / heads_per_ngram / layer_multipliers / head_vocab_sizes (the primes) / head_offsets,
     // embedding_length_per_layer_input (the key length) and engram.pad_token_id (a token id, not yet through the token map).
@@ -1182,26 +1191,73 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
     // keeps checkpoints out of that range).
     const bool skip = prompt_skip && hparams.dsv41_skip_src >= 0;
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    // Pipelined prefill (llama_set_layer_range, server-prefill-peer.h): this graph runs the layers [il_begin, il_end)
+    // only. Past layer 0 the stream and the pending hc mix come in through llama_set_hc_input (n_embd*hc + hc floats per
+    // token, see load_arch_hparams); up to il_end < n_layer they go out as the nextn embeddings. A stage has to start at
+    // a layer from which on every layer reads only streams published inside the stage (compressed KV, index keys, picks:
+    // with the released model the sources 2, 8, 14, 20); with the layer skip, a stage that is not the last ends at the
+    // last stream source or before it (llama_context::prompt_skip_for), so only the last one meets the skipped layers.
+    const int il_begin = std::max(0, cparams.layer_begin);
+    const int il_end   = cparams.layer_end < 0 ? n_layer : std::min<int>(cparams.layer_end, n_layer);
+    GGML_ASSERT(il_begin < il_end);
+    for (int il = il_begin; il < il_end; ++il) {
+        if (hparams.dsv4_compress_ratios[il] == 0) {
+            continue;
+        }
+        if (hparams.dsv41_kv_source[il] < il_begin || hparams.dsv41_index_key_source[il] < il_begin ||
+            hparams.dsv41_topk_source[il] < il_begin) {
+            throw std::runtime_error(format("layer range [%d, %d): layer %d reads a stream of layer %d/%d/%d, before the range",
+                    il_begin, il_end, il, hparams.dsv41_kv_source[il], hparams.dsv41_index_key_source[il], hparams.dsv41_topk_source[il]));
+        }
+    }
+
+    ggml_tensor * inp = il_begin == 0 ? build_inp_embd(model.tok_embd) : nullptr;
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = skip ? nullptr : build_inp_out_ids();
+    // the first parts of a pipelined prefill have no outputs: an unused input would get no buffer
+    ggml_tensor * inp_out_ids = skip || il_end < n_layer ? nullptr : build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     ggml_build_forward_expand(gf, inp_attn->self_attn_mask.raw);
+    // a skipped last stage of a pipelined prefill may run nothing that reads the positions: keep the input allocated
+    ggml_build_forward_expand(gf, inp_pos);
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL    = nullptr;
+    ggml_tensor * pre_mix = nullptr;
+    if (il_begin == 0) {
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
 
-    // Layer 0 has no previous sublayer to take a mix from, so the reference hands it a one-hot
-    // that selects the first copy.
-    ggml_tensor * pre_mix = ggml_concat(ctx0,
-            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f),
-            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
-    cb(pre_mix, "hc_pre_init", -1);
+        // Layer 0 has no previous sublayer to take a mix from, so the reference hands it a one-hot
+        // that selects the first copy.
+        pre_mix = ggml_concat(ctx0,
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f),
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
+        cb(pre_mix, "hc_pre_init", -1);
+    } else {
+        // the stream and the pending mix after layer il_begin - 1, computed elsewhere (llama_set_hc_input)
+        GGML_ASSERT(hc_in != nullptr && "llama_set_layer_range past layer 0 needs llama_set_hc_input");
+        const int64_t width = n_embd*hc + hc;
+        GGML_ASSERT(hparams.n_embd_out() == (uint32_t) width && "DeepSeek-V4.1 pipelined prefill: residual width mismatch");
+        auto inp_hc = std::make_unique<llm_graph_input_hc_rows>(hc_in);
+        inp_hc->rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, width, n_tokens);
+        ggml_set_input(inp_hc->rows);
+        ggml_set_name(inp_hc->rows, "hc_rows_input");
+        ggml_tensor * rows = inp_hc->rows;
+        res->add_input(std::move(inp_hc));
 
-    for (int il = 0; il < n_layer; ++il) {
+        inpL = ggml_cont(ctx0, ggml_view_3d(ctx0, rows, n_embd, hc, n_tokens,
+                    n_embd*sizeof(float), rows->nb[1], 0));
+        cb(inpL, "hc_init", -1);
+        pre_mix = ggml_cont(ctx0, ggml_view_2d(ctx0, rows, hc, n_tokens, rows->nb[1], n_embd*hc*sizeof(float)));
+        cb(pre_mix, "hc_pre_init", -1);
+    }
+    // make sure the inputs are in the same graph split as the first layer
+    ggml_build_forward_expand(gf, inpL);
+    ggml_build_forward_expand(gf, pre_mix);
+
+    for (int il = il_begin; il < il_end; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -1311,6 +1367,16 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
+    }
+
+    if (il_end < n_layer) {
+        // a first part of a pipelined prefill: the stream and the pending mix go to the next part as the nextn embeddings
+        res->t_h_nextn = ggml_concat(ctx0, ggml_cont_2d(ctx0, inpL, n_embd*hc, n_tokens), ggml_cont(ctx0, pre_mix), 0);
+        cb(res->t_h_nextn, "h_nextn", -1);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
+        res->t_embd   = nullptr;
+        res->t_logits = nullptr;
+        return;
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {

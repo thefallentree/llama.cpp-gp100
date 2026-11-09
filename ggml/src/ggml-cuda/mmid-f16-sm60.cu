@@ -1202,7 +1202,7 @@ struct mmid16_gemm_plan {
     bool    tile16 = false; // the pipelined 16-slot tiles (mmid16_q2_0_gemm_p<64, 4, 4>)
     int     q4     = 0;     // Q4_0 experts: 1 + the GGML_CUDA_MMID16_Q4TILE instantiation (0 = Q2_0)
     ggml_type iq   = GGML_TYPE_COUNT; // the i-quant experts (mmid16_iq_gemm_p), else GGML_TYPE_COUNT
-    int     iq_tile = 16;   // i-quant tile mode (GGML_CUDA_MMID16_IQ_TILE): 16 = <64,4,4> 16-slot tiles, 32 = <64,4,8> 32-slot,
+    int     iq_tile = 129;  // i-quant tile mode (GGML_CUDA_MMID16_IQ_TILE): 16 = <64,4,4> 16-slot tiles, 32 = <64,4,8> 32-slot,
                             // 128 = <128,4,4> 32-slot, 33 / 129 = mixed: <64,4,8> / <128,4,4> on the full 32-slot groups + <64,4,4> on the remainders
     const half2 * xh_ptr = nullptr; // the converted activations: the pool allocation above or the context's cache
     const float * xs_ptr = nullptr;
@@ -1327,7 +1327,10 @@ static void mmid16_gemm_setup(
     if (p.q4) {
         p.mixed = false; p.narrow = p.q4 == 3; p.tile16 = p.q4 != 3; p.narrow128 = false;
     }
-    static const int iq_tile_env = getenv("GGML_CUDA_MMID16_IQ_TILE") != nullptr ? atoi(getenv("GGML_CUDA_MMID16_IQ_TILE")) : 16;
+    // GGML_CUDA_MMID16_IQ_TILE (default 129): the i-quant tile mode, see mmid16_gemm_plan::iq_tile. 129 = <128,4,4> on the full
+    // 32-slot groups + <64,4,4> on the remainders: the same fill as the 16-slot tiles, the decode shared by twice the slots and
+    // 16 warps/SM instead of 10 (DP3-IQ: 1536-token Coder ops 6.2 -> ~7.5 TFLOPS)
+    static const int iq_tile_env = getenv("GGML_CUDA_MMID16_IQ_TILE") != nullptr ? atoi(getenv("GGML_CUDA_MMID16_IQ_TILE")) : 129;
     if (p.iq != GGML_TYPE_COUNT) {
         p.mixed = false; p.narrow = false; p.tile16 = true; p.narrow128 = false;
         p.iq_tile = iq_tile_env;

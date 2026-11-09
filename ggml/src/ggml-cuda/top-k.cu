@@ -66,13 +66,12 @@ struct top_k_radix_state {
     uint32_t prefix_mask;
     int rank;
     int greater_count;
-    int equal_count;
 };
 
 static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
-        states[row] = {0, 0, k, 0, 0};
+        states[row] = {0, 0, k, 0};
     }
 }
 
@@ -82,6 +81,7 @@ static __global__ void top_k_radix_histogram(
         const top_k_radix_state * __restrict__ states,
         int * __restrict__ block_histograms,
         int ncols,
+        int block_cols,
         int blocks_per_row,
         int shift) {
     constexpr int NBINS = 1 << RADIX_BITS;
@@ -90,15 +90,15 @@ static __global__ void top_k_radix_histogram(
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
     const float * row_src = src + (size_t) row * ncols;
+    const int64_t col_begin = (int64_t) row_block * block_cols;
+    const int64_t col_end   = min(col_begin + block_cols, (int64_t) ncols);
     __shared__ int histogram[NBINS];
 
     histogram[tid] = 0;
     __syncthreads();
 
     const top_k_radix_state state = states[row];
-    for (int col = row_block * BLOCK_SIZE + tid;
-         col < ncols;
-         col += blocks_per_row * BLOCK_SIZE) {
+    for (int64_t col = col_begin + tid; col < col_end; col += BLOCK_SIZE) {
         const uint32_t key = top_k_float_to_ordered(row_src[col]);
         if ((key & state.prefix_mask) == state.prefix) {
             atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
@@ -143,11 +143,68 @@ static __global__ void top_k_radix_select(
     }
 }
 
-static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < nrows) {
-        states[row].greater_count = 0;
-        states[row].equal_count = 0;
+// The gather of a row's block, the same for the multi-launch and the fused select. A block owns the contiguous
+// columns [block_begin, block_begin + block_cols) (block_cols a multiple of 32*nwarps), each warp a contiguous
+// part of them. The keys above the threshold go to the first slots in any order (an atomic counter). The ties fill
+// the last `rank` slots in column order, the lowest columns win, so the result is the same in every run: the
+// ties of the blocks before this one (block_ties[b*256], the last pass' histograms in the bin of the threshold),
+// then the ties of the warps before this one, then a warp ballot walks its columns.
+template<int BLOCK_SIZE>
+static __device__ __forceinline__ void top_k_gather_ordered(
+        const float * __restrict__ row_src, int * __restrict__ row_dst, int * greater_count,
+        const int * __restrict__ block_ties, const int row_block, const uint32_t threshold, const int rank,
+        const int k, const int64_t block_begin, const int block_cols, const int ncols) {
+    constexpr int nwarps = BLOCK_SIZE / WARP_SIZE;
+    __shared__ int warp_ties[nwarps];
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t warp_begin = block_begin + (int64_t) warp * (block_cols / nwarps);
+    const int64_t warp_end   = min(warp_begin + block_cols / nwarps, (int64_t) ncols);
+
+    int nties = 0;
+    for (int64_t col = warp_begin + lane; col < warp_end; col += WARP_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key > threshold) {
+            row_dst[atomicAdd(greater_count, 1)] = col;
+        } else if (key == threshold) {
+            nties++;
+        }
+    }
+
+    int pos = 0;
+    for (int b = lane; b < row_block; b += WARP_SIZE) {
+        pos += __ldcg(&block_ties[b * 256]);
+    }
+#pragma unroll
+    for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+        pos += __shfl_xor_sync(0xffffffff, pos, o);
+    }
+    if (pos >= rank || __ldcg(&block_ties[row_block * 256]) == 0) {
+        return; // uniform over the block: no ties of this block are kept
+    }
+#pragma unroll
+    for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+        nties += __shfl_xor_sync(0xffffffff, nties, o);
+    }
+    if (lane == 0) {
+        warp_ties[warp] = nties;
+    }
+    __syncthreads();
+    for (int w = 0; w < warp; ++w) {
+        pos += warp_ties[w];
+    }
+    // pos is the same in all lanes of the warp, so the lanes leave the loop together
+    const int pos_end = min(pos + nties, rank);
+    for (int64_t tile = warp_begin; tile < warp_end && pos < pos_end; tile += WARP_SIZE) {
+        const int64_t col    = tile + lane;
+        const bool    is_tie = col < warp_end && top_k_float_to_ordered(row_src[col]) == threshold;
+        const uint32_t ties  = __ballot_sync(0xffffffff, is_tie);
+        const int tie_pos    = pos + __popc(ties & ((1u << lane) - 1));
+        if (is_tie && tie_pos < pos_end) {
+            row_dst[k - rank + tie_pos] = col;
+        }
+        pos += __popc(ties);
     }
 }
 
@@ -155,31 +212,19 @@ template<int BLOCK_SIZE>
 static __global__ void top_k_radix_gather(
         const float * __restrict__ src,
         int * __restrict__ dst,
+        const int * __restrict__ block_histograms,
         top_k_radix_state * __restrict__ states,
         int ncols,
+        int block_cols,
         int k,
         int blocks_per_row) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
-    const int tid = threadIdx.x;
-    const float * row_src = src + (size_t) row * ncols;
-    int * row_dst = dst + (size_t) row * k;
     top_k_radix_state * state = &states[row];
-
-    for (int col = row_block * BLOCK_SIZE + tid;
-         col < ncols;
-         col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > state->prefix) {
-            const int pos = atomicAdd(&state->greater_count, 1);
-            row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
-            }
-        }
-    }
+    const uint32_t threshold = state->prefix;
+    const int * block_ties = block_histograms + (size_t) row * blocks_per_row * 256 + (threshold & 255);
+    top_k_gather_ordered<BLOCK_SIZE>(src + (size_t) row * ncols, dst + (size_t) row * k, &state->greater_count,
+        block_ties, row_block, threshold, state->rank, k, (int64_t) row_block * block_cols, block_cols, ncols);
 }
 
 static void top_k_radix_cuda(
@@ -189,6 +234,8 @@ static void top_k_radix_cuda(
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
     const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
+    // each block of a row reads a contiguous range of whole tiles
+    const int block_cols = (int) (((int64_t) ncols + blocks_per_row*BLOCK_SIZE - 1) / (blocks_per_row*BLOCK_SIZE) * BLOCK_SIZE);
 
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
@@ -201,16 +248,14 @@ static void top_k_radix_cuda(
     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
         top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-                src, states, histograms, ncols, blocks_per_row, shift);
+                src, states, histograms, ncols, block_cols, blocks_per_row, shift);
         top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
     }
 
-    top_k_radix_reset_counters
-        <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, dst, states, ncols, k, blocks_per_row);
+            src, dst, histograms, states, ncols, block_cols, k, blocks_per_row);
 }
 
 // The same radix select as one launch for a few long rows (a decode window's indexer: 3-8 rows of up to 128K pool
@@ -236,7 +281,7 @@ static __device__ __forceinline__ void top_k_fused_grid_sync(unsigned int * bar,
 
 static __global__ void __launch_bounds__(CUDA_TOP_K_FUSED_BLOCK)
 top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * __restrict__ work,
-                  const int ncols, const int k, const int blocks_per_row) {
+                  int * __restrict__ ties, const int ncols, const int block_cols, const int k, const int blocks_per_row) {
     constexpr int BS = CUDA_TOP_K_FUSED_BLOCK;
     const int row = blockIdx.x / blocks_per_row;
     const int rb  = blockIdx.x % blocks_per_row;
@@ -246,6 +291,8 @@ top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * 
     const float *  row_src = src + (size_t) row*ncols;
     int *          row_dst = dst + (size_t) row*k;
     const unsigned int nblocks = gridDim.x;
+    const int64_t col_begin = (int64_t) rb*block_cols;
+    const int64_t col_end   = min(col_begin + block_cols, (int64_t) ncols);
     __shared__ int      hist[256];
     __shared__ uint32_t s_prefix;
     __shared__ int      s_rank;
@@ -257,13 +304,17 @@ top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * 
         const int shift = 24 - 8*pass;
         hist[tid] = 0;
         __syncthreads();
-        for (int col = rb*BS + tid; col < ncols; col += blocks_per_row*BS) {
+        for (int64_t col = col_begin + tid; col < col_end; col += BS) {
             const uint32_t key = top_k_float_to_ordered(row_src[col]);
             if ((key & pmask) == prefix) {
                 atomicAdd(&hist[(key >> shift) & 255], 1);
             }
         }
         __syncthreads();
+        if (pass == 3) {
+            // the ties of this block (the bin of the threshold), for the ordered gather
+            __stcg(&ties[((size_t) row*blocks_per_row + rb)*256 + tid], hist[tid]);
+        }
         if (hist[tid] != 0) {
             atomicAdd(&rw[pass*256 + tid], hist[tid]);
         }
@@ -310,19 +361,9 @@ top_k_radix_fused(const float * __restrict__ src, int * __restrict__ dst, int * 
         rank   = s_rank;
         pmask |= 255u << shift;
     }
-    // the gather: the keys above the k-th in any order, then the first rank of those equal to it
-    for (int col = rb*BS + tid; col < ncols; col += blocks_per_row*BS) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > prefix) {
-            const int pos = atomicAdd(&rw[4*256], 1);
-            row_dst[pos] = col;
-        } else if (key == prefix) {
-            const int pos = atomicAdd(&rw[4*256 + 1], 1);
-            if (pos < rank) {
-                row_dst[k - rank + pos] = col;
-            }
-        }
-    }
+    // the gather: the keys above the k-th in any order, then the first rank of those equal to it, in column order
+    top_k_gather_ordered<BS>(row_src, row_dst, &rw[4*256], ties + (size_t) row*blocks_per_row*256 + (prefix & 255),
+        rb, prefix, rank, k, col_begin, block_cols, ncols);
 }
 
 static bool top_k_radix_fused_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int nrows, const int k, cudaStream_t stream) {
@@ -348,8 +389,12 @@ static bool top_k_radix_fused_cuda(ggml_cuda_pool & pool, const float * src, int
     const size_t n_work = 32 + (size_t) nrows*CUDA_TOP_K_FUSED_ROW_INTS;
     ggml_cuda_pool_alloc<int> work_alloc(pool, n_work);
     int * work = work_alloc.get();
+    // the last pass' per-block bins (every one is written by its block, no memset)
+    ggml_cuda_pool_alloc<int> ties_alloc(pool, (size_t) nrows*blocks_per_row*256);
+    const int block_cols = (int) (((int64_t) ncols + blocks_per_row*CUDA_TOP_K_FUSED_BLOCK - 1) /
+                                  (blocks_per_row*CUDA_TOP_K_FUSED_BLOCK) * CUDA_TOP_K_FUSED_BLOCK);
     CUDA_CHECK(cudaMemsetAsync(work, 0, n_work*sizeof(int), stream));
-    top_k_radix_fused<<<blocks_per_row*nrows, CUDA_TOP_K_FUSED_BLOCK, 0, stream>>>(src, dst, work, ncols, k, blocks_per_row);
+    top_k_radix_fused<<<blocks_per_row*nrows, CUDA_TOP_K_FUSED_BLOCK, 0, stream>>>(src, dst, work, ties_alloc.get(), ncols, block_cols, k, blocks_per_row);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

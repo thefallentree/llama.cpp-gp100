@@ -4206,7 +4206,9 @@ static void ggml_cuda_mul_mat_id_generic(ggml_backend_cuda_context & ctx, ggml_t
             }
         }
 
-        if (ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst)) {
+        // not for the hot pairs of a hot/cold layer (mmid_skip_from: the ids still name the cold experts, which only the
+        // sorted fallback below skips; the sm_60 GEMM would read them beyond src0 - the i-quants reach here that way)
+        if (ctx.mmid_skip_from < 0 && ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst)) {
             ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
             return;
         }

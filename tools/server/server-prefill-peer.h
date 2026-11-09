@@ -86,7 +86,10 @@ struct prefill_peer_config {
 bool prefill_peer_run(const prefill_peer_config & cfg,
                       llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
                       llama_seq_id seq_id, const llama_token * tokens, int32_t n_split, int32_t n_ubatch,
-                      int32_t n_ckpt, prefill_peer_ckpt * ckpt, prefill_peer_stats & stats);
+                      int32_t n_ckpt, prefill_peer_ckpt * ckpt, prefill_peer_stats & stats, int32_t align_at = -1);
+
+// align_at > 0: a message ends there (the first row of DeepSeek-V4.1's layer-skip tail), so that no ubatch mixes skipped
+// rows with tail rows: a ubatch the tail starts in runs every layer for all its rows
 
 // The peer: serves heads one connection at a time, forever (returns only on a socket setup error).
 void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);

@@ -302,6 +302,8 @@ struct server_slot {
     // DeepSeek-V4.1 exact long-prompt layer skip (LLAMA_DSV41_LAYER_SKIP): the end position handed to
     // llama_set_prompt_end for this prompt, -1 when the prompt is read in full
     llama_pos prompt_skip_end = -1;
+    // its first row run in full (prompt_skip_end - the tail): batches and pipeline messages end there (no mixed ubatch)
+    llama_pos prompt_skip_from = -1;
 
     // speculative decoding
     common_speculative * spec;
@@ -4669,11 +4671,15 @@ private:
                         // that the checkpoints at 4 and 4 + n_ubatch before the end still hold exact rings (see the
                         // graph of llama_model_deepseek41). A prompt with less than a window of 1024 rows to save is read in full
                         slot.prompt_skip_end = -1;
+                        slot.prompt_skip_from = -1;
                         if (!slot.task->tokens.has_mtmd) {
                             const llama_pos end = slot.task->n_tokens() - (n_ubatch + 8);
                             const int32_t  tail = llama_set_prompt_end(ctx_tgt, slot.id, end);
                             if (tail > 0 && end - n_past >= tail + 1024) {
                                 slot.prompt_skip_end = end;
+                                // LLAMA_DSV41_SKIP_ALIGN=0: ubatches as they fall (one may mix skipped and tail rows)
+                                static const bool align = getenv("LLAMA_DSV41_SKIP_ALIGN") == nullptr || atoi(getenv("LLAMA_DSV41_SKIP_ALIGN")) != 0;
+                                slot.prompt_skip_from = align ? end - tail : -1;
                                 SLT_INF(slot, "layer skip: the layers past the last stream source run on the last %d rows of %d, the %d rows from %d are skipped\n",
                                         tail, slot.task->n_tokens(), end - tail - n_past, n_past);
                             } else {
@@ -4775,7 +4781,7 @@ private:
                             prefill_peer_ckpt  pck;
                             common_speculative_catchup_join(spec.get());
                             if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_send, n_ubatch,
-                                                 ck_arg, &pck, pst)) {
+                                                 ck_arg, &pck, pst, slot.prompt_skip_from)) {
                                 for (int32_t i = 0; i < n_send; ++i) {
                                     slot.prompt.tokens.push_back(toks[i]);
                                 }
@@ -4876,6 +4882,10 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        // a batch ends where the layer-skip tail starts, so that its ubatches are either skipped or full
+                        if (slot.prompt_skip_from > 0 && slot.prompt.n_tokens() == slot.prompt_skip_from && batch.size() > 0) {
+                            break;
+                        }
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

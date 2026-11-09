@@ -662,7 +662,7 @@ void snapshot_partial(llama_context * ctx, llama_seq_id seq_id, int32_t il_lo, i
 bool prefill_peer_run(const prefill_peer_config & cfg,
                       llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
                       llama_seq_id seq_id, const llama_token * tokens, int32_t n_split, int32_t n_ubatch,
-                      int32_t n_ckpt, prefill_peer_ckpt * ckpt, prefill_peer_stats & stats) {
+                      int32_t n_ckpt, prefill_peer_ckpt * ckpt, prefill_peer_stats & stats, int32_t align_at) {
     head_active_guard head_guard;
     const double t0 = now_ms();
     stats = {};
@@ -755,7 +755,10 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     double t_ck_ms = 0.0;
     for (int32_t off = 0; off < n_split && ok; ++i_msg) {
         // the messages are cut at n_ckpt, so the stages see one ubatch that starts there (the local path's last one)
-        const int32_t n = std::min(n_chunk, (n_ckpt > off ? n_ckpt : n_split) - off);
+        int32_t n = std::min(n_chunk, (n_ckpt > off ? n_ckpt : n_split) - off);
+        if (align_at > off && align_at < off + n) {
+            n = align_at - off;   // the skip tail starts on a message boundary
+        }
         const int32_t pos0 = off;
         off += n;
         batch.clear();

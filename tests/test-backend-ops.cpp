@@ -12666,6 +12666,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 16, 6, true,  2304, n, 5120));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 16, 6, false, 5120, n, 2304));
     }
+    // DeepSeek-V4.1-Flash Coder (GSQ-RCO, 192 experts, 6 used) prompt ubatches: the sm_60 i-quant HFMA2 GEMM (mmid16_iq_gemm_p),
+    // gate/up (k = 5120) and down (k = 2304) at 512 and 1536 tokens
+    for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M}) {
+        for (int n : {512, 1536}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 192, 6, false, 2304, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 192, 6, false, 5120, n, 2304));
+        }
+    }
     for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         for (int k : {5120, 2304, 256}) {
             for (bool b : {false, true}) {
@@ -14280,6 +14288,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    // DeepSeek-V4.1-Flash Coder (GSQ-RCO, 192 experts, 6 used) prompt ubatches: the sm_60 i-quant HFMA2 GEMM (mmid16_iq_gemm_p),
+    // gate/up (k = 5120) and down (k = 2304) at 512 and 1536 tokens
+    for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M}) {
+        for (int n : {512, 1536}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 192, 6, false, 2304, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 192, 6, false, 5120, n, 2304));
         }
     }
 

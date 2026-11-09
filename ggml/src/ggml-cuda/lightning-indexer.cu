@@ -420,13 +420,11 @@ lightning_indexer_kernel_lanes(
 // does 128 FMAs, then a 3-shuffle transpose-reduce over the 4 d-slice lanes leaves the full dot product of key ds in
 // lane ds (the lane holds the keys [ds, ds^2, ds^1, ds^3], so no selects are needed), followed by ReLU x weight.
 // Same FP32 products as the vec kernel, summed in another order.
-#define LIGHTNING_INDEXER_REG_THREADS 256
-#define LIGHTNING_INDEXER_REG_KEYS    256
 #define LIGHTNING_INDEXER_REG_HP      4   // heads per pass
 #define LIGHTNING_INDEXER_REG_QS      36  // floats per staged d-slice (32 + 4 of padding)
 
-template <int NT, int NH, ggml_type TYPE_K>
-static __global__ void __launch_bounds__(LIGHTNING_INDEXER_REG_THREADS, 1)
+template <int NT, int NH, int WARPS, ggml_type TYPE_K>
+static __global__ void __launch_bounds__(WARPS*32, 8/WARPS)
 lightning_indexer_kernel_reg(
         const float * Q, const char * K, const float * W, const half * M, const int32_t * R, float * dst,
         int64_t n_batch, int64_t n_kv,
@@ -436,8 +434,11 @@ lightning_indexer_kernel_reg(
         size_t nbw1, size_t nbw3,
         size_t nbm1, size_t nbm3,
         int64_t nem3) {
-    constexpr int THREADS = LIGHTNING_INDEXER_REG_THREADS;
+    constexpr int THREADS = WARPS*32;
+    constexpr int KEYS    = WARPS*32; // keys per block
     constexpr int HP      = LIGHTNING_INDEXER_REG_HP;
+    constexpr int NQ      = HP*NT*64/THREADS; // float2 of a query pass per thread
+    static_assert((HP*NT*64) % THREADS == 0, "the query pass must split evenly over the threads");
     constexpr int QS      = LIGHTNING_INDEXER_REG_QS;
     constexpr int D       = 128;
     constexpr int DS      = D/4;   // dims per slice
@@ -454,7 +455,7 @@ lightning_indexer_kernel_reg(
     const int ds       = lane & 3;   // d-slice
     const int i_stream = blockIdx.z;
     const int t0       = blockIdx.y * NT;
-    const int key0     = blockIdx.x*LIGHTNING_INDEXER_REG_KEYS + warp*32 + kg*4;
+    const int key0     = blockIdx.x*KEYS + warp*32 + kg*4;
 
     for (int i = tid; i < NT*NH; i += THREADS) {
         const int t = i / NH;
@@ -501,11 +502,11 @@ lightning_indexer_kernel_reg(
         }
     }
 
-    // the queries of a pass: HP x NT rows of 64 float2, NT float2 per thread
-    float2 q_pre[NT];
+    // the queries of a pass: HP x NT rows of 64 float2, NQ float2 per thread
+    float2 q_pre[NQ];
     auto load_q = [&](const int h0) {
 #pragma unroll
-        for (int j = 0; j < NT; ++j) {
+        for (int j = 0; j < NQ; ++j) {
             const int i = tid + j*THREADS;
             const int h = i / (NT*64);
             const int r = (i / 64) % NT;
@@ -517,7 +518,7 @@ lightning_indexer_kernel_reg(
     };
     auto store_q = [&]() {
 #pragma unroll
-        for (int j = 0; j < NT; ++j) {
+        for (int j = 0; j < NQ; ++j) {
             const int i = tid + j*THREADS;
             const int h = i / (NT*64);
             const int r = (i / 64) % NT;
@@ -550,16 +551,21 @@ lightning_indexer_kernel_reg(
         for (int h = 0; h < HP; ++h) {
             const float4 * qp = (const float4 *) &q_s[h][t][ds*QS];
 
+            // the whole query slice is requested before the first FMA so that the shared loads overlap the FMAs
+            float4 q4[DS/4];
+#pragma unroll
+            for (int j = 0; j < DS/4; ++j) {
+                q4[j] = qp[j];
+            }
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for (int j = 0; j < DS/4; ++j) {
-                const float4 q4 = qp[j];
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    acc[i] = fmaf(k_reg[i][4*j + 0], q4.x, acc[i]);
-                    acc[i] = fmaf(k_reg[i][4*j + 1], q4.y, acc[i]);
-                    acc[i] = fmaf(k_reg[i][4*j + 2], q4.z, acc[i]);
-                    acc[i] = fmaf(k_reg[i][4*j + 3], q4.w, acc[i]);
+                    acc[i] = fmaf(k_reg[i][4*j + 0], q4[j].x, acc[i]);
+                    acc[i] = fmaf(k_reg[i][4*j + 1], q4[j].y, acc[i]);
+                    acc[i] = fmaf(k_reg[i][4*j + 2], q4[j].z, acc[i]);
+                    acc[i] = fmaf(k_reg[i][4*j + 3], q4[j].w, acc[i]);
                 }
             }
 
@@ -1013,6 +1019,29 @@ static bool lightning_indexer_reg_applies(const ggml_tensor * q, const ggml_tens
     return true;
 }
 
+template <int NT, int NH, int WARPS>
+static void lightning_indexer_reg_launch_w(ggml_backend_cuda_context & ctx,
+        const float * Q, const char * K, const float * W, const half * M, const int32_t * R, float * dst,
+        const ggml_type type_K, const int n_stream, const int n_batch, const int n_kv,
+        const size_t nb1, const size_t nb3,
+        const size_t nbq1, const size_t nbq2, const size_t nbq3,
+        const size_t nbk2, const size_t nbk3,
+        const size_t nbw1, const size_t nbw3,
+        const size_t nbm1, const size_t nbm3,
+        const int64_t nem3) {
+    const dim3 block(WARPS*32, 1, 1);
+    const dim3 grid((unsigned) ((n_kv + WARPS*32 - 1)/(WARPS*32)), (unsigned) ((n_batch + NT - 1)/NT), (unsigned) n_stream);
+    if (type_K == GGML_TYPE_F16) {
+        lightning_indexer_kernel_reg<NT, NH, WARPS, GGML_TYPE_F16><<<grid, block, 0, ctx.stream()>>>(
+            Q, K, W, M, R, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3);
+    } else {
+        lightning_indexer_kernel_reg<NT, NH, WARPS, GGML_TYPE_F32><<<grid, block, 0, ctx.stream()>>>(
+            Q, K, W, M, R, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3);
+    }
+}
+
+// small token counts (decode windows) take 128-key blocks: two blocks per SM and twice the blocks for the small grid;
+// larger ones take 256-key blocks, where the query prefetch of 128 threads would spill (NT=8: STACK 144, 125 vs 81 ms)
 template <int NT, int NH>
 static void lightning_indexer_reg_launch(ggml_backend_cuda_context & ctx,
         const float * Q, const char * K, const float * W, const half * M, const int32_t * R, float * dst,
@@ -1023,15 +1052,8 @@ static void lightning_indexer_reg_launch(ggml_backend_cuda_context & ctx,
         const size_t nbw1, const size_t nbw3,
         const size_t nbm1, const size_t nbm3,
         const int64_t nem3) {
-    const dim3 block(LIGHTNING_INDEXER_REG_THREADS, 1, 1);
-    const dim3 grid((unsigned) ((n_kv + LIGHTNING_INDEXER_REG_KEYS - 1)/LIGHTNING_INDEXER_REG_KEYS), (unsigned) ((n_batch + NT - 1)/NT), (unsigned) n_stream);
-    if (type_K == GGML_TYPE_F16) {
-        lightning_indexer_kernel_reg<NT, NH, GGML_TYPE_F16><<<grid, block, 0, ctx.stream()>>>(
-            Q, K, W, M, R, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3);
-    } else {
-        lightning_indexer_kernel_reg<NT, NH, GGML_TYPE_F32><<<grid, block, 0, ctx.stream()>>>(
-            Q, K, W, M, R, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3);
-    }
+    lightning_indexer_reg_launch_w<NT, NH, (NT <= 4 ? 4 : 8)>(ctx, Q, K, W, M, R, dst, type_K, n_stream, n_batch, n_kv,
+        nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3);
 }
 
 template <int NH>

@@ -33,6 +33,9 @@ struct fattn_sparse_sm60_args {
     const int32_t * counts; // [seq][query]
     const float *   sinks;  // [n_head] or nullptr
     float *         dst;    // [DV][n_head][n_q][n_seq]
+    float *         part;   // n_split > 1: per block the unnormalized O[32][512], then m[32], l[32]
+    int             n_split; // blocks per (query, head group): each takes cpb chunks of the row list
+    int             cpb;
     int             n_q;
     int             n_head;
     int             n_kv_max;
@@ -75,7 +78,9 @@ static __device__ __forceinline__ void fss_store_rows(float (* s_k)[FSS_D], cons
     }
 }
 
-// kv_same: V is K (deepseek41): the chunk's rows serve both the scores and the values
+// kv_same: V is K (deepseek41): the chunk's rows serve both the scores and the values.
+// With n_split > 1 (few queries) a block takes cpb chunks of the list and leaves its softmax state and
+// unnormalized sum to part; fattn_sparse_sm60_join adds the blocks up.
 template <bool kv_same>
 __global__ void __launch_bounds__(FSS_NT, 1)
 fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
@@ -90,7 +95,8 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
     const int tid = threadIdx.x;
     const int q   = blockIdx.x;
     const int hg  = blockIdx.y;
-    const int seq = blockIdx.z;
+    const int seq   = blockIdx.z / a.n_split;
+    const int split = blockIdx.z - seq*a.n_split;
     const int h0  = hg*FSS_HB;
     const int kvh = h0 / a.gqa;
 
@@ -101,6 +107,8 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
     const int32_t * idx   = a.idx + ((int64_t) seq*a.n_q + q)*a.n_kv_max;
     const int       count = a.counts[(int64_t) seq*a.n_q + q];
     const int       n_ch  = (count + FSS_RC - 1)/FSS_RC;
+    const int       c0    = split*a.cpb;
+    const int       c1    = min(c0 + a.cpb, n_ch);
 
     if (tid < FSS_HB) {
         s_m[tid] = -INFINITY;
@@ -135,15 +143,15 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
     };
     uint4  kpre[4];
     float4 q01[2], qA, qB;
-    if (n_ch > 0) {
-        fss_gather(Kb, a.nbk1, idx, count, 0, tid, kpre);
+    if (c0 < c1) {
+        fss_gather(Kb, a.nbk1, idx, count, c0, tid, kpre);
         q01[0] = load_slab(0);
         q01[1] = load_slab(1);
         qA     = load_slab(2);
         qB     = load_slab(3);
     }
 
-    for (int c = 0; c < n_ch; ++c) {
+    for (int c = c0; c < c1; ++c) {
         fss_store_rows(s_k, kpre, tid);
         if (tid < FSS_RC) {
             const int rsel = c*FSS_RC + tid;
@@ -156,7 +164,7 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
 
         uint4 vpre[4];
         if constexpr (kv_same) {
-            if (c + 1 < n_ch) {
+            if (c + 1 < c1) {
                 fss_gather(Kb, a.nbk1, idx, count, c + 1, tid, kpre);
             }
         } else {
@@ -172,6 +180,7 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
             }
         }
 
+#ifndef FSS_SKIP_QK
         for (int j = 0; j < n_slab; ++j) {
             float4 qC = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (j + 4 < n_slab) {
@@ -202,8 +211,9 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
             qA = qB;
             qB = qC;
         }
+#endif
         // the next chunk's first slabs (Q is the same for every chunk)
-        if (c + 1 < n_ch) {
+        if (c + 1 < c1) {
             q01[0] = load_slab(0);
             q01[1] = load_slab(1);
             qA     = load_slab(2);
@@ -245,7 +255,7 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
 
         if constexpr (!kv_same) {
             fss_store_rows(s_k, vpre, tid); // the scores are done with the K rows
-            if (c + 1 < n_ch) {
+            if (c + 1 < c1) {
                 fss_gather(Kb, a.nbk1, idx, count, c + 1, tid, kpre);
             }
         }
@@ -293,6 +303,7 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
                 o[h][i] *= alpha;
             }
         }
+#ifndef FSS_SKIP_PV
 #pragma unroll 4
         for (int r = 0; r < FSS_RC; ++r) {
             const float4 p0 = *(const float4 *) (s_p[r] + pv_hg*8);
@@ -306,7 +317,25 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
                 o[h][4] += p[h]*v1.x; o[h][5] += p[h]*v1.y; o[h][6] += p[h]*v1.z; o[h][7] += p[h]*v1.w;
             }
         }
+#endif
         __syncthreads(); // the next chunk overwrites the rows and the weights
+    }
+
+    if (a.n_split > 1) {
+        // the block's part: the sinks join in fattn_sparse_sm60_join
+        float * part = a.part + ((((int64_t) seq*a.n_q + q)*(a.n_head/FSS_HB) + hg)*a.n_split + split)*(FSS_HB*FSS_D + 2*FSS_HB);
+        float * po   = part + (int64_t) pv_hg*8*FSS_D;
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            float * oh = po + (int64_t) h*FSS_D;
+            *(float4 *) (oh + 4*pv_dg)           = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+            *(float4 *) (oh + FSS_D/2 + 4*pv_dg) = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+        }
+        if (tid < FSS_HB) {
+            part[FSS_HB*FSS_D + tid]          = s_m[tid];
+            part[FSS_HB*FSS_D + FSS_HB + tid] = s_l[tid];
+        }
+        return;
     }
 
     // the sinks: one more softmax term without a value
@@ -328,6 +357,39 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
         *(float4 *) (oh + 4*pv_dg)           = make_float4(o[h][0]*inv, o[h][1]*inv, o[h][2]*inv, o[h][3]*inv);
         *(float4 *) (oh + FSS_D/2 + 4*pv_dg) = make_float4(o[h][4]*inv, o[h][5]*inv, o[h][6]*inv, o[h][7]*inv);
     }
+}
+
+// block (head, query, seq), 128 threads x float4: out = sum_s exp(m_s - m) O_s / (sum_s exp(m_s - m) l_s + exp(sink - m))
+static __global__ void fattn_sparse_sm60_join(const fattn_sparse_sm60_args a) {
+    const int h   = blockIdx.x;
+    const int q   = blockIdx.y;
+    const int seq = blockIdx.z;
+    const int hg  = h / FSS_HB;
+    const int hh  = h - hg*FSS_HB;
+    const float * part = a.part + ((((int64_t) seq*a.n_q + q)*(a.n_head/FSS_HB) + hg)*a.n_split)*(FSS_HB*FSS_D + 2*FSS_HB);
+    constexpr int ps = FSS_HB*FSS_D + 2*FSS_HB;
+    float m = -INFINITY;
+    for (int sp = 0; sp < a.n_split; ++sp) {
+        m = fmaxf(m, part[(int64_t) sp*ps + FSS_HB*FSS_D + hh]);
+    }
+    float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  l = 0.0f;
+    if (m > -INFINITY) {
+        for (int sp = 0; sp < a.n_split; ++sp) {
+            const float * p = part + (int64_t) sp*ps;
+            const float ms = p[FSS_HB*FSS_D + hh];
+            const float w  = ms > -INFINITY ? expf(ms - m) : 0.0f;
+            const float4 v = *(const float4 *) (p + (int64_t) hh*FSS_D + 4*threadIdx.x);
+            o.x += w*v.x; o.y += w*v.y; o.z += w*v.z; o.w += w*v.w;
+            l   += w*p[FSS_HB*FSS_D + FSS_HB + hh];
+        }
+        if (a.sinks) {
+            l += expf(a.sinks[h] - m);
+        }
+    }
+    const float inv = l > 0.0f ? 1.0f/l : 0.0f;
+    float * out = a.dst + (((int64_t) seq*a.n_q + q)*a.n_head + h)*FSS_D;
+    *(float4 *) (out + 4*threadIdx.x) = make_float4(o.x*inv, o.y*inv, o.z*inv, o.w*inv);
 }
 
 static int fss_env_int(const char * name, const int def) {
@@ -470,11 +532,28 @@ void ggml_cuda_fattn_sparse_sm60(ggml_backend_cuda_context & ctx, ggml_tensor * 
     a.sinks = sinks ? (const float *) sinks->data : nullptr;
     a.dst   = (float *) dst->data;
 
-    const dim3 grid((unsigned) a.n_q, (unsigned) (a.n_head/FSS_HB), (unsigned) Q->ne[3]);
+    // few queries: the chunks of a list go to several blocks (a block per chunk at the extreme), so that the device
+    // is busy; many queries: a block per (query, head group) walks the whole list
+    static const int min_blocks = fss_env_int("GGML_CUDA_FA_SPARSE_SM60_MIN_BLOCKS", 2*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
+    const int     n_ch_max = (a.n_kv_max + FSS_RC - 1)/FSS_RC;
+    const int64_t n_blocks = (int64_t) a.n_q*(a.n_head/FSS_HB)*Q->ne[3];
+    a.n_split = (int) std::min<int64_t>(n_ch_max, std::max<int64_t>(1, (min_blocks + n_blocks - 1)/n_blocks));
+    a.cpb     = (n_ch_max + a.n_split - 1)/a.n_split;
+    a.n_split = (n_ch_max + a.cpb - 1)/a.cpb;
+    a.part    = nullptr;
+    ggml_cuda_pool_alloc<float> part(ctx.pool());
+    if (a.n_split > 1) {
+        a.part = part.alloc((size_t) n_blocks*a.n_split*(FSS_HB*FSS_D + 2*FSS_HB));
+    }
+
+    const dim3 grid((unsigned) a.n_q, (unsigned) (a.n_head/FSS_HB), (unsigned) (Q->ne[3]*a.n_split));
     if (a.kv_same) {
         fattn_sparse_sm60_d512<true><<<grid, FSS_NT, 0, stream>>>(a);
     } else {
         fattn_sparse_sm60_d512<false><<<grid, FSS_NT, 0, stream>>>(a);
+    }
+    if (a.n_split > 1) {
+        fattn_sparse_sm60_join<<<dim3((unsigned) a.n_head, (unsigned) a.n_q, (unsigned) Q->ne[3]), FSS_D/4, 0, stream>>>(a);
     }
     CUDA_CHECK(cudaGetLastError());
 }

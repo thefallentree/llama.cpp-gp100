@@ -452,6 +452,125 @@ static __global__ void fattn_sparse_sm60_join(const fattn_sparse_sm60_args a) {
     *(float4 *) (out + 4*threadIdx.x) = make_float4(o.x*inv, o.y*inv, o.z*inv, o.w*inv);
 }
 
+// Mask compaction for few queries: the one-block-per-query compaction of fattn.cu scans the whole mask row
+// serially (65536 columns at a 64K context take ~50 us). Here the row is cut into ranges of FSS_CMP_SPAN columns,
+// a block per range: pass 1 counts the visible columns of its range, pass 2 writes them (ascending) at the offset
+// given by the counts of the ranges before it. Columns beyond n_kv_max are dropped, the list is padded with -1.
+#define FSS_CMP_VPT  8                     // values per thread
+#define FSS_CMP_SPAN (FSS_NT*FSS_CMP_VPT)  // 2048 columns per block
+
+template <bool write>
+__global__ void __launch_bounds__(FSS_NT, 1)
+fss_compact_mask(const half * __restrict__ mask, int32_t * __restrict__ indices, int32_t * __restrict__ counts,
+        int32_t * __restrict__ range_counts, const int ne30, const int n_q, const int n_ranges, const int n_kv_max,
+        const int64_t s31, const int64_t s33) {
+    __shared__ int s_cnt[FSS_CMP_VPT][FSS_NT/32];
+    __shared__ int s_base[2];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int r    = blockIdx.x;
+    const int q    = blockIdx.y;
+    const int seq  = blockIdx.z;
+    const int i0   = r*FSS_CMP_SPAN;
+
+    const half * mrow = mask + seq*s33 + (int64_t) q*s31;
+    int32_t * rc = range_counts + ((int64_t) seq*n_q + q)*n_ranges;
+
+    uint32_t sel[FSS_CMP_VPT];
+#pragma unroll
+    for (int k = 0; k < FSS_CMP_VPT; ++k) {
+        const int i = i0 + k*FSS_NT + tid;
+        const bool v = i < ne30 && isfinite(__half2float(mrow[i]));
+        sel[k] = __ballot_sync(0xffffffff, (int) v);
+        if (lane == 0) {
+            s_cnt[k][warp] = __popc(sel[k]);
+        }
+    }
+    if (write && warp == 0) {
+        // the ranges before this one, and the total
+        int before = 0, total = 0;
+        for (int j = lane; j < n_ranges; j += 32) {
+            const int c = rc[j];
+            before += j < r ? c : 0;
+            total  += c;
+        }
+        before = warp_reduce_sum(before);
+        total  = warp_reduce_sum(total);
+        if (lane == 0) {
+            s_base[0] = before;
+            s_base[1] = total;
+        }
+    }
+    __syncthreads();
+
+    if constexpr (!write) {
+        if (tid == 0) {
+            int c = 0;
+#pragma unroll
+            for (int k = 0; k < FSS_CMP_VPT; ++k) {
+#pragma unroll
+                for (int w = 0; w < FSS_NT/32; ++w) {
+                    c += s_cnt[k][w];
+                }
+            }
+            rc[r] = c;
+        }
+        return;
+    } else {
+        int32_t * list = indices + ((int64_t) seq*n_q + q)*n_kv_max;
+        const int base  = s_base[0];
+        const int total = s_base[1];
+        const uint32_t lane_mask = (1u << lane) - 1;
+        int pos = base;
+#pragma unroll
+        for (int k = 0; k < FSS_CMP_VPT; ++k) {
+            int wpre = 0;
+            for (int w = 0; w < FSS_NT/32; ++w) {
+                wpre += w < warp ? s_cnt[k][w] : 0;
+            }
+            if ((sel[k] >> lane) & 1) {
+                const int dst = pos + wpre + __popc(sel[k] & lane_mask);
+                if (dst < n_kv_max) {
+                    list[dst] = i0 + k*FSS_NT + tid;
+                }
+            }
+#pragma unroll
+            for (int w = 0; w < FSS_NT/32; ++w) {
+                pos += s_cnt[k][w];
+            }
+        }
+        if (r == 0) {
+            const int count = min(total, n_kv_max);
+            for (int i = count + tid; i < n_kv_max; i += FSS_NT) {
+                list[i] = -1;
+            }
+            if (tid == 0) {
+                counts[(int64_t) seq*n_q + q] = count;
+            }
+        }
+    }
+}
+
+static void fss_compact_mask_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, int32_t * indices,
+        int32_t * counts, const int n_q, const int n_kv_max, cudaStream_t stream) {
+    const int ne30     = (int) mask->ne[0];
+    const int n_seq    = (int) mask->ne[3];
+    const int n_ranges = (ne30 + FSS_CMP_SPAN - 1)/FSS_CMP_SPAN;
+    const int nsm      = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    if (n_ranges == 1 || (int64_t) n_q*n_seq >= 2*nsm) {
+        ggml_cuda_flash_attn_ext_compact_mask(mask, indices, counts, n_q, 1, n_kv_max, stream);
+        return;
+    }
+    ggml_cuda_pool_alloc<int32_t> range_counts(ctx.pool(), (size_t) n_seq*n_q*n_ranges);
+    const int64_t s31 = mask->nb[1]/sizeof(half);
+    const int64_t s33 = mask->nb[3]/sizeof(half);
+    const dim3 grid((unsigned) n_ranges, (unsigned) n_q, (unsigned) n_seq);
+    fss_compact_mask<false><<<grid, FSS_NT, 0, stream>>>((const half *) mask->data, indices, counts, range_counts.ptr, ne30, n_q, n_ranges, n_kv_max, s31, s33);
+    fss_compact_mask<true> <<<grid, FSS_NT, 0, stream>>>((const half *) mask->data, indices, counts, range_counts.ptr, ne30, n_q, n_ranges, n_kv_max, s31, s33);
+}
+
 static int fss_env_int(const char * name, const int def) {
     const char * v = getenv(name);
     return v ? atoi(v) : def;
@@ -613,7 +732,7 @@ void ggml_cuda_fattn_sparse_sm60(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<int32_t> lists(ctx.pool(), n_lists*a.n_kv_max + n_lists);
     a.idx    = lists.ptr;
     a.counts = lists.ptr + n_lists*a.n_kv_max;
-    ggml_cuda_flash_attn_ext_compact_mask(mask, lists.ptr, lists.ptr + n_lists*a.n_kv_max, a.n_q, 1, a.n_kv_max, stream);
+    fss_compact_mask_launch(ctx, mask, lists.ptr, lists.ptr + n_lists*a.n_kv_max, a.n_q, a.n_kv_max, stream);
 
     a.Q     = (const char *) Q->data;
     a.nbq1  = Q->nb[1];

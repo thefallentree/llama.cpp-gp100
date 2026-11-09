@@ -6,11 +6,17 @@
 // a block takes one query and 32 heads of one kv head and walks the query's visible rows (the mask compaction's
 // index list, <= n_kv_max) in chunks of 16. The 16 gathered rows are converted once and kept in shared memory as
 // FP32 (32 KB) for both the scores and the values (K == V in deepseek41; otherwise the V rows are gathered after
-// the scores). Q is streamed from global memory in 32-column slabs. All arithmetic is FP32: the tile kernel's
-// 16-element fp16 windows already cost acceptance on this model.
+// the scores). K/V rows are read in their cache type: f16 rows are converted from the gather registers, q8_0 rows
+// (544 bytes) are staged raw in shared memory and dequantized from there, so nothing of the K/V tensor beyond the
+// selected rows is touched (the whole-tensor f16 conversion of the other kernels grows with the context).
+// Q (32 heads x 512, FP32) lives in registers: a thread holds 4 heads x 16 columns. All arithmetic is FP32: the
+// tile kernel's 16-element fp16 windows already cost acceptance on this model.
 //
-//   scores: S[32 h][16 r] = sum_d Q[h][d] K[r][d], a thread owns 4 heads x 4 rows over 1/8 of d (float4 slices),
-//           the 8 slices of a warp are reduce-scattered with shuffles
+//   scores: S[32 h][16 r] = sum_d Q[h][d] K[r][d]; a warp owns 4 heads, its 32 lanes own 16-column slices
+//           (float4 j, j + 32, j + 64, j + 96 of the row), a pass takes 4 rows: 4 h x 4 r x 16 d per lane, then
+//           the 16 partial sums are reduce-scattered over the 32 lanes with shuffles. The heads and rows a lane
+//           accumulates are permuted by the lane index (slot s holds (head, row) = s ^ (lane >> 1)) so that each
+//           butterfly stage adds a fixed register of the partner: no selects.
 //   softmax: online per head over the 16 rows, the sinks join the denominator at the end
 //   values: O[32 h][512 d] += P[h][r] V[r][d], a thread owns 8 heads x (4 + 4) columns
 #define FSS_D   512
@@ -18,14 +24,15 @@
 #define FSS_RC  16   // rows per chunk
 #define FSS_NT  256  // threads
 #define FSS_PS  40   // row stride of the score tile (floats): 16-byte aligned, conflict-free stores
-#define FSS_QS  32   // Q slab width (columns)
+#define FSS_Q8_ROW (FSS_D/QK8_0*(int) sizeof(block_q8_0)) // 544 bytes per q8_0 row
+#define FSS_Q8_U4  (FSS_RC*FSS_Q8_ROW/16)                 // 544 uint4 per chunk
 
 struct fattn_sparse_sm60_args {
     const char *    Q;      // f32, strides in bytes
     int64_t         nbq1, nbq2, nbq3;
-    const char *    K;      // f16
+    const char *    K;      // f16 or q8_0 rows
     int64_t         nbk1, nbk2, nbk3;
-    const char *    V;      // f16
+    const char *    V;      // same type as K
     int64_t         nbv1, nbv2, nbv3;
     const half *    mask;
     int64_t         sm1, sm3; // elements
@@ -53,20 +60,22 @@ static __device__ __forceinline__ void fss_cvt8(const uint4 u, float4 & lo, floa
     hi = make_float4(c.x, c.y, d.x, d.y);
 }
 
-// the 4 row pieces of a thread for chunk c: piece i is row (tid>>6) + 4i, 16-byte column (tid & 63)
-static __device__ __forceinline__ void fss_gather(
+static __device__ __forceinline__ int fss_row_id(const int32_t * idx, const int count, const int rsel) {
+    const int id = rsel < count ? idx[rsel] : -1;
+    return id >= 0 ? id : 0; // a dead row reads row 0, its score is -inf
+}
+
+// f16 rows: the 4 row pieces of a thread for chunk c: piece i is row (tid>>6) + 4i, 16-byte column (tid & 63)
+static __device__ __forceinline__ void fss_gather_f16(
         const char * base, const int64_t nb1, const int32_t * idx, const int count, const int c, const int tid, uint4 (&v)[4]) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const int r    = (tid >> 6) + 4*i;
-        const int rsel = c*FSS_RC + r;
-        int id = rsel < count ? idx[rsel] : -1;
-        id = id >= 0 ? id : 0; // a dead row reads row 0, its score is -inf
+        const int id = fss_row_id(idx, count, c*FSS_RC + (tid >> 6) + 4*i);
         v[i] = __ldg((const uint4 *) (base + (int64_t) id*nb1) + (tid & 63));
     }
 }
 
-static __device__ __forceinline__ void fss_store_rows(float (* s_k)[FSS_D], const uint4 (&v)[4], const int tid) {
+static __device__ __forceinline__ void fss_store_rows_f16(float (* s_k)[FSS_D], const uint4 (&v)[4], const int tid) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int r  = (tid >> 6) + 4*i;
@@ -78,14 +87,67 @@ static __device__ __forceinline__ void fss_store_rows(float (* s_k)[FSS_D], cons
     }
 }
 
+// q8_0 rows: the chunk's 16 rows are 544 contiguous bytes each = 34 uint4; piece p = tid + 256 i is
+// row p / 34, uint4 p % 34 of the row
+static __device__ __forceinline__ void fss_gather_q8(
+        const char * base, const int64_t nb1, const int32_t * idx, const int count, const int c, const int tid, uint4 (&v)[3]) {
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const int p = tid + FSS_NT*i;
+        if (p < FSS_Q8_U4) {
+            const int r  = p / (FSS_Q8_ROW/16);
+            const int u  = p - r*(FSS_Q8_ROW/16);
+            const int id = fss_row_id(idx, count, c*FSS_RC + r);
+            v[i] = __ldg((const uint4 *) (base + (int64_t) id*nb1) + u);
+        }
+    }
+}
+
+static __device__ __forceinline__ void fss_stage_q8(uint4 * s_raw, const uint4 (&v)[3], const int tid) {
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const int p = tid + FSS_NT*i;
+        if (p < FSS_Q8_U4) {
+            s_raw[p] = v[i];
+        }
+    }
+}
+
+// thread (row tid >> 4, block tid & 15): the 32 values of the staged block, one float4 at a time in an order
+// rotated by the block index so that the 8 lanes of a store phase hit 8 different bank groups (and only 4 values
+// are live next to the Q and O registers)
+static __device__ __forceinline__ void fss_dequant_q8(float (* s_k)[FSS_D], const uint4 * s_raw, const int tid) {
+    const int r   = tid >> 4;
+    const int b   = tid & 15;
+    const uint16_t * src = (const uint16_t *) s_raw + r*(FSS_Q8_ROW/2) + b*((int) sizeof(block_q8_0)/2);
+    const float d   = __half2float(__ushort_as_half(src[0]));
+    const float off = -8388736.0f*d; // (2^23 + 128) d: the byte u = q + 128 sits in the mantissa of 2^23 + u
+    float * dst = s_k[r] + QK8_0*b;
+#pragma unroll
+    for (int t = 0; t < QK8_0/4; ++t) {
+        const int j = (t + b) & 7;
+        const uint32_t w0 = src[1 + 2*j];
+        const uint32_t w1 = src[2 + 2*j];
+        float4 f;
+        f.x = fmaf(__uint_as_float((w0 & 0xff) ^ 0x4B000080u), d, off);
+        f.y = fmaf(__uint_as_float((w0 >> 8)   ^ 0x4B000080u), d, off);
+        f.z = fmaf(__uint_as_float((w1 & 0xff) ^ 0x4B000080u), d, off);
+        f.w = fmaf(__uint_as_float((w1 >> 8)   ^ 0x4B000080u), d, off);
+        *(float4 *) (dst + 4*j) = f;
+    }
+}
+
 // kv_same: V is K (deepseek41): the chunk's rows serve both the scores and the values.
 // With n_split > 1 (few queries) a block takes cpb chunks of the list and leaves its softmax state and
 // unnormalized sum to part; fattn_sparse_sm60_join adds the blocks up.
-template <bool kv_same>
+template <ggml_type type_KV, bool kv_same>
 __global__ void __launch_bounds__(FSS_NT, 1)
 fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
+    constexpr bool q8 = type_KV == GGML_TYPE_Q8_0;
+    static_assert(q8 || type_KV == GGML_TYPE_F16, "K/V type");
+
     __shared__ __align__(16) float s_k[FSS_RC][FSS_D];      // the chunk's rows
-    __shared__ __align__(16) float s_q[2][FSS_HB][FSS_QS];  // Q slabs (double buffered)
+    __shared__ __align__(16) uint4 s_raw[q8 ? FSS_Q8_U4 : 1]; // the chunk's raw q8_0 rows
     __shared__ __align__(16) float s_p[FSS_RC][FSS_PS];     // scores, then weights: [row][head]
     __shared__ float s_m[FSS_HB];
     __shared__ float s_l[FSS_HB];
@@ -127,136 +189,128 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
         }
     }
 
-    // scores: 4 heads x 4 rows per thread over the float4 slice s of every slab
-    const int qk_s  = tid & 7;
-    const int qk_rt = (tid >> 3) & 3;
-    const int qk_ht = tid >> 5;
-
-    // Q slab loads: thread -> head tid>>3, float4 tid&7 of the slab
-    const char * Qld = Qb + (int64_t) (tid >> 3)*a.nbq2 + 16*(tid & 7);
-
-    // Q slabs: the smem ring holds slabs j, j + 1 while slab j is used; qA, qB, qC hold slabs j + 2 .. j + 4 in
-    // flight (a slab is stored three compute phases after its load)
-    constexpr int n_slab = FSS_D/FSS_QS; // 16
-    auto load_slab = [&](const int j) -> float4 {
-        return __ldg((const float4 *) (Qld + (int64_t) j*FSS_QS*sizeof(float)));
-    };
-    uint4  kpre[4];
-    float4 q01[2], qA, qB;
-    if (c0 < c1) {
-        fss_gather(Kb, a.nbk1, idx, count, c0, tid, kpre);
-        q01[0] = load_slab(0);
-        q01[1] = load_slab(1);
-        qA     = load_slab(2);
-        qB     = load_slab(3);
+    // scores: warp w owns heads 4w .. 4w+3, lane l the float4 columns l, l + 32, l + 64, l + 96;
+    // register slot hs holds head 4w + (hs ^ (l >> 3)), row slot rs of a pass holds row 4p + (rs ^ ((l >> 1) & 3))
+    const int qk_w  = tid >> 5;
+    const int qk_l  = tid & 31;
+    const int qk_hx = qk_l >> 3;
+    const int qk_rx = (qk_l >> 1) & 3;
+    float4 qr[4][4];
+#pragma unroll
+    for (int hs = 0; hs < 4; ++hs) {
+        const char * Qh = Qb + (int64_t) (4*qk_w + (hs ^ qk_hx))*a.nbq2;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            qr[hs][k] = __ldg((const float4 *) Qh + qk_l + 32*k);
+        }
     }
 
+    uint4 kpre[q8 ? 3 : 4];
+    if (c0 < c1) {
+        if constexpr (q8) {
+            fss_gather_q8(Kb, a.nbk1, idx, count, c0, tid, kpre);
+            fss_stage_q8(s_raw, kpre, tid);
+        } else {
+            fss_gather_f16(Kb, a.nbk1, idx, count, c0, tid, kpre);
+        }
+    }
+    __syncthreads();
+
     for (int c = c0; c < c1; ++c) {
-        fss_store_rows(s_k, kpre, tid);
+        if constexpr (q8) {
+            fss_dequant_q8(s_k, s_raw, tid);
+        } else {
+            fss_store_rows_f16(s_k, kpre, tid);
+        }
         if (tid < FSS_RC) {
             const int rsel = c*FSS_RC + tid;
-            int id = rsel < count ? idx[rsel] : -1;
+            const int id = rsel < count ? idx[rsel] : -1;
             s_mv[tid] = id >= 0 ? __half2float(mrow[id]) : -INFINITY;
         }
-        *(float4 *) (s_q[0][tid >> 3] + 4*(tid & 7)) = q01[0];
-        *(float4 *) (s_q[1][tid >> 3] + 4*(tid & 7)) = q01[1];
         __syncthreads();
 
+        // the next chunk's K rows land in registers while this chunk computes
         uint4 vpre[4];
-        if constexpr (kv_same) {
+        if constexpr (kv_same || q8) {
             if (c + 1 < c1) {
-                fss_gather(Kb, a.nbk1, idx, count, c + 1, tid, kpre);
+                if constexpr (q8) {
+                    fss_gather_q8(Kb, a.nbk1, idx, count, c + 1, tid, kpre);
+                } else {
+                    fss_gather_f16(Kb, a.nbk1, idx, count, c + 1, tid, kpre);
+                }
             }
         } else {
-            fss_gather(Vb, a.nbv1, idx, count, c, tid, vpre);
-        }
-
-        float sacc[4][4];
-#pragma unroll
-        for (int hh = 0; hh < 4; ++hh) {
-#pragma unroll
-            for (int rr = 0; rr < 4; ++rr) {
-                sacc[hh][rr] = 0.0f;
-            }
+            fss_gather_f16(Vb, a.nbv1, idx, count, c, tid, vpre);
         }
 
 #ifndef FSS_SKIP_QK
-        for (int j = 0; j < n_slab; ++j) {
-            float4 qC = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            if (j + 4 < n_slab) {
-                qC = load_slab(j + 4);
-            }
-            const float * sq = s_q[j & 1][qk_ht*4];
-            const float * sk = s_k[qk_rt*4] + j*FSS_QS + 4*qk_s;
-            float4 kq[4];
+#pragma unroll 1
+        for (int p = 0; p < FSS_RC/4; ++p) {
+            float acc[16];
 #pragma unroll
-            for (int rr = 0; rr < 4; ++rr) {
-                kq[rr] = *(const float4 *) (sk + rr*FSS_D);
+            for (int s = 0; s < 16; ++s) {
+                acc[s] = 0.0f;
             }
 #pragma unroll
-            for (int hh = 0; hh < 4; ++hh) {
-                const float4 qq = *(const float4 *) (sq + hh*FSS_QS + 4*qk_s);
+            for (int k = 0; k < 4; ++k) {
+                float4 kq[4];
 #pragma unroll
-                for (int rr = 0; rr < 4; ++rr) {
-                    sacc[hh][rr] += qq.x*kq[rr].x;
-                    sacc[hh][rr] += qq.y*kq[rr].y;
-                    sacc[hh][rr] += qq.z*kq[rr].z;
-                    sacc[hh][rr] += qq.w*kq[rr].w;
+                for (int rs = 0; rs < 4; ++rs) {
+                    kq[rs] = *(const float4 *) (s_k[4*p + (rs ^ qk_rx)] + 4*(qk_l + 32*k));
+                }
+#pragma unroll
+                for (int hs = 0; hs < 4; ++hs) {
+#pragma unroll
+                    for (int rs = 0; rs < 4; ++rs) {
+                        acc[4*hs + rs] += qr[hs][k].x*kq[rs].x;
+                        acc[4*hs + rs] += qr[hs][k].y*kq[rs].y;
+                        acc[4*hs + rs] += qr[hs][k].z*kq[rs].z;
+                        acc[4*hs + rs] += qr[hs][k].w*kq[rs].w;
+                    }
                 }
             }
-            __syncthreads(); // slab j is done: its buffer takes slab j + 2 (slab j + 1 was stored one phase ago)
-            if (j + 2 < n_slab) {
-                *(float4 *) (s_q[j & 1][tid >> 3] + 4*(tid & 7)) = qA;
+            // butterfly: lane bit 4 <-> slot bit 3, 3 <-> 2, 2 <-> 1, 1 <-> 0; the partner's slot s | c holds the
+            // same (head, row) as this lane's slot s
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                acc[s] += __shfl_xor_sync(0xffffffff, acc[s + 8], 16);
             }
-            qA = qB;
-            qB = qC;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                acc[s] += __shfl_xor_sync(0xffffffff, acc[s + 4], 8);
+            }
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                acc[s] += __shfl_xor_sync(0xffffffff, acc[s + 2], 4);
+            }
+            acc[0] += __shfl_xor_sync(0xffffffff, acc[1], 2);
+            acc[0] += __shfl_xor_sync(0xffffffff, acc[0], 1);
+            // slot 0 of lane l: head 4w + (l >> 3), row 4p + ((l >> 1) & 3); lanes l and l ^ 1 agree
+            if ((qk_l & 1) == 0) {
+                const int r = 4*p + qk_rx;
+                s_p[r][4*qk_w + qk_hx] = acc[0]*a.scale + s_mv[r];
+            }
+        }
+#else
+        if (tid < FSS_RC*FSS_HB) {
+            s_p[tid >> 5][tid & 31] = s_mv[tid >> 5];
         }
 #endif
-        // the next chunk's first slabs (Q is the same for every chunk)
-        if (c + 1 < c1) {
-            q01[0] = load_slab(0);
-            q01[1] = load_slab(1);
-            qA     = load_slab(2);
-            qB     = load_slab(3);
-        }
-
-        // reduce-scatter over the 8 slice lanes: lane s ends with head (s>>1)&3, rows 2*(s&1), 2*(s&1)+1
-        float r2[2][4];
-#pragma unroll
-        for (int hh = 0; hh < 2; ++hh) {
-#pragma unroll
-            for (int rr = 0; rr < 4; ++rr) {
-                const float keep = (qk_s & 4) ? sacc[hh + 2][rr] : sacc[hh][rr];
-                const float send = (qk_s & 4) ? sacc[hh][rr] : sacc[hh + 2][rr];
-                r2[hh][rr] = keep + __shfl_xor_sync(0xffffffff, send, 4);
-            }
-        }
-        float r1[4];
-#pragma unroll
-        for (int rr = 0; rr < 4; ++rr) {
-            const float keep = (qk_s & 2) ? r2[1][rr] : r2[0][rr];
-            const float send = (qk_s & 2) ? r2[0][rr] : r2[1][rr];
-            r1[rr] = keep + __shfl_xor_sync(0xffffffff, send, 2);
-        }
-        float r0[2];
-#pragma unroll
-        for (int rr = 0; rr < 2; ++rr) {
-            const float keep = (qk_s & 1) ? r1[rr + 2] : r1[rr];
-            const float send = (qk_s & 1) ? r1[rr] : r1[rr + 2];
-            r0[rr] = keep + __shfl_xor_sync(0xffffffff, send, 1);
-        }
-        {
-            const int hh = qk_ht*4 + ((qk_s >> 1) & 3);
-            const int rb = qk_rt*4 + 2*(qk_s & 1);
-            s_p[rb][hh]     = r0[0]*a.scale + s_mv[rb];
-            s_p[rb + 1][hh] = r0[1]*a.scale + s_mv[rb + 1];
-        }
         __syncthreads();
 
         if constexpr (!kv_same) {
-            fss_store_rows(s_k, vpre, tid); // the scores are done with the K rows
-            if (c + 1 < c1) {
-                fss_gather(Kb, a.nbk1, idx, count, c + 1, tid, kpre);
+            // the scores are done with the K rows: V takes their place
+            if constexpr (q8) {
+                uint4 vraw[3];
+                fss_gather_q8(Vb, a.nbv1, idx, count, c, tid, vraw);
+                fss_stage_q8(s_raw, vraw, tid);
+                __syncthreads();
+                fss_dequant_q8(s_k, s_raw, tid);
+            } else {
+                fss_store_rows_f16(s_k, vpre, tid);
+                if (c + 1 < c1) {
+                    fss_gather_f16(Kb, a.nbk1, idx, count, c + 1, tid, kpre);
+                }
             }
         }
 
@@ -318,6 +372,12 @@ fattn_sparse_sm60_d512(const fattn_sparse_sm60_args a) {
             }
         }
 #endif
+        if constexpr (q8) {
+            // every thread passed this chunk's dequantization: the staging takes the next rows
+            if (c + 1 < c1) {
+                fss_stage_q8(s_raw, kpre, tid);
+            }
+        }
         __syncthreads(); // the next chunk overwrites the rows and the weights
     }
 
@@ -397,9 +457,26 @@ static int fss_env_int(const char * name, const int def) {
     return v ? atoi(v) : def;
 }
 
+// K and V rows as the kernel reads them without a conversion: both f16 or both q8_0, rows (and the head / sequence
+// strides) 16-byte aligned. Decided from the strides only: the scratch size is queried before the buffers exist,
+// the launch asserts the data alignment (buffers are 128-byte aligned, cache views sit at row multiples).
+bool ggml_cuda_fattn_sparse_sm60_kv_native(const ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0)) {
+        return false;
+    }
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_cuda_fattn_sparse_sm60_shall_use(const int cc, const ggml_tensor * dst) {
     static const int  enabled = fss_env_int("GGML_CUDA_FA_SPARSE_SM60", 1);
-    static const int  min_q   = fss_env_int("GGML_CUDA_FA_SPARSE_SM60_MIN_Q", 8);
+    static const int  min_q   = fss_env_int("GGML_CUDA_FA_SPARSE_SM60_MIN_Q", 1);
     if (!enabled || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc >= GGML_CUDA_CC_VOLTA) {
         return false;
     }
@@ -434,6 +511,9 @@ bool ggml_cuda_fattn_sparse_sm60_shall_use(const int cc, const ggml_tensor * dst
     }
     if (Q->nb[0] != sizeof(float) || Q->nb[1] % 16 != 0 || Q->nb[2] % 16 != 0 || Q->nb[3] % 16 != 0) {
         return false;
+    }
+    if (ggml_cuda_fattn_sparse_sm60_kv_native(dst)) {
+        return true;
     }
     for (const ggml_tensor * t : {K, V}) {
         if (t->nb[0] != ggml_type_size(t->type)) {
@@ -492,18 +572,31 @@ void ggml_cuda_fattn_sparse_sm60(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     cudaStream_t stream = ctx.stream();
 
-    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
+    const bool native = ggml_cuda_fattn_sparse_sm60_kv_native(dst);
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, !native, !native);
     const bool V_is_K_view = V == K || (V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs)));
 
     fattn_sparse_sm60_args a;
-    fss_kv_f16(K, f16_extra.K, stream, a.K, a.nbk1, a.nbk2, a.nbk3);
-    if (V_is_K_view && V->type == K->type && V->nb[1] == K->nb[1] && V->nb[2] == K->nb[2] && V->nb[3] == K->nb[3]) {
-        a.V    = a.K;
-        a.nbv1 = a.nbk1;
-        a.nbv2 = a.nbk2;
-        a.nbv3 = a.nbk3;
+    if (native) {
+        GGML_ASSERT((uintptr_t) K->data % 16 == 0 && (uintptr_t) V->data % 16 == 0);
+        a.K    = (const char *) K->data;
+        a.nbk1 = K->nb[1];
+        a.nbk2 = K->nb[2];
+        a.nbk3 = K->nb[3];
+        a.V    = (const char *) V->data;
+        a.nbv1 = V->nb[1];
+        a.nbv2 = V->nb[2];
+        a.nbv3 = V->nb[3];
     } else {
-        fss_kv_f16(V, f16_extra.V, stream, a.V, a.nbv1, a.nbv2, a.nbv3);
+        fss_kv_f16(K, f16_extra.K, stream, a.K, a.nbk1, a.nbk2, a.nbk3);
+        if (V_is_K_view && V->type == K->type && V->nb[1] == K->nb[1] && V->nb[2] == K->nb[2] && V->nb[3] == K->nb[3]) {
+            a.V    = a.K;
+            a.nbv1 = a.nbk1;
+            a.nbv2 = a.nbk2;
+            a.nbv3 = a.nbk3;
+        } else {
+            fss_kv_f16(V, f16_extra.V, stream, a.V, a.nbv1, a.nbv2, a.nbv3);
+        }
     }
     a.kv_same = a.V == a.K && a.nbv1 == a.nbk1 && a.nbv2 == a.nbk2 && a.nbv3 == a.nbk3;
     GGML_ASSERT(a.nbk1 % 16 == 0 && a.nbk2 % 16 == 0 && a.nbk3 % 16 == 0);
@@ -547,10 +640,19 @@ void ggml_cuda_fattn_sparse_sm60(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     const dim3 grid((unsigned) a.n_q, (unsigned) (a.n_head/FSS_HB), (unsigned) (Q->ne[3]*a.n_split));
-    if (a.kv_same) {
-        fattn_sparse_sm60_d512<true><<<grid, FSS_NT, 0, stream>>>(a);
+    const bool q8 = native && K->type == GGML_TYPE_Q8_0;
+    if (q8) {
+        if (a.kv_same) {
+            fattn_sparse_sm60_d512<GGML_TYPE_Q8_0, true><<<grid, FSS_NT, 0, stream>>>(a);
+        } else {
+            fattn_sparse_sm60_d512<GGML_TYPE_Q8_0, false><<<grid, FSS_NT, 0, stream>>>(a);
+        }
     } else {
-        fattn_sparse_sm60_d512<false><<<grid, FSS_NT, 0, stream>>>(a);
+        if (a.kv_same) {
+            fattn_sparse_sm60_d512<GGML_TYPE_F16, true><<<grid, FSS_NT, 0, stream>>>(a);
+        } else {
+            fattn_sparse_sm60_d512<GGML_TYPE_F16, false><<<grid, FSS_NT, 0, stream>>>(a);
+        }
     }
     if (a.n_split > 1) {
         fattn_sparse_sm60_join<<<dim3((unsigned) a.n_head, (unsigned) a.n_q, (unsigned) Q->ne[3]), FSS_D/4, 0, stream>>>(a);

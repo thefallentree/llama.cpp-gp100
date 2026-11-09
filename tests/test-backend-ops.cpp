@@ -13469,6 +13469,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 2048,   9, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, true,  512));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {64, 1}, 2048,  16, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, true,  640));
     }
+    // the same at decode sizes over a long q8_0 cache (the rows are gathered from the cache, nothing is converted)
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 32768,  1, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true,  640));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 32768,  4, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true,  640));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16384,  3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 640));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},  4096,  5, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, true,  640));
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -14397,6 +14402,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the same at decode / small-batch sizes (the sparse kernel's threshold)
     for (int64_t nb : {1, 4, 16, 64}) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+    }
+    // the model's cache type (q8_0, K == V): the prompt at 8K, decode batches at 8K / 32K / 64K
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, 1536, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, 640));
+    for (int64_t kv : {8192, 32768, 65536}) {
+        for (int64_t nb : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, 640));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

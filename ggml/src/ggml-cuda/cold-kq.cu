@@ -15,7 +15,8 @@ bool ggml_cuda_cold_kq_enabled() {
 
 bool ggml_cuda_cold_kq_node(const ggml_tensor * node) {
     return node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(node) && node->ne[2] > MMVQ_MAX_BATCH_SIZE &&
-           ggml_cuda_moe_host_ktype(node->src[0]->type) && node->src[0]->type != GGML_TYPE_Q4_0;
+           ggml_cuda_moe_host_ktype(node->src[0]->type) && node->src[0]->type != GGML_TYPE_Q4_0 &&
+           !ggml_cuda_mmid_iq_prompt(node);   // the i-quants that the sm_60 GEMM takes (mmid-f16-sm60.cuh)
 }
 
 static size_t cold_kq_budget() {

@@ -551,6 +551,265 @@ mmid16_q2_0_gemm_p(
 #endif // FP16_AVAILABLE
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// I-quant experts (IQ2_XXS, IQ2_XS, IQ1_M: the GSQ-RCO DeepSeek-V4.1 Coder) in the pipelined 16-slot tile. sm_60 has
+// no DP4A, and the generic path (dequantize each expert to F16 + cuBLAS per expert, the ids read on the host) ran at
+// ~3 TFLOPS with ~78 ms per 1536-token op. Here the codes of a 64-value k-block are decoded into shared memory as half,
+// in the Q2_0 pair order (pair j of a 16-value chunk = elements (j, j + 8)), so the activation conversion, the tile
+// table and the cold-expert staging/prefetch of the Q2_0 path are shared. A 16-value chunk is two 8-value grid groups
+// of one 32-value sub-block; the sub-block scale goes into the half values (exact: (2s+1)/32 times a grid value of
+// 8/25/43, or (2s+1) times q + delta for IQ1_M), the super-block scale is the per-k-block float scale of the tile
+// (IQ2: 4*d, since d*(0.5+s)/4 = 4*d * (2s+1)/32; IQ1_M: d). |half| <= 41.7 (IQ2) / 16.9 (IQ1_M), so a 64-product
+// half2 sum of activations in [-1, 1] stays far below the half range.
+
+static __device__ __forceinline__ uint32_t mmid16_ksigns(const uint32_t i) {
+    // ksigns_iq2xs[i] = i | parity(i) << 7
+    return i | ((__popc(i) & 1) << 7);
+}
+
+// the raw bits of one 16-value chunk (lq) of k-block kb of a row: a, b and the k-block's float scale
+template <ggml_type T>
+static __device__ __forceinline__ void mmid16_iq_load(const char * __restrict__ row, const int kb, const int lq, uint32_t & a, uint32_t & b, float & d) {
+    const int sb   = kb >> 2;
+    const int ib32 = ((kb & 3) << 1) | (lq >> 1);
+    const int h    = lq & 1;
+    if constexpr (T == GGML_TYPE_IQ2_XXS) {
+        const uint16_t * blk = (const uint16_t *) (row + (int64_t) sb*66);
+        const uint16_t * q2  = blk + 1 + 4*ib32;
+        d = 4.0f*__half2float(__ushort_as_half(blk[0]));
+        a = h ? q2[1] : q2[0];
+        b = (uint32_t) q2[2] | ((uint32_t) q2[3] << 16);
+    } else if constexpr (T == GGML_TYPE_IQ2_XS) {
+        const uint16_t * blk = (const uint16_t *) (row + (int64_t) sb*74);
+        const uint16_t * q2  = blk + 1 + 4*ib32 + 2*h;
+        d = 4.0f*__half2float(__ushort_as_half(blk[0]));
+        a = (uint32_t) q2[0] | ((uint32_t) q2[1] << 16);
+        b = (((const uint8_t *) blk)[2 + 64 + ib32] >> (4*h)) & 0xf;
+    } else {
+        static_assert(T == GGML_TYPE_IQ1_M, "i-quant type");
+        const uint8_t * blk = (const uint8_t *) (row + (int64_t) sb*56);
+        a = (uint32_t) *((const uint16_t *) (blk + 4*ib32 + 2*h)) | ((uint32_t) blk[32 + 2*ib32 + h] << 16);
+        const uint2 sc = *((const uint2 *) (blk + 48));
+        const uint32_t s0 = sc.x & 0xffff, s1 = sc.x >> 16, s2 = sc.y & 0xffff, s3 = sc.y >> 16;
+        const uint16_t u = (uint16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000));
+        d = __half2float(__ushort_as_half(u));
+        const int ib16 = 2*ib32 + h;
+        const uint32_t sw = (ib16 >> 2) == 0 ? s0 : (ib16 >> 2) == 1 ? s1 : (ib16 >> 2) == 2 ? s2 : s3;
+        b = (sw >> (3*(ib16 & 3))) & 7;
+    }
+}
+
+// the 16 values of a chunk as 8 half2 pairs (v[j], v[j + 8]); h = lq & 1 selects the sign bits of IQ2_XXS.
+// Integer magic: a byte x (< 1024) in the mantissa of 0x6400 is the half 1024 + x, minus 1024 exactly x; the scale and
+// the sign of each pair go in with one HMUL2 (sign bits XORed into the scale pair). ~7 instructions per pair.
+template <ggml_type T>
+static __device__ __forceinline__ void mmid16_iq_decode(const uint32_t a, const uint32_t b, const int h, half2 * out) {
+    const half2 k1024 = __float2half2_rn(1024.0f);
+    if constexpr (T == GGML_TYPE_IQ2_XXS || T == GGML_TYPE_IQ2_XS) {
+        uint2    g0, g1;
+        uint32_t s0, s1, sc;
+        if constexpr (T == GGML_TYPE_IQ2_XXS) {
+            g0 = *((const uint2 *) &iq2xxs_grid[a & 0xff]);
+            g1 = *((const uint2 *) &iq2xxs_grid[(a >> 8) & 0xff]);
+            s0 = mmid16_ksigns((b >> (14*h))     & 127);
+            s1 = mmid16_ksigns((b >> (14*h + 7)) & 127);
+            sc = 2*(b >> 28) + 1;
+        } else {
+            g0 = *((const uint2 *) &iq2xs_grid[a & 511]);
+            g1 = *((const uint2 *) &iq2xs_grid[(a >> 16) & 511]);
+            s0 = mmid16_ksigns((a >> 9)  & 127);
+            s1 = mmid16_ksigns((a >> 25) & 127);
+            sc = 2*b + 1;
+        }
+        const half2    f  = __float2half2_rn((float) sc*(1.0f/32.0f));
+        const uint32_t fu = mmid16_u32(f);
+        const uint32_t S  = s0 | (s1 << 16);   // pair j's signs: bits j and 16 + j
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint32_t lo = j < 4 ? g0.x : g0.y;
+            const uint32_t hi = j < 4 ? g1.x : g1.y;
+            // byte j%4 of lo into byte 0, of hi into byte 2 (selector nibbles: 4 = hi's byte 0)
+            const uint32_t sel = (uint32_t) (j & 3) | ((uint32_t) (4 + (j & 3)) << 8);   // selector nibble k = result byte k
+            uint32_t w = __byte_perm(lo, hi, sel);
+            w = (w & 0x00ff00ffu) | 0x64006400u;
+            const uint32_t sg = ((S >> j) << 15) & 0x80008000u;
+            out[j] = __hmul2(__hsub2(mmid16_h2(w), k1024), mmid16_h2(fu ^ sg));
+        }
+    } else {
+        const uint32_t qh = a >> 16;
+        const uint32_t g0 = iq1s_grid_gpu[(a & 0xff)        | ((qh & 7) << 8)];
+        const uint32_t g1 = iq1s_grid_gpu[((a >> 8) & 0xff) | (((qh >> 4) & 7) << 8)];
+        const half2 f  = __float2half2_rn((float) (2*b + 1));
+        const half2 dd = __floats2half2_rn(qh & 0x08 ? -1.0f - IQ1M_DELTA : -1.0f + IQ1M_DELTA,
+                                           qh & 0x80 ? -1.0f - IQ1M_DELTA : -1.0f + IQ1M_DELTA);
+        // value j of a group: j < 4 the low nibble of byte j, else the high nibble of byte j - 4
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint32_t lo = j < 4 ? g0 : g0 >> 4;
+            const uint32_t hi = j < 4 ? g1 : g1 >> 4;
+            const uint32_t sel = (uint32_t) (j & 3) | ((uint32_t) (4 + (j & 3)) << 8);   // selector nibble k = result byte k
+            uint32_t w = __byte_perm(lo, hi, sel);
+            w = (w & 0x000f000fu) | 0x64006400u;
+            out[j] = __hmul2(__hadd2(__hsub2(mmid16_h2(w), k1024), dd), f);
+        }
+    }
+}
+
+template <int NT, int RPT, int NJ, ggml_type T>
+static __global__ void __launch_bounds__(NT, mmid16_tile_cfg<NT, RPT, NJ>::MINB)
+mmid16_iq_gemm_p(
+        const char * __restrict__ w, const half2 * __restrict__ xh, const float * __restrict__ xs,
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
+        const int32_t * __restrict__ tile_expert, const int32_t * __restrict__ tile_col0,
+        float * __restrict__ dst, const int nkb, const int64_t nb01, const int64_t nb02, const int64_t stride_dst,
+        const char * __restrict__ w_cold, const int n_hot, const int e_lo, const int e_hi, const int cold_base) {
+#if defined(FP16_AVAILABLE)
+    using C = mmid16_tile_cfg<NT, RPT, NJ>;
+    constexpr int TM = C::TM, RG = C::RG, TX = C::TX, TN = C::TN, WI = C::WI, XI = C::XI;
+
+    const int e = tile_expert[blockIdx.y];
+    if (e < 0 || e < e_lo || e >= e_hi || (e >= n_hot && w_cold == nullptr)) {
+        return;
+    }
+    const int c0   = tile_col0[blockIdx.y];
+    const int cend = expert_bounds[e + 1];
+    const int row0 = blockIdx.x*TM;
+
+    __shared__ __align__(16) uint32_t ws [TM][MMID16_LDS];
+    __shared__ __align__(16) uint32_t xsm[TN][MMID16_LDS];
+    __shared__ float wd [TM];
+    __shared__ float xsc[TN];
+
+    const int tid = threadIdx.x;
+    const int tx  = tid % TX;
+    const int ty  = tid / TX;
+    const char * wexp = e < n_hot ? w + (int64_t) e*nb02 : w_cold + (int64_t) (e - cold_base)*nb02;
+
+    float acc[RPT][NJ];
+#pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+    uint32_t ra[WI], rb[WI];
+    float    rd[WI];
+    uint4    rx[XI];
+    float    rxs = 0.0f;
+
+    const char *  wr[WI];
+    const uint4 * xp[XI];
+    bool          xok[XI];
+#pragma unroll
+    for (int i = 0; i < WI; ++i) {
+        const int lr = (i*NT + tid) / 4;
+        wr[i] = wexp + (int64_t) (row0 + lr)*nb01;
+    }
+#pragma unroll
+    for (int i = 0; i < XI; ++i) {
+        const int idx = i*NT + tid; const int col = idx / 8; const int part = idx % 8; const int c = c0 + col;
+        xok[i] = idx < TN*8 && c < cend;
+        xp[i]  = (const uint4 *) (xh + (int64_t) (xok[i] ? c : c0)*nkb*32) + part;
+    }
+    const bool    xsok = tid < TN && c0 + tid < cend;
+    const float * xsp  = xs + (int64_t) (xsok ? c0 + tid : c0)*nkb;
+
+    int kl = 0; // the k-block of the next load
+#define MMID16_IQ_LOAD() do { \
+        _Pragma("unroll") for (int i = 0; i < WI; ++i) { \
+            mmid16_iq_load<T>(wr[i], kl, (i*NT + tid) % 4, ra[i], rb[i], rd[i]); \
+        } \
+        _Pragma("unroll") for (int i = 0; i < XI; ++i) { \
+            rx[i] = xok[i] ? *xp[i] : make_uint4(0, 0, 0, 0); \
+            xp[i] += 8; \
+        } \
+        rxs = xsok ? *xsp : 0.0f; xsp++; kl++; \
+    } while (0)
+#define MMID16_IQ_STORE() do { \
+        _Pragma("unroll") for (int i = 0; i < WI; ++i) { \
+            const int lr = (i*NT + tid) / 4; const int lq = (i*NT + tid) % 4; \
+            half2 hv[8]; mmid16_iq_decode<T>(ra[i], rb[i], lq & 1, hv); \
+            uint4 * wsp = (uint4 *) &ws[lr][8*lq]; \
+            wsp[0] = make_uint4(mmid16_u32(hv[0]), mmid16_u32(hv[1]), mmid16_u32(hv[2]), mmid16_u32(hv[3])); \
+            wsp[1] = make_uint4(mmid16_u32(hv[4]), mmid16_u32(hv[5]), mmid16_u32(hv[6]), mmid16_u32(hv[7])); \
+            if (lq == 0) { wd[lr] = rd[i]; } \
+        } \
+        _Pragma("unroll") for (int i = 0; i < XI; ++i) { \
+            const int idx = i*NT + tid; const int col = idx / 8; const int part = idx % 8; \
+            if (idx < TN*8) { *((uint4 *) &xsm[col][4*part]) = rx[i]; } \
+        } \
+        if (tid < TN) { xsc[tid] = rxs; } \
+    } while (0)
+
+    MMID16_IQ_LOAD();
+    for (int kb = 0; kb < nkb; ++kb) {
+        MMID16_IQ_STORE();
+        __syncthreads();
+        if (kb + 1 < nkb) {
+            MMID16_IQ_LOAD();
+        }
+        half2 hacc[RPT][NJ];
+#pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                hacc[i][j] = make_half2(0.0f, 0.0f);
+            }
+        }
+#pragma unroll
+        for (int p4 = 0; p4 < 8; ++p4) {
+            uint4 wv[RPT];
+            uint4 xv[NJ];
+#pragma unroll
+            for (int i = 0; i < RPT; ++i) {
+                wv[i] = *((const uint4 *) &ws[ty + RG*i][4*p4]);
+            }
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                xv[j] = *((const uint4 *) &xsm[tx + TX*j][4*p4]);
+            }
+#pragma unroll
+            for (int i = 0; i < RPT; ++i) {
+#pragma unroll
+                for (int j = 0; j < NJ; ++j) {
+                    hacc[i][j] = __hfma2(mmid16_h2(wv[i].x), mmid16_h2(xv[j].x), hacc[i][j]);
+                    hacc[i][j] = __hfma2(mmid16_h2(wv[i].y), mmid16_h2(xv[j].y), hacc[i][j]);
+                    hacc[i][j] = __hfma2(mmid16_h2(wv[i].z), mmid16_h2(xv[j].z), hacc[i][j]);
+                    hacc[i][j] = __hfma2(mmid16_h2(wv[i].w), mmid16_h2(xv[j].w), hacc[i][j]);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+            const float dw = wd[ty + RG*i];
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                acc[i][j] += dw*xsc[tx + TX*j]*__half2float(__hadd(__low2half(hacc[i][j]), __high2half(hacc[i][j])));
+            }
+        }
+        __syncthreads();
+    }
+#undef MMID16_IQ_LOAD
+#undef MMID16_IQ_STORE
+
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        const int c = c0 + tx + TX*j;
+        if (c < cend) {
+            float * d = dst + (int64_t) ids_dst[c]*stride_dst + row0;
+#pragma unroll
+            for (int i = 0; i < RPT; ++i) {
+                d[ty + RG*i] = acc[i][j];
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(w, xh, xs, ids_dst, expert_bounds, tile_expert, tile_col0, dst, nkb, nb01, nb02, stride_dst, w_cold, n_hot, e_lo, e_hi, cold_base);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
 // The Q4_0 variant of the pipelined tile: 8 words and two scales per row per k-block, one half2 accumulator per
 // 32-value block (GGML_CUDA_MMID16_Q4TILE selects the instantiation).
 template <int NT, int RPT, int NJ, int MINB = mmid16_tile_cfg<NT, RPT, NJ>::MINB>
@@ -834,7 +1093,13 @@ bool ggml_cuda_mmid_f16_sm60_supported(
     }
     // GGML_CUDA_SM60_MMID_Q4=0: the Q4_0 experts (the MTP layer's, all resident) stay on MMQ
     static const bool q4 = getenv("GGML_CUDA_SM60_MMID_Q4") == nullptr || atoi(getenv("GGML_CUDA_SM60_MMID_Q4")) != 0;
-    if ((src0->type != GGML_TYPE_Q2_0 && !(q4 && src0->type == GGML_TYPE_Q4_0)) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    // GGML_CUDA_SM60_MMID_IQ=0: the IQ2_XXS / IQ2_XS / IQ1_M experts stay on the generic path (dequantize + cuBLAS per expert)
+    static const bool iq = getenv("GGML_CUDA_SM60_MMID_IQ") == nullptr || atoi(getenv("GGML_CUDA_SM60_MMID_IQ")) != 0;
+    const bool is_iq = iq && ggml_cuda_mmid_iq_type(src0->type);
+    if ((src0->type != GGML_TYPE_Q2_0 && !(q4 && src0->type == GGML_TYPE_Q4_0) && !is_iq) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (is_iq && src0->ne[0] % QK_K != 0) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -881,6 +1146,7 @@ struct mmid16_gemm_plan {
     bool    narrow128 = false; // the narrow tiles with 128 threads
     bool    tile16 = false; // the pipelined 16-slot tiles (mmid16_q2_0_gemm_p<64, 4, 4>)
     int     q4     = 0;     // Q4_0 experts: 1 + the GGML_CUDA_MMID16_Q4TILE instantiation (0 = Q2_0)
+    ggml_type iq   = GGML_TYPE_COUNT; // the i-quant experts (mmid16_iq_gemm_p, 16-slot tiles only), else GGML_TYPE_COUNT
     const half2 * xh_ptr = nullptr; // the converted activations: the pool allocation above or the context's cache
     const float * xs_ptr = nullptr;
     dim3    grid;
@@ -915,6 +1181,7 @@ static void mmid16_gemm_setup(
     // (4x2), 2 = 64x32 of 4 warps (4x4, 3 blocks per SM)
     static const int q4tile = getenv("GGML_CUDA_MMID16_Q4TILE") != nullptr ? atoi(getenv("GGML_CUDA_MMID16_Q4TILE")) : 0;
     p.q4 = src0->type == GGML_TYPE_Q4_0 ? 1 + q4tile : 0;
+    p.iq = ggml_cuda_mmid_iq_type(src0->type) ? src0->type : GGML_TYPE_COUNT;
     GGML_ASSERT(p.q4 == 0 || n_cold == 0);
 
     p.ids_src1.alloc(n_assign);
@@ -1003,6 +1270,9 @@ static void mmid16_gemm_setup(
     if (p.q4) {
         p.mixed = false; p.narrow = p.q4 == 3; p.tile16 = p.q4 != 3; p.narrow128 = false;
     }
+    if (p.iq != GGML_TYPE_COUNT) {
+        p.mixed = false; p.narrow = false; p.tile16 = true; p.narrow128 = false;
+    }
     const int     tn     = p.tile16 ? 16 : p.narrow ? 32 : 64;
     const int64_t t_max  = (n_assign + tn - 1)/tn + ne02;
     GGML_ASSERT(t_max <= 65535);
@@ -1045,7 +1315,18 @@ static void mmid16_gemm_launch(
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * src0 = p.src0;
     ggml_tensor *       dst  = p.dst;
-    if (p.q4) {
+    if (p.iq != GGML_TYPE_COUNT) {
+#define MMID16_IQ_LAUNCH(T) mmid16_iq_gemm_p<64, 4, 4, T><<<p.grid, 64, 0, stream>>>( \
+            (const char *) src0->data, p.xh_ptr, p.xs_ptr, p.ids_dst.get(), p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), \
+            (float *) dst->data, p.nkb, src0->nb[1], src0->nb[2], dst->nb[1]/sizeof(float), w_cold, p.n_hot, e_lo, e_hi, cold_base)
+        switch (p.iq) {
+            case GGML_TYPE_IQ2_XXS: MMID16_IQ_LAUNCH(GGML_TYPE_IQ2_XXS); break;
+            case GGML_TYPE_IQ2_XS:  MMID16_IQ_LAUNCH(GGML_TYPE_IQ2_XS);  break;
+            case GGML_TYPE_IQ1_M:   MMID16_IQ_LAUNCH(GGML_TYPE_IQ1_M);   break;
+            default: GGML_ABORT("mmid16: no i-quant kernel for %s", ggml_type_name(p.iq));
+        }
+#undef MMID16_IQ_LAUNCH
+    } else if (p.q4) {
         switch (p.q4) {
             case 2:
                 mmid16_q4_0_gemm_p<128, 4, 2><<<p.grid, 128, 0, stream>>>(
@@ -1175,10 +1456,19 @@ void ggml_cuda_mmid_vec_f16_sm60(
 // ---------------------------------------------------------------------------------------------------------------
 // prefetch of the cold experts for prompt batches
 
+bool ggml_cuda_mmid_iq_prompt(const ggml_tensor * node) {
+    // not the batches the host tier takes (GGML_CUDA_MOE_HOST_PROMPT=1 up to _MAX_TOK): those go through the generic path,
+    // which reads the ids on the host and must stay out of CUDA graph capture (ggml_cuda_mul_mat_id_needs_sync via
+    // ggml_cuda_cold_kq_node; an earlier version captured them and faulted on stale ids at the 89-token tail ubatch)
+    return node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(node) && node->ne[2] > MMVQ_MAX_BATCH_SIZE &&
+           !ggml_cuda_moe_host_takes_prompt((int) node->ne[2]) && ggml_cuda_mmid_iq_type(node->src[0]->type) &&
+           ggml_cuda_mmid_f16_sm60_supported(node->src[0], node->src[1], node->src[2], node);
+}
+
 bool ggml_cuda_mmid_cold_prompt(const ggml_tensor * node) {
     // Q2_K / Q3_K cold experts have their own staging (cold-kq.cuh), not through the sm_60 Q2_0 GEMM
     return node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_cold(node) && node->ne[2] > MMVQ_MAX_BATCH_SIZE &&
-           !ggml_cuda_moe_host_ktype(node->src[0]->type);
+           (!ggml_cuda_moe_host_ktype(node->src[0]->type) || ggml_cuda_mmid_iq_prompt(node));
 }
 
 static bool ggml_cuda_cold_prefetch_enabled() {

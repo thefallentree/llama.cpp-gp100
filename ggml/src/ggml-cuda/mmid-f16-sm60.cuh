@@ -34,6 +34,14 @@ void ggml_cuda_cold_prefetch_free(ggml_backend_cuda_context & ctx);
 // prompt-sized cold MUL_MAT_IDs (computed eagerly: the prefetch issues host-side copies and events)
 bool ggml_cuda_mmid_cold_prompt(const ggml_tensor * node);
 
+// the i-quant expert types of the sm_60 HFMA2 GEMM (mmid16_iq_gemm_p)
+static inline bool ggml_cuda_mmid_iq_type(const ggml_type t) {
+    return t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ1_M;
+}
+// a prompt-sized hot/cold MUL_MAT_ID of i-quant experts that the sm_60 GEMM takes (instead of the generic dequant path
+// of cold-kq.cuh): its cold experts go through the prefetch ring / the per-op staging like Q2_0's
+bool ggml_cuda_mmid_iq_prompt(const ggml_tensor * node);
+
 // Q2_0 MUL_MAT_ID mat-vec (up to MMVQ_MAX_BATCH_SIZE tokens) on sm_60, same HFMA2 decode.
 bool ggml_cuda_mmid_vec_f16_sm60_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
 

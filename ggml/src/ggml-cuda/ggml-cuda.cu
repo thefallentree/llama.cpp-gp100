@@ -4088,6 +4088,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (ggml_cuda_mmid_cold(dst)) {
         if (ggml_cuda_moe_host_ktype(src0->type)) {
+            // i-quant experts in a prompt batch that the host tier does not take: the sm_60 HFMA2 GEMM with the cold experts
+            // from the prefetch ring (or staged per op), no host sync (GGML_CUDA_SM60_MMID_IQ=0: the generic path below)
+            if (!ggml_cuda_moe_host_active(ctx, dst) && !ggml_cuda_mmid_allgpu() && ggml_cuda_mmid_iq_prompt(dst)) {
+                if (ggml_cuda_cold_prefetch_run(ctx, dst)) {
+                    return;
+                }
+                ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                return;
+            }
             // a prompt batch that the host tier does not take: the cold experts it touches are staged in VRAM and the
             // dequant fallback computes every pair (GGML_CUDA_COLD_PREFETCH_KQ=0: not allowed)
             const bool gpu_cold = !ggml_cuda_moe_host_active(ctx, dst) && !ggml_cuda_mmid_allgpu() && ggml_cuda_cold_kq_node(dst) && ggml_cuda_cold_kq_enabled();
@@ -4141,6 +4150,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_mmid_vec_iq_sm60(ctx, src0, src1, ids, dst);
         ggml_cuda_mmid_check_pairs(ctx, dst, nullptr, 0, /*hot_only =*/ false,
                                    ggml_cuda_mmid_vec_iq_sm60_last_hit() ? "sm60 iq kernel, cache hit" : "sm60 iq kernel, converted");
+        return;
+    }
+
+    // i-quant experts, prompt batches: the sm_60 HFMA2 GEMM (resident experts: no hot/cold split)
+    if (ggml_cuda_mmid_iq_type(src0->type) && dst->ne[2] > MMVQ_MAX_BATCH_SIZE && ggml_cuda_mmid_f16_sm60_supported(src0, src1, ids, dst)) {
+        ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
         return;
     }
 
@@ -8271,7 +8286,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         bool prompt_ec = false;   // the first hot/cold node is a prompt batch of K-quants (the layers of a graph have the same tokens)
         for (int i = 0; i < cgraph->n_nodes && !needs_ec; ++i) {
             needs_ec  = ggml_cuda_mmid_cold(cgraph->nodes[i]);
-            prompt_ec = needs_ec && ggml_cuda_cold_kq_node(cgraph->nodes[i]);
+            prompt_ec = needs_ec && (ggml_cuda_cold_kq_node(cgraph->nodes[i]) || ggml_cuda_mmid_iq_prompt(cgraph->nodes[i]));
         }
         if (needs_ec && cuda_ctx->window_active) {
             cuda_ctx->window_needs_ec = true;

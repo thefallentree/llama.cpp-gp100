@@ -466,7 +466,22 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     // so reaching here is a bug.
     GGML_ASSERT(gather == nullptr);
 
-    if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+    // A concat along dim 2 of tensors whose first three dimensions are contiguous is, per i3, two contiguous blocks
+    // (so is a dim-1 concat with ne2 == 1): two device copies instead of the one-element-per-thread kernel, which the
+    // byte-typed quantized case ran at ~26 GB/s. DeepSeek-V4.1 builds k_all = concat(raw window rows, ALL compressed
+    // rows) for every layer and token: 36 MB per layer at 64K context, 1.36 ms per call (37 ms of a 108 ms decode step).
+    // GGML_CUDA_CONCAT_MEMCPY=0 goes back to the kernel.
+    static const bool concat_memcpy = getenv("GGML_CUDA_CONCAT_MEMCPY") == nullptr || atoi(getenv("GGML_CUDA_CONCAT_MEMCPY")) != 0;
+    if (concat_memcpy && (dim == 2 || (dim == 1 && dst->ne[2] == 1)) &&
+        ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1) && ggml_is_contiguous_to_3(dst)) {
+        const size_t size0 = src0->nb[2]*src0->ne[2];
+        const size_t size1 = src1->nb[2]*src1->ne[2];
+        GGML_ASSERT(size0 + size1 == dst->nb[2]*dst->ne[2]);
+        for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
+            CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + i3*dst->nb[3],         (const char *) src0->data + i3*src0->nb[3], size0, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + i3*dst->nb[3] + size0, (const char *) src1->data + i3*src1->nb[3], size1, cudaMemcpyDeviceToDevice, stream));
+        }
+    } else if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;

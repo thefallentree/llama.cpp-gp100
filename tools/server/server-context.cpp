@@ -4757,20 +4757,29 @@ private:
                                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                                 n_swa > 0);
+                        // without the assembled checkpoint the pipeline stops at n_ckpt and the local path decodes the last
+                        // n_ubatch + 4 tokens itself, so that it makes the checkpoint before them as usual (a prompt that
+                        // differs from a cached one in its last ~1500 tokens restores from it instead of a full re-prefill);
+                        // the peers learn the real prompt end from the negative n_ckpt (their layer-skip tail).
+                        // LLAMA_PREFILL_PEER_CUT=0: the whole prompt but 4 tokens through the pipeline, no checkpoint
+                        static const bool peer_cut = getenv("LLAMA_PREFILL_PEER_CUT") == nullptr || atoi(getenv("LLAMA_PREFILL_PEER_CUT")) != 0;
+                        const bool    cut    = !want_ckpt && peer_cut && params_base.n_ctx_checkpoints > 0;
+                        const int32_t n_send = cut ? n_ckpt : n_split;
+                        const int32_t ck_arg = cut ? -(n_prompt - n_ckpt) : (want_ckpt ? n_ckpt : -1);
                         if (n_ckpt >= 2*n_ubatch) {
-                            std::vector<llama_token> toks(n_split);
-                            for (int32_t i = 0; i < n_split; ++i) {
+                            std::vector<llama_token> toks(n_send);
+                            for (int32_t i = 0; i < n_send; ++i) {
                                 toks[i] = input_tokens[i];
                             }
                             prefill_peer_stats pst;
                             prefill_peer_ckpt  pck;
                             common_speculative_catchup_join(spec.get());
-                            if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_split, n_ubatch,
-                                                 want_ckpt ? n_ckpt : -1, &pck, pst)) {
-                                for (int32_t i = 0; i < n_split; ++i) {
+                            if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_send, n_ubatch,
+                                                 ck_arg, &pck, pst)) {
+                                for (int32_t i = 0; i < n_send; ++i) {
                                     slot.prompt.tokens.push_back(toks[i]);
                                 }
-                                slot.stats.n_prompt_processed += n_split;
+                                slot.stats.n_prompt_processed += n_send;
                                 slot.stats.update_prompt_last();
                                 if (!pck.data_tgt.empty()) {
                                     adopt_checkpoint(slot, pck);

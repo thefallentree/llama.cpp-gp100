@@ -669,7 +669,10 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     if (ckpt) {
         *ckpt = {};
     }
-    if (n_ckpt <= 0 || n_ckpt >= n_split || ckpt == nullptr) {
+    if (n_ckpt < -1) {
+        // no checkpoint; the prompt goes on -n_ckpt tokens after n_split (the local path decodes them): sent as is so
+        // that the stages know the prompt end
+    } else if (n_ckpt <= 0 || n_ckpt >= n_split || ckpt == nullptr) {
         n_ckpt = -1;
     }
 
@@ -1055,10 +1058,11 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     // beyond the tail). The skip is exact, so a stage that decides otherwise than the head still gives the same state;
     // llama_context::prompt_skip_for applies it only to a stage that fits it. Other models: no tail, a no-op.
     {
-        const llama_pos end  = (llama_pos) n_split + 4 - (n_ubatch + 8);
+        // (n_ckpt < -1: the head stopped the pipeline -n_ckpt tokens before the prompt's end, see prefill_peer_run)
+        const llama_pos end  = (llama_pos) n_split + (n_ckpt < -1 ? -n_ckpt : 4) - (n_ubatch + 8);
         const int32_t   tail = llama_set_prompt_end(ctx_tgt, seq_id, end);
         if (tail > 0 && end >= tail + 1024) {
-            LOG_WRN("prefill-peer: layer skip: the layers past the last stream source run on the last %d rows of %d\n", tail, n_split + 4);
+            LOG_WRN("prefill-peer: layer skip: the layers past the last stream source run on the last %d rows of %d\n", tail, end + n_ubatch + 8);
         } else {
             llama_set_prompt_end(ctx_tgt, seq_id, -1);
         }

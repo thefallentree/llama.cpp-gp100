@@ -13460,6 +13460,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // sparse prompt processing (deepseek41: MQA 64 heads, D = 512, K == V, sinks, <= 640 visible rows per query)
+    for (bool sinks : {false, true}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 2048, 128, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, true,  640));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 2048, 128, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, false, 640));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096,  37, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true,  640));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 2048,  40, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 2, 1, 3}, true, true,  640));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 2048,   9, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, true,  512));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {64, 1}, 2048,  16, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, true,  640));
+    }
+
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -14379,6 +14389,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // deepseek41 prompt attention: 1536 queries x 64 heads over <= 640 visible rows of a 2K / 8K / 32K cache (K == V, sinks)
+    for (int64_t kv : {2048, 8192, 32768}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1536, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

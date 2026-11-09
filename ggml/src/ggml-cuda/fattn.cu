@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-sparse-sm60.cuh"
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_MUSA)
@@ -564,6 +565,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_SPARSE_SM60 = 500, // Pascal: gather of the mask's visible rows (n_kv_max), D = 512
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -686,6 +688,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
+    // without tensor cores the n_kv_max hint selects the gather kernel: its cost does not grow with the K/V length
+    if (ggml_cuda_fattn_sparse_sm60_shall_use(cc, dst)) {
+        return BEST_FATTN_KERNEL_SPARSE_SM60;
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -798,6 +805,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
+        case BEST_FATTN_KERNEL_SPARSE_SM60:
             need_f16_K = true;
             need_f16_V = true;
             break;
@@ -829,6 +837,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SPARSE_SM60:
+            ggml_cuda_fattn_sparse_sm60(ctx, dst);
             break;
     }
 }

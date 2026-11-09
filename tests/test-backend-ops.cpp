@@ -14620,6 +14620,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // the 64-head DeepSeek-V4.1 indexer: a 1536-token prompt ubatch over the index keys of a ~45K and a 11K context, and
+    // decode windows over the keys of a 64K context (the sm_60 register kernel vs the vec kernel)
+    for (int kv : { 22272, 5632 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 1536, 1, 1, GGML_TYPE_F16, true));
+    }
+    for (int bs : { 1, 4, 8 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 32768, bs, 1, 1, GGML_TYPE_F16, true));
+    }
+
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {

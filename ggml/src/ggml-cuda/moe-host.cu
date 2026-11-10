@@ -678,8 +678,8 @@ static void mh_part_env(int & h, int & k, int & max_tok) {
         const char * e = getenv("GGML_CUDA_MOE_HOST_PART");
         const char * m = getenv("GGML_CUDA_MOE_HOST_PART_MAX_TOK");
         if (e != nullptr && strcmp(e, "auto") == 0) {
-            sh = -2; sk = 16;   // h from the cost model per batch (ggml_cuda_moe_host_part)
-            smax = m != nullptr ? atoi(m) : 1536;
+            sh = -2; sk = 16;   // h from the cost model per batch (mh_part_auto)
+            smax = m != nullptr ? atoi(m) : 1024;   // full 1536-token ubatches keep the pure GPU path (fastest measured)
             GGML_LOG_WARN("moe-host: shared prompt batches above %d and up to %d tokens: the host tier's share of the cold experts from the cost model\n",
                           ggml_cuda_moe_host_prompt_max(), smax);
         } else if (e != nullptr && sscanf(e, "%d/%d", &sh, &sk) == 2 && sh > 0 && sk > sh) {
@@ -693,23 +693,42 @@ static void mh_part_env(int & h, int & k, int & max_tok) {
     h = sh; k = sk; max_tok = smax;
 }
 
+// auto: the host's share h of k for a batch of n tokens from the per-layer cost model (DP4, measured on the P100 node with the
+// Coder, 24 host threads): the GPU streams every cold expert in GPU_MS (155 ms, flat); the host tier's cost per token is
+// HOST_US + HOST_US2 * n (660 us at 150 tokens, ~850 at 500, ~1010 at 1000, ~1900 at 1536: the activations outgrow the
+// caches), so the shared layer costs max(h/k * host, (k-h)/k * gpu). h is the better of floor/ceil of the balance point; 0
+// (no sharing, the pure GPU path) unless the model predicts at least PART_MIN_GAIN (5 %) under the GPU alone.
+static int mh_part_auto(const int n_tokens, const int k) {
+    static const double gpu_ms   = getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS")   != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS"))   : 155.0;
+    static const double host_us  = getenv("GGML_CUDA_MOE_HOST_PART_HOST_US")  != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_HOST_US"))  : 600.0;
+    static const double host_us2 = getenv("GGML_CUDA_MOE_HOST_PART_HOST_US2") != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_HOST_US2")) : 0.41;
+    static const double min_gain = getenv("GGML_CUDA_MOE_HOST_PART_MIN_GAIN") != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_MIN_GAIN")) : 0.05;
+    const double host_ms = (host_us + host_us2*n_tokens)*1e-3*n_tokens;   // the host tier with every cold expert, per layer
+    const double hb = k*gpu_ms/(gpu_ms + host_ms);                         // the balance point
+    int best = 0; double best_ms = gpu_ms*(1.0 - min_gain);
+    for (int h = (int) floor(hb); h <= (int) ceil(hb); h++) {
+        if (h < 1 || h >= k) continue;
+        const double ms = std::max(h*host_ms/k, (k - h)*gpu_ms/k);
+        if (ms < best_ms) { best_ms = ms; best = h; }
+    }
+    return best;
+}
+
 void ggml_cuda_moe_host_part(const int n_tokens, int * h, int * k) {
     int m;
     mh_part_env(*h, *k, m);
     if (*h == -2) {
-        // GGML_CUDA_MOE_HOST_PART_GPU_MS: the GPU's cold stream per layer (flat), _PART_HOST_US: the host tier's cost per
-        // token per layer with every cold expert (both measured on the P100 node, the Coder: 155 ms, 660 us)
-        static const double gpu_ms  = getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS")  != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS"))  : 155.0;
-        static const double host_us = getenv("GGML_CUDA_MOE_HOST_PART_HOST_US") != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_HOST_US")) : 660.0;
-        const double s = gpu_ms/(gpu_ms + host_us*1e-3*n_tokens);
-        *h = std::min(*k - 1, std::max(1, (int) lround(s*(*k))));
+        *h = mh_part_auto(n_tokens, *k);
     }
 }
 
 bool ggml_cuda_moe_host_partitions(const int n_tokens) {
     int h, k, m;
     mh_part_env(h, k, m);
-    return k != 0 && ggml_cuda_moe_host_takes_prompts() && n_tokens > ggml_cuda_moe_host_prompt_max() && n_tokens <= m;
+    if (k == 0 || !ggml_cuda_moe_host_takes_prompts() || n_tokens <= ggml_cuda_moe_host_prompt_max() || n_tokens > m) {
+        return false;
+    }
+    return h != -2 || mh_part_auto(n_tokens, k) > 0;
 }
 
 // The gate/up/swiglu/down triple of a hot/cold Q2_0 layer that the MUL_MAT_ID node i opens: the other two

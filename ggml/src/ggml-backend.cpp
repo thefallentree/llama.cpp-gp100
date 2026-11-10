@@ -2236,8 +2236,8 @@ static bool ggml_backend_sched_input_from_host(ggml_backend_t split_backend, con
            ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy);
 }
 
-// GGML_SCHED_COPY_UNREAD=1: copy every split input as before #31419 (inputs of nodes that are not computed included)
-static const bool sched_copy_unread = getenv("GGML_SCHED_COPY_UNREAD") != nullptr && atoi(getenv("GGML_SCHED_COPY_UNREAD")) != 0;
+// GGML_SCHED_COPY_UNREAD=0: skip the split inputs of nodes that are not computed (#31419); default on = copy every input as before
+static const bool sched_copy_unread = getenv("GGML_SCHED_COPY_UNREAD") == nullptr || atoi(getenv("GGML_SCHED_COPY_UNREAD")) != 0;
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);

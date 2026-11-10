@@ -3787,8 +3787,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src1 = dst->src[1];
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     if (ggml_cuda_mmid_cold(dst)) {
-        // the Q2_K / Q3_K prompt batches go through the generic path below, which reads the ids on the host
-        return ggml_cuda_cold_kq_node(dst);
+        // the Q2_K / Q3_K prompt batches go through the generic path below, which reads the ids on the host; a shared
+        // prompt batch (moe-host.cuh) opens the host triple at run time and stays out of capture too
+        return ggml_cuda_cold_kq_node(dst) || ggml_cuda_moe_host_partitions((int) dst->ne[2]);
     }
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -4095,6 +4096,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
                 ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                return;
+            }
+            // a shared prompt batch: the host tier has its share of the cold experts (the triple is open), the GEMM
+            // stages the routed others per op and skips the host's tiles; the collect writes the host's rows
+            if (ggml_cuda_moe_host_active(ctx, dst) && !ggml_cuda_mmid_allgpu() && ggml_cuda_mmid_iq_prompt(dst) &&
+                ggml_cuda_moe_host_partitions((int) dst->ne[2])) {
+                ggml_cuda_moe_host_part((int) dst->ne[2], &ctx.mmid_part_h, &ctx.mmid_part_k);
+                ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                ctx.mmid_part_h = ctx.mmid_part_k = 0;
                 return;
             }
             // a prompt batch that the host tier does not take: the cold experts it touches are staged in VRAM and the

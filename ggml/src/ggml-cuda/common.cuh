@@ -1445,6 +1445,7 @@ struct ggml_cuda_cold_kq {
 struct ggml_backend_cuda_context {
     bool mmid_no_mmq = false; // the Q2_K hot/cold path (glm5-next) keeps the generic mul_mat_id off MMQ
     int  mmid_skip_from = -1; // >= 0: the dequant fallback skips the pairs whose expert id is >= this (their rows are zeroed)
+    int  mmid_part_h = 0, mmid_part_k = 0; // a shared prompt batch (moe-host.cuh): the sm_60 GEMM skips the host's cold experts (c % k < h)
     const char * mmid_cold_data = nullptr; // the dequant fallback also computes the cold experts [n_hot, n_hot + n_cold) from this host memory
     int  mmid_n_cold = 0;
     bool mmid_force_fallback = false; // the generic mul_mat_id takes the dequant fallback whatever the batch size

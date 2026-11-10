@@ -39,7 +39,8 @@ bool ggml_cuda_moe_host_takes_prompt(int n_tokens);
 // _PART_MAX_TOK (default 1024; fixed h/k: 1536) tokens is shared: the host tier computes the cold experts whose cold index c has c % k < h,
 // the GPU stages the others (per op, routed only) and computes them with the hot ones; the host's rows land in the
 // collect. auto: h/16 from the per-layer cost model GPU stream = _PART_GPU_MS (155) flat vs host = (_PART_HOST_US (600) +
-// _PART_HOST_US2 (0.41) * n) per token, the better of floor/ceil of the balance, 0 = pure GPU unless >= _PART_MIN_GAIN (5 %).
+// _PART_HOST_US2 (0.41) * n) per token, the GPU side plus _PART_GPU_US (50) * n of unoverlapped GEMMs: h = argmin, 0 = pure GPU
+// unless >= _PART_MIN_GAIN (5 %) under the GPU alone (so shared up to ~600 tokens).
 bool ggml_cuda_moe_host_partitions(int n_tokens);
 void ggml_cuda_moe_host_part(int n_tokens, int * h, int * k);
 

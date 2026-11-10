@@ -696,19 +696,23 @@ static void mh_part_env(int & h, int & k, int & max_tok) {
 // auto: the host's share h of k for a batch of n tokens from the per-layer cost model (DP4, measured on the P100 node with the
 // Coder, 24 host threads): the GPU streams every cold expert in GPU_MS (155 ms, flat); the host tier's cost per token is
 // HOST_US + HOST_US2 * n (660 us at 150 tokens, ~850 at 500, ~1010 at 1000, ~1900 at 1536: the activations outgrow the
-// caches), so the shared layer costs max(h/k * host, (k-h)/k * gpu). h is the better of floor/ceil of the balance point; 0
-// (no sharing, the pure GPU path) unless the model predicts at least PART_MIN_GAIN (5 %) under the GPU alone.
+// caches), so the shared layer costs max(h/k * host, (k-h)/k * gpu + GPU_US * n) (the GPU's own GEMMs do not overlap the
+// stream in a shared batch: 50 us per token fits the measured 150/500/1000/1536-token batches within 5 %). h = the argmin;
+// 0 (no sharing, the pure GPU path: the ring overlaps stream and compute) unless the model predicts at least PART_MIN_GAIN
+// (5 %) under the GPU alone, which it does up to ~600 tokens.
 static int mh_part_auto(const int n_tokens, const int k) {
     static const double gpu_ms   = getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS")   != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS"))   : 155.0;
     static const double host_us  = getenv("GGML_CUDA_MOE_HOST_PART_HOST_US")  != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_HOST_US"))  : 600.0;
     static const double host_us2 = getenv("GGML_CUDA_MOE_HOST_PART_HOST_US2") != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_HOST_US2")) : 0.41;
+    static const double gpu_us   = getenv("GGML_CUDA_MOE_HOST_PART_GPU_US")   != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_GPU_US"))   : 50.0;
     static const double min_gain = getenv("GGML_CUDA_MOE_HOST_PART_MIN_GAIN") != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_MIN_GAIN")) : 0.05;
     const double host_ms = (host_us + host_us2*n_tokens)*1e-3*n_tokens;   // the host tier with every cold expert, per layer
-    const double hb = k*gpu_ms/(gpu_ms + host_ms);                         // the balance point
+    // the GPU side of a shared layer: its share of the stream plus its MoE GEMMs (GPU_US per token: a shared batch stays out
+    // of the prefetch ring, so unlike the pure GPU path its compute does not overlap the next layer's stream)
+    const double gpu_tok = gpu_us*1e-3*n_tokens;
     int best = 0; double best_ms = gpu_ms*(1.0 - min_gain);
-    for (int h = (int) floor(hb); h <= (int) ceil(hb); h++) {
-        if (h < 1 || h >= k) continue;
-        const double ms = std::max(h*host_ms/k, (k - h)*gpu_ms/k);
+    for (int h = 1; h < k; h++) {
+        const double ms = std::max(h*host_ms/k, (k - h)*gpu_ms/k + gpu_tok);
         if (ms < best_ms) { best_ms = ms; best = h; }
     }
     return best;

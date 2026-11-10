@@ -35,6 +35,13 @@ void ggml_cuda_moe_host_register(ggml_backend_cuda_context & ctx, const ggml_cgr
 bool ggml_cuda_moe_host_takes_prompts();
 // whether the host tier takes a prompt batch of n_tokens (GGML_CUDA_MOE_HOST_PROMPT=1 and n_tokens <= GGML_CUDA_MOE_HOST_PROMPT_MAX_TOK)
 bool ggml_cuda_moe_host_takes_prompt(int n_tokens);
+// GGML_CUDA_MOE_HOST_PART=h/k or auto (with _PROMPT=1): a prompt batch of more than _PROMPT_MAX_TOK and at most
+// _PART_MAX_TOK (default 1536) tokens is shared: the host tier computes the cold experts whose cold index c has c % k < h,
+// the GPU stages the others (per op, routed only) and computes them with the hot ones; the host's rows land in the
+// collect. auto: h/16 from the per-layer cost model GPU stream = _PART_GPU_MS (155) flat vs host = _PART_HOST_US (660)
+// per token: h = 16 * gpu / (gpu + host * n_tokens).
+bool ggml_cuda_moe_host_partitions(int n_tokens);
+void ggml_cuda_moe_host_part(int n_tokens, int * h, int * k);
 
 // The weight types whose cold experts the host tier computes with its k kernels (moe-host-cpu.cpp, moe-host-iq.inc): Q2_K /
 // Q3_K (glm5-next, deepseek41), Q4_0 (glm5-next's NextN block), and the i-quants of Project Maya's files.

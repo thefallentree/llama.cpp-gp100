@@ -111,10 +111,12 @@ static __global__ void mmid16_convert_rows(
 template <int TN, int MODE = 0>
 static __global__ void mmid16_tiles(
         const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_expert,
-        int32_t * __restrict__ tile_col0, const int n_experts) {
+        int32_t * __restrict__ tile_col0, const int n_experts, const int n_hot = 0, const int part_h = 0, const int part_k = 0) {
     __shared__ int scan[1024];
     const int e   = threadIdx.x;
-    const int cnt = e < n_experts ? expert_bounds[e + 1] - expert_bounds[e] : 0;
+    // a shared prompt batch: no tiles for the host tier's cold experts (their rows come from the collect)
+    const bool host = part_k > 0 && e >= n_hot && (e - n_hot) % part_k < part_h;
+    const int cnt = e < n_experts && !host ? expert_bounds[e + 1] - expert_bounds[e] : 0;
     int nt  = (cnt + TN - 1)/TN;
     int off = 0;
     if (MODE == 1) {
@@ -1130,10 +1132,10 @@ static __global__ void mmid16_stage_cold_slots(
 
 static __global__ void mmid16_stage_cold_experts(
         const int32_t * __restrict__ expert_bounds, const int n_hot,
-        const uint4 * __restrict__ w_cold, const int64_t n16, uint4 * __restrict__ stage) {
+        const uint4 * __restrict__ w_cold, const int64_t n16, uint4 * __restrict__ stage, const int part_h, const int part_k) {
     const int ec = blockIdx.y;
-    if (expert_bounds[n_hot + ec + 1] == expert_bounds[n_hot + ec]) {
-        return;
+    if (expert_bounds[n_hot + ec + 1] == expert_bounds[n_hot + ec] || (part_k > 0 && ec % part_k < part_h)) {
+        return;   // not routed to, or the host tier's in a shared batch
     }
     const uint4 * src = w_cold + (int64_t) ec*n16;
     uint4 *       dst = stage  + (int64_t) ec*n16;
@@ -1259,7 +1261,7 @@ static void mmid16_gemm_setup(
         const int64_t n16 = src0->nb[2]/16;
         p.stage.alloc((size_t) n_cold*src0->nb[2]);
         mmid16_stage_cold_experts<<<dim3(16, n_cold, 1), 256, 0, stream>>>(
-            p.bounds.get(), n_hot, (const uint4 *) w_cold, n16, (uint4 *) p.stage.get());
+            p.bounds.get(), n_hot, (const uint4 *) w_cold, n16, (uint4 *) p.stage.get(), ctx.mmid_part_h, ctx.mmid_part_k);
         w_cold = p.stage.get();
     }
     p.w_cold = w_cold;
@@ -1352,6 +1354,7 @@ static void mmid16_gemm_setup(
         nthr *= 2;
     }
     p.grid = dim3(ne01/MMID16_TM, t_max, 1);
+    const int ph = ctx.mmid_part_h, pk = ctx.mmid_part_k;
     if (iq_mixed) {
         // 32-slot tiles on the full groups of 32 slots of every expert, 16-slot tiles on the remainders (at most 2 per expert)
         const int64_t t_max2 = 2*ne02;
@@ -1359,8 +1362,8 @@ static void mmid16_gemm_setup(
         p.tile_col02.alloc(t_max2);
         ggml_cuda_fill_async(p.tile_expert2.get(), 0xFF, t_max2*sizeof(int32_t), stream);
         p.grid2 = dim3(ne01/MMID16_TM, t_max2, 1);
-        mmid16_tiles<32, 1><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(),  p.tile_col0.get(),  ne02);
-        mmid16_tiles<16, 2><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(), ne02);
+        mmid16_tiles<32, 1><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(),  p.tile_col0.get(),  ne02, n_hot, ph, pk);
+        mmid16_tiles<16, 2><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(), ne02, n_hot, ph, pk);
     } else if (mixed) {
         // wide tiles: at most n_assign/64 of them; narrow remainder tiles: at most 2 per expert
         const int64_t t_max2 = 2*ne02;
@@ -1368,14 +1371,14 @@ static void mmid16_gemm_setup(
         p.tile_col02.alloc(t_max2);
         ggml_cuda_fill_async(p.tile_expert2.get(), 0xFF, t_max2*sizeof(int32_t), stream);
         p.grid2 = dim3(ne01/MMID16_TM, t_max2, 1);
-        mmid16_tiles<64, 1><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(),  p.tile_col0.get(),  ne02);
-        mmid16_tiles<32, 2><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(), ne02);
+        mmid16_tiles<64, 1><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(),  p.tile_col0.get(),  ne02, n_hot, ph, pk);
+        mmid16_tiles<32, 2><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert2.get(), p.tile_col02.get(), ne02, n_hot, ph, pk);
     } else if (p.tile16) {
-        mmid16_tiles<16><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02);
+        mmid16_tiles<16><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02, n_hot, ph, pk);
     } else if (p.narrow) {
-        mmid16_tiles<32><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02);
+        mmid16_tiles<32><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02, n_hot, ph, pk);
     } else {
-        mmid16_tiles<64><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02);
+        mmid16_tiles<64><<<1, nthr, 0, stream>>>(p.bounds.get(), p.tile_expert.get(), p.tile_col0.get(), ne02, n_hot, ph, pk);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1685,7 +1688,8 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
         // (mmid16_stage_cold_experts) instead of copying every cold expert of the op: 269-616-token prompt batches took
         // 14-18% less that way on Qwen3.8 (the prefetch wins at 1536 tokens, where nearly every expert is routed to)
         if (ggml_cuda_mmid_cold_prompt(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-            !ggml_cuda_moe_host_takes_prompt((int) n->src[2]->ne[1]) && n->src[2]->ne[1] >= cold_prefetch_min_tok &&
+            !ggml_cuda_moe_host_takes_prompt((int) n->src[2]->ne[1]) && !ggml_cuda_moe_host_partitions((int) n->src[2]->ne[1]) &&
+            n->src[2]->ne[1] >= cold_prefetch_min_tok &&
             ggml_cuda_mmid_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)) {
             pf.ops.push_back(n);
             need = std::max(need, cold_piece_of(n).bytes);

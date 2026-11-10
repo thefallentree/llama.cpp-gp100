@@ -8,6 +8,7 @@
 #include <atomic>
 #include <climits>
 #include <cstring>
+#include <cmath>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -93,7 +94,8 @@ static __global__ void mh_quantize_rows(const float * __restrict__ x, const int6
 
 // Prompt-sized batches, 2/2: compact the cold pairs (one block, a running offset over chunks of the ids) and ring.
 static __global__ void mh_ring(const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_tokens,
-                               const int n_hot, mh_mailbox * mb, uint32_t * dstate, const int slot) {
+                               const int n_hot, mh_mailbox * mb, uint32_t * dstate, const int slot,
+                               const int part_h, const int part_k) {
     __shared__ int wcount[MH_RING_THREADS/WARP_SIZE];
     __shared__ int s_base;
     const int lane  = threadIdx.x % WARP_SIZE;
@@ -109,7 +111,7 @@ static __global__ void mh_ring(const int32_t * __restrict__ ids, const int si1, 
         bool cold = false;
         if (i < n_all) {
             e    = ids[(i / n_used)*si1 + i % n_used];
-            cold = e >= n_hot;
+            cold = e >= n_hot && (part_k == 0 || (e - n_hot) % part_k < part_h);   // a shared batch: the host's share only
         }
         const unsigned int m = __ballot_sync(0xffffffff, cold);
         if (lane == 0) {
@@ -553,6 +555,8 @@ static std::atomic<int> g_mh_mailboxes { 0 };
 // The mailbox is sized once, at the first host triple: GGML_CUDA_MOE_HOST_MAX_TOK tokens (default 512, the usual
 // prompt ubatch) of that triple's n_embd. Wider batches keep the GPU path. It is never reallocated: graphs queued
 // earlier may still be using it.
+static void mh_part_env(int & h, int & k, int & max_tok);
+
 static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n_embd, const int n_used) {
     if (ctx.moe_host_mb != nullptr) {
         return true;
@@ -564,7 +568,9 @@ static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n
         return false;
     }
     const char * env = getenv("GGML_CUDA_MOE_HOST_MAX_TOK");
-    const int cap_tok   = std::max(MH_SMALL_TOK, env ? atoi(env) : 512);
+    int part_h = 0, part_k = 0, part_max = 0;
+    mh_part_env(part_h, part_k, part_max);
+    const int cap_tok   = std::max(MH_SMALL_TOK, env ? atoi(env) : std::max(512, part_k != 0 ? part_max : 0));
     const int cap_pairs = cap_tok*n_used;
     const size_t size   = mh_mailbox_layout(nullptr, cap_tok, cap_pairs, n_embd);
 
@@ -662,6 +668,48 @@ static int ggml_cuda_moe_host_prompt_max() {
 
 bool ggml_cuda_moe_host_takes_prompt(const int n_tokens) {
     return ggml_cuda_moe_host_takes_prompts() && n_tokens <= ggml_cuda_moe_host_prompt_max();
+}
+
+// GGML_CUDA_MOE_HOST_PART=h/k: the host/GPU share of the cold experts of a shared prompt batch (0/0 = off)
+static void mh_part_env(int & h, int & k, int & max_tok) {
+    static int sh = -1, sk = 0, smax = 1536;
+    if (sh < 0) {
+        sh = 0;
+        const char * e = getenv("GGML_CUDA_MOE_HOST_PART");
+        const char * m = getenv("GGML_CUDA_MOE_HOST_PART_MAX_TOK");
+        if (e != nullptr && strcmp(e, "auto") == 0) {
+            sh = -2; sk = 16;   // h from the cost model per batch (ggml_cuda_moe_host_part)
+            smax = m != nullptr ? atoi(m) : 1536;
+            GGML_LOG_WARN("moe-host: shared prompt batches above %d and up to %d tokens: the host tier's share of the cold experts from the cost model\n",
+                          ggml_cuda_moe_host_prompt_max(), smax);
+        } else if (e != nullptr && sscanf(e, "%d/%d", &sh, &sk) == 2 && sh > 0 && sk > sh) {
+            smax = m != nullptr ? atoi(m) : 1536;
+            GGML_LOG_WARN("moe-host: shared prompt batches above %d and up to %d tokens: the host tier takes %d of every %d cold experts\n",
+                          ggml_cuda_moe_host_prompt_max(), smax, sh, sk);
+        } else {
+            sh = 0; sk = 0;
+        }
+    }
+    h = sh; k = sk; max_tok = smax;
+}
+
+void ggml_cuda_moe_host_part(const int n_tokens, int * h, int * k) {
+    int m;
+    mh_part_env(*h, *k, m);
+    if (*h == -2) {
+        // GGML_CUDA_MOE_HOST_PART_GPU_MS: the GPU's cold stream per layer (flat), _PART_HOST_US: the host tier's cost per
+        // token per layer with every cold expert (both measured on the P100 node, the Coder: 155 ms, 660 us)
+        static const double gpu_ms  = getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS")  != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_GPU_MS"))  : 155.0;
+        static const double host_us = getenv("GGML_CUDA_MOE_HOST_PART_HOST_US") != nullptr ? atof(getenv("GGML_CUDA_MOE_HOST_PART_HOST_US")) : 660.0;
+        const double s = gpu_ms/(gpu_ms + host_us*1e-3*n_tokens);
+        *h = std::min(*k - 1, std::max(1, (int) lround(s*(*k))));
+    }
+}
+
+bool ggml_cuda_moe_host_partitions(const int n_tokens) {
+    int h, k, m;
+    mh_part_env(h, k, m);
+    return k != 0 && ggml_cuda_moe_host_takes_prompts() && n_tokens > ggml_cuda_moe_host_prompt_max() && n_tokens <= m;
 }
 
 // The gate/up/swiglu/down triple of a hot/cold Q2_0 layer that the MUL_MAT_ID node i opens: the other two
@@ -932,7 +980,8 @@ static bool mh_open(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const
     const ggml_tensor * ids = node->src[2];
     const int n_used   = (int) ids->ne[0];
     const int n_tokens = (int) ids->ne[1];
-    if (n_tokens > MH_SMALL_TOK && (!ggml_cuda_moe_host_takes_prompts() || n_tokens > ggml_cuda_moe_host_prompt_max())) {
+    if (n_tokens > MH_SMALL_TOK && (!ggml_cuda_moe_host_takes_prompts() || n_tokens > ggml_cuda_moe_host_prompt_max()) &&
+        !ggml_cuda_moe_host_partitions(n_tokens)) {
         return false;
     }
     if (ctx.moe_host_mb != nullptr && (n_tokens > ctx.moe_host_mb->cap_tok || n_tokens*n_used > ctx.moe_host_mb->cap_pairs)) {
@@ -1027,8 +1076,12 @@ bool ggml_cuda_moe_host_begin(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
         const int wpb  = MH_PUBLISH_THREADS/WARP_SIZE;
         mh_quantize_rows<<<(nblk + wpb - 1)/wpb, MH_PUBLISH_THREADS, 0, ctx.stream()>>>(
             (const float *) a.x->data, sx_tok, a.n_embd, a.n_tokens, ctx.moe_host_mb);
+        int part_h = 0, part_k = 0;
+        if (ggml_cuda_moe_host_partitions(a.n_tokens)) {
+            ggml_cuda_moe_host_part(a.n_tokens, &part_h, &part_k);
+        }
         mh_ring<<<1, MH_RING_THREADS, 0, ctx.stream()>>>(
-            (const int32_t *) a.ids->data, si1, a.n_used, a.n_tokens, a.n_hot, ctx.moe_host_mb, ctx.moe_host_dstate, a.slot);
+            (const int32_t *) a.ids->data, si1, a.n_used, a.n_tokens, a.n_hot, ctx.moe_host_mb, ctx.moe_host_dstate, a.slot, part_h, part_k);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

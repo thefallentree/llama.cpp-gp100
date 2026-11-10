@@ -3277,7 +3277,7 @@ void llama_context::decode_extract(const llm_graph_result * res, const llama_uba
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             // the device buffer replaces the host extraction, see build_h_nextn_dev()
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn_cur) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 

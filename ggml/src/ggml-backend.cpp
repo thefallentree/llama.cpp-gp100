@@ -2236,6 +2236,9 @@ static bool ggml_backend_sched_input_from_host(ggml_backend_t split_backend, con
            ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy);
 }
 
+// GGML_SCHED_COPY_UNREAD=1: copy every split input as before #31419 (inputs of nodes that are not computed included)
+static const bool sched_copy_unread = getenv("GGML_SCHED_COPY_UNREAD") != nullptr && atoi(getenv("GGML_SCHED_COPY_UNREAD")) != 0;
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2315,7 +2318,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
             if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && !ggml_backend_sched_input_from_host(split_backend, input, input_cpy) &&
-                    !ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
+                    !ggml_backend_sched_is_host_weight(input) && (sched_copy_unread || sched->hv_tensor_requires_copy[hash_id(input)])) {
                 ggml_backend_sched_copy_input(sched, split, input);
             }
         }
@@ -2324,7 +2327,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_sched_prefetch_inputs(sched, split_id);
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
-            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && ggml_backend_sched_is_host_weight(input) && (sched_copy_unread || sched->hv_tensor_requires_copy[hash_id(input)])) {
                 ggml_backend_sched_copy_input(sched, split, input);
             }
         }

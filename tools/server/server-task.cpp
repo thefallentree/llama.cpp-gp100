@@ -2414,6 +2414,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, next_d0, -1);
         }
     }
+    // CL1: the restored segments must cover the whole prompt; an entry that lost earlier segments must not be reused
+    {
+        const llama_pos gap = llama_memory_seq_pos_gap(ctx_tgt, id_slot, 0);
+        if (gap >= 0 && gap < n_e) {
+            SRV_WRN("prompt cache: entry of %d tokens restores only up to pos %d (%zu segments): dropped\n", n_e, gap, e.data.segs.size());
+            return fail("segments do not cover the prompt");
+        }
+    }
     const int64_t t_recr = ggml_time_us();
 
     if (!e.data.recr.empty() && llama_state_seq_set_data_ext(ctx_tgt, e.data.recr.data(), e.data.recr.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != e.data.recr.size()) {

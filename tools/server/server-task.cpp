@@ -2036,7 +2036,22 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         *origin = nullptr;
     }
 
-    const int lcp = e != nullptr ? e->prompt.tokens.get_common_prefix(prompt.tokens) : 0;
+    int lcp = e != nullptr ? e->prompt.tokens.get_common_prefix(prompt.tokens) : 0;
+
+    // CL1: the slot's origin entry is the conversation the slot came from; when the slot has since moved on to ANOTHER
+    // conversation (prefix reuse without a cache update), the prompt shares only a prefix with the entry and the entry's
+    // tail is that other conversation. Saving over it would destroy its cached state (the next request of that
+    // conversation re-prefills everything). A stale tail longer than LLAMA_CACHE_FORK_TOL tokens (default 256, more than
+    // a re-tokenized answer tail) therefore means a different conversation: the entry stays, this prompt gets its own.
+    static const int fork_tol = getenv("LLAMA_CACHE_FORK_TOL") != nullptr ? std::max(0, atoi(getenv("LLAMA_CACHE_FORK_TOL"))) : 256;
+    if (e != nullptr && e->prompt.n_tokens() - lcp > fork_tol) {
+        SRV_DBG("prompt cache: slot %d holds another conversation than its entry (%d of %d tokens shared): the entry stays, a new one is made\n",
+                id_slot, lcp, e->prompt.n_tokens());
+        e->owner = -1;
+        e = nullptr;
+        *origin = nullptr;
+        lcp = 0;
+    }
 
     // nothing new since the entry was saved: the checkpoints go back in, that is all
     if (e != nullptr && lcp == n && e->prompt.n_tokens() == n) {

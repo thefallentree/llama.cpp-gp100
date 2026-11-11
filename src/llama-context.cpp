@@ -2205,7 +2205,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // small ubatches can use one of the extra graph slots, so that alternating shapes do not evict each other
     if (cparams.n_graph_slots > 1 && gf_slots.empty()) {
-        const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+        const size_t max_nodes = this->graph_max_nodes();
 
         gf_slots.resize(cparams.n_graph_slots);
 
@@ -3730,9 +3730,15 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes() const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
-        model.arch == LLM_ARCH_HRM_TEXT) {
-        res = std::max<uint32_t>(1024u, 64u * model.n_tensors());
+    // the fork keeps the ubatch term: its graphs still add nodes per token chunk (qwen4exp build_qsa_sel, sel_chunk) and
+    // the graph slots size their schedulers from it (upstream removed it in ccd360f06 together with the non-fused GDN)
+    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT) {
+        // the n_tokens*40 budget below is exhausted at ubatch 3840
+        res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_HRM_TEXT) {
+        // the 128-slot looped graph needs roughly one stack per token budget
+        res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_METIS16 ||
@@ -3751,7 +3757,7 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4) {
-        res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
+        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
         // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
@@ -3940,7 +3946,7 @@ void llama_context::gf_slots_invalidate() {
 }
 
 void llama_context::gf_slots_recreate_one(graph_slot & slot) {
-    const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+    const size_t max_nodes = this->graph_max_nodes();
     slot.valid    = false;
     slot.last_use = 0;
     slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -3963,9 +3969,9 @@ size_t llama_context::gf_slots_compute_size() const {
 
 void llama_context::gf_main_sched_recreate() {
     synchronize();
-    const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch);
+    const size_t max_nodes = this->graph_max_nodes();
     for (auto & r : gf_res_prev) {
-        r.reset();
+        r->reset();
     }
     gf_res_prev_active = nullptr;
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));

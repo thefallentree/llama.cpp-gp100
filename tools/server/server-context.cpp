@@ -4623,6 +4623,20 @@ private:
                                 }
                             }
 
+                            // CL1: the attention cache must hold every position below the reused prefix. A prompt restored from the
+                            // host cache (or a slot that kept its cells) can have a hole there (an entry whose earlier segments were
+                            // dropped by a delta save, a partial restore): the hybrid pos_min check above cannot see it (the recurrent
+                            // state is at the end), the prefix would attend to nothing there and the indexer's pooled rows could point
+                            // at cells now holding another conversation (the cross-session leak of 2026-11-10). Re-process fully instead.
+                            if (n_past > 0) {
+                                const llama_pos gap = llama_memory_seq_pos_gap(ctx_tgt, slot.id, 0);
+                                if (gap >= 0 && gap < pos_next) {
+                                    SLT_WRN(slot, "cached prefix has a hole at pos %d (n_past = %d, pos_next = %d): forcing full prompt re-processing\n", gap, n_past, pos_next);
+                                    n_past   = 0;
+                                    pos_next = 0;
+                                }
+                            }
+
                             {
                                 // erase any checkpoints with pos_max > pos_next, or that cover tokens not shared with the new prompt
                                 // (one that belongs to the conversation the slot is leaving goes back to its cache entry: a

@@ -2070,8 +2070,16 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     // the entry's segments that still hold valid cells: [p0, min(p1, lcp)); a segment with too many cells past the
     // common prefix, or a short tail, is re-saved with the new cells
     size_t n_keep = 0;
-    if (e != nullptr) {
+    // a segment's cells end where the next segment starts (the last one: at the entry's prompt end); its p1 is open-ended
+    // (INT32_MAX) for every prompt shorter than a chunk, so the rules below compare against this effective end, never p1
+    // (CL1: comparing the drafter's end d1 against an open-ended p1 dropped every later segment and left their cells in no
+    // segment: the restored entry then had a hole, which leaked another conversation's cells into the prompt)
+    auto seg_end = [&](size_t i) -> llama_pos {
+        const auto & segs = e->data.segs;
         const llama_pos n_prev = e->prompt.n_tokens();
+        return std::min<llama_pos>(segs[i].p1, i + 1 < segs.size() ? segs[i + 1].p0 : n_prev);
+    };
+    if (e != nullptr) {
         for (const auto & seg : e->data.segs) {
             if (seg.p0 >= lcp) {
                 break;
@@ -2080,11 +2088,12 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
         if (n_keep > 0) {
             const auto & last = e->data.segs[n_keep - 1];
-            const int64_t n_seg   = (int64_t) std::min<llama_pos>(last.p1, n_prev) - last.p0;
-            const int64_t n_stale = (int64_t) std::min<llama_pos>(last.p1, n_prev) - lcp;
+            const llama_pos end = seg_end(n_keep - 1);
+            const int64_t n_seg   = (int64_t) end - last.p0;
+            const int64_t n_stale = (int64_t) end - lcp;
             if (n_stale > std::max<int64_t>(seg_min, n_seg / 4)) {
                 n_keep--;
-            } else if (last.p1 <= lcp && n_seg < seg_min && n_keep > 1) {
+            } else if (end <= lcp && n_seg < seg_min && n_keep > 1) {
                 n_keep--;
             }
         }
@@ -2102,14 +2111,14 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         // an earlier kept segment whose drafter part has a hole becomes the last kept one (the delta re-saves from there)
         for (size_t i = 0; i + 1 < n_keep; ++i) {
             const auto & seg = e->data.segs[i];
-            if (seg.d1 < seg.p1) {
+            if (seg.d1 < seg_end(i)) {
                 n_keep = i + 1;
                 break;
             }
         }
         while (n_keep > 0) {
             const auto & last = e->data.segs[n_keep - 1];
-            const llama_pos d_end = std::min<llama_pos>({last.p1, lcp, last.d1});
+            const llama_pos d_end = std::min<llama_pos>({seg_end(n_keep - 1), lcp, last.d1});
             if (d_end > last.d0) {
                 break;
             }
@@ -2121,6 +2130,8 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             *origin = nullptr;
         }
     }
+    // the kept cells end at the last kept segment's effective end: the new segments start there, never past it
+    const llama_pos kept_end = (e != nullptr && n_keep > 0) ? seg_end(n_keep - 1) : 0;
     std::vector<server_state_seg> kept;
     if (e != nullptr) {
         for (size_t i = 0; i < n_keep; ++i) {
@@ -2128,7 +2139,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
         e->data.segs.clear();
     }
-    const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept.back().p1, lcp);
+    const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept_end, lcp);
     // where the new drafter part starts: the kept drafter cells reach only d1 of the last kept segment
     const llama_pos keep_end_dft = kept.empty() ? 0 : std::min<llama_pos>(keep_end, kept.back().d1);
 

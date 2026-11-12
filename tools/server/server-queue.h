@@ -2,6 +2,7 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -20,6 +21,10 @@ private:
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
     int n_inflight = 0; // requests that keep the server awake, see wait_until_no_sleep()
+
+    // HC3 watchdog: when the start_loop() thread began its current unit of work (a task, an update of the slots), in ms;
+    // 0 while it waits for tasks or sleeps
+    std::atomic<int64_t> t_busy_since_ms{0};
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -73,6 +78,13 @@ public:
 
     // let the server sleep again once the caller no longer uses the server state
     void release_inflight();
+
+    // HC3 watchdog: how long the start_loop() thread has been inside one unit of work (0 = waiting for tasks)
+    int64_t stall_ms() const;
+
+    // the number of tasks waiting in the queue; -1 when the queue lock could not be taken right away (the health
+    // check must never block behind a wedged loop)
+    int64_t n_queued_nowait();
 
     bool is_sleeping() {
         std::unique_lock<std::mutex> lock(mutex_tasks);

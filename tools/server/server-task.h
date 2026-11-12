@@ -895,11 +895,29 @@ struct server_prompt_cache {
     // the slot no longer holds the entry's cells (prompt_clear)
     void release(server_prompt_cache_state * e);
 
+    // HC1: the entry load() would restore for tokens_new instead of the slot's prompt, when its common prefix with
+    // tokens_new is at least min_gain tokens longer than the slot's; nullptr = none (the slot keeps its prompt)
+    const server_prompt_cache_state * find_better(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int min_gain);
+
+    // HC1: the entry was used now (saved or restored): it becomes the newest, the last to be evicted (LRU;
+    // LLAMA_CACHE_LRU=0: the old order, by first save)
+    void touch(server_prompt_cache_state * e);
+
     void update();
 
 private:
     // the oldest entry no slot owns, states.end() when every entry is owned
     std::list<server_prompt_cache_state>::iterator evictable();
+
+    // the entry load() restores for tokens_new (most similar, keeps the most context), states.end() = the slot's prompt
+    std::list<server_prompt_cache_state>::iterator best_entry(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int * lcp_out);
+
+    // HC1: an entry no slot owns, oldest first, sheds its older checkpoints down to the newest LLAMA_CACHE_TRIM_CKPTS
+    // (default 3; < 0 = never); the bytes freed, 0 = nothing left to trim
+    size_t trim_checkpoints_one();
+
+    // until size() + need fits the limit: trim checkpoints of unowned entries first, then evict the oldest
+    void make_room(size_t need, const char * why);
 };
 
 // used exclusively by router mode

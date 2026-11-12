@@ -32,6 +32,22 @@ static bool srv_timing() {
     return v;
 }
 
+// HC1: the slot-selection cache rule (see get_available_slot); LLAMA_CACHE_SWITCH=0 = only the f_keep < 0.5 rule
+static bool cache_switch_on() {
+    static const bool v = getenv("LLAMA_CACHE_SWITCH") == nullptr || atoi(getenv("LLAMA_CACHE_SWITCH")) != 0;
+    return v;
+}
+// a stale slot tail longer than this is another conversation (same knob and default as server_prompt_cache::save)
+static int cache_fork_tol() {
+    static const int v = getenv("LLAMA_CACHE_FORK_TOL") != nullptr ? atoi(getenv("LLAMA_CACHE_FORK_TOL")) : 256;
+    return v < 0 ? 0 : v;
+}
+// an entry must share this many more tokens with the task than the slot to be worth a switch (~0.4 s of prefill)
+static int cache_switch_min() {
+    static const int v = getenv("LLAMA_CACHE_SWITCH_MIN") != nullptr ? atoi(getenv("LLAMA_CACHE_SWITCH_MIN")) : 256;
+    return v < 1 ? 1 : v;
+}
+
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
@@ -1955,6 +1971,25 @@ private:
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
+                } else if (prompt_cache && task.id_slot == -1 && !task.is_stateless() && cache_switch_on()) {
+                    // HC1: f_keep >= 0.5 alone does not mean the slot holds this conversation. Agent sessions share a
+                    // long system prompt + tool schema: a slot holding a SHORT other conversation keeps > half of its
+                    // tokens for any of them, so the cache was never consulted (the returning session re-prefilled
+                    // from the shared prefix while its own entry sat in the cache: 79% of the lost tokens at 12
+                    // pi sessions on 3 nodes) and the short conversation was dropped without a save. The cache is
+                    // updated too when the slot would lose more than LLAMA_CACHE_FORK_TOL tokens (another
+                    // conversation: it is saved first) or when an entry shares LLAMA_CACHE_SWITCH_MIN more tokens
+                    // with the task than the slot does (LLAMA_CACHE_SWITCH=0: the old rule only)
+                    const int n_slot   = ret->prompt.n_tokens();
+                    const int lcp_slot = (int) ret->prompt.tokens.get_common_prefix(task.tokens);
+                    if (n_slot - lcp_slot > cache_fork_tol()) {
+                        SLT_INF(*ret, "prompt cache: the slot holds another conversation (%d of %d tokens shared), saving it\n", lcp_slot, n_slot);
+                        update_cache = true;
+                    } else if (const auto * better = prompt_cache->find_better(ret->prompt, task.tokens, ret->id, cache_switch_min())) {
+                        SLT_INF(*ret, "prompt cache: an entry of %d tokens shares more with the task than the slot (%d of %d tokens)\n",
+                                better->prompt.n_tokens(), lcp_slot, n_slot);
+                        update_cache = true;
+                    }
                 }
             }
         }

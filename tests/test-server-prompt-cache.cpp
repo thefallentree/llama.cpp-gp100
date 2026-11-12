@@ -8,6 +8,7 @@
 // - HC1 (2026-11-12): eviction is least-recently-used (a restored entry survives a later save that needs room), older
 //   checkpoints of unowned entries are shed before whole entries go, and find_better() names the entry a returning
 //   conversation would restore while the slot holds a short other conversation sharing the system prefix
+// - HC2: a delta save keeps the earlier segments although the drafter lags the target (only the new cells are saved)
 //
 // CPU only, a tiny generated model (test-generate-models): test-server-prompt-cache -m <model.gguf>
 
@@ -287,6 +288,40 @@ static bool scenario_find_better(server_prompt_cache & cache, slot & s, int32_t 
     s.clear();
     return true;
 }
+// scenario F (HC2): a delta save keeps every earlier segment and saves only the new cells. The drafter lags the target
+// (LAG), so each segment's drafter part ends before the target part; the next segment's drafter part starts there, which
+// is no hole. Before HC2 the save took that lag for a hole and re-saved everything after the first segment on every turn
+// (O(conversation) bytes per save); LLAMA_CACHE_HOLE_OLD=1 restores that rule and fails this scenario.
+static bool scenario_delta_keeps_segments(server_prompt_cache & cache, slot & s, int32_t n_vocab) {
+    cache.states.clear();
+    const llama_tokens conv = make_conv(n_vocab, 9, 8, 200);
+    const int N[] = {40, 72, 104, 136};
+    for (int i = 0; i < 4; ++i) {
+        CHECK(turn(cache, s, conv, N[i]));
+        const auto * e = s.origin;
+        CHECK(cache.states.size() == 1);
+        fprintf(stderr, "  turn %d (%d tokens): %zu segments:", i, N[i], e->data.segs.size());
+        for (const auto & seg : e->data.segs) {
+            fprintf(stderr, " [%d,%s) d[%d,%d)", seg.p0, seg.p1 == INT32_MAX ? "inf" : std::to_string(seg.p1).c_str(), seg.d0, seg.d1);
+        }
+        fprintf(stderr, "\n");
+        // one segment per turn, each starting where the previous turn ended
+        CHECK(e->data.segs.size() == (size_t) i + 1);
+        CHECK(e->data.segs.back().p0 == (i == 0 ? 0 : N[i - 1]));
+        s.clear();
+    }
+    // the restore still covers the whole prompt (target and drafter)
+    server_tokens tokens_new(llama_tokens(conv.begin(), conv.begin() + N[3]), false);
+    CHECK(cache.load(s.prompt, tokens_new, s.tgt, s.dft, nullptr, SEQ, nullptr, &s.origin));
+    const llama_pos gap_t = llama_memory_seq_pos_gap(s.tgt, SEQ, 0);
+    const llama_pos gap_d = llama_memory_seq_pos_gap(s.dft, SEQ, 0);
+    fprintf(stderr, "  restore: target contiguous up to %d, drafter up to %d (drafter cells end at %d)\n", gap_t, gap_d, N[3] - LAG);
+    CHECK(s.prompt.n_tokens() == N[3]);
+    CHECK(gap_t >= N[3]);
+    CHECK(gap_d == N[3] - LAG);
+    s.clear();
+    return true;
+}
 
 int main(int argc, char ** argv) {
     std::string model_path;
@@ -367,6 +402,7 @@ int main(int argc, char ** argv) {
         {"C: least recently used entry is evicted", scenario_lru},
         {"D: older checkpoints are shed before an entry is evicted", scenario_trim},
         {"E: find_better names the returning conversation's entry", scenario_find_better},
+        {"F: a delta save keeps the earlier segments (HC2)", scenario_delta_keeps_segments},
     };
     for (const auto & sc : hc1) {
         fprintf(stderr, "scenario %s\n", sc.name);

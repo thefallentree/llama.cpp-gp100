@@ -2005,6 +2005,128 @@ void server_prompt_cache::release(server_prompt_cache_state * e) {
     }
 }
 
+// HC1: LRU order (LLAMA_CACHE_LRU=0: entries keep the position of their first save, the pre-HC1 FIFO eviction)
+static bool cache_lru_on() {
+    static const bool on = getenv("LLAMA_CACHE_LRU") == nullptr || atoi(getenv("LLAMA_CACHE_LRU")) != 0;
+    return on;
+}
+
+void server_prompt_cache::touch(server_prompt_cache_state * e) {
+    if (e == nullptr || !cache_lru_on()) {
+        return;
+    }
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (&*it == e) {
+            // splice keeps every pointer to the entry valid (slots hold them as their origin)
+            states.splice(states.end(), states, it);
+            return;
+        }
+    }
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::best_entry(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int * lcp_out) {
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_sim_best  = float(lcp_best) / tokens_new.size();
+
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+    auto it_best = states.end();
+
+    // find the most similar cached prompt, that would also preserve the most context
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        // an entry another slot holds is in use there
+        if (it->owner >= 0 && it->owner != id_slot) {
+            continue;
+        }
+
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+
+        // don't trash large prompts
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            f_keep_best = f_keep_cur;
+            f_sim_best  = f_sim_cur;
+            lcp_best    = lcp_cur;
+
+            it_best = it;
+        }
+    }
+
+    if (lcp_out != nullptr) {
+        *lcp_out = lcp_best;
+    }
+    return it_best;
+}
+
+const server_prompt_cache_state * server_prompt_cache::find_better(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int min_gain) {
+    int lcp_best = 0;
+    auto it = best_entry(prompt, tokens_new, id_slot, &lcp_best);
+    if (it == states.end()) {
+        return nullptr;
+    }
+    const int lcp_slot = prompt.tokens.get_common_prefix(tokens_new);
+    return lcp_best - lcp_slot >= min_gain ? &*it : nullptr;
+}
+
+size_t server_prompt_cache::trim_checkpoints_one() {
+    static const int keep = getenv("LLAMA_CACHE_TRIM_CKPTS") != nullptr ? atoi(getenv("LLAMA_CACHE_TRIM_CKPTS")) : 3;
+    if (keep < 0) {
+        return 0;
+    }
+    for (auto & st : states) {
+        if (st.owner >= 0 || st.prompt.checkpoints.size() <= (size_t) keep) {
+            continue;
+        }
+        size_t freed = 0;
+        const size_t n0 = st.prompt.checkpoints.size();
+        // the newest checkpoints (largest n_tokens) are the restore points of the conversation's next turn (a
+        // re-rendered last answer); the older ones only serve an edit far back in the conversation
+        while (st.prompt.checkpoints.size() > (size_t) keep) {
+            auto victim = st.prompt.checkpoints.begin();
+            for (auto it = st.prompt.checkpoints.begin(); it != st.prompt.checkpoints.end(); ++it) {
+                if (it->n_tokens < victim->n_tokens) {
+                    victim = it;
+                }
+            }
+            freed += victim->size();
+            st.prompt.checkpoints.erase(victim);
+        }
+        SRV_WRN(" - prompt cache: entry of %d tokens trimmed from %zu to %zu checkpoints (%.3f MiB freed)\n",
+                st.prompt.n_tokens(), n0, st.prompt.checkpoints.size(), freed / (1024.0 * 1024.0));
+        if (freed > 0) {
+            return freed;
+        }
+    }
+    return 0;
+}
+
+void server_prompt_cache::make_room(size_t need, const char * why) {
+    if (limit_size == 0) {
+        return;
+    }
+    while (size() + need > limit_size) {
+        if (trim_checkpoints_one() > 0) {
+            continue;
+        }
+        auto it = evictable();
+        if (it == states.end()) {
+            break;
+        }
+        SRV_WRN(" - %s, removing oldest entry (size = %.3f MiB, %d tokens)\n", why, it->size() / (1024.0 * 1024.0), it->prompt.n_tokens());
+        states.erase(it);
+    }
+}
+
 // LLAMA_CACHE_DELTA=0: every save is a new full entry (measurement switch)
 static bool cache_delta_on() {
     static const bool on = getenv("LLAMA_CACHE_DELTA") == nullptr || atoi(getenv("LLAMA_CACHE_DELTA")) != 0;
@@ -2062,6 +2184,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             e->prompt.checkpoints = prompt.checkpoints;
         }
         SRV_DBG("prompt cache: entry of slot %d unchanged (%d tokens), checkpoints back\n", id_slot, n);
+        touch(e);
         return e;
     }
 
@@ -2222,24 +2345,16 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
     }
 
-    if (limit_size > 0) {
-        // make room before allocating the new buffers to avoid breaching the limit
-        while (size() + state_size_new > limit_size) {
-            auto it = evictable();
-            if (it == states.end()) {
-                break;
-            }
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    it->size() / (1024.0 * 1024.0));
-            states.erase(it);
-        }
-    }
+    // make room before allocating the new buffers to avoid breaching the limit (HC1: older checkpoints of unowned
+    // entries go first, then whole entries, least recently used first)
+    make_room(state_size_new, "making room for prompt cache entry");
 
     if (e == nullptr) {
         states.push_back({});
         e = &states.back();
     }
     e->owner = id_slot;
+    touch(e);
     e->data.segs = std::move(kept);
 
     auto fail = [&]() {
@@ -2329,42 +2444,8 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state * saved, server_prompt_cache_state ** origin) {
     const int64_t t_load = ggml_time_us();
-    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
-
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
-
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
-    auto it_best = states.end();
-
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        // an entry another slot holds is in use there
-        if (it->owner >= 0 && it->owner != id_slot) {
-            continue;
-        }
-
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-            lcp_best    = lcp_cur;
-
-            it_best = it;
-        }
-    }
+    int lcp_best = 0;
+    auto it_best = best_entry(prompt, tokens_new, id_slot, &lcp_best);
 
     if (it_best == states.end()) {
         if (saved != nullptr) {
@@ -2375,6 +2456,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             saved->prompt.checkpoints.clear();
             saved->owner = id_slot;
             *origin = saved;
+            touch(saved);
             SRV_DBG("prompt cache: the slot keeps its prompt (%d of %d tokens shared), %zu checkpoints back\n",
                     lcp_best, (int) prompt.tokens.size(), prompt.checkpoints.size());
         }
@@ -2382,7 +2464,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     auto & e = *it_best;
-    SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_TRC(" - found better prompt with lcp = %d\n", lcp_best);
 
     SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
 
@@ -2468,6 +2550,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
     e.owner = id_slot;
     *origin = &e;
+    touch(&e);
 
     if (srv_cache_timing()) {
         SRV_WRN("timing cache load: slot %d n_tokens %d: lcp search %.1f segs %zu %.1f recr %.1f ms (%.1f MiB)\n", id_slot, n_e,
@@ -2478,17 +2561,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (size() > limit_size) {
-            auto it = evictable();
-            if (it == states.end()) {
-                break;
-            }
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
-
-            states.erase(it);
-        }
-    }
+    make_room(0, "cache size limit reached");
 
     // average size per token
     const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));

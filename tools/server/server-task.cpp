@@ -1803,7 +1803,8 @@ void server_state_pool::prealloc(size_t bytes) {
 // a slab is pinned on a thread while the pool still has room, so a save seldom waits for cudaMallocHost (0.4 s per 512 MiB)
 void server_state_pool::prefetch() {
     static const bool off = getenv("LLAMA_CACHE_SLAB_PREFETCH") != nullptr && atoi(getenv("LLAMA_CACHE_SLAB_PREFETCH")) == 0;
-    if (off || (limit > 0 && capacity() >= limit)) {
+    const size_t cmax = max_capacity();
+    if (off || (limit > 0 && capacity() >= limit) || (cmax > 0 && capacity() + slab_size > cmax)) {
         return;
     }
     size_t largest = 0;
@@ -1835,23 +1836,16 @@ void server_state_pool::prefetch() {
     });
 }
 
-uint8_t * server_state_pool::alloc(size_t n, int32_t & slab_out) {
-    n = round(n);
-    slab_out = -1;
-    if (n == 0) {
-        return nullptr;
+// joins the slabs pinned ahead (pending) to the pool; mtx must NOT be held by the caller
+void server_state_pool::adopt_pending() {
+    std::lock_guard<std::mutex> lk(mtx);
+    for (auto & s : pending) {
+        slabs.push_back(std::move(s));
     }
+    pending.clear();
+}
 
-    // slabs pinned ahead join the pool
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        for (auto & s : pending) {
-            slabs.push_back(std::move(s));
-        }
-        pending.clear();
-    }
-
-    // first fit over the slabs
+uint8_t * server_state_pool::fit(size_t n, int32_t & slab_out) {
     for (size_t si = 0; si < slabs.size(); ++si) {
         auto & s = slabs[si];
         for (auto it = s.free_blocks.begin(); it != s.free_blocks.end(); ++it) {
@@ -1864,27 +1858,61 @@ uint8_t * server_state_pool::alloc(size_t n, int32_t & slab_out) {
                 }
                 n_used  += n;
                 slab_out = (int32_t) si;
-                prefetch();
                 return s.base + off;
             }
         }
     }
+    return nullptr;
+}
 
-    // a new slab (pinned through the device's host buffer type, plain when there is none or it fails); a prefetch in
-    // flight is waited for first
+size_t server_state_pool::max_capacity() const {
+    if (cap_max > 0) {
+        return cap_max;
+    }
+    // the cache's limit plus two slabs of fragmentation slack (0 = no limit, no cap)
+    return limit > 0 ? limit + 2*slab_size : 0;
+}
+
+// HC3: no path loops or recurses. The pre-HC3 code re-entered alloc() while holding mtx after joining a prefetch whose
+// slab was still pending; the inner call locked mtx again and the main thread hung for good (gpu-50, 2026-11-12: a save
+// after a 32K-token answer needed a block bigger than any free one while the prefetch of the previous allocation ran)
+uint8_t * server_state_pool::alloc(size_t n, int32_t & slab_out) {
+    n = round(n);
+    slab_out = -1;
+    cap_refused = false;
+    if (n == 0) {
+        return nullptr;
+    }
+
+    // slabs pinned ahead join the pool
+    adopt_pending();
+
+    // first fit over the slabs
+    if (uint8_t * q = fit(n, slab_out)) {
+        prefetch();
+        return q;
+    }
+
+    // a prefetch in flight is waited for (its slab may fit), then first fit once more
     if (th.joinable()) {
         th.join();
-        std::lock_guard<std::mutex> lk(mtx);
-        if (!pending.empty()) {
-            for (auto & s : pending) {
-                slabs.push_back(std::move(s));
-            }
-            pending.clear();
-            return alloc(n, slab_out);
+        adopt_pending();
+        if (uint8_t * q = fit(n, slab_out)) {
+            prefetch();
+            return q;
         }
     }
 
+    // a new slab (pinned through the device's host buffer type, plain when there is none or it fails), unless the pool
+    // would grow past its cap: free blocks too small for n (fragmentation) must not grow the pinned memory without bound
     const size_t cap = std::max(slab_size, n);
+    const size_t cmax = max_capacity();
+    if (cmax > 0 && capacity() + cap > cmax) {
+        cap_refused = true;
+        SRV_WRN("prompt cache: no free block of %.1f MiB and a new %.1f MiB slab would grow the pool past %.1f MiB (%zu slabs, %.1f MiB, %.1f MiB in use)\n",
+                n / (1024.0*1024.0), cap / (1024.0*1024.0), cmax / (1024.0*1024.0), slabs.size(), capacity() / (1024.0*1024.0), n_used / (1024.0*1024.0));
+        return nullptr;
+    }
 
     const int64_t t0 = ggml_time_us();
     slab s;
@@ -2352,7 +2380,8 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
 
     // make room before allocating the new buffers to avoid breaching the limit (HC1: older checkpoints of unowned
     // entries go first, then whole entries, least recently used first)
-    make_room(state_size_new, "making room for prompt cache entry");
+    // (HC3: the kept segments are out of the entry while it is rebuilt: size() misses them, so they count as needed)
+    make_room(state_size_new + size_kept, "making room for prompt cache entry");
 
     if (e == nullptr) {
         states.push_back({});
@@ -2363,8 +2392,6 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     e->data.segs = std::move(kept);
 
     auto fail = [&]() {
-        SRV_ERR("%s", "failed to allocate memory for prompt cache state\n");
-
         for (auto it = states.begin(); it != states.end(); ++it) {
             if (&*it == e) {
                 states.erase(it);
@@ -2373,6 +2400,17 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
         *origin = nullptr;
 
+        // HC3: the pool refused to grow past its cap (no free block fits, nothing left to evict): this entry is skipped,
+        // the cache and its limit stay as they are and serving goes on
+        if (pool.cap_refused) {
+            SRV_WRN("prompt cache: the state of slot %d (%d tokens, %.1f MiB) does not fit the pool, entry skipped\n",
+                    id_slot, n, (state_size_new + size_kept) / (1024.0 * 1024.0));
+            pool.cap_refused = false;
+            return (server_prompt_cache_state *) nullptr;
+        }
+
+        SRV_ERR("%s", "failed to allocate memory for prompt cache state\n");
+
         limit_size = std::max<size_t>(1, 0.4*size());
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
@@ -2380,6 +2418,24 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         update();
 
         return (server_prompt_cache_state *) nullptr;
+    };
+
+    // a buffer from the pool; when the pool refuses to grow (fragmentation past its cap) the least recently used unowned
+    // entry goes and the allocation is retried: every round removes an entry, so this ends (HC3)
+    auto alloc_buf = [&](server_state_buf & b, size_t sz) -> bool {
+        while (!b.alloc(pool, sz)) {
+            if (!pool.cap_refused) {
+                return false;
+            }
+            auto it = evictable();
+            if (it == states.end()) {
+                return false;
+            }
+            SRV_WRN(" - prompt cache: pool full or fragmented, removing oldest entry (size = %.3f MiB, %d tokens)\n",
+                    it->size() / (1024.0 * 1024.0), it->prompt.n_tokens());
+            states.erase(it);
+        }
+        return true;
     };
 
     const int64_t t2 = ggml_time_us();
@@ -2397,7 +2453,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             const llama_pos gap = llama_memory_seq_pos_gap(ctx_dft, id_slot, c.ad);
             seg.d1 = gap < 0 ? c.b : std::min<llama_pos>(c.b, gap);
         }
-        if (!seg.main.alloc(pool, c.sz_tgt) || !seg.drft.alloc(pool, c.sz_dft)) {
+        if (!alloc_buf(seg.main, c.sz_tgt) || !alloc_buf(seg.drft, c.sz_dft)) {
             return fail();
         }
         if (c.sz_tgt > 0 && llama_state_seq_get_data_range(ctx_tgt, seg.main.data(), c.sz_tgt, id_slot, c.a, c.b) != c.sz_tgt) {
@@ -2413,7 +2469,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     }
     const int64_t t3 = ggml_time_us();
 
-    if (!e->data.recr.alloc(pool, sz_recr)) {
+    if (!alloc_buf(e->data.recr, sz_recr)) {
         return fail();
     }
     if (sz_recr > 0 && llama_state_seq_get_data_ext(ctx_tgt, e->data.recr.data(), sz_recr, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != sz_recr) {

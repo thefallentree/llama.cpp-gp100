@@ -6345,6 +6345,34 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
+        // HC3 watchdog (gpu-50, 2026-11-12: the task loop hung for 45 minutes in a prompt cache save while /health said
+        // "ok" and the router kept placing sessions there): the loop inside one unit of work (a task, one update of the
+        // slots: seconds at most) for more than LLAMA_SRV_WATCHDOG_S seconds (default 60, 0 = off) while tasks wait, or
+        // for twice that with none waiting, is wedged: 503 with the reason, so routers stop placing work here
+        static const int64_t wd_s = getenv("LLAMA_SRV_WATCHDOG_S") != nullptr ? atoll(getenv("LLAMA_SRV_WATCHDOG_S")) : 60;
+        if (wd_s > 0) {
+            const int64_t stall = queue_tasks.stall_ms();
+            if (stall > wd_s*1000) {
+                const int64_t n_queued = queue_tasks.n_queued_nowait();
+                if (n_queued != 0 || stall > 2*wd_s*1000) {
+                    const std::string reason = string_format("task loop stalled: no progress for %.0f s (watchdog %d s), %s tasks queued",
+                            stall / 1e3, (int) wd_s, n_queued < 0 ? "unknown" : std::to_string(n_queued).c_str());
+                    static std::atomic<int64_t> t_last_log{0};
+                    const int64_t now = ggml_time_ms();
+                    if (now - t_last_log.load() > 10000) {
+                        t_last_log = now;
+                        SRV_ERR("watchdog: %s\n", reason.c_str());
+                    }
+                    json err = format_error_response(reason, ERROR_TYPE_UNAVAILABLE);
+                    err["reason"] = "task_loop_stalled";
+                    err["stall_ms"] = stall;
+                    res->status = 503;
+                    res->data = safe_json_to_str({{"status", "unhealthy"}, {"error", err}});
+                    return res;
+                }
+            }
+        }
+
         res->ok({{"status", "ok"}});
         return res;
     };

@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <unistd.h>
 #include <chrono>
 #include <thread>
 
@@ -154,6 +156,10 @@ bool server_queue::process_new_tasks(bool is_yielding) {
         queue_tasks.pop_front();
         lock.unlock();
 
+        if (!is_yielding) {
+            t_busy_since_ms = ggml_time_ms(); // a new unit of work of the start_loop() thread (watchdog)
+        }
+
         QUE_DBG("processing task, id = %d\n", task.id);
         if (!callback_new_task(std::move(task), is_yielding)) {
             // set it aside, do not put it back in the queue, else we offer it again in a loop
@@ -303,6 +309,14 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
+        t_busy_since_ms = ggml_time_ms();
+        // LLAMA_SRV_DEBUG_STALL_FILE=<path> (tests of the watchdog only): the loop is stuck while the file exists
+        static const char * stall_file = getenv("LLAMA_SRV_DEBUG_STALL_FILE");
+        if (stall_file != nullptr) {
+            while (running && access(stall_file, F_OK) == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
         if (process_new_tasks(false)) {
             break; // terminate
         }
@@ -312,7 +326,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
         // this will run the main inference process for all slots
         const int64_t t_update_slots = ggml_time_ms();
+        t_busy_since_ms = t_update_slots;
         callback_update_slots();
+        t_busy_since_ms = 0;
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
             // shift instead of reset, so that non-task_resets_idle_timer tasks do not delay the sleep
@@ -367,7 +383,21 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         }
     }
 
+    t_busy_since_ms = 0;
     worker_stop();
+}
+
+int64_t server_queue::stall_ms() const {
+    const int64_t t = t_busy_since_ms.load();
+    return t > 0 ? std::max<int64_t>(0, ggml_time_ms() - t) : 0;
+}
+
+int64_t server_queue::n_queued_nowait() {
+    std::unique_lock<std::mutex> lock(mutex_tasks, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return -1;
+    }
+    return (int64_t) queue_tasks.size();
 }
 
 void server_queue::cleanup_pending_task(int id_target) {

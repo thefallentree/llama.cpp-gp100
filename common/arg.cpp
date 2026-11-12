@@ -1663,6 +1663,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_PREDICT"));
     add_opt(common_arg(
+        {"--n-predict-max"}, "N",
+        string_format("upper bound on the tokens any request may generate: a request asking for more, or for no limit, "
+                      "is clamped to N and stops with finish_reason \"length\" (default: %d, -1 = no bound)", params.n_predict_max),
+        [](common_params & params, int value) {
+            params.n_predict_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_N_PREDICT_MAX"));
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

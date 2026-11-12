@@ -772,3 +772,38 @@ def test_completion_checkpoint_kept_after_restore():
     for suffix in suffixes[1:]:
         assert len(suffix) > server.n_ubatch + 4
         assert cache_n(prefix + suffix) == len(prefix) - 1
+
+
+@pytest.mark.parametrize("n_predict,n_expected", [
+    (64, 16),   # asks for more than the bound
+    (-1, 16),   # asks for no limit
+    (8, 8),     # below the bound: unchanged
+])
+def test_completion_n_predict_max(n_predict: int, n_expected: int):
+    global server
+    server.n_predict = None
+    server.n_predict_max = 16
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "n_predict": n_predict,
+        "prompt": "I believe the meaning of life is",
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200
+    assert res.body["tokens_predicted"] == n_expected
+    assert res.body["stop_type"] == "limit"
+
+
+@pytest.mark.parametrize("max_tokens_key", ["max_tokens", "max_completion_tokens"])
+def test_chat_completion_n_predict_max(max_tokens_key: str):
+    global server
+    server.n_predict_max = 16
+    server.start()
+    res = server.make_request("POST", "/chat/completions", data={
+        max_tokens_key: 64,
+        "messages": [{"role": "user", "content": "Tell me a long story"}],
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200
+    assert res.body["usage"]["completion_tokens"] == 16
+    assert res.body["choices"][0]["finish_reason"] == "length"

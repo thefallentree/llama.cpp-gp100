@@ -2255,6 +2255,12 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // the server-wide bound caps both (--n-predict-max): a request for more, or for no limit, is clamped
+        if (params_base.n_predict_max >= 0 && slot.task->need_sampling() && (slot.n_predict_max < 0 || slot.n_predict_max > params_base.n_predict_max)) {
+            SLT_WRN(slot, "n_predict = %d clamped to --n-predict-max = %d\n", slot.n_predict_max, params_base.n_predict_max);
+            slot.n_predict_max = params_base.n_predict_max;
+        }
+
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
         } else {

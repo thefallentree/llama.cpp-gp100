@@ -9,19 +9,29 @@
 //   checkpoints of unowned entries are shed before whole entries go, and find_better() names the entry a returning
 //   conversation would restore while the slot holds a short other conversation sharing the system prefix
 // - HC2: a delta save keeps the earlier segments although the drafter lags the target (only the new cells are saved)
+// - HC3 (gpu-50 wedge, 2026-11-12): a save whose buffer fits no free block while the pool's slab prefetch is in flight
+//   must not hang (the pre-HC3 alloc() re-entered itself holding the pool mutex: a self-deadlock of the main thread);
+//   a save the pool cannot hold (past its capacity cap, nothing to evict) is skipped and the next one works.
+//   A watchdog fails a scenario that does not return in 60 s.
 //
 // CPU only, a tiny generated model (test-generate-models): test-server-prompt-cache -m <model.gguf>
 
 #include "server-task.h"
+#include "server-queue.h"
 #include "llama.h"
 #include "log.h"
 #include "../src/llama-ext.h" // llama_memory_seq_pos_gap
+#include "../ggml/src/ggml-backend-impl.h" // a slow host buffer type (pinning takes 0.4 s per 512 MiB on the nodes)
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #define CHECK(cond) do { \
@@ -323,11 +333,185 @@ static bool scenario_delta_keeps_segments(server_prompt_cache & cache, slot & s,
     return true;
 }
 
+// a host buffer type that takes SLOW_MS per allocation (cudaMallocHost of a slab): the pool's slab prefetch thread is then
+// still running when the next allocation of a save looks for room
+static const int SLOW_MS = 300;
+static ggml_backend_buffer_t slow_alloc_buffer(ggml_backend_buffer_type_t, size_t size) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(SLOW_MS));
+    return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+}
+static const char * slow_get_name(ggml_backend_buffer_type_t) { return "slow_host"; }
+static size_t slow_get_alignment(ggml_backend_buffer_type_t) { return 64; }
+static bool slow_is_host(ggml_backend_buffer_type_t) { return true; }
+static ggml_backend_buffer_type slow_buft = {
+    /* .iface = */ {
+        /* .get_name         = */ slow_get_name,
+        /* .alloc_buffer     = */ slow_alloc_buffer,
+        /* .alloc_buffer_n   = */ nullptr,
+        /* .get_alignment    = */ slow_get_alignment,
+        /* .get_max_size     = */ nullptr,
+        /* .get_alloc_size   = */ nullptr,
+        /* .get_alloc_size_n = */ nullptr,
+        /* .is_host          = */ slow_is_host,
+    },
+    /* .device  = */ nullptr,
+    /* .context = */ nullptr,
+};
+
+// scenario G (HC3): the pool alone. A 40 KiB allocation makes the first 64 KiB slab and starts the prefetch of the next
+// (less than half a slab is free); a 100 KiB allocation right after fits no free block, joins the prefetch and finds
+// its slab pending. Pre-HC3: alloc() called itself with the pool mutex held and the inner call locked it again.
+static bool scenario_pool_alloc_during_prefetch(server_prompt_cache &, slot &, int32_t) {
+    server_state_pool pool;
+    pool.buft      = &slow_buft;
+    pool.slab_size = 64*1024;
+    int32_t si = -1;
+    uint8_t * a = pool.alloc(40*1024, si);
+    CHECK(a != nullptr && si == 0);
+    const int32_t sa = si;
+    uint8_t * b = pool.alloc(100*1024, si);
+    fprintf(stderr, "  pool: %zu slabs, %.0f KiB, %.0f KiB in use\n", pool.slabs.size(), pool.capacity() / 1024.0, pool.n_used / 1024.0);
+    CHECK(b != nullptr);
+    CHECK(pool.slabs.size() == 3); // the first, the prefetched one, the 100 KiB one
+    pool.free(si, b, 100*1024);
+    pool.free(sa, a, 40*1024);
+    CHECK(pool.n_used == 0);
+    return true;
+}
+
+// scenario H (HC3, the gpu-50 wedge through the server's path): a save into a pool with a slow host buffer type and
+// slabs smaller than any buffer of the save. The target segment gets a slab of its own, which starts the prefetch of
+// another slab; the drafter segment then fits nowhere, the prefetch is joined and its slab is pending: pre-HC3 the
+// main thread hung right there (gdb: server_state_pool::alloc <- server_state_pool::alloc <- server_state_buf::alloc
+// <- server_prompt_cache::save <- server_slot::prompt_save <- get_available_slot)
+static bool scenario_save_during_prefetch(server_prompt_cache &, slot & s, int32_t n_vocab) {
+    server_prompt_cache cache(/*limit_size_mib=*/ 64, /*limit_tokens=*/ 0, &slow_buft);
+    cache.pool.slab_size = 256;
+    const llama_tokens conv = make_conv(n_vocab, 10, 8, 128);
+    const int64_t t0 = ggml_time_us();
+    CHECK(turn(cache, s, conv, 96));
+    fprintf(stderr, "  save of 96 tokens: %zu segments, %.1f KiB, pool %zu slabs (%.0f ms)\n", s.origin->data.segs.size(),
+            s.origin->size() / 1024.0, cache.pool.slabs.size(), (ggml_time_us() - t0) / 1e3);
+    CHECK(s.origin->data.segs.size() == 1);
+    CHECK(s.origin->data.segs[0].main.size() > 256 && s.origin->data.segs[0].drft.size() > 256);
+    s.clear();
+    // and the entry restores
+    server_tokens tokens_new(llama_tokens(conv.begin(), conv.begin() + 96), false);
+    CHECK(cache.load(s.prompt, tokens_new, s.tgt, s.dft, nullptr, SEQ, nullptr, &s.origin));
+    CHECK(s.prompt.n_tokens() == 96);
+    s.clear();
+    return true;
+}
+
+// scenario I (HC3): the pool may not grow past its cap. A save whose buffers fit no free block evicts the least recently
+// used unowned entry and retries; with nothing left to evict the save is skipped (nullptr, a WARN), the cache limit
+// stays (the out-of-memory path cuts it to 40%), and the next save after the pressure is gone works
+static bool scenario_save_skipped_when_pool_full(server_prompt_cache &, slot & s, int32_t n_vocab) {
+    server_prompt_cache cache(/*limit_size_mib=*/ 64, /*limit_tokens=*/ 0, nullptr);
+    cache.pool.slab_size = 4096;
+    const llama_tokens A = make_conv(n_vocab, 11, 8, 128), B = make_conv(n_vocab, 12, 8, 128), C = make_conv(n_vocab, 13, 8, 128);
+    CHECK(turn(cache, s, A, 64)); s.clear();
+    const size_t limit0 = cache.limit_size;
+
+    // the pool is capped at what it holds now (a slab prefetched after A's save joins first) and every free byte is taken
+    if (cache.pool.th.joinable()) {
+        cache.pool.th.join();
+    }
+    cache.pool.adopt_pending();
+    cache.pool.cap_max = cache.pool.capacity();
+    std::vector<server_state_buf> filler;
+    auto fill = [&]() {
+        for (auto & sl : cache.pool.slabs) {
+            while (!sl.free_blocks.empty()) {
+                const size_t sz = sl.free_blocks.begin()->second;
+                filler.emplace_back();
+                if (!filler.back().alloc(cache.pool, sz)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    CHECK(fill());
+
+    // B evicts A (unowned, least recently used) and takes its blocks
+    CHECK(turn(cache, s, B, 64));
+    fprintf(stderr, "  B saved into a full pool: %zu entries (A %s)\n", cache.states.size(), entry_of(cache, A) ? "kept" : "evicted");
+    CHECK(entry_of(cache, A) == nullptr);
+    CHECK(entry_of(cache, B) != nullptr);
+    s.clear();
+
+    // nothing to evict: C's save is skipped, the server goes on
+    cache.states.clear();
+    CHECK(fill());
+    CHECK(s.extend(C, 64));
+    auto * e = cache.save(s.prompt, s.tgt, s.dft, nullptr, SEQ, &s.origin, true);
+    fprintf(stderr, "  C into a full pool with nothing to evict: %s, %zu entries, limit %.1f MiB\n", e ? "saved" : "skipped",
+            cache.states.size(), cache.limit_size / (1024.0 * 1024.0));
+    CHECK(e == nullptr);
+    CHECK(s.origin == nullptr);
+    CHECK(cache.states.empty());
+    CHECK(cache.limit_size == limit0);
+    CHECK(!cache.pool.cap_refused);
+
+    // the pressure goes: the same save works
+    filler.clear();
+    e = cache.save(s.prompt, s.tgt, s.dft, nullptr, SEQ, &s.origin, true);
+    CHECK(e != nullptr);
+    CHECK(s.origin == e);
+    s.clear();
+    return true;
+}
+
+// scenario J (HC3): the task loop's watchdog numbers. A task that keeps the loop for 1.5 s shows as a stall of more than
+// a second with the next task queued behind it; once the loop is back waiting the stall is 0 (/health turns 503 on
+// these when the stall passes LLAMA_SRV_WATCHDOG_S)
+static bool scenario_queue_watchdog(server_prompt_cache &, slot &, int32_t) {
+    server_queue q;
+    std::atomic<int> n_done{0};
+    q.on_new_task([&](server_task && task, bool) {
+        if (task.id == 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        }
+        n_done++;
+        return true;
+    });
+    q.on_update_slots([]() {});
+    std::thread loop([&]() { q.start_loop(-1); });
+    CHECK(q.stall_ms() == 0 || q.stall_ms() < 100);
+    server_task t1(SERVER_TASK_TYPE_METRICS); t1.id = 1;
+    server_task t2(SERVER_TASK_TYPE_METRICS); t2.id = 2;
+    q.post(std::move(t1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    q.post(std::move(t2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    const int64_t stall = q.stall_ms();
+    const int64_t queued = q.n_queued_nowait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    const int64_t stall_after = q.stall_ms();
+    fprintf(stderr, "  stall during the slow task %lld ms (%lld queued), after %lld ms, %d tasks done\n",
+            (long long) stall, (long long) queued, (long long) stall_after, n_done.load());
+    q.terminate();
+    loop.join();
+    CHECK(stall >= 1000);
+    CHECK(queued == 1);
+    CHECK(stall_after == 0);
+    CHECK(n_done == 2);
+    return true;
+}
+
+// the watchdog: a scenario that does not return within this deadline hung (the process exits with 2)
+static std::atomic<int64_t> g_deadline_us{0};
+static std::atomic<const char *> g_scenario{""};
+
 int main(int argc, char ** argv) {
     std::string model_path;
+    std::string only; // --only CDGH: run only the table scenarios with these letters (A and B always run)
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "-m" && i + 1 < argc) {
             model_path = argv[++i];
+        } else if (std::string(argv[i]) == "--only" && i + 1 < argc) {
+            only = argv[++i];
         }
     }
     if (model_path.empty()) {
@@ -342,6 +526,18 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     common_log_set_verbosity_thold(0);
+
+    std::thread([]() {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const int64_t d = g_deadline_us.load();
+            if (d > 0 && ggml_time_us() > d) {
+                fprintf(stderr, "FAIL: scenario %s did not return within 60 s (hung)\n", g_scenario.load());
+                fflush(stderr);
+                _exit(2);
+            }
+        }
+    }).detach();
 
     auto mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
@@ -403,10 +599,21 @@ int main(int argc, char ** argv) {
         {"D: older checkpoints are shed before an entry is evicted", scenario_trim},
         {"E: find_better names the returning conversation's entry", scenario_find_better},
         {"F: a delta save keeps the earlier segments (HC2)", scenario_delta_keeps_segments},
+        {"G: a pool allocation while the slab prefetch runs does not hang (HC3)", scenario_pool_alloc_during_prefetch},
+        {"H: a save that fits no free block while the prefetch runs does not hang (HC3)", scenario_save_during_prefetch},
+        {"I: a save the capped pool cannot hold is skipped, the next works (HC3)", scenario_save_skipped_when_pool_full},
+        {"J: the task loop watchdog sees a stuck task (HC3)", scenario_queue_watchdog},
     };
     for (const auto & sc : hc1) {
+        if (!only.empty() && only.find(sc.name[0]) == std::string::npos) {
+            continue;
+        }
         fprintf(stderr, "scenario %s\n", sc.name);
-        if (sc.fn(cache, s, n_vocab)) {
+        g_scenario = sc.name;
+        g_deadline_us = ggml_time_us() + 60*1000*1000;
+        const bool ok = sc.fn(cache, s, n_vocab);
+        g_deadline_us = 0;
+        if (ok) {
             fprintf(stderr, "  OK\n");
         } else {
             fprintf(stderr, "  FAILED\n");

@@ -743,8 +743,17 @@ struct server_state_pool {
 
     ~server_state_pool();
 
-    // n bytes (rounded up to 256); the slab index in slab_out; nullptr when no memory could be had
+    // HC3: the pool's capacity cap (0 = the cache limit plus two slabs; no cap without a limit) and whether the last
+    // alloc() failed on it (a skipped save, not an out-of-memory)
+    size_t cap_max     = 0;
+    bool   cap_refused = false;
+
+    // n bytes (rounded up to 256); the slab index in slab_out; nullptr when no memory could be had. Terminates on every
+    // path: at most two first-fit passes (before and after a prefetch in flight is joined) and one new slab
     uint8_t * alloc(size_t n, int32_t & slab_out);
+    uint8_t * fit(size_t n, int32_t & slab_out);
+    void      adopt_pending();
+    size_t    max_capacity() const;
     void      free(int32_t slab, uint8_t * p, size_t n);
     size_t    capacity() const;
 

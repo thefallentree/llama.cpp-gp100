@@ -2246,10 +2246,15 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     // M3: the drafter's cells of the last kept segment end where its drafter part ended (d1, it lags the target): a kept
     // segment whose drafter part would not reach its own start goes too (a drafter that lagged a whole segment)
     if (e != nullptr && ctx_dft != nullptr) {
-        // an earlier kept segment whose drafter part has a hole becomes the last kept one (the delta re-saves from there)
+        // an earlier kept segment whose drafter part has a hole becomes the last kept one (the delta re-saves from there).
+        // HC2: a hole is a drafter cell in NO segment: this segment's drafter part ends before the next one's starts.
+        // A delta save starts the next drafter part where this one ended (d0 = the kept d1, the MTP drafter lags the
+        // target by a token or more), so d1 < seg_end(i) alone is no hole: comparing against seg_end re-saved every
+        // segment after the first on every switch (O(conversation) bytes per save: 80-100 MiB at 12K, measured)
+        static const bool hole_old = getenv("LLAMA_CACHE_HOLE_OLD") != nullptr && atoi(getenv("LLAMA_CACHE_HOLE_OLD")) != 0;
         for (size_t i = 0; i + 1 < n_keep; ++i) {
             const auto & seg = e->data.segs[i];
-            if (seg.d1 < seg_end(i)) {
+            if (seg.d1 < (hole_old ? seg_end(i) : e->data.segs[i + 1].d0)) {
                 n_keep = i + 1;
                 break;
             }

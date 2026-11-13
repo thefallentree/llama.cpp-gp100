@@ -249,6 +249,14 @@ public:
 
     size_t size() const { return tokens.size(); }
 
+    // true if any position holds a media chunk (has_mtmd only says that the server has a multimodal context)
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
+    // if position p lies past the first position of a media chunk and inside its position span, the end of that span
+    // (the first position after the chunk), else -1. An M-RoPE image puts all its tokens at its first position and
+    // advances the text after it by max(nx, ny) positions, so the positions in between have no cells.
+    llama_pos media_span_end(llama_pos p) const;
+
     bool empty() const { return tokens.empty(); }
 
     void clear() {
@@ -844,3 +852,8 @@ struct server_role {
 private:
     FILE * cmd_out = nullptr; // the stdout the router reads the commands from
 };
+
+// the first position >= p0 below which every position the prompt `tokens` occupies has a cell of seq_id in ctx's attention
+// cache: llama_memory_seq_pos_gap, with the positions inside media chunks (see server_tokens::media_span_end) skipped.
+// For a text-only prompt this is llama_memory_seq_pos_gap itself.
+llama_pos server_tokens_pos_gap(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, const server_tokens & tokens);

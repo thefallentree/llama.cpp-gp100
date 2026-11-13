@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "../../src/llama-ext.h" // llama_memory_seq_pos_gap
 
 #include <cpp-httplib/httplib.h>
 
@@ -784,6 +785,38 @@ llama_tokens server_tokens::get_text_tokens() const {
         }
     }
     return res;
+}
+
+llama_pos server_tokens::media_span_end(llama_pos p) const {
+    // the first position of a media chunk is its start index minus what the earlier chunks saved (n_tokens - n_pos each)
+    llama_pos shift = 0;
+    for (const auto & [start_idx, chunk] : map_idx_to_media) {
+        const llama_pos p0    = (llama_pos) start_idx - shift;
+        const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+        if (p0 >= p) {
+            break;
+        }
+        if (p < p0 + n_pos) {
+            return p0 + n_pos;
+        }
+        shift += (llama_pos) mtmd_input_chunk_get_n_tokens(chunk.get()) - n_pos;
+    }
+    return -1;
+}
+
+llama_pos server_tokens_pos_gap(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, const server_tokens & tokens) {
+    llama_pos p = p0;
+    while (true) {
+        const llama_pos gap = llama_memory_seq_pos_gap(ctx, seq_id, p);
+        if (gap < 0) {
+            return gap;
+        }
+        const llama_pos end = tokens.media_span_end(gap);
+        if (end < 0) {
+            return gap;
+        }
+        p = end; // end > gap: every round moves forward
+    }
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {

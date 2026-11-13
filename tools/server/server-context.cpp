@@ -4670,7 +4670,8 @@ private:
                             // state is at the end), the prefix would attend to nothing there and the indexer's pooled rows could point
                             // at cells now holding another conversation (the cross-session leak of 2026-11-10). Re-process fully instead.
                             if (n_past > 0) {
-                                const llama_pos gap = llama_memory_seq_pos_gap(ctx_tgt, slot.id, 0);
+                                // (VS1: the positions inside an image's span have no cells by design: skipped)
+                                const llama_pos gap = server_tokens_pos_gap(ctx_tgt, slot.id, 0, slot.prompt.tokens);
                                 if (gap >= 0 && gap < pos_next) {
                                     SLT_WRN(slot, "cached prefix has a hole at pos %d (n_past = %d, pos_next = %d): forcing full prompt re-processing\n", gap, n_past, pos_next);
                                     n_past   = 0;
@@ -4802,7 +4803,7 @@ private:
                         others_idle = others_idle && (&other == &slot || !other.is_processing());
                     }
                     if (peer_cfg.enabled() && p0 == 0 && batch.size() == 0 && others_idle && !wait_shared &&
-                        !input_tokens.has_mtmd && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                        !input_tokens.has_media() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         slot.task->n_tokens_shared == 0 && slot.task->n_tokens() >= peer_cfg.min_tokens &&
                         slot.prompt.n_tokens() == 0 && slot.lora.empty()) {
                         // all but the last 4 tokens go through the pipeline, in the ubatches the local path would decode

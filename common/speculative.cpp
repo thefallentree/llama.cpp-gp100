@@ -2394,7 +2394,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // tokens, so a prompt sub-batch of n_batch tokens overflows it by their number (the server crashed
                 // on a 2048-token sub-batch after a generation: 2049 rows). The rows so far are decoded as a batch of
                 // their own then (positions are sequential, the decode is the same catch-up).
-                if (batch.size() >= cap_dft && !eval && !chain_heads) {
+                // VS1: the draft context does not take a batch that mixes token and embd (image) rows: the rows so far
+                // are decoded first when the kind changes (the deferred text rows in front of an image chunk)
+                const bool kind_switch = batch.size() > 0 &&
+                    (batch.tokens.back().id == LLAMA_TOKEN_NULL) != (t.id == LLAMA_TOKEN_NULL);
+                if ((batch.size() >= cap_dft || kind_switch) && !eval && !chain_heads) {
                     const int64_t t_d0 = timing ? ggml_time_us() : 0;
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                     if (timing) { t_phase_us[1] += ggml_time_us() - t_d0; }

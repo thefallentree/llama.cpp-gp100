@@ -229,6 +229,10 @@ public:
     const ggml_tensor * tok_embd_host = nullptr;
     std::vector<float>  rows_buf;
 
+    // the graph reads the embd input as its token embeddings (built for an embd ubatch: image rows), not the tokens;
+    // a graph built for one kind of ubatch is not reused for the other
+    bool embd_in = false;
+
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
 };

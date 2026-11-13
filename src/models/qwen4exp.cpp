@@ -766,10 +766,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
 
         if (llm_graph_tok_embd_host(model.tok_embd)) {
             // the rows gathered on the host: no get_rows of the host table, the draft window is one split
+            // (image rows of a multimodal prompt are copied in as they are, see llm_graph_input_embd_h::set_input)
             inp->tok_embd_host = model.tok_embd;
             inp->tok_rows      = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.tok_embd->ne[0], n_tokens);
             ggml_set_input(inp->tok_rows);
             tok_embd = inp->tok_rows;
+        } else if (!ubatch.token) {
+            // an embd ubatch (the image rows of a multimodal prompt): the rows are the embeddings, as in the target
+            inp->embd_in = true;
+            tok_embd = inp->embd;
         } else {
             tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
         }

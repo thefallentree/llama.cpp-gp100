@@ -284,14 +284,30 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
-    ASSERT_EMBD_OR_TOKEN(*ubatch);
+    if (tok_rows == nullptr) {
+        ASSERT_EMBD_OR_TOKEN(*ubatch); // the host-gathered rows take a mixed ubatch too
+    }
 
     const int64_t n_tokens = ubatch->n_tokens;
 
-    if (ubatch->token && tok_rows != nullptr) {
+    if (tok_rows != nullptr) {
         GGML_ASSERT(tok_embd_host && tok_rows->ne[0] == tok_embd_host->ne[0] && tok_rows->ne[1] == n_tokens);
-        rows_buf.resize((size_t) n_tokens*tok_rows->ne[0]);
-        llm_graph_gather_tok_embd(tok_embd_host, ubatch->token, n_tokens, rows_buf.data());
+        const int64_t w = tok_rows->ne[0];
+        rows_buf.resize((size_t) n_tokens*w);
+        if (ubatch->token && !ubatch->is_mixed()) {
+            llm_graph_gather_tok_embd(tok_embd_host, ubatch->token, n_tokens, rows_buf.data());
+        } else {
+            // image rows (an embd or mixed ubatch) are their own embeddings, the token rows come from the table
+            GGML_ASSERT(ubatch->embd && w == n_embd);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const bool is_embd = !ubatch->token || ubatch->type[i];
+                if (is_embd) {
+                    memcpy(rows_buf.data() + i*w, ubatch->embd + i*w, w*sizeof(float));
+                } else {
+                    llm_graph_gather_tok_embd(tok_embd_host, ubatch->token + i, 1, rows_buf.data() + i*w);
+                }
+            }
+        }
         ggml_backend_tensor_set(tok_rows, rows_buf.data(), 0, rows_buf.size()*sizeof(float));
     } else if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -355,6 +371,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!tok_rows) || tok_rows->ne[1] == params.ubatch.n_tokens;
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    // the host-gathered rows serve every kind of ubatch; else a graph reads either the tokens or the embd rows
+    res &= tok_rows != nullptr || embd_in == (params.ubatch.token == nullptr);
 
     const bool has_rows = params.ubatch.data && !params.ubatch.data->embd_state_row.empty();
     res &= has_rows == (h_rows != nullptr);

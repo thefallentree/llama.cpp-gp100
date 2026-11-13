@@ -2233,6 +2233,11 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
     }
 
+    // VS1: segments are ranges of POSITIONS (the state API's unit); n and lcp count tokens. They are the same for text,
+    // but an M-RoPE image of n_tokens cells takes only max(nx, ny) positions: the boundaries below are positions
+    const llama_pos n_pos   = prompt.tokens.pos_next();
+    const llama_pos lcp_pos = prompt.tokens.pos_next(lcp);
+
     // the entry's segments that still hold valid cells: [p0, min(p1, lcp)); a segment with too many cells past the
     // common prefix, or a short tail, is re-saved with the new cells
     size_t n_keep = 0;
@@ -2242,12 +2247,12 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     // segment: the restored entry then had a hole, which leaked another conversation's cells into the prompt)
     auto seg_end = [&](size_t i) -> llama_pos {
         const auto & segs = e->data.segs;
-        const llama_pos n_prev = e->prompt.n_tokens();
+        const llama_pos n_prev = e->prompt.tokens.pos_next();
         return std::min<llama_pos>(segs[i].p1, i + 1 < segs.size() ? segs[i + 1].p0 : n_prev);
     };
     if (e != nullptr) {
         for (const auto & seg : e->data.segs) {
-            if (seg.p0 >= lcp) {
+            if (seg.p0 >= lcp_pos) {
                 break;
             }
             n_keep++;
@@ -2256,10 +2261,10 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             const auto & last = e->data.segs[n_keep - 1];
             const llama_pos end = seg_end(n_keep - 1);
             const int64_t n_seg   = (int64_t) end - last.p0;
-            const int64_t n_stale = (int64_t) end - lcp;
+            const int64_t n_stale = (int64_t) end - lcp_pos;
             if (n_stale > std::max<int64_t>(seg_min, n_seg / 4)) {
                 n_keep--;
-            } else if (end <= lcp && n_seg < seg_min && n_keep > 1) {
+            } else if (end <= lcp_pos && n_seg < seg_min && n_keep > 1) {
                 n_keep--;
             }
         }
@@ -2289,7 +2294,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
         while (n_keep > 0) {
             const auto & last = e->data.segs[n_keep - 1];
-            const llama_pos d_end = std::min<llama_pos>({seg_end(n_keep - 1), lcp, last.d1});
+            const llama_pos d_end = std::min<llama_pos>({seg_end(n_keep - 1), lcp_pos, last.d1});
             if (d_end > last.d0) {
                 break;
             }
@@ -2310,19 +2315,19 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
         e->data.segs.clear();
     }
-    const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept_end, lcp);
+    const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept_end, lcp_pos);
     // where the new drafter part starts: the kept drafter cells reach only d1 of the last kept segment
     const llama_pos keep_end_dft = kept.empty() ? 0 : std::min<llama_pos>(keep_end, kept.back().d1);
 
     // the new segments: [keep_end, n) in chunks of seg_max, the last one open-ended (cells past n go with it)
     struct chunk { llama_pos a, b, ad; size_t sz_tgt, sz_dft; };
     std::vector<chunk> chunks;
-    for (llama_pos a = keep_end; a < n; a += seg_max) {
-        const llama_pos b = (a + seg_max >= n) ? INT32_MAX : a + seg_max;
+    for (llama_pos a = keep_end; a < n_pos; a += seg_max) {
+        const llama_pos b = (a + seg_max >= n_pos) ? INT32_MAX : a + seg_max;
         chunks.push_back({a, b, a, 0, 0});
     }
     if (chunks.empty()) {
-        // n == keep_end: the tail was trimmed only; one open-ended chunk for whatever cells sit past it
+        // n_pos == keep_end: the tail was trimmed only; one open-ended chunk for whatever cells sit past it
         chunks.push_back({keep_end, INT32_MAX, keep_end, 0, 0});
     }
     chunks.front().ad = keep_end_dft;
@@ -2450,7 +2455,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         if (dft_pm < 0) {
             seg.d1 = INT32_MAX;
         } else {
-            const llama_pos gap = llama_memory_seq_pos_gap(ctx_dft, id_slot, c.ad);
+            const llama_pos gap = server_tokens_pos_gap(ctx_dft, id_slot, c.ad, prompt.tokens);
             seg.d1 = gap < 0 ? c.b : std::min<llama_pos>(c.b, gap);
         }
         if (!alloc_buf(seg.main, c.sz_tgt) || !alloc_buf(seg.drft, c.sz_dft)) {
@@ -2558,7 +2563,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
     }
 
-    const int32_t n_e = e.prompt.n_tokens();
+    const int32_t n_e = e.prompt.tokens.pos_next(); // positions (VS1: an image's tokens take fewer positions)
     for (size_t i = 0; i < e.data.segs.size(); ++i) {
         auto & seg = e.data.segs[i];
 
@@ -2585,7 +2590,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
     // CL1: the restored segments must cover the whole prompt; an entry that lost earlier segments must not be reused
     {
-        const llama_pos gap = llama_memory_seq_pos_gap(ctx_tgt, id_slot, 0);
+        const llama_pos gap = server_tokens_pos_gap(ctx_tgt, id_slot, 0, e.prompt.tokens);
         if (gap >= 0 && gap < n_e) {
             SRV_WRN("prompt cache: entry of %d tokens restores only up to pos %d (%zu segments): dropped\n", n_e, gap, e.data.segs.size());
             return fail("segments do not cover the prompt");

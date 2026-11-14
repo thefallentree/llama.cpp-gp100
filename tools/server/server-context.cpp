@@ -4,6 +4,7 @@
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
+#include "server-loop-guard.h"
 #include "server-ckpt-spread.h"
 #include "server-common.h"
 #include "server-decision.h"
@@ -365,6 +366,10 @@ struct server_slot {
 
     stop_type stop;
 
+    // the loop guard of this reply and what it did (usage.loop_guard)
+    server_loop_guard loop_guard;
+    json              loop_guard_report;
+
     std::string stopping_word;
 
     // state
@@ -473,6 +478,7 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+        loop_guard_report = json();
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -1853,6 +1859,7 @@ private:
                 /* media_allow_private   */ params_base.media_allow_private_urls,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
+            chat_params.loop_guard = params_base.loop_guard;
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
@@ -2257,6 +2264,9 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        slot.loop_guard.init(params_base.loop_guard_span, params_base.loop_guard_reps, task.params.loop_guard ? params_base.loop_guard_period : 0);
+        slot.loop_guard_report = json();
+
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         // the server-wide bound caps both (--n-predict-max): a request for more, or for no limit, is clamped
@@ -2424,6 +2434,27 @@ private:
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
+        }
+
+        // a degenerate repetition: in the thinking the think block closes and the answer follows, otherwise the reply ends
+        if (const int32_t period = slot.loop_guard.push(result.tok); period > 0 && slot.has_next_token) {
+            const bool thinking = common_sampler_reasoning_budget_state(slot.smpl.get()) == REASONING_BUDGET_COUNTING;
+            const bool closed   = thinking && common_sampler_reasoning_budget_force(slot.smpl.get());
+            if (!closed) {
+                slot.stop           = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
+            }
+            slot.loop_guard.reset();
+            const int n = slot.loop_guard_report.is_object() ? slot.loop_guard_report.value("count", 0) : 0;
+            slot.loop_guard_report = {
+                { "triggered", true },
+                { "action",    closed ? "think_closed" : "stopped" },
+                { "period",    period },
+                { "n_gen",     slot.stats.n_gen },
+                { "count",     n + 1 },
+            };
+            SLT_WRN(slot, "loop guard: period %d tokens at n_gen = %d, %s\n", period, (int) slot.stats.n_gen,
+                    closed ? "the think block is closed" : "the reply ends");
         }
 
         // a reply that already ended (EOS, a stop string, a limit) keeps its own reason
@@ -2609,6 +2640,7 @@ private:
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
+        res->loop_guard            = slot.loop_guard_report;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;

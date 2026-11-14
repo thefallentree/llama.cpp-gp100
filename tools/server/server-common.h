@@ -387,6 +387,7 @@ struct server_chat_params {
     std::string media_path;
     bool media_allow_private_urls = false;
     bool force_pure_content = false;
+    bool loop_guard = false; // default of a request's loop_guard: arms the budget sampler so a loop can close the think block
 };
 
 // used by /completions endpoint

@@ -1650,7 +1650,9 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_budget_start_tag"] = out_session.thinking_start_tag();
             llama_params["reasoning_budget_end_tags"] = out_session.thinking_end_tags();
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
-            llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+            // the loop guard closes a looping think block through the budget sampler, which then must exist
+            const bool lg = body.contains("loop_guard") && body.at("loop_guard").is_boolean() ? body.at("loop_guard").get<bool>() : opt.loop_guard;
+            llama_params["reasoning_control"] = json_value(body, "reasoning_control", false) || lg;
         }
     }
 

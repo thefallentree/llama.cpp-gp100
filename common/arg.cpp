@@ -1683,6 +1683,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DEADLINE_S"));
     add_opt(common_arg(
+        {"--loop-guard"},
+        {"--no-loop-guard"},
+        string_format("default of a request's \"loop_guard\": a degenerate repetition in the thinking closes the think block "
+                      "and the answer follows, one in the answer ends the reply with finish_reason \"length\"; reported in "
+                      "usage.loop_guard (default: %s)", params.loop_guard ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.loop_guard = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOOP_GUARD"));
+    add_opt(common_arg(
+        {"--loop-guard-span"}, "N",
+        string_format("loop guard: a loop is periodic over at least N tokens (default: %d)", params.loop_guard_span),
+        [](common_params & params, int value) {
+            params.loop_guard_span = std::max(1, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOOP_GUARD_SPAN"));
+    add_opt(common_arg(
+        {"--loop-guard-reps"}, "N",
+        string_format("loop guard: a loop repeats its period at least N times (default: %d)", params.loop_guard_reps),
+        [](common_params & params, int value) {
+            params.loop_guard_reps = std::max(2, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOOP_GUARD_REPS"));
+    add_opt(common_arg(
+        {"--loop-guard-period"}, "N",
+        string_format("loop guard: the longest period checked, in tokens (default: %d)", params.loop_guard_period),
+        [](common_params & params, int value) {
+            params.loop_guard_period = std::max(1, std::min(value, 4096));
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOOP_GUARD_PERIOD"));
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

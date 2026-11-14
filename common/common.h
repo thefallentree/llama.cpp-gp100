@@ -478,6 +478,10 @@ struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_predict_max         =    -1; // server: upper bound on the tokens of any request, -1 == no bound
     double  deadline_s            =     0; // server: default deadline of a request in seconds, 0 = none
+    bool    loop_guard            = false; // server: default of a request's loop_guard (cut a degenerate repetition)
+    int32_t loop_guard_span       =   512; // server: a loop is periodic over at least this many tokens ...
+    int32_t loop_guard_reps       =     8; // ... and at least this many repetitions ...
+    int32_t loop_guard_period     =   512; // ... of a period of at most this many tokens
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)

@@ -104,6 +104,8 @@ struct task_params {
     double  deadline_s    = 0;  // if positive, end the reply this many seconds after the request with finish_reason "deadline"
     int64_t t_deadline_us = -1; // the deadline in ggml_time_us(), -1 = none
 
+    bool loop_guard = false; // cut a degenerate repetition (server_loop_guard)
+
     std::map<int, float> lora; // mapping adapter ID -> scale
 
     std::vector<std::string> antiprompt;
@@ -433,6 +435,7 @@ struct server_task_result_cmpl_final : server_task_result {
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
+    json      loop_guard; // what the loop guard did, null = nothing (usage.loop_guard)
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;

@@ -721,9 +721,10 @@ struct parser_executor {
                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos, {}, std::move(invalid_utf8));
             }
 
-            if (match == common_trie::PARTIAL_MATCH && !ctx.is_complete()) {
+            if (match == common_trie::PARTIAL_MATCH && (!ctx.is_complete() || ctx.is_truncated())) {
                 // Found a partial match extending to end of input, return everything before it.
-                // On a complete input the delimiter can no longer form, so the bytes belong to the text
+                // On a complete input the delimiter can no longer form, so the bytes belong to the text,
+                // unless the input was cut: then they are the start of a delimiter the cut dropped
                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos, {}, std::move(invalid_utf8));
             }
 

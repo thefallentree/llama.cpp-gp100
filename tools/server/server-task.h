@@ -166,7 +166,8 @@ struct task_result_state {
         const common_chat_input & added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
-        bool filter_tool_calls = false);
+        bool filter_tool_calls = false,
+        bool truncated = false); // the reply was cut (limit, stop string): drop a closer it began
 };
 
 struct server_task {
@@ -458,7 +459,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs, false, stop == STOP_TYPE_LIMIT || stop == STOP_TYPE_WORD);
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;

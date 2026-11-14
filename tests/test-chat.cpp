@@ -8492,6 +8492,100 @@ static void test_chat_session() {
     }
 }
 
+// a reply cut (token limit, stop string) inside a tool call's value or its closer must not leave the
+// closer's first bytes or the framing newline in the arguments, whole or streamed
+static void test_chat_cut_tool_call() {
+    LOG_DBG("%s\n", __func__);
+    struct cut_case {
+        std::string tmpl;
+        std::string reasoning;   // output before the call
+        std::string head;        // the call up to the value
+        std::string value;       // the value as written
+        std::string args_cut;    // the arguments of a call cut after the value (a cut string stays open)
+        std::string args_full;   // the arguments of the complete call
+    };
+    const std::string tail = "\n</parameter>\n</function>\n</tool_call>";
+    const std::vector<cut_case> cases = {
+        { "models/templates/Qwen3.5-4B.jinja", "ok\n</think>\n\n", "<tool_call>\n<function=python>\n<parameter=code>\n",
+          "echo \"no /work\"", R"({"code":"echo \"no /work\")", R"({"code":"echo \"no /work\""})" },
+        { "models/templates/Qwen3.5-4B.jinja", "ok\n</think>\n\n", "<tool_call>\n<function=python>\n<parameter=code>\n",
+          "a\n\nb", R"({"code":"a\n\nb)", R"({"code":"a\n\nb"})" },
+        { "models/templates/Qwen3.5-4B.jinja", "ok\n</think>\n\n", "<tool_call>\n<function=special_function>\n<parameter=arg1>\n",
+          "12", R"({"arg1":12)", R"({"arg1":12})" },
+        { "models/templates/Qwen3-Coder.jinja", "", "<tool_call>\n<function=python>\n<parameter=code>\n",
+          "print(1)", R"x({"code":"print(1))x", R"x({"code":"print(1)"})x" },
+    };
+
+    for (const auto & c : cases) {
+        auto tmpls = read_templates(c.tmpl);
+        common_chat_templates_inputs inputs;
+        inputs.messages         = { message_user };
+        inputs.tools            = { python_tool, special_function_tool };
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+
+        const std::string full = c.reasoning + c.head + c.value + tail;
+
+        // whole: one finish(); streamed: one byte per feed(), then finish(); the deltas must add up to the final arguments
+        auto run = [&](const std::string & text, bool truncated, bool streamed) {
+            common_chat_session s(tmpls.get(), nullptr, inputs);
+            common_chat_msg     prv = s.msg();
+            std::string         sent;
+            auto add = [&](const common_chat_msg & m) {
+                for (const auto & d : common_chat_msg_diff::compute_diffs(prv, m)) {
+                    sent += d.tool_call_delta.arguments;
+                }
+                prv = m;
+            };
+            if (streamed) {
+                for (size_t i = 0; i < text.size(); i++) {
+                    add(s.feed(common_chat_input(text.substr(i, 1))));
+                }
+                add(s.finish(common_chat_input(), truncated));
+            } else {
+                add(s.finish(common_chat_input(text), truncated));
+            }
+            const auto & m = s.msg();
+            const std::string args = m.tool_calls.empty() ? std::string() : m.tool_calls[0].arguments;
+            assert_equals(args, sent);
+            return args;
+        };
+
+        // complete calls: unchanged byte for byte by the truncation rule
+        for (bool streamed : { false, true }) {
+            assert_equals(c.args_full, run(full, false, streamed));
+            assert_equals(c.args_full, run(full, true, streamed));
+        }
+
+        // cut after the value, at every prefix of the closer "\n</parameter>\n" (and of the rest of the call)
+        const size_t v_end = c.reasoning.size() + c.head.size() + c.value.size();
+        for (size_t cut = v_end; cut < full.size(); cut++) {
+            const std::string text = full.substr(0, cut);
+            const bool        closed = cut >= v_end + std::string("\n</parameter>\n").size();
+            for (bool streamed : { false, true }) {
+                const std::string args = run(text, true, streamed);
+                if (closed) {
+                    // the value is closed: its quote may follow, the object's brace once the call closes
+                    assert_equals(true, args.rfind(c.args_cut, 0) == 0 && args.size() <= c.args_full.size());
+                } else {
+                    assert_equals(c.args_cut, args);
+                }
+                assert_equals(std::string::npos, args.find("</"));
+            }
+        }
+
+        // a cut inside the value keeps the bytes the value wrote
+        for (size_t n = 1; n < c.value.size(); n++) {
+            const std::string text = full.substr(0, v_end - c.value.size() + n);
+            const std::string w    = c.value.substr(0, n);
+            if (w.back() == '\n') {
+                continue; // a newline at the cut may be the closer's framing newline: dropped
+            }
+            assert_equals(true, run(text, true, false).find(json(w).dump().substr(1, json(w).dump().size() - 2)) != std::string::npos ||
+                                run(text, true, false).find(w) != std::string::npos);
+        }
+    }
+}
+
 static void test_chat_json_depth() {
     LOG_DBG("%s\n", __func__);
     const auto arrays = [](size_t n) {
@@ -8810,6 +8904,7 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_prompt_parts();
         test_chat_session();
+        test_chat_cut_tool_call();
         test_chat_json_depth();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();

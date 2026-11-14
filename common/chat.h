@@ -389,8 +389,9 @@ std::string common_chat_format_example(const struct common_chat_templates *     
                                        const std::map<std::string, std::string> & chat_template_kwargs);
 
 const char *    common_chat_format_name(common_chat_format format);
-common_chat_msg common_chat_parse(const common_chat_input & input, bool is_partial, const common_chat_parser_params & params);
-common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const common_chat_input & input, bool is_partial, const common_chat_parser_params & params);
+// is_truncated: a complete output that was cut (token limit, stop string): a closing marker it began is dropped
+common_chat_msg common_chat_parse(const common_chat_input & input, bool is_partial, const common_chat_parser_params & params, bool is_truncated = false);
+common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const common_chat_input & input, bool is_partial, const common_chat_parser_params & params, bool is_truncated = false);
 
 struct common_chat_session_params {
     bool echo  = false; // include the assistant prefill in the output when continuing a message
@@ -425,7 +426,8 @@ class common_chat_session {
 
     const common_chat_msg & feed(const common_chat_input & chunk);
 
-    const common_chat_msg & finish(const common_chat_input & chunk = {});
+    // truncated: the output was cut (token limit, stop string), see common_chat_parse
+    const common_chat_msg & finish(const common_chat_input & chunk = {}, bool truncated = false);
 
   private:
     common_chat_prompt                  prompt_parts;

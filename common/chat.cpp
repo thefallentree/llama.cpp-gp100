@@ -1705,14 +1705,16 @@ common_chat_input common_chat_input_tokenize(const llama_vocab * vocab, const st
 
 common_chat_msg common_chat_parse(const common_chat_input &         input,
                                   bool                              is_partial,
-                                  const common_chat_parser_params & params) {
-    return common_chat_peg_parse(params.parser, input, is_partial, params);
+                                  const common_chat_parser_params & params,
+                                  bool                              is_truncated) {
+    return common_chat_peg_parse(params.parser, input, is_partial, params, is_truncated);
 }
 
 common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_parser,
                                       const common_chat_input &         input,
                                       bool                              is_partial,
-                                      const common_chat_parser_params & params) {
+                                      const common_chat_parser_params & params,
+                                      bool                              is_truncated) {
     // both branches must be lvalues, a temporary here would copy the arena on every call
     static const common_peg_arena content_only =
         build_chat_peg_parser([](common_chat_peg_builder & p) { return p.content(p.rest()) + p.end(); });
@@ -1730,6 +1732,9 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
     if (!is_partial) {
         flags |= COMMON_PEG_PARSE_FLAG_COMPLETE;
+        if (is_truncated) {
+            flags |= COMMON_PEG_PARSE_FLAG_TRUNCATED;
+        }
     }
     if (params.debug) {
         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
@@ -1857,11 +1862,11 @@ const common_chat_msg & common_chat_session::feed(const common_chat_input & chun
     return result;
 }
 
-const common_chat_msg & common_chat_session::finish(const common_chat_input & chunk) {
+const common_chat_msg & common_chat_session::finish(const common_chat_input & chunk, bool truncated) {
     GGML_ASSERT(!finished && "finish() called twice");
     finished = true;
     input.append(chunk);
-    auto msg = common_chat_parse(input, false, parser_params);
+    auto msg = common_chat_parse(input, false, parser_params, truncated);
     if (!msg.empty()) {
         result = std::move(msg);
     }

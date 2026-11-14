@@ -295,6 +295,11 @@ struct parser_executor {
             ++pos;
         }
 
+        if (!ctx.special_text_ok(start_pos, p.literal)) {
+            // e.g. "<tool_call>" spelled with ordinary tokens is text, not the <tool_call> token
+            return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos);
+        }
+
         return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
     }
 
@@ -688,6 +693,22 @@ struct parser_executor {
         return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, pos);
     }
 
+    // the trie match at pos, counting only the delimiters whose special token texts are the special tokens
+    common_trie::match_result delimiter_at(const std::vector<std::string> & delimiters, size_t pos) const {
+        auto best = common_trie::NO_MATCH;
+        for (const auto & d : delimiters) {
+            const size_t n = std::min(d.size(), ctx.input.size() - pos);
+            if (ctx.input.compare(pos, n, d, 0, n) != 0 || !ctx.special_text_ok(pos, d)) {
+                continue;
+            }
+            if (n == d.size()) {
+                return common_trie::COMPLETE_MATCH;
+            }
+            best = common_trie::PARTIAL_MATCH;
+        }
+        return best;
+    }
+
     common_peg_parse_result operator()(const common_peg_until_parser & p) const {
         common_trie matcher(p.delimiters);
 
@@ -715,6 +736,11 @@ struct parser_executor {
 
             // Check if a delimiter starts at this position
             auto match = matcher.check_at(ctx.input, pos);
+
+            if (match != common_trie::NO_MATCH && ctx.special) {
+                // a delimiter whose special token text is ordinary text here does not delimit
+                match = delimiter_at(p.delimiters, pos);
+            }
 
             if (match == common_trie::COMPLETE_MATCH) {
                 // Found a complete delimiter, return everything before it
@@ -829,6 +855,19 @@ struct parser_executor {
         return arena.parse(p.child, ctx, start_pos);
     }
 };
+
+common_peg_special_tokens::common_peg_special_tokens(const llama_vocab * vocab) {
+    const llama_token n_tokens = llama_vocab_n_tokens(vocab);
+    for (llama_token id = 0; id < n_tokens; ++id) {
+        if (llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+            std::string text = common_token_to_piece(vocab, id, true);
+            if (!text.empty()) {
+                tokens.emplace_back(std::move(text), id);
+            }
+        }
+    }
+    std::stable_sort(tokens.begin(), tokens.end(), [](const auto & a, const auto & b) { return a.first.size() > b.first.size(); });
+}
 
 common_peg_parse_result common_peg_arena::parse(common_peg_parse_context & ctx, size_t start) const {
     if (root_ == COMMON_PEG_INVALID_PARSER_ID) {

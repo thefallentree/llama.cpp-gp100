@@ -342,6 +342,8 @@ MTMD_API int32_t mtmd_tokenize(const mtmd_context * ctx,
 // - when you don't want to use media markers (they will be tokenized as normal text)
 // - when you want to control parse_special for each text part
 // note: per-part add_special will be ignored
+// note: adjacent text parts are tokenized as one text; in a part with parse_special == false no special token is
+//       matched at all, not even a user-defined one (llama_tokenize_with_literals)
 // return 1 if a part has both text and bitmap set (or neither)
 MTMD_API int32_t mtmd_tokenize_from_parts(const mtmd_context * ctx,
                                           mtmd_input_chunks * output,

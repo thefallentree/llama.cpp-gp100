@@ -325,6 +325,7 @@ llama_test_cmd(python3
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
+llama_build_and_test(test-tokenize-literal.cpp  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gemma-4.gguf ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)

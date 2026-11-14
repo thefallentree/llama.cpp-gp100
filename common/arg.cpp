@@ -3933,6 +3933,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_ASSISTANT"));
     add_opt(common_arg(
+        {"--chat-input-special"},
+        {"--no-chat-input-special"},
+        string_format("whether special tokens in the user input of chat messages (message content, tool results, tool call arguments) are parsed as special tokens; "
+                      "when disabled their text is tokenized as plain text, also user-defined tokens such as <think> or <tool_call>, while the chat template's own markup stays special; "
+                      "does not affect the raw /completions endpoint; a request may override it with \"chat_input_special\" (default: %s)",
+                      params.chat_input_special ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.chat_input_special = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_INPUT_SPECIAL"));
+    add_opt(common_arg(
         {"-sps", "--slot-prompt-similarity"}, "SIMILARITY",
         string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
         [](common_params & params, const std::string & value) {

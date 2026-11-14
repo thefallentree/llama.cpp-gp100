@@ -6028,7 +6028,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (chat_session.has_template()) {
+            // chat path: the session holds the rendered prompt split into template and user input parts
+            const bool input_special = json_value(data, "chat_input_special", params.chat_input_special);
+            inputs.push_back(tokenize_chat_prompt(ctx_server.vocab, ctx_server.mctx, chat_session.prompt(), files, input_special, ctx_server.init_opt));
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
@@ -7948,26 +7952,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
             return res;
     }
 
-    common_chat_session session; // dummy, unused
+    common_chat_session session;
     json body_parsed = oaicompat_chat_params_parse(
             ctx_server.vocab,
             body,
             meta->chat_params,
             files,
             session);
-    json prompt = body_parsed.at("prompt");
-    // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
 
-    // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
-    size_t n_tokens;
-    if (ctx_server.mctx != nullptr) {
-        if (!prompt.is_string()) {
-            throw std::runtime_error("for mtmd, input prompt must be a string.");
-        }
-        n_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true).size();
-    } else {
-        n_tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true).size();
-    }
+    // the same tokens as the completion of this request
+    const bool input_special = json_value(body_parsed, "chat_input_special", params.chat_input_special);
+    size_t n_tokens = tokenize_chat_prompt(ctx_server.vocab, ctx_server.mctx, session.prompt(), files, input_special, ctx_server.init_opt, /* is_placeholder */ true).size();
 
     json response = {{"input_tokens", static_cast<int64_t>(n_tokens)}};
     if (is_oai) {

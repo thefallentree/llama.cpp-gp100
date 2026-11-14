@@ -696,6 +696,7 @@ struct common_params {
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
+    bool chat_input_special = false; // if false, special tokens in the user input of chat messages are tokenized as plain text (upstream default: true, PR #32033)
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
     std::vector<std::string> api_keys;
@@ -1220,6 +1221,16 @@ std::vector<llama_token> common_tokenize(
            const std::string & text,
                         bool   add_special,
                         bool   parse_special = false);
+
+// like common_tokenize(), but no special token, not even a user-defined one, is matched inside the literal
+// [begin, end) byte ranges (sorted, not overlapping): e.g. the user input inside a rendered chat template.
+// The text between special tokens is tokenized as a whole, across the range borders
+std::vector<llama_token> common_tokenize_with_literals(
+    const struct llama_vocab * vocab,
+           const std::string & text,
+    const std::vector<std::pair<size_t, size_t>> & literal,
+                        bool   add_special,
+                        bool   parse_special);
 
 // tokenizes a token into a piece, optionally renders special/control tokens
 // should work similar to Python's `tokenizer.id_to_piece`

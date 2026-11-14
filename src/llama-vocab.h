@@ -191,6 +191,14 @@ struct llama_vocab {
                          bool   add_special,
                          bool   parse_special = false) const;
 
+    // literal: sorted, non-overlapping [begin, end) byte ranges of raw_text in which no special token,
+    // not even a user-defined one, is matched; the text there is tokenized as plain text
+    std::vector<llama_token> tokenize(
+            const std::string & raw_text,
+                         bool   add_special,
+                         bool   parse_special,
+            const std::vector<std::pair<size_t, size_t>> & literal) const;
+
     // does not write null-terminator to buf
     int32_t token_to_piece(
                   llama_token   token,

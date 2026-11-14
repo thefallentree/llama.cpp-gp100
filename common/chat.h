@@ -293,6 +293,9 @@ struct common_chat_prompt {
 
     std::string str() const;
 
+    // the text, and the [begin, end) byte ranges of the user input parts in it
+    std::string str(std::vector<std::pair<size_t, size_t>> & input_ranges) const;
+
     void append(const std::string & text, bool is_input = false);
 
     // replace the last occurrence of `from`, user input parts are skipped
@@ -340,6 +343,11 @@ struct common_chat_input {
 
 common_chat_input common_chat_input_tokenize(const llama_vocab * vocab, const std::string & text);
 
+// tokenize a rendered chat prompt; with input_special == false no special token is matched inside the user input
+// parts, their text is plain text, while the template text around them keeps its special tokens
+std::vector<llama_token> common_chat_prompt_tokenize(const llama_vocab * vocab, const common_chat_prompt & prompt,
+                                                     bool add_special, bool input_special);
+
 // per-message parsing syntax
 // should be derived from common_chat_params
 struct common_chat_parser_params {
@@ -347,6 +355,9 @@ struct common_chat_parser_params {
     common_chat_input  generation_prompt;
     bool               debug  = false; // Enable debug output for PEG parser
     common_peg_arena   parser = {};
+    // the vocab's special tokens: with them, a special token's text that the model generated as ordinary tokens
+    // (e.g. "<tool_call>" inside prose or a file) is text, only the special token itself is structure
+    std::shared_ptr<const common_peg_special_tokens> special_tokens;
     common_chat_parser_params() = default;
     common_chat_parser_params(const common_chat_params & chat_params) {
         format  = chat_params.format;

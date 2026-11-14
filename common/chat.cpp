@@ -1623,6 +1623,32 @@ std::string common_chat_prompt::str() const {
     return out;
 }
 
+std::string common_chat_prompt::str(std::vector<std::pair<size_t, size_t>> & input_ranges) const {
+    input_ranges.clear();
+    std::string out;
+    for (const auto & part : parts) {
+        if (part.is_input && !part.text.empty()) {
+            if (!input_ranges.empty() && input_ranges.back().second == out.size()) {
+                input_ranges.back().second += part.text.size();
+            } else {
+                input_ranges.emplace_back(out.size(), out.size() + part.text.size());
+            }
+        }
+        out += part.text;
+    }
+    return out;
+}
+
+std::vector<llama_token> common_chat_prompt_tokenize(const llama_vocab * vocab, const common_chat_prompt & prompt,
+                                                     bool add_special, bool input_special) {
+    if (input_special) {
+        return common_tokenize(vocab, prompt.str(), add_special, true);
+    }
+    std::vector<std::pair<size_t, size_t>> input_ranges;
+    const std::string text = prompt.str(input_ranges);
+    return common_tokenize_with_literals(vocab, text, input_ranges, add_special, true);
+}
+
 void common_chat_prompt::append(const std::string & text, bool is_input) {
     if (text.empty()) {
         return;
@@ -1741,6 +1767,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     }
 
     common_peg_parse_context ctx(std::move(effective_input.text), std::move(effective_input.tokens), flags);
+    ctx.set_special_tokens(params.special_tokens);
     auto result = parser.parse(ctx);
 
     if (result.fail()) {
@@ -1829,6 +1856,8 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
         grammar_triggers = std::move(resolved.grammar_triggers);
 
         delimiters.tokenize(vocab);
+
+        parser_params.special_tokens = std::make_shared<const common_peg_special_tokens>(vocab);
     } else {
         grammar_triggers = std::move(applied.grammar_triggers);
     }

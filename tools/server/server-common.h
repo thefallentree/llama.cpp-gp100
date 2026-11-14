@@ -334,6 +334,17 @@ server_tokens process_mtmd_prompt(
                                          const mtmd_helper_init_opt & init_opt,
                                           bool is_placeholder = false);
 
+// tokenize a rendered chat prompt: unless input_special is set, no special token is matched inside the user input
+// parts (their text is plain text), while the template text keeps its special tokens; see process_mtmd_prompt() for is_placeholder
+server_tokens tokenize_chat_prompt(
+                                        const llama_vocab * vocab,
+                                        mtmd_context * mctx,
+                                        const common_chat_prompt & prompt,
+                                        const std::vector<raw_buffer> & files,
+                                        bool input_special,
+                                        const mtmd_helper_init_opt & init_opt,
+                                        bool is_placeholder = false);
+
 // decode one media url (http/file/data-uri) into out_files; throws on failure
 void handle_media(std::vector<raw_buffer> & out_files, const std::string & url, const std::string & media_path, bool allow_private_urls);
 

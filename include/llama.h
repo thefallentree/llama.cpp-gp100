@@ -1330,6 +1330,23 @@ extern "C" {
                             bool   add_special,
                             bool   parse_special);
 
+    /// @details Like llama_tokenize(), but no special token - not even a user-defined one, which llama_tokenize()
+    ///          matches with parse_special == false - is matched inside the literal ranges: the text there is
+    ///          tokenized as plain text. The text runs between special tokens are still tokenized as a whole,
+    ///          across the range borders. For a rendered chat template with the user input as literal ranges.
+    /// @param literal_ranges n_literal_ranges pairs of [begin, end) byte offsets into text, sorted and not overlapping
+    /// @return As llama_tokenize(), INT32_MIN also for invalid ranges
+    LLAMA_API int32_t llama_tokenize_with_literals(
+        const struct llama_vocab * vocab,
+                      const char * text,
+                         int32_t   text_len,
+                   const int32_t * literal_ranges,
+                         int32_t   n_literal_ranges,
+                     llama_token * tokens,
+                         int32_t   n_tokens_max,
+                            bool   add_special,
+                            bool   parse_special);
+
     // Token Id -> Piece.
     // Uses the vocabulary in the provided context.
     // Does not write null terminator to the buffer.

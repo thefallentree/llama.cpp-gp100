@@ -2189,7 +2189,9 @@ struct llama_vocab::impl {
 
     void init_tokenizer(enum llama_vocab_type type);
 
-    void tokenizer_st_partition(std::forward_list<fragment_buffer_variant> & buffer, bool parse_special) const;
+    // literal: sorted, non-overlapping byte ranges of the text in which no special token is matched
+    void tokenizer_st_partition(std::forward_list<fragment_buffer_variant> & buffer, bool parse_special,
+                                const std::vector<std::pair<size_t, size_t>> * literal = nullptr) const;
 
     std::string token_to_piece_for_cache(
                   llama_token   token,
@@ -2199,7 +2201,8 @@ struct llama_vocab::impl {
     std::vector<llama_token> tokenize(
             const std::string & raw_text,
                          bool   add_special,
-                         bool   parse_special = false) const;
+                         bool   parse_special = false,
+            const std::vector<std::pair<size_t, size_t>> * literal = nullptr) const;
 
     int32_t tokenize(
                    const char * text,
@@ -3642,7 +3645,19 @@ void llama_vocab::impl::init_tokenizer(enum llama_vocab_type type) {
 
 // #define PRETOKENIZERDEBUG
 
-void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer_variant> & buffer, bool parse_special) const {
+// true if [begin, end) overlaps one of the sorted, non-overlapping literal ranges
+static bool llama_overlaps_literal(const std::vector<std::pair<size_t, size_t>> & literal, size_t begin, size_t end) {
+    // the first range that ends after begin
+    auto it = std::upper_bound(literal.begin(), literal.end(), begin,
+        [](size_t pos, const std::pair<size_t, size_t> & r) { return pos < r.second; });
+    return it != literal.end() && it->first < end;
+}
+
+void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer_variant> & buffer, bool parse_special,
+                                               const std::vector<std::pair<size_t, size_t>> * literal) const {
+    if (literal != nullptr && literal->empty()) {
+        literal = nullptr;
+    }
     // for each special token
     for (const llama_token special_id : cache_special_tokens) {
         const auto & data = vocab.get_token_data(special_id);
@@ -3667,6 +3682,8 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
 
                 auto raw_text_base_offset = fragment.offset;
                 auto raw_text_base_length = fragment.length;
+                // where the search for the next occurrence starts, past any occurrences inside literal ranges
+                auto search_offset = raw_text_base_offset;
 
                 // loop over the text
                 while (true) {
@@ -3674,10 +3691,16 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                     //  passing offset argument only limit the "search area" but match coordinates
                     //  are still relative to the source full raw_text
                     //  string_view begins at pos 0 for the same reason
-                    auto match = std::string_view(raw_text.data(), raw_text_base_offset + raw_text_base_length).find(text, raw_text_base_offset);
+                    auto match = std::string_view(raw_text.data(), raw_text_base_offset + raw_text_base_length).find(text, search_offset);
 
                     // no occurrences found, stop processing this fragment for a given special token
                     if (match == std::string::npos) break;
+
+                    // an occurrence touching a literal range is plain text, it stays in the fragment
+                    if (literal != nullptr && llama_overlaps_literal(*literal, match, match + text.length())) {
+                        search_offset = match + 1;
+                        continue;
+                    }
 
 #ifdef PRETOKENIZERDEBUG
                     LLAMA_LOG_WARN("FF: (%ld %ld %ld) '%s'\n", raw_text->length(), raw_text_base_offset, raw_text_base_length, raw_text->substr(raw_text_base_offset, raw_text_base_length).c_str());
@@ -3692,7 +3715,9 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                         int64_t left_reminder_length = match - raw_text_base_offset;
 
                         if (data.attr & LLAMA_TOKEN_ATTR_LSTRIP) {
-                            while (left_reminder_length > 0 && isspace(raw_text[left_reminder_offset + left_reminder_length - 1])) {
+                            // never strip the whitespace of a literal range
+                            while (left_reminder_length > 0 && isspace(raw_text[left_reminder_offset + left_reminder_length - 1]) &&
+                                   !(literal != nullptr && llama_overlaps_literal(*literal, left_reminder_offset + left_reminder_length - 1, left_reminder_offset + left_reminder_length))) {
                                 left_reminder_length--;
                             }
                         }
@@ -3717,7 +3742,8 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                         int64_t right_reminder_length = raw_text_base_length - ((match - raw_text_base_offset) + text.length());
 
                         if (data.attr & LLAMA_TOKEN_ATTR_RSTRIP) {
-                            while (right_reminder_length > 0 && isspace(raw_text[right_reminder_offset])) {
+                            while (right_reminder_length > 0 && isspace(raw_text[right_reminder_offset]) &&
+                                   !(literal != nullptr && llama_overlaps_literal(*literal, right_reminder_offset, right_reminder_offset + 1))) {
                                 right_reminder_offset++;
                                 right_reminder_length--;
                             }
@@ -3741,6 +3767,7 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                         // repeat for the right side
                         raw_text_base_offset = right_reminder_offset;
                         raw_text_base_length = right_reminder_length;
+                        search_offset        = right_reminder_offset;
 
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("RR: (%ld %ld) '%s'\n", raw_text_base_offset, raw_text_base_length, raw_text->substr(raw_text_base_offset, raw_text_base_length).c_str());
@@ -3809,7 +3836,8 @@ static std::string llama_decode_text(const std::string & text) {
 std::vector<llama_token> llama_vocab::impl::tokenize(
         const std::string & raw_text,
         bool add_special,
-        bool parse_special) const {
+        bool parse_special,
+        const std::vector<std::pair<size_t, size_t>> * literal) const {
     GGML_ASSERT(tokenizer && "Tokenizer not initialized. Call llama_vocab::init_tokenizer() first.");
 
     std::vector<llama_token> output;
@@ -3817,7 +3845,7 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
 
     if (!raw_text.empty()) {
         fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
-        tokenizer_st_partition(fragment_buffer, parse_special);
+        tokenizer_st_partition(fragment_buffer, parse_special, literal);
     }
 
     switch (get_type()) {
@@ -4674,6 +4702,14 @@ std::vector<llama_token> llama_vocab::tokenize(
     return pimpl->tokenize(raw_text, add_special, parse_special);
 }
 
+std::vector<llama_token> llama_vocab::tokenize(
+        const std::string & raw_text,
+        bool add_special,
+        bool parse_special,
+        const std::vector<std::pair<size_t, size_t>> & literal) const {
+    return pimpl->tokenize(raw_text, add_special, parse_special, &literal);
+}
+
 const std::string & llama_vocab::token_to_piece(llama_token token) const {
     return pimpl->token_to_piece(token);
 }
@@ -4829,6 +4865,41 @@ int32_t llama_tokenize(
                         bool   add_special,
                         bool   parse_special) {
     return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+}
+
+int32_t llama_tokenize_with_literals(
+    const struct llama_vocab * vocab,
+                  const char * text,
+                     int32_t   text_len,
+               const int32_t * literal_ranges,
+                     int32_t   n_literal_ranges,
+                 llama_token * tokens,
+                     int32_t   n_tokens_max,
+                        bool   add_special,
+                        bool   parse_special) {
+    std::vector<std::pair<size_t, size_t>> literal;
+    literal.reserve(std::max(n_literal_ranges, 0));
+    for (int32_t i = 0; i < n_literal_ranges; i++) {
+        const int32_t begin = literal_ranges[2*i + 0];
+        const int32_t end   = literal_ranges[2*i + 1];
+        if (begin < 0 || end < begin || end > text_len || (!literal.empty() && (size_t) begin < literal.back().second)) {
+            LLAMA_LOG_ERROR("%s: literal range %d [%d, %d) is out of order or out of the text\n", __func__, i, begin, end);
+            return std::numeric_limits<int32_t>::min();
+        }
+        if (begin < end) {
+            literal.emplace_back(begin, end);
+        }
+    }
+    const auto res = vocab->tokenize(std::string(text, text_len), add_special, parse_special, literal);
+    if (res.size() >= static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        LLAMA_LOG_ERROR("%s: tokenization result size %zu exceeds int32_t limit\n", __func__, res.size());
+        return std::numeric_limits<int32_t>::min();
+    }
+    if (n_tokens_max < (int) res.size()) {
+        return -((int) res.size());
+    }
+    std::copy(res.begin(), res.end(), tokens);
+    return res.size();
 }
 
 int32_t llama_token_to_piece(

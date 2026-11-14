@@ -1165,6 +1165,90 @@ server_tokens process_mtmd_prompt(
     return result;
 }
 
+server_tokens tokenize_chat_prompt(
+        const llama_vocab * vocab,
+        mtmd_context * mctx,
+        const common_chat_prompt & prompt,
+        const std::vector<raw_buffer> & files,
+        bool input_special,
+        const mtmd_helper_init_opt & init_opt,
+        bool is_placeholder) {
+    if (mctx == nullptr) {
+        return server_tokens(common_chat_prompt_tokenize(vocab, prompt, /* add_special */ true, input_special), false);
+    }
+    if (input_special) {
+        return process_mtmd_prompt(mctx, prompt.str(), files, init_opt, is_placeholder);
+    }
+
+    // these will be freed upon going out of scope
+    mtmd::bitmaps bitmaps;
+    std::vector<mtmd_helper::video_ptr> videos;
+    for (auto & file : files) {
+        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+        if (!out.bitmap) {
+            throw std::runtime_error("Failed to load image or audio file");
+        }
+        bitmaps.entries.emplace_back(out.bitmap);
+        if (out.video_ctx) {
+            videos.emplace_back(out.video_ctx);
+        }
+    }
+    auto bitmaps_c_ptr = bitmaps.c_ptr();
+
+    // split the parts on the media markers and put the bitmaps in their place (after PR #32033);
+    // mtmd tokenizes adjacent text parts as one text, with the user input parts as literal ranges
+    struct segment {
+        std::string         text;
+        bool                is_input;
+        const mtmd_bitmap * bitmap;
+    };
+    std::vector<segment> segments;
+    const std::string marker = get_media_marker();
+    size_t i_bm = 0;
+    for (const auto & part : prompt.parts) {
+        size_t start = 0;
+        while (true) {
+            const size_t pos = part.text.find(marker, start);
+            const size_t end = pos == std::string::npos ? part.text.size() : pos;
+            if (end > start) {
+                segments.push_back({part.text.substr(start, end - start), part.is_input, nullptr});
+            }
+            if (pos == std::string::npos) {
+                break;
+            }
+            if (i_bm >= bitmaps_c_ptr.size()) {
+                throw std::runtime_error("number of media markers in the prompt exceeds the number of media files");
+            }
+            segments.push_back({"", false, bitmaps_c_ptr[i_bm++]});
+            start = pos + marker.size();
+        }
+    }
+    if (i_bm != bitmaps_c_ptr.size()) {
+        throw std::runtime_error("number of media markers in the prompt does not match the number of media files");
+    }
+
+    std::vector<mtmd_input_text> texts(segments.size());
+    std::vector<mtmd_input_part> parts(segments.size());
+    std::vector<const mtmd_input_part *> parts_ptr(segments.size());
+    for (size_t i = 0; i < segments.size(); i++) {
+        const auto & seg = segments[i];
+        if (seg.bitmap != nullptr) {
+            parts[i] = {nullptr, seg.bitmap};
+        } else {
+            texts[i] = {seg.text.data(), seg.text.size(), /* add_special */ false, /* parse_special */ !seg.is_input};
+            parts[i] = {&texts[i], nullptr};
+        }
+        parts_ptr[i] = &parts[i];
+    }
+
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    const int32_t res = mtmd_tokenize_from_parts(mctx, chunks.ptr.get(), parts_ptr.data(), parts_ptr.size(), /* add_special */ true);
+    if (res != 0) {
+        throw std::runtime_error("Failed to tokenize prompt");
+    }
+    return server_tokens(chunks, true);
+}
+
 /**
  * tokenize a single input "prompt" object
  * use tokenize_input_prompts() if the input could be an array.

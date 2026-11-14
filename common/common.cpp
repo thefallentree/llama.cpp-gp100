@@ -1895,6 +1895,39 @@ std::vector<llama_token> common_tokenize(
     return result;
 }
 
+std::vector<llama_token> common_tokenize_with_literals(
+    const struct llama_vocab * vocab,
+           const std::string & text,
+    const std::vector<std::pair<size_t, size_t>> & literal,
+                        bool   add_special,
+                        bool   parse_special) {
+    if (literal.empty()) {
+        return common_tokenize(vocab, text, add_special, parse_special);
+    }
+    std::vector<int32_t> ranges;
+    ranges.reserve(2*literal.size());
+    for (const auto & r : literal) {
+        ranges.push_back((int32_t) r.first);
+        ranges.push_back((int32_t) r.second);
+    }
+    const int32_t n_ranges = (int32_t) literal.size();
+    // upper limit for the number of tokens
+    int n_tokens = text.length() + 2 * add_special;
+    std::vector<llama_token> result(n_tokens);
+    n_tokens = llama_tokenize_with_literals(vocab, text.data(), text.length(), ranges.data(), n_ranges, result.data(), result.size(), add_special, parse_special);
+    if (n_tokens == std::numeric_limits<int32_t>::min()) {
+        throw std::runtime_error("Tokenization failed: input text too large or invalid literal ranges");
+    }
+    if (n_tokens < 0) {
+        result.resize(-n_tokens);
+        int check = llama_tokenize_with_literals(vocab, text.data(), text.length(), ranges.data(), n_ranges, result.data(), result.size(), add_special, parse_special);
+        GGML_ASSERT(check == -n_tokens);
+    } else {
+        result.resize(n_tokens);
+    }
+    return result;
+}
+
 std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);

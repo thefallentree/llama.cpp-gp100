@@ -1428,6 +1428,12 @@ struct mtmd_tokenizer {
     mtmd_input_chunks cur;
     uint32_t n_images_added = 0; // 0-based index assigned to the next image chunk
 
+    // mtmd_tokenize_from_parts(): adjacent text parts are tokenized as one text, with the parts that do not
+    // parse special tokens as literal ranges (no special token at all is matched there, not even a user-defined one)
+    bool literal_parts = false;
+    std::string pending_text;
+    std::vector<std::pair<size_t, size_t>> pending_literal;
+
     ~mtmd_tokenizer() {
         // note: mtmd::bitmap is already RAII
         for (auto & str : text_from_lazy) {
@@ -1479,6 +1485,7 @@ struct mtmd_tokenizer {
         this->add_special = add_special;
         parse_special = true; // only used for text returned by lazy bitmaps
         vocab         = ctx->vocab;
+        literal_parts = true;
 
         for (size_t i = 0; i < n_parts; i++) {
             const mtmd_input_part * p = input_parts[i];
@@ -1572,14 +1579,21 @@ struct mtmd_tokenizer {
                     return 1;
                 }
                 auto bmps = merged_bitmaps[i_bm++];
+                flush_text();
                 int32_t res = add_media(bmps);
                 if (res != 0) {
                     return res;
                 }
+            } else if (literal_parts) {
+                if (!p.parse_special && !p.text.empty()) {
+                    pending_literal.emplace_back(pending_text.size(), pending_text.size() + p.text.size());
+                }
+                pending_text += p.text;
             } else {
                 add_text(p.text, p.parse_special);
             }
         }
+        flush_text();
 
         if (vocab != nullptr) {
             if (add_special && llama_vocab_get_add_bos(vocab)) {
@@ -1623,6 +1637,37 @@ struct mtmd_tokenizer {
         }
         LOG_DBG("%s: %s\n", __func__, txt.c_str());
         auto tokens = mtmd_tokenize_text_internal(vocab, txt, /* add_special */ false, parse_special);
+        add_text(tokens);
+    }
+
+    // tokenize the pending text parts as one text, so the tokens across the part borders are those of the whole text
+    void flush_text() {
+        if (pending_text.empty()) {
+            return;
+        }
+        if (vocab == nullptr) {
+            throw std::runtime_error("llama_vocab is not provided");
+        }
+        std::vector<int32_t> ranges;
+        for (const auto & r : pending_literal) {
+            ranges.push_back((int32_t) r.first);
+            ranges.push_back((int32_t) r.second);
+        }
+        std::vector<llama_token> tokens(pending_text.size() + 2);
+        int32_t n = llama_tokenize_with_literals(vocab, pending_text.data(), pending_text.size(), ranges.data(), pending_literal.size(),
+                                                 tokens.data(), tokens.size(), /* add_special */ false, /* parse_special */ true);
+        if (n == std::numeric_limits<int32_t>::min()) {
+            throw std::runtime_error("Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
+        }
+        if (n < 0) {
+            tokens.resize(-n);
+            n = llama_tokenize_with_literals(vocab, pending_text.data(), pending_text.size(), ranges.data(), pending_literal.size(),
+                                             tokens.data(), tokens.size(), false, true);
+            GGML_ASSERT(n == (int32_t) tokens.size());
+        }
+        tokens.resize(n);
+        pending_text.clear();
+        pending_literal.clear();
         add_text(tokens);
     }
 

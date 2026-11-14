@@ -787,6 +787,27 @@ llama_tokens server_tokens::get_text_tokens() const {
     return res;
 }
 
+llama_tokens server_tokens::get_tokens_by_pos() const {
+    if (map_idx_to_media.empty()) {
+        return get_text_tokens();
+    }
+    llama_tokens res;
+    res.reserve(tokens.size());
+    size_t idx = 0;
+    while (idx < tokens.size()) {
+        const auto it = map_idx_to_media.find(idx);
+        if (it != map_idx_to_media.end()) {
+            const llama_pos n_pos = mtmd_input_chunk_get_n_pos(it->second.get());
+            res.insert(res.end(), (size_t) n_pos, LLAMA_TOKEN_NULL);
+            idx += mtmd_input_chunk_get_n_tokens(it->second.get());
+        } else {
+            res.push_back(tokens[idx]);
+            idx++;
+        }
+    }
+    return res;
+}
+
 llama_pos server_tokens::media_span_end(llama_pos p) const {
     // the first position of a media chunk is its start index minus what the earlier chunks saved (n_tokens - n_pos each)
     llama_pos shift = 0;

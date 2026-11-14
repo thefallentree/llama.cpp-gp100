@@ -5440,7 +5440,9 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    // indexed by position: the MTP drafter matches its deferred rows against prompt[pos] (VS1: an image
+                    // takes fewer positions than tokens; the text-only list made it drop the last prompt rows)
+                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_tokens_by_pos());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;

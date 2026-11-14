@@ -241,6 +241,10 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    // the tokens indexed by position (pos_next() entries): a media chunk's positions hold LLAMA_TOKEN_NULL. For a
+    // text-only prompt this is get_text_tokens(). The MTP drafter checks its deferred rows against prompt[pos].
+    llama_tokens get_tokens_by_pos() const;
+
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 

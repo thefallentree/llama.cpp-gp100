@@ -375,6 +375,78 @@ static void test_utf8_boundary_detection() {
     GGML_ASSERT(common_utf8_is_complete(std::string("hello\xC3\xA9", 7)));    // ASCII + complete 2-byte
 }
 
+// speculative verification across the budget: the target samples each drafted position through the budget sampler
+// and accepts until the first mismatch (common_sampler_sample_and_accept_n); a rollback restores a clone and replays
+// the accepted tokens. Drafted tokens past the budget must be refused at the first forced position, and the replay
+// must leave the sampler where the verification left it.
+static void test_reasoning_budget_draft_verify() {
+    const llama_tokens start  = {100};
+    const llama_tokens end    = {10, 101};          // "\n</think>"
+    const llama_tokens forced = {102, 10, 101};     // message + "\n</think>"
+    const llama_token  max_token = 102;
+
+    // the target's own argmax at each position: the draft (it agrees with the drafter), unless the budget forces
+    auto verify = [&](llama_sampler * s, const llama_tokens & draft) {
+        llama_tokens accepted;
+        for (size_t i = 0; i <= draft.size(); i++) {
+            std::vector<llama_token_data> cur;
+            for (llama_token t = 0; t <= max_token; t++) {
+                const bool pref = i < draft.size() && t == draft[i];
+                cur.push_back({ t, pref ? 100.0f : logf((float) (t + 1)), 0.0f });
+            }
+            llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+            llama_sampler_apply(s, &cur_p);
+            llama_token best = -1;
+            float vmax = -INFINITY;
+            for (const auto & c : cur) {
+                if (c.logit > vmax) { vmax = c.logit; best = c.id; }
+            }
+            llama_sampler_accept(s, best);
+            accepted.push_back(best);
+            if (i == draft.size() || best != draft[i]) {
+                break;
+            }
+        }
+        return accepted;
+    };
+
+    // budget 3, counting from the generation prompt's start tag; 2 thought tokens are already accepted
+    auto * s = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 3, REASONING_BUDGET_IDLE);
+    for (llama_token t : llama_tokens{100, 50, 51}) {
+        llama_sampler_accept(s, t);
+    }
+    auto * save = llama_sampler_clone(s);
+
+    // the drafter keeps thinking past the budget: 52 is the last allowed token, 53 and 54 are past it
+    const llama_tokens draft = {52, 53, 54};
+    const llama_tokens acc = verify(s, draft);
+    GGML_ASSERT(acc.size() == 2 && acc[0] == 52 && acc[1] == forced[0] && "drafted tokens past the budget must be refused");
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING);
+    GGML_ASSERT(get_forced_token(s, max_token) == forced[1]);
+
+    // rollback (restore the clone, replay what was accepted): the same state and the same next forced token
+    llama_sampler_free(s);
+    s = llama_sampler_clone(save);
+    for (llama_token t : acc) {
+        llama_sampler_accept(s, t);
+    }
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING);
+    GGML_ASSERT(get_forced_token(s, max_token) == forced[1]);
+
+    // the next round's drafts disagree with the rest of the close: only the forced tokens are accepted, then the answer
+    const llama_tokens acc2 = verify(s, {60, 61});
+    GGML_ASSERT(acc2.size() == 1 && acc2[0] == forced[1]);
+    const llama_tokens acc3 = verify(s, {60, 61});
+    GGML_ASSERT(acc3.size() == 1 && acc3[0] == forced[2]);
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_DONE);
+    const llama_tokens acc4 = verify(s, {60, 61});
+    GGML_ASSERT(acc4.size() == 3 && acc4[0] == 60 && acc4[1] == 61 && "the answer after the close is drafted freely");
+
+    llama_sampler_free(save);
+    llama_sampler_free(s);
+    fprintf(stderr, "  Test 'draft verify across the budget' passed\n");
+}
+
 int main(void) {
     // Reasoning budget sampler tests
     printf("Testing reasoning budget sampler... ");
@@ -507,12 +579,28 @@ int main(void) {
             SIZE_MAX, SIZE_MAX); // no forcing expected (natural end)
     }
 
+    // Test 9: a tool call opened inside the think block (Qwen3.5: "<tool_call>" is an end sequence) ends the
+    // budget's count, so the forced close never lands inside the call, however long the call runs
+    // Flow: i=0 accept(100)->COUNTING rem=3; i=1,2 rem=2,1; i=3 accept(200)->natural end, DONE; i=4..9 the call
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{10, 101}, {101}, {200}};
+        const std::vector<llama_token> forced = {102, 10, 101};
+        const std::vector<llama_token> sequence = {100, 50, 51, 200, 60, 61, 62, 63, 64, 65};
+
+        test_reasoning_budget("tool call inside the think block", sequence, start, end, forced,
+            3,      // the call opens on the budget's last token
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX); // no forcing: the call is not cut
+    }
+
+    test_reasoning_budget_draft_verify();
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
 
-    printf("OK (12 tests passed)\n");
+    printf("OK (14 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

@@ -77,6 +77,16 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(-1, std::numeric_limits<int64_t>::max())
         ->set_desc("Set a time limit in milliseconds for the prediction phase. The timeout triggers if generation exceeds this time (measured since the first token) and a newline has been generated. Useful for FIM applications"));
 
+    add((new field_num<double>("deadline_s", params.deadline_s))
+        ->set_handler([](field_eval_context & ctx, const json & data) {
+            const json & v = data.at("deadline_s");
+            if (!v.is_number() || !(v.get<double>() > 0.0) || v.get<double>() > 1e6) {
+                throw std::invalid_argument("must be a number of seconds, more than 0 and at most 1000000");
+            }
+            ctx.params.deadline_s = v.get<double>();
+        })
+        ->set_desc("End the reply this many seconds after the request arrived: generation stops, the tokens produced so far and the usage are returned with finish_reason \"deadline\" (default: the server's --deadline-s, 0 = none)"));
+
     add((new field_json("response_fields"))
         ->set_desc("A list of response fields to return. Missing fields are omitted without error. Fields with a slash are unnested (e.g. generation_settings/n_predict moves n_predict to the root)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
@@ -515,6 +525,14 @@ task_params eval_llama_cmpl_schema(
     // eval all fields in the schema
     for (const auto & f : schema) {
         f->eval(ctx, data);
+    }
+
+    // the deadline counts from the request's arrival, the server's default applies without the field
+    if (params.deadline_s <= 0.0 && params_base.deadline_s > 0.0) {
+        params.deadline_s = params_base.deadline_s;
+    }
+    if (params.deadline_s > 0.0) {
+        params.t_deadline_us = ggml_time_us() + (int64_t) (params.deadline_s * 1e6);
     }
 
     // debugging

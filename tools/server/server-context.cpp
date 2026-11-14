@@ -592,6 +592,10 @@ struct server_slot {
         return n_predict_max == -1 ? -1 : n_predict_max - (int32_t) stats.n_gen;
     }
 
+    bool deadline_passed() const {
+        return task && task->params.t_deadline_us > 0 && ggml_time_us() >= task->params.t_deadline_us;
+    }
+
     bool has_budget() const {
         return n_predict_max == -1 || n_remaining() > 0;
     }
@@ -2422,6 +2426,14 @@ private:
             SLT_DBG(slot, "%s", "stopped by EOS\n");
         }
 
+        // a reply that already ended (EOS, a stop string, a limit) keeps its own reason
+        if (slot.has_next_token && slot.deadline_passed()) {
+            slot.stop           = STOP_TYPE_DEADLINE;
+            slot.has_next_token = false;
+
+            SLT_INF(slot, "stopped by deadline_s = %.3f, n_gen = %d\n", slot.task->params.deadline_s, (int) slot.stats.n_gen);
+        }
+
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
@@ -3843,6 +3855,21 @@ private:
     }
 
     void update_slots() {
+        // a deadline that passes before the first token ends the reply during its prompt, as a cancel would;
+        // a generating slot is stopped by process_token(); a parent or a child waits for the others' prompt
+        for (auto & slot : slots) {
+            if ((slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) &&
+                    slot.task && slot.task->need_sampling() && !slot.task->is_parent() && !slot.task->is_child() &&
+                    slot.deadline_passed()) {
+                SLT_INF(slot, "deadline_s = %.3f passed during the prompt (%d of %d tokens)\n",
+                        slot.task->params.deadline_s, slot.prompt.n_tokens(), slot.task->n_tokens());
+                slot.stop           = STOP_TYPE_DEADLINE;
+                slot.has_next_token = false;
+                send_final_response(slot);
+                slot.release();
+            }
+        }
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();

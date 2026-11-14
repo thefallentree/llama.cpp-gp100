@@ -1671,6 +1671,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_N_PREDICT_MAX"));
     add_opt(common_arg(
+        {"--deadline-s"}, "N",
+        string_format("default deadline of a request in seconds (a request's \"deadline_s\" overrides it): the reply ends "
+                      "with the tokens produced so far and finish_reason \"deadline\" (default: %g, 0 = none)", params.deadline_s),
+        [](common_params & params, const std::string & value) {
+            const double v = std::stod(value);
+            if (!(v >= 0.0) || v > 1e6) {
+                throw std::invalid_argument("--deadline-s must be between 0 and 1000000");
+            }
+            params.deadline_s = v;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DEADLINE_S"));
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

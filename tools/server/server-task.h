@@ -56,6 +56,7 @@ enum stop_type {
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
     STOP_TYPE_LIMIT,
+    STOP_TYPE_DEADLINE, // the request's deadline_s passed: finish_reason "deadline"
 };
 
 enum server_control_action {
@@ -99,6 +100,9 @@ struct task_params {
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
+
+    double  deadline_s    = 0;  // if positive, end the reply this many seconds after the request with finish_reason "deadline"
+    int64_t t_deadline_us = -1; // the deadline in ggml_time_us(), -1 = none
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
@@ -459,7 +463,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs, false, stop == STOP_TYPE_LIMIT || stop == STOP_TYPE_WORD);
+        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs, false, stop == STOP_TYPE_LIMIT || stop == STOP_TYPE_WORD || stop == STOP_TYPE_DEADLINE);
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;

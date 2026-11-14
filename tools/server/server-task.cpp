@@ -164,9 +164,10 @@ common_chat_msg task_result_state::update_chat_msg(
         const common_chat_input & added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
-        bool filter_tool_calls) {
+        bool filter_tool_calls,
+        bool truncated) {
     auto msg_prv_copy = chat_msg;
-    auto new_msg = is_partial ? chat_session.feed(added) : chat_session.finish(added);
+    auto new_msg = is_partial ? chat_session.feed(added) : chat_session.finish(added, truncated);
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;

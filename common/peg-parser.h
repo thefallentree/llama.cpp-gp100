@@ -166,6 +166,8 @@ enum common_peg_parse_flags {
     COMMON_PEG_PARSE_FLAG_LENIENT  = 1 << 0,
     COMMON_PEG_PARSE_FLAG_DEBUG    = 1 << 1,
     COMMON_PEG_PARSE_FLAG_COMPLETE = 1 << 2,
+    // the complete input was cut (a token limit, a stop string): a delimiter prefix at its end is a cut delimiter, not text
+    COMMON_PEG_PARSE_FLAG_TRUNCATED = 1 << 3,
 };
 
 inline common_peg_parse_flags operator|(common_peg_parse_flags a, common_peg_parse_flags b) {
@@ -211,6 +213,7 @@ struct common_peg_parse_context {
     bool is_lenient() const { return flags & COMMON_PEG_PARSE_FLAG_LENIENT; }
     bool is_debug() const { return flags & COMMON_PEG_PARSE_FLAG_DEBUG; }
     bool is_complete() const { return flags & COMMON_PEG_PARSE_FLAG_COMPLETE; }
+    bool is_truncated() const { return flags & COMMON_PEG_PARSE_FLAG_TRUNCATED; }
 };
 
 class common_peg_arena;

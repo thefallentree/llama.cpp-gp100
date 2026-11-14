@@ -1592,6 +1592,10 @@ std::string server_task_result_metrics::to_metrics() {
             "Number of prompt tokens reused from the cache",
             (double) metrics.n_prompt_cached
         }, {
+            "prompt_tokens_reusable_total",
+            "Number of prompt tokens shared with a cached state (cached / reusable = the hit share)",
+            (double) metrics.n_prompt_reusable
+        }, {
             "prompt_seconds_total",
             "Total time spent processing prompts",
             metrics.prompt.time / 1.e6

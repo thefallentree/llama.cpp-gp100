@@ -4525,6 +4525,8 @@ private:
                                 return;
                             }
 
+                            slot.stats.n_prompt_reusable = 0;
+
                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
@@ -4613,6 +4615,7 @@ private:
 
                             // number of cached tokens shared with the new prompt, before any checkpoint is restored
                             const int n_prefix = n_past;
+                            slot.stats.n_prompt_reusable = n_prefix;
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
@@ -4777,8 +4780,13 @@ private:
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
+                        // at least one token is evaluated, so a fully matching prompt can reuse all but its last token
+                        slot.stats.n_prompt_reusable  = std::max<uint64_t>(n_past,
+                                std::min<uint64_t>(slot.stats.n_prompt_reusable, std::max(0, slot.task->n_tokens() - 1)));
 
-                        metrics.add_prompt_cached(n_past);
+                        metrics.add_prompt_cached(n_past, slot.stats.n_prompt_reusable);
+                        SLT_INF(slot, "prompt cache hit: n_cached = %d of n_reusable = %d (n_prompt = %d)\n",
+                                n_past, (int) slot.stats.n_prompt_reusable, slot.task->n_tokens());
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -5104,8 +5112,10 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, we are near the end of the prompt or --checkpoint-every tokens past the last one
+                        const int64_t n_last_ckpt = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens;
+                        const bool is_every = params_base.checkpoint_every > 0 && n_tokens_start >= n_last_ckpt + params_base.checkpoint_every;
+                        if (!is_user_start && !near_prompt_end && !is_every) {
                             do_checkpoint = false;
                         }
                     }

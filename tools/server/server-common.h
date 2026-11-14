@@ -434,6 +434,7 @@ json format_response_rerank(
 // shared between server_slot and server_task_result_*
 struct server_slot_stats {
     uint64_t n_prompt_cached    = 0;
+    uint64_t n_prompt_reusable  = 0; // prompt tokens shared with the cached state (slot or cache entry), before any checkpoint restore
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
 
@@ -551,6 +552,9 @@ struct server_metrics {
 
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
+    // prompt tokens that were in a cached state (the slot's or a cache entry's common prefix with the prompt); cached /
+    // reusable is the hit share of what could have been reused (the rest was lost to the distance to a checkpoint)
+    uint64_t n_prompt_reusable = 0;
 
     uint64_t n_tokens_max = 0;
 
@@ -576,8 +580,9 @@ struct server_metrics {
         prompt_bucket.add(n_tokens, n_tokens, t_us);
     }
 
-    void add_prompt_cached(uint64_t n_tokens) {
-        n_prompt_cached += n_tokens;
+    void add_prompt_cached(uint64_t n_tokens, uint64_t n_reusable) {
+        n_prompt_cached   += n_tokens;
+        n_prompt_reusable += n_reusable;
     }
 };
 

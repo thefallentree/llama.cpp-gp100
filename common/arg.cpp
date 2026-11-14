@@ -1761,6 +1761,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-every"}, "N",
+        string_format("also create a context checkpoint every N tokens of a long prompt, so that a prompt diverging in its middle\n"
+            "re-processes at most about N tokens (default: %d, 0 = only at user messages and near the end of the prompt)", params.checkpoint_every),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-every must be non-negative");
+            }
+            params.checkpoint_every = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_EVERY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--checkpoint-spread"},
         "when the checkpoint list is full, evict the checkpoint whose removal leaves the smallest gap for its distance from the newest\n"
         "(kept points thin out geometrically back from the end, so a client rewriting its history N tokens back re-reads about N tokens)\n"

@@ -87,6 +87,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         })
         ->set_desc("End the reply this many seconds after the request arrived: generation stops, the tokens produced so far and the usage are returned with finish_reason \"deadline\" (default: the server's --deadline-s, 0 = none)"));
 
+    add((new field_bool("loop_guard", params.loop_guard))
+        ->set_desc("Cut a degenerate repetition: in the thinking the think block closes and the answer follows, in the answer the reply ends with finish_reason \"length\"; reported in usage.loop_guard (default: the server's --loop-guard)"));
+
     add((new field_json("response_fields"))
         ->set_desc("A list of response fields to return. Missing fields are omitted without error. Fields with a slash are unnested (e.g. generation_settings/n_predict moves n_predict to the root)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
@@ -514,6 +517,7 @@ task_params eval_llama_cmpl_schema(
     params.verbose       = params_base.verbosity > 9;
 
     params.reasoning_format = params_base.reasoning_format;
+    params.loop_guard       = params_base.loop_guard;
 
     // create context and schema
     field_eval_context ctx(params);

@@ -293,6 +293,9 @@ set_tests_properties(test-llama-context PROPERTIES
 
 # the server's host prompt cache: delta saves with a lagging drafter keep every cell, a restore refuses a hole (CL1)
 if (LLAMA_BUILD_SERVER)
+    llama_build(test-loop-guard.cpp)
+    target_include_directories(test-loop-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_test(test-loop-guard LABEL "main behavior")
     llama_build(test-server-prompt-cache.cpp)
     target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-prompt-cache PRIVATE server-context)

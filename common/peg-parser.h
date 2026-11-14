@@ -190,11 +190,52 @@ struct common_peg_recursion_error : std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+// the texts of a vocab's special tokens (control and user-defined), longest first
+struct common_peg_special_tokens {
+    std::vector<std::pair<std::string, llama_token>> tokens;
+
+    common_peg_special_tokens() = default;
+    explicit common_peg_special_tokens(const llama_vocab * vocab);
+};
+
 struct common_peg_parse_context {
     std::string input;               // [h,   e,  l,  l,  o,  _,  w,  o,  r,  l,  d]
     std::vector<llama_token> tokens; // [id, -1, -1, -1, -1, id, -1, -1, -1, -1, -1]
     common_peg_parse_flags flags;
     common_peg_ast_arena ast;
+
+    // with the tokens: the text of a special token in a literal or delimiter matches only the special token itself,
+    // not the same text generated as ordinary tokens. Text before the first token has no tokens and always matches
+    std::shared_ptr<const common_peg_special_tokens> special;
+    size_t first_token = 0;
+
+    void set_special_tokens(std::shared_ptr<const common_peg_special_tokens> sp) {
+        special     = std::move(sp);
+        first_token = 0;
+        while (first_token < tokens.size() && tokens[first_token] == LLAMA_TOKEN_NULL) {
+            first_token++;
+        }
+    }
+
+    // false if a special token's text in lit, matched at pos, is ordinary text in the input
+    bool special_text_ok(size_t pos, std::string_view lit) const {
+        if (!special || tokens.empty() || first_token >= tokens.size()) {
+            return true;
+        }
+        for (const auto & [text, id] : special->tokens) {
+            if (text.size() > lit.size()) {
+                continue;
+            }
+            for (size_t k = lit.find(text); k != std::string_view::npos; k = lit.find(text, k + 1)) {
+                const size_t q = pos + k;
+                if (q >= tokens.size() || tokens[q] == id || (tokens[q] == LLAMA_TOKEN_NULL && q < first_token)) {
+                    continue; // not generated yet, the special token, or text that came without tokens
+                }
+                return false;
+            }
+        }
+        return true;
+    }
 
     int parse_depth;
     std::vector<int> rule_depth; // index: rule child id

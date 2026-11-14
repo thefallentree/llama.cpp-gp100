@@ -13,6 +13,14 @@
 //   must not hang (the pre-HC3 alloc() re-entered itself holding the pool mutex: a self-deadlock of the main thread);
 //   a save the pool cannot hold (past its capacity cap, nothing to evict) is skipped and the next one works.
 //   A watchdog fails a scenario that does not return in 60 s.
+// - TF1 (audit for "an entry evicted during its own pass", 2026-11-14):
+//   K: a delta save over the size limit is skipped and must leave the slot's origin entry whole (it kept only the
+//      segments before the common prefix under the entry's full token list: a hole the next restore dropped the
+//      entry for, after wiping the slot's cells)
+//   L: three slots on one context pair under a tiny size limit and a capped pool: every save evicts or trims, delta
+//      saves, divergent tails, idle saves, clears; after every step no entry a slot holds was freed or handed to
+//      another slot, every entry tiles its prompt, every pool block belongs to exactly one live buffer
+//      (build with -DLLAMA_SANITIZE_ADDRESS=ON to catch a use-after-free too)
 //
 // CPU only, a tiny generated model (test-generate-models): test-server-prompt-cache -m <model.gguf>
 
@@ -50,7 +58,7 @@ static llama_token conv_token(int32_t n_vocab, llama_pos pos) {
     return (llama_token) ((11*(uint32_t) pos + 3) % (uint32_t) n_vocab);
 }
 
-static bool decode_range(llama_context * ctx, const llama_tokens & conv, llama_pos p0, llama_pos p1) {
+static bool decode_range(llama_context * ctx, const llama_tokens & conv, llama_pos p0, llama_pos p1, llama_seq_id seq = SEQ) {
     if (p0 >= p1) {
         return true;
     }
@@ -59,7 +67,7 @@ static bool decode_range(llama_context * ctx, const llama_tokens & conv, llama_p
         batch.token   [batch.n_tokens] = conv[p];
         batch.pos     [batch.n_tokens] = p;
         batch.n_seq_id[batch.n_tokens] = 1;
-        batch.seq_id  [batch.n_tokens][0] = SEQ;
+        batch.seq_id  [batch.n_tokens][0] = seq;
         batch.logits  [batch.n_tokens] = p + 1 == p1;
         batch.n_tokens++;
     }
@@ -500,6 +508,393 @@ static bool scenario_queue_watchdog(server_prompt_cache &, slot &, int32_t) {
     return true;
 }
 
+// the cells of seq from position keep on go; a recurrent (hybrid) memory cannot cut its state there: the sequence is
+// decoded again up to keep instead (what the server gets from a context checkpoint)
+static bool truncate_seq(llama_context * ctx, llama_seq_id seq, const llama_tokens & conv, llama_pos keep) {
+    if (llama_memory_seq_pos_max(llama_get_memory(ctx), seq) < keep || llama_memory_seq_rm(llama_get_memory(ctx), seq, keep, -1)) {
+        return true;
+    }
+    llama_memory_seq_rm(llama_get_memory(ctx), seq, -1, -1);
+    return decode_range(ctx, conv, 0, keep, seq);
+}
+
+// scenario K (TF1): the slot holds entry E (3 segments, 104 tokens) and its prompt now ends in another tail (a re-rendered
+// answer: 90 tokens shared, 200 in all). The delta save is over the size limit and skipped: E must stay whole and restore.
+// Pre-fix: the segments past the common prefix were already freed when the limit check skipped the save, E kept 2 of its
+// 3 segments under its 104 tokens and the restore failed (CL1 guard) and dropped it.
+static bool scenario_over_limit_keeps_origin(server_prompt_cache & cache, slot & s, int32_t n_vocab) {
+    cache.states.clear();
+    const size_t limit0 = cache.limit_size;
+    const llama_tokens conv = make_conv(n_vocab, 14, 8, 200);
+    const int N[] = {40, 72, 104};
+    for (int i = 0; i < 3; ++i) {
+        CHECK(turn(cache, s, conv, N[i]));
+        if (i < 2) {
+            s.clear();
+        }
+    }
+    auto * e = s.origin;
+    CHECK(e != nullptr && e->data.segs.size() == 3);
+    const size_t size_e = e->size();
+
+    // the slot's tail changes after 90 tokens
+    llama_tokens conv2(conv.begin(), conv.begin() + 90);
+    for (int p = 90; p < 200; ++p) {
+        conv2.push_back((llama_token) ((13*(uint32_t) p + 17) % (uint32_t) n_vocab));
+    }
+    CHECK(truncate_seq(s.tgt, SEQ, conv, 90));
+    CHECK(truncate_seq(s.dft, SEQ, conv, 90));
+    CHECK(s.extend(conv2, 200));
+
+    cache.limit_size = size_e; // the kept part + the new cells do not fit
+    auto * r = cache.save(s.prompt, s.tgt, s.dft, nullptr, SEQ, &s.origin, true);
+    fprintf(stderr, "  over-limit delta save: %s; entry: %zu segments, %d tokens, owner %d\n", r ? "saved" : "skipped",
+            e->data.segs.size(), e->prompt.n_tokens(), e->owner);
+    CHECK(r == nullptr);
+    CHECK(s.origin == nullptr);
+    CHECK(cache.states.size() == 1 && &cache.states.front() == e);
+    CHECK(e->owner == -1);
+    CHECK(e->data.segs.size() == 3);
+    CHECK(e->size() == size_e);
+    cache.limit_size = limit0;
+    s.clear();
+
+    // the conversation comes back: E restores in full
+    server_tokens tokens_new(llama_tokens(conv.begin(), conv.begin() + 104), false);
+    const bool loaded = cache.load(s.prompt, tokens_new, s.tgt, s.dft, nullptr, SEQ, nullptr, &s.origin);
+    const llama_pos gap = llama_memory_seq_pos_gap(s.tgt, SEQ, 0);
+    fprintf(stderr, "  restore after the skipped save: load %d, %d tokens, cells contiguous up to %d\n", (int) loaded, s.prompt.n_tokens(), gap);
+    CHECK(loaded);
+    CHECK(s.prompt.n_tokens() == 104);
+    CHECK(gap >= 104);
+    s.clear();
+    return true;
+}
+
+// scenario L (TF1): the stress. Three slots (seq = slot id, as in the server) share a context pair
+static llama_context * g_tgt3 = nullptr;
+static llama_context * g_dft3 = nullptr;
+
+struct mslot {
+    llama_seq_id seq = 0;
+    server_prompt prompt;
+    server_prompt_cache_state * origin = nullptr;
+    const llama_tokens * conv = nullptr; // the conversation the slot holds (for the step's bookkeeping only)
+
+    void clear() {
+        conv = nullptr;
+        llama_memory_seq_rm(llama_get_memory(g_tgt3), seq, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(g_dft3), seq, -1, -1);
+        prompt.clear();
+        if (origin != nullptr) {
+            origin->owner = -1;
+            origin = nullptr;
+        }
+    }
+};
+
+// a fourth sequence restores every entry on the side: a segment's p1 is open-ended, so only a restore shows its cells
+static const llama_seq_id SEQ_PROBE = 3;
+
+static bool probe_entry(const server_prompt_cache_state & st, int step) {
+    auto * mem = llama_get_memory(g_tgt3);
+    llama_memory_seq_rm(mem, SEQ_PROBE, -1, -1);
+    const auto & segs = st.data.segs;
+    const llama_pos n_e = st.prompt.tokens.pos_next();
+    for (size_t i = 0; i < segs.size(); ++i) {
+        if (!segs[i].main.empty()) {
+            CHECK(llama_state_seq_set_data_range(g_tgt3, segs[i].main.data(), segs[i].main.size(), SEQ_PROBE) == segs[i].main.size());
+        }
+        const llama_pos next_p0 = i + 1 < segs.size() ? segs[i + 1].p0 : n_e;
+        if (segs[i].p1 > next_p0) {
+            llama_memory_seq_rm(mem, SEQ_PROBE, next_p0, -1);
+        }
+    }
+    const llama_pos gap = llama_memory_seq_pos_gap(g_tgt3, SEQ_PROBE, 0);
+    llama_memory_seq_rm(mem, SEQ_PROBE, -1, -1);
+    if (gap >= 0 && gap < n_e) {
+        fprintf(stderr, "FAIL step %d: entry of %d tokens (owner %d, %zu segments) restores only up to pos %d\n", step, st.prompt.n_tokens(),
+                st.owner, segs.size(), gap);
+        return false;
+    }
+    return true;
+}
+
+static uint32_t g_rng = 12345;
+static uint32_t rnd(uint32_t n) {
+    g_rng = g_rng*1664525u + 1013904223u;
+    return (g_rng >> 8) % n;
+}
+
+// the invariants of the cache against the slots: what a slot holds is alive, its own, and whole
+static bool check_invariants(server_prompt_cache & cache, std::vector<mslot> & slots, int step) {
+    auto in_cache = [&](const server_prompt_cache_state * p) {
+        for (const auto & st : cache.states) {
+            if (&st == p) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (auto & ms : slots) {
+        if (ms.origin != nullptr) {
+            if (!in_cache(ms.origin)) {
+                fprintf(stderr, "FAIL step %d: slot %d's origin %p was freed\n", step, ms.seq, (void *) ms.origin);
+                return false;
+            }
+            CHECK(ms.origin->owner == ms.seq);
+        }
+    }
+    struct blk { int32_t slab; size_t off, n; };
+    std::vector<blk> blks;
+    size_t n_used = 0;
+    auto add_buf = [&](const server_state_buf & b) -> bool {
+        if (b.p == nullptr) {
+            CHECK(b.cap == 0 || b.pool == nullptr);
+            return true;
+        }
+        CHECK(b.pool == &cache.pool);
+        CHECK(b.slab >= 0 && (size_t) b.slab < cache.pool.slabs.size());
+        const auto & sl = cache.pool.slabs[b.slab];
+        CHECK(b.p >= sl.base && b.p + server_state_pool::round(b.cap) <= sl.base + sl.cap);
+        blks.push_back({b.slab, (size_t) (b.p - sl.base), server_state_pool::round(b.cap)});
+        n_used += server_state_pool::round(b.cap);
+        return true;
+    };
+    for (const auto & st : cache.states) {
+        // an owned entry belongs to exactly the slot whose origin it is
+        if (st.owner >= 0) {
+            CHECK((size_t) st.owner < slots.size());
+            CHECK(slots[st.owner].origin == &st);
+        }
+        // the segments tile [0, pos_next) for the target, the drafter parts leave no hole
+        const auto & segs = st.data.segs;
+        CHECK(!segs.empty());
+        CHECK(segs[0].p0 == 0 && segs[0].d0 == 0);
+        for (size_t i = 0; i + 1 < segs.size(); ++i) {
+            if (!(segs[i].p1 >= segs[i + 1].p0 && segs[i].d1 >= segs[i + 1].d0 && segs[i + 1].d0 <= segs[i + 1].p0)) {
+                fprintf(stderr, "FAIL step %d: entry of %d tokens: segment %zu [%d,%d) d[%d,%d) then [%d,%d) d[%d,%d)\n", step,
+                        st.prompt.n_tokens(), i, segs[i].p0, segs[i].p1, segs[i].d0, segs[i].d1, segs[i + 1].p0, segs[i + 1].p1, segs[i + 1].d0, segs[i + 1].d1);
+                return false;
+            }
+        }
+        if (segs.back().p1 < st.prompt.tokens.pos_next()) {
+            fprintf(stderr, "FAIL step %d: entry of %d tokens: segments end at %d (%zu segments)\n", step, st.prompt.n_tokens(), segs.back().p1, segs.size());
+            return false;
+        }
+        for (const auto & seg : segs) {
+            CHECK(add_buf(seg.main));
+            CHECK(add_buf(seg.drft));
+        }
+        CHECK(add_buf(st.data.recr));
+    }
+    // every block in use is one live buffer's, no two overlap
+    if (n_used != cache.pool.n_used) {
+        fprintf(stderr, "FAIL step %d: the entries hold %zu bytes of the pool, the pool counts %zu in use\n", step, n_used, cache.pool.n_used);
+        return false;
+    }
+    std::sort(blks.begin(), blks.end(), [](const blk & a, const blk & b) { return a.slab != b.slab ? a.slab < b.slab : a.off < b.off; });
+    for (size_t i = 0; i + 1 < blks.size(); ++i) {
+        if (blks[i].slab == blks[i + 1].slab) {
+            CHECK(blks[i].off + blks[i].n <= blks[i + 1].off);
+        }
+    }
+    // and no free block overlaps a used one
+    for (size_t si = 0; si < cache.pool.slabs.size(); ++si) {
+        for (const auto & [off, n] : cache.pool.slabs[si].free_blocks) {
+            for (const auto & b : blks) {
+                if (b.slab == (int32_t) si) {
+                    CHECK(off + n <= b.off || b.off + b.n <= off);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool scenario_stress(server_prompt_cache &, slot &, int32_t n_vocab) {
+    const int N_SLOTS = 3, N_CONV = 7, N_MAX = 230, STEPS = 400;
+    server_prompt_cache cache(/*limit_size_mib=*/ 64, /*limit_tokens=*/ 0, nullptr);
+    cache.pool.slab_size = 16*1024;
+
+    std::vector<mslot> slots(N_SLOTS);
+    for (int i = 0; i < N_SLOTS; ++i) {
+        slots[i].seq = i;
+        slots[i].clear();
+    }
+    std::vector<llama_tokens> convs(N_CONV);
+    std::vector<int> len(N_CONV, 0);
+    int next_id = 100;
+    for (int c = 0; c < N_CONV; ++c) {
+        convs[c] = make_conv(n_vocab, next_id++, 24, N_MAX);
+    }
+
+    int n_over = 0, n_over_stale = 0, n_stale = 0;
+    int n_saves = 0, n_saved = 0, n_loads = 0, n_restored = 0, n_failed_loads = 0, n_idle = 0, n_clears = 0, n_back = 0;
+    size_t max_entries = 0;
+    bool limited = false;
+    size_t limit_lo = 0, limit_hi = 0;
+    for (int step = 0; step < STEPS; ++step) {
+        // phases where a long conversation alone is over the limit: its saves are skipped (the entry it extends stays)
+        if (limited) {
+            // (low: three quarters of the biggest entry so far; the recurrent state makes the size per token misleading)
+            if (step % 60 == 30) {
+                size_t max_e = 0;
+                for (const auto & st : cache.states) {
+                    max_e = std::max(max_e, st.size());
+                }
+                limit_lo = std::max(limit_lo, max_e * 3 / 4);
+            }
+            cache.limit_size = step % 60 >= 30 ? limit_lo : limit_hi;
+        }
+        // once the first entries show the size per token: room for about two conversations, the pool capped near it
+        if (!limited && cache.n_tokens() > 0 && step > 6) {
+            const size_t per_tok = std::max<size_t>(1, cache.size() / cache.n_tokens());
+            cache.limit_size = per_tok * 2 * N_MAX;
+            cache.pool.cap_max = std::max<size_t>(cache.pool.capacity(), cache.limit_size + 2*cache.pool.slab_size);
+            limited = true;
+            limit_hi = cache.limit_size;
+            limit_lo = 0;
+            fprintf(stderr, "  step %d: limit %.1f KiB (%zu B/token), pool cap %.1f KiB\n", step, cache.limit_size / 1024.0, per_tok,
+                    cache.pool.cap_max / 1024.0);
+        }
+
+        const int op = (int) rnd(10);
+        mslot * pms = &slots[rnd(N_SLOTS)];
+        if (op == 0) {
+            mslot & ms = *pms;
+            // prompt_clear (a child or stateless task, the unified-KV purge)
+            ms.clear();
+            n_clears++;
+        } else if (op == 1) {
+            mslot & ms = *pms;
+            // cache_idle_slots: an idle slot saves (checkpoints copied), the slot keeps its prompt and the entry
+            if (ms.prompt.n_tokens() > 0) {
+                n_saves++;
+                if (cache.save(ms.prompt, g_tgt3, g_dft3, nullptr, ms.seq, &ms.origin, false) != nullptr) {
+                    n_saved++;
+                    CHECK(ms.origin != nullptr);
+                }
+                cache.update();
+                n_idle++;
+            }
+        } else {
+            // a request: conversation c grows by a turn; sometimes its last answer comes back re-rendered (a new tail)
+            const int c = (int) rnd(N_CONV);
+            // the server prefers the slot that holds the conversation (LCP similarity): its next save is a delta
+            for (auto & o : slots) {
+                if (o.conv == &convs[c] && o.prompt.n_tokens() > 0 && rnd(3) != 0) {
+                    pms = &o;
+                }
+            }
+            mslot & ms = *pms;
+            if (len[c] + 32 > N_MAX) {
+                convs[c] = make_conv(n_vocab, next_id++, 24, N_MAX);
+                len[c] = 0;
+            }
+            if (len[c] > 40 && rnd(2) == 0) {
+                for (int p = len[c] - 1 - (int) rnd(12); p < N_MAX; ++p) {
+                    convs[c][p] = (llama_token) ((5*(uint32_t) p + 31*(uint32_t) step + 9) % (uint32_t) n_vocab);
+                }
+            }
+            const int n = std::min(N_MAX, len[c] + 8 + (int) rnd(24));
+            len[c] = n;
+            const llama_tokens & conv = convs[c];
+            server_tokens tokens_new(llama_tokens(conv.begin(), conv.begin() + n), false);
+
+            // the server's slot switch (get_available_slot): find_better's pointer is used right away only
+            if (const auto * better = cache.find_better(ms.prompt, tokens_new, ms.seq, 16)) {
+                CHECK(better->owner < 0 || better->owner == ms.seq);
+            }
+            server_prompt_cache_state * saved = nullptr;
+            if (ms.prompt.n_tokens() > 0) {
+                n_saves++;
+                auto * held = ms.origin;
+                const bool stale = held != nullptr && (int) held->prompt.tokens.get_common_prefix(ms.prompt.tokens) < held->prompt.n_tokens();
+                const size_t held_segs = held != nullptr ? held->data.segs.size() : 0;
+                saved = cache.save(ms.prompt, g_tgt3, g_dft3, nullptr, ms.seq, &ms.origin, true);
+                n_saved += saved != nullptr;
+                n_over += saved == nullptr && held != nullptr && cache.limit_size == limit_lo;
+                n_over_stale += saved == nullptr && stale && held_segs > 1;
+                n_stale += stale;
+                CHECK(saved == ms.origin);
+                CHECK(check_invariants(cache, slots, step));
+            }
+            n_loads++;
+            const int n_before = ms.prompt.n_tokens();
+            if (!cache.load(ms.prompt, tokens_new, g_tgt3, g_dft3, nullptr, ms.seq, saved, &ms.origin)) {
+                n_failed_loads++;
+                ms.clear();
+            } else if (ms.origin != nullptr && ms.origin != saved) {
+                n_restored++;
+                // a restored prompt has every cell
+                CHECK(llama_memory_seq_pos_gap(g_tgt3, ms.seq, 0) >= ms.prompt.n_tokens());
+            }
+            cache.update();
+            CHECK(check_invariants(cache, slots, step));
+
+            // prompt reuse: the common prefix stays; the checkpoints past it go back to the origin entry or away
+            const int lcp = (int) ms.prompt.tokens.get_common_prefix(tokens_new);
+            CHECK(truncate_seq(g_tgt3, ms.seq, conv, lcp));
+            CHECK(truncate_seq(g_dft3, ms.seq, conv, std::min(lcp, n - LAG)));
+            ms.prompt.tokens.keep_first(lcp);
+            for (auto it = ms.prompt.checkpoints.begin(); it != ms.prompt.checkpoints.end();) {
+                if (it->n_tokens > lcp) {
+                    auto * origin = ms.origin;
+                    if (origin != nullptr && it->n_tokens <= origin->prompt.n_tokens() &&
+                            (origin->prompt.checkpoints.empty() || origin->prompt.checkpoints.back().n_tokens < it->n_tokens)) {
+                        auto next = std::next(it);
+                        origin->prompt.checkpoints.splice(origin->prompt.checkpoints.end(), ms.prompt.checkpoints, it);
+                        it = next;
+                        n_back++;
+                    } else {
+                        it = ms.prompt.checkpoints.erase(it);
+                    }
+                } else {
+                    ++it;
+                }
+            }
+
+            // the prefill and a few checkpoints on the way (one per ~32 tokens, the newest five kept)
+            const llama_pos t0 = llama_memory_seq_pos_max(llama_get_memory(g_tgt3), ms.seq) + 1;
+            const llama_pos d0 = llama_memory_seq_pos_max(llama_get_memory(g_dft3), ms.seq) + 1;
+            if (t0 != lcp) {
+                fprintf(stderr, "FAIL step %d slot %d: cells end at %d, prompt %d tokens, lcp %d (restored %d, origin %p saved %p, n_before %d)\n",
+                        step, ms.seq, t0, ms.prompt.n_tokens(), lcp, (int) (ms.origin != saved), (void *) ms.origin, (void *) saved, n_before);
+                return false;
+            }
+            CHECK(decode_range(g_tgt3, conv, t0, n, ms.seq));
+            CHECK(decode_range(g_dft3, conv, d0, n - LAG, ms.seq));
+            ms.prompt.tokens = server_tokens(llama_tokens(conv.begin(), conv.begin() + n), false);
+            for (int k = lcp / 32 + 1; k * 32 <= n; ++k) {
+                ms.prompt.checkpoints.push_back(fake_ckpt(k * 32, 512 + 64 * (size_t) rnd(16)));
+            }
+            while (ms.prompt.checkpoints.size() > 5) {
+                ms.prompt.checkpoints.pop_front();
+            }
+            ms.conv = &conv;
+        }
+        CHECK(check_invariants(cache, slots, step));
+        for (const auto & st : cache.states) {
+            CHECK(probe_entry(st, step));
+        }
+        max_entries = std::max(max_entries, cache.states.size());
+    }
+    fprintf(stderr, "  %d saves of a held entry skipped in the low-limit phases (%d with a stale tail; %d delta saves onto a stale tail)\n",
+            n_over, n_over_stale, n_stale);
+    fprintf(stderr, "  %d steps: %d saves (%d kept), %d loads (%d restores, %d failed), %d idle saves, %d clears, %d checkpoints back; "
+            "max %zu entries, end %zu entries %.1f KiB (limit %.1f KiB), pool %zu slabs %.1f KiB\n",
+            STEPS, n_saves, n_saved, n_loads, n_restored, n_failed_loads, n_idle, n_clears, n_back, max_entries, cache.states.size(),
+            cache.size() / 1024.0, cache.limit_size / 1024.0, cache.pool.slabs.size(), cache.pool.capacity() / 1024.0);
+    // a restore never fails here: every entry tiles its prompt
+    CHECK(n_failed_loads == 0);
+    CHECK(n_restored > 20);
+    for (auto & ms : slots) {
+        ms.clear();
+    }
+    return true;
+}
+
 // the watchdog: a scenario that does not return within this deadline hung (the process exits with 2)
 static std::atomic<int64_t> g_deadline_us{0};
 static std::atomic<const char *> g_scenario{""};
@@ -562,6 +957,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // scenario L: three slots on one context pair (seq = slot id)
+    {
+        auto cp3 = cparams;
+        cp3.n_ctx     = 4*1024; // room for every slot's cells and the ghosts of the saved ones
+        cp3.n_seq_max = 4; // the slots' 3 + the probe
+        g_tgt3 = llama_init_from_model(model, cp3);
+        g_dft3 = llama_init_from_model(model, cp3);
+        if (g_tgt3 == nullptr || g_dft3 == nullptr) {
+            fprintf(stderr, "failed to create the 3-sequence contexts\n");
+            return 1;
+        }
+    }
+
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     llama_tokens conv;
     for (llama_pos p = 0; p < 128; ++p) {
@@ -603,6 +1011,8 @@ int main(int argc, char ** argv) {
         {"H: a save that fits no free block while the prefetch runs does not hang (HC3)", scenario_save_during_prefetch},
         {"I: a save the capped pool cannot hold is skipped, the next works (HC3)", scenario_save_skipped_when_pool_full},
         {"J: the task loop watchdog sees a stuck task (HC3)", scenario_queue_watchdog},
+        {"K: an over-limit delta save leaves the slot's entry whole (TF1)", scenario_over_limit_keeps_origin},
+        {"L: three slots under a tiny limit and a capped pool: nothing in use is freed (TF1)", scenario_stress},
     };
     for (const auto & sc : hc1) {
         if (!only.empty() && only.find(sc.name[0]) == std::string::npos) {
@@ -623,6 +1033,8 @@ int main(int argc, char ** argv) {
     }
 
     cache.states.clear();
+    llama_free(g_dft3);
+    llama_free(g_tgt3);
     llama_free(ctx_dft);
     llama_free(ctx_tgt);
     llama_model_free(model);

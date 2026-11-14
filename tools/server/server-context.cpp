@@ -2154,7 +2154,8 @@ private:
             // if lora has changed, check to see if the cache should be cleared
             if (lora_should_clear_cache(slot.prompt.lora, task_loras)) {
                 SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.prompt.lora.size(), task_loras.size());
-                slot.prompt.clear();
+                // releases the host cache entry too: a bare prompt.clear() kept it owned by the slot (never evictable)
+                slot.prompt_clear();
             } else {
                 SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }

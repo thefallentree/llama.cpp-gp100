@@ -731,7 +731,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // of materializing and filtering an n_vocab-sized candidate array (~1.3 ms per token on a 248k vocabulary).
     // Logit biases (e.g. --ignore-eos) and suppressed tokens are applied to the few tokens they name.
     // with the backend's candidates (llama_sampler_chain_set_preselect_k) the chain runs on them below
-    if (!grmr && !rbudget && common_sampler_is_greedy(gsmpl->params) && llama_get_sampled_candidates_count_ith(ctx, idx) == 0) {
+    // the reasoning budget only changes logits while it forces its close: until then the scan picks the same token
+    const bool rbudget_idle = !rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING;
+    if (!grmr && rbudget_idle && common_sampler_is_greedy(gsmpl->params) && llama_get_sampled_candidates_count_ith(ctx, idx) == 0) {
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const int     n_vocab = llama_vocab_n_tokens(vocab);

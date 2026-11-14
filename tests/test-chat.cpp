@@ -8446,6 +8446,9 @@ static void test_chat_session() {
         assert_contains(session.prompt().str(), "<|im_start|>user\nHey there!<|im_end|>\n<|im_start|>assistant\n<think>\n");
         assert_equals(false, session.grammar().empty());
         assert_equals(std::string("<|im_start|>assistant\n<think>\n"), session.generation_prompt());
+        // a tool call opened in the think block ends the reasoning budget's count: its forced close never cuts the call
+        const auto & ends = session.thinking_end_tags();
+        assert_equals(true, std::find(ends.begin(), ends.end(), "<tool_call>") != ends.end());
 
         const std::string thinking = "I'm\nthinking\n</think>\n\n";
         for (size_t i = 0; i < thinking.size(); i += 3) {

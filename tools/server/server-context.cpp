@@ -4903,6 +4903,15 @@ private:
                         //       so the timing is queued and flushed on the next sync
                         metrics_pre_decode();
 
+                        // VS1: the drafter's async catch-up of the text batch before this chunk must be done first: the
+                        // chunk's decode runs the drafter's catch-up itself (its callback) and the encoder shares the GPU;
+                        // a catch-up still running on its thread next to them deadlocked the GPUs (both at 100%)
+                        if (spec && !common_speculative_catchup_join(spec.get())) {
+                            send_error(slot, "the drafter's catch-up failed", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;

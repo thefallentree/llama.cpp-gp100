@@ -1369,24 +1369,6 @@ public:
                     return false;
                 }
                 store_context_features(seq_id, n_chunk);
-                if (is_lilicorr) {
-                    // Ordinary DFlash can write to the KV cache, but LiliCorr needs to store embeddings across sequences.
-                    const float * projected = llama_get_embeddings_nextn(ctx_dft);
-                    if (projected) {
-                        const size_t seq_offset = (size_t) seq_id * lilicorr_rows;
-                        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
-                        for (int32_t i = 0; i < n_chunk; ++i) {
-                            const llama_pos pos = batch_inject.tokens[i].pos[0];
-                            if (pos < pos_min) {
-                                continue;
-                            }
-                            const size_t slot = seq_offset + (size_t) pos % lilicorr_rows;
-                            std::memcpy(lilicorr_embd.data() + slot * (size_t) n_embd_dec,
-                                    projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
-                            lilicorr_pos[slot] = pos;
-                        }
-                    }
-                }
                 if (trace_sync()) {
                     LOG_WRN("%s: inject seq %d, %d rows at pos %d\n", __func__, (int) seq_id, (int) n_chunk,
                             (int) batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0]);

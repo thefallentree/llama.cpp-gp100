@@ -250,6 +250,7 @@ static inline std::string stop_type_to_str(stop_type type) {
         case STOP_TYPE_EOS:   return "eos";
         case STOP_TYPE_WORD:  return "word";
         case STOP_TYPE_LIMIT: return "limit";
+        case STOP_TYPE_DEADLINE: return "deadline";
         default:              return "none";
     }
 }
@@ -379,6 +380,8 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     json finish_reason = "length";
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = "stop";
+    } else if (stop == STOP_TYPE_DEADLINE) {
+        finish_reason = "deadline";
     }
     json res = json {
         {"choices",            json::array({
@@ -419,6 +422,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
+    } else if (stop == STOP_TYPE_DEADLINE) {
+        finish_reason = "deadline";
     }
 
     json choice {
@@ -461,6 +466,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     std::string finish_reason = "length";
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
+    } else if (stop == STOP_TYPE_DEADLINE) {
+        finish_reason = "deadline";
     }
 
     json deltas = json::array();

@@ -2319,17 +2319,14 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         }
     }
     // the kept cells end at the last kept segment's effective end: the new segments start there, never past it
-    const llama_pos kept_end = (e != nullptr && n_keep > 0) ? seg_end(n_keep - 1) : 0;
-    std::vector<server_state_seg> kept;
-    if (e != nullptr) {
-        for (size_t i = 0; i < n_keep; ++i) {
-            kept.push_back(std::move(e->data.segs[i]));
-        }
-        e->data.segs.clear();
-    }
-    const llama_pos keep_end = kept.empty() ? 0 : std::min<llama_pos>(kept_end, lcp_pos);
+    // TF1: the kept segments stay in the entry until the save is sure to go on: the over-limit skip below leaves the
+    // entry whole (it used to keep only these segments under the entry's full token list: a hole, which the next
+    // restore of the conversation found only after wiping the slot's cells, then dropped the entry)
+    const bool has_kept = e != nullptr && n_keep > 0;
+    const llama_pos kept_end = has_kept ? seg_end(n_keep - 1) : 0;
+    const llama_pos keep_end = has_kept ? std::min<llama_pos>(kept_end, lcp_pos) : 0;
     // where the new drafter part starts: the kept drafter cells reach only d1 of the last kept segment
-    const llama_pos keep_end_dft = kept.empty() ? 0 : std::min<llama_pos>(keep_end, kept.back().d1);
+    const llama_pos keep_end_dft = has_kept ? std::min<llama_pos>(keep_end, e->data.segs[n_keep - 1].d1) : 0;
 
     // the new segments: [keep_end, n) in chunks of seg_max, the last one open-ended (cells past n go with it)
     struct chunk { llama_pos a, b, ad; size_t sz_tgt, sz_dft; };
@@ -2364,8 +2361,8 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     state_size_new += checkpoints_size;
 
     size_t size_kept = 0;
-    for (const auto & seg : kept) {
-        size_kept += seg.size();
+    for (size_t i = 0; has_kept && i < n_keep; ++i) {
+        size_kept += e->data.segs[i].size();
     }
 
     const int64_t t1 = ggml_time_us();
@@ -2375,11 +2372,19 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 (state_size_new + size_kept) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         if (e != nullptr) {
-            e->data.segs = std::move(kept);
             e->owner = -1;
             *origin = nullptr;
         }
         return nullptr;
+    }
+
+    // the save goes on: the kept segments leave the entry while it is rebuilt, the stale ones past them go
+    std::vector<server_state_seg> kept;
+    if (has_kept) {
+        for (size_t i = 0; i < n_keep; ++i) {
+            kept.push_back(std::move(e->data.segs[i]));
+        }
+        e->data.segs.clear();
     }
 
     // remove any cached prompts that are fully contained in the current prompt

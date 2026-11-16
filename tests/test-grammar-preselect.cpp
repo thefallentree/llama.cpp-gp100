@@ -80,12 +80,19 @@ int main(int argc, char ** argv) {
         { "greedy", 0.0f, 40, 0.95f },
         { "top_k20_temp0.7", 0.7f, 20, 0.8f },
         { "greedy_budget_nogrammar", 0.0f, 40, 0.95f },   // a reasoning budget (think tags) without a grammar: the budget sampler alone
+        { "lazy_top_k20_temp0.7", 0.7f, 20, 0.8f },       // the lazy tool-call grammar (trigger word "<tool_call>": its tokens open every sequence)
     };
     int n_fail = 0, n_fallback_total = 0;
     for (const auto & c : cfgs) {
         common_params_sampling params;
         const bool budget_only = std::string(c.name) == "greedy_budget_nogrammar";
-        if (budget_only) {
+        const bool lazy        = std::string(c.name) == "lazy_top_k20_temp0.7";
+        const std::vector<llama_token> trigger_toks = common_tokenize(vocab, "<tool_call>", false, true);
+        if (lazy) {
+            params.grammar          = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, TOOL_CALL_GRAMMAR);
+            params.grammar_lazy     = true;
+            params.grammar_triggers = { { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<tool_call>", LLAMA_TOKEN_NULL } };
+        } else if (budget_only) {
             params.reasoning_budget_start  = common_tokenize(vocab, "<think>", false, true);
             params.reasoning_budget_end    = { common_tokenize(vocab, "</think>", false, true) };
             params.reasoning_budget_forced = params.reasoning_budget_end[0];
@@ -121,7 +128,14 @@ int main(int argc, char ** argv) {
         std::normal_distribution<float> nd(0.0f, 2.0f);
         int n_steps = 0, n_fallback = 0, n_equal = 0, n_valid = 0;
         for (int seq = 0; seq < 12; ++seq) {
-            common_sampler_reset(gs); common_sampler_reset(ref); common_sampler_reset(chk);
+            if (seq > 0) {
+                // fresh samplers per sequence, like the server's sampler per task (a lazy grammar's trigger buffer is not
+                // part of a reset: with a reset the trigger would fire at once in the next sequence)
+                common_sampler_free(gs); common_sampler_free(ref); common_sampler_free(chk);
+                gs  = common_sampler_init(model, params);
+                ref = common_sampler_init(model, params_ref);
+                chk = common_sampler_init(model, params_ref);
+            }
             for (int step = 0; step < 24; ++step) {
                 std::vector<float> logits(n_vocab);
                 for (int t = 0; t < n_vocab; ++t) {
@@ -132,7 +146,15 @@ int main(int argc, char ** argv) {
                     logits[rng() % n_vocab] += 6.0f + (rng() % 5);
                 }
                 const int kind = step % 3;   // 0: plain random, 1: valid tokens spiked (the sharp rows of a real model), 2: forced fallback
+                if (lazy && step < (int) trigger_toks.size()) {
+                    logits[trigger_toks[step]] = 200.0f;   // the trigger word's tokens open every sequence: the grammar is active after them
+                }
                 const std::vector<char> valid = valid_mask(chk, n_vocab);
+                int n_invalid = 0;
+                for (int t = 0; t < n_vocab; ++t) {
+                    n_invalid += valid[t] ? 0 : 1;
+                }
+
                 if (kind == 1) {
                     int placed = 0;
                     for (int t = 0; t < n_vocab && placed < 3; ++t) {
@@ -167,7 +189,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "FAIL %s seq %d step %d kind %d: id %d (valid %d, fallback %d) ref %d\n", c.name, seq, step, kind, id, (int) is_valid, (int) fallback, id_ref);
                     n_fail++;
                 }
-                if (kind == 2 && !fallback && !budget_only) {   // (without a grammar no token is invalid: nothing forces the fallback)
+                if (kind == 2 && !fallback && !budget_only && n_invalid >= k_pre) {   // (without an active grammar no token is invalid: nothing forces the fallback)
                     fprintf(stderr, "FAIL %s seq %d step %d: the forced fallback did not trigger\n", c.name, seq, step);
                     n_fail++;
                 }
@@ -180,6 +202,10 @@ int main(int argc, char ** argv) {
             }
         }
         printf("%s: %d steps, %d equal to the full row, %d valid, %d fallbacks\n", c.name, n_steps, n_equal, n_valid, n_fallback);
+        if (lazy && n_fallback == 0) {
+            fprintf(stderr, "FAIL %s: the lazy grammar never became active (no forced fallback after the trigger)\n", c.name);
+            n_fail++;
+        }
         n_fallback_total += n_fallback;
         common_sampler_free(gs); common_sampler_free(ref); common_sampler_free(chk);
     }

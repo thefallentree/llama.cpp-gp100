@@ -1650,9 +1650,15 @@ struct test_case {
         // GGML_TEST_GRAPH_REPEAT=N: the whole graph computed on backend1 once more and then N more times, each result
         // compared with the first (a backend's graph replay path: CUDA graphs are captured from the second compute of
         // the same graph on, GGML_CUDA_GRAPH_INSTANTIATE_FAIL=1 makes every instantiation fail so that the fallback
-        // without a graph runs); meant for ops without in-place writes, e.g. -o ADD, MUL_MAT, SOFT_MAX, GET_ROWS
+        // without a graph runs). Graphs with an in-place node (a non-view op whose output is a view of another tensor:
+        // the in-place ADD/SOFT_MAX/ROPE variants, CPY, SET_ROWS) are skipped, a second compute changes their inputs.
         static const int graph_repeat = getenv("GGML_TEST_GRAPH_REPEAT") != nullptr ? atoi(getenv("GGML_TEST_GRAPH_REPEAT")) : 0;
-        if (graph_repeat > 0 && ud.ok && cmp_ok) {
+        bool graph_inplace = false;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            graph_inplace |= node->view_src != nullptr && !ggml_is_view_op(node->op);
+        }
+        if (graph_repeat > 0 && ud.ok && cmp_ok && !graph_inplace) {
             if (ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
                 printf("graph repeat: compute failed ");
                 ud.ok = false;

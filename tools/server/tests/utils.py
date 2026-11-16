@@ -78,6 +78,7 @@ class ServerProcess:
     n_ga_w: int | None = None
     n_predict: int | None = None
     n_predict_max: int | None = None
+    reverse_prompt: str | None = None
     n_prompts: int | None = 0
     slot_save_path: str | None = None
     id_slot: int | None = None
@@ -251,6 +252,8 @@ class ServerProcess:
             server_args.extend(["--n-predict", self.n_predict])
         if self.n_predict_max is not None:
             server_args.extend(["--n-predict-max", self.n_predict_max])
+        if self.reverse_prompt is not None:
+            server_args.extend(["--reverse-prompt", self.reverse_prompt])
         if self.slot_save_path:
             server_args.extend(["--slot-save-path", self.slot_save_path])
         if self.n_ga:

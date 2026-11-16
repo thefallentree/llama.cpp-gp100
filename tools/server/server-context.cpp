@@ -13,7 +13,6 @@
 #include "server-queue.h"
 #include "server-realtime.h"
 #include "server-schema.h"
-#include "server-slot-sched.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -1211,7 +1210,8 @@ private:
 
     json json_ui_settings = json::object();
 
-    server_slot_sched slot_sched;
+    // Necessary similarity of prompt for slot selection
+    float slot_prompt_similarity = 0.0f;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1530,7 +1530,7 @@ private:
         n_swa_reuse = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) ? 0 : n_swa;
 
         // Necessary similarity of prompt for slot selection
-        slot_sched.slot_prompt_similarity = params_base.slot_prompt_similarity;
+        slot_prompt_similarity = params_base.slot_prompt_similarity;
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
@@ -1940,27 +1940,27 @@ private:
         return nullptr;
     }
 
-    std::vector<server_slot_info> get_slot_infos() const {
-        std::vector<server_slot_info> res;
-        for (const server_slot & slot : slots) {
-            res.push_back({ slot.id, slot.task.get(), slot.is_processing(), slot.t_last_used, &slot.prompt });
-        }
-        return res;
-    }
+    server_slot * get_available_slot(const server_task & task) {
+        server_slot * ret = nullptr;
 
-    // call only when the task is sure to launch on the slot
-    void update_prompt_cache(server_slot & slot, const server_task & task) {
-        SRV_TRC("%s", "updating prompt cache\n");
+        bool update_cache = false;
 
-        const int64_t t_start = ggml_time_us();
+        // if a specific slot is requested, use it (still goes through cache update logic below)
+        if (task.id_slot != -1) {
+            ret = get_slot_by_id(task.id_slot);
+            if (ret) {
+                // a busy slot is returned untouched, the caller defers the task
+                if (ret->is_processing()) {
+                    return ret;
+                }
 
-        slot.prompt_save(*prompt_cache);
-
-        if (!slot.prompt_load(*prompt_cache, task.tokens, get_task_lora(task))) {
-            slot.prompt_clear();
+                SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+            }
         }
 
-        prompt_cache->update();
+        // find the slot that has at least n% prompt similarity
+        if (slot_prompt_similarity != 0.0f) {
+            float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -2147,13 +2147,12 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // per-request lora if given, otherwise the global config
         auto task_loras = get_task_lora(task);
-
-        // the state can come from the prompt cache, so it is compared with its own lora config, not with the one of the last task
-        if (!are_lora_equal(task_loras, slot.prompt.lora)) {
+        if (!are_lora_equal(task_loras, slot.lora)) {
             // if lora has changed, check to see if the cache should be cleared
-            if (lora_should_clear_cache(slot.prompt.lora, task_loras)) {
-                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.prompt.lora.size(), task_loras.size());
+            if (lora_should_clear_cache(slot.lora, task_loras)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
                 // releases the host cache entry too: a bare prompt.clear() kept it owned by the slot (never evictable)
                 slot.prompt_clear();
             } else {
@@ -2892,11 +2891,24 @@ private:
         return true;
     }
 
+    // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
-        for (int id : slot_sched.get_free_slots(get_slot_infos(), n_slots_needed, exclude_id_slot)) {
-            free_slots.push_back(get_slot_by_id(id));
+        for (auto & slot : slots) {
+            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+                free_slots.push_back(&slot);
+            }
         }
+
+        std::stable_sort(free_slots.begin(), free_slots.end(), [](const server_slot * a, const server_slot * b) {
+            if ((a->prompt.n_tokens() == 0) != (b->prompt.n_tokens() == 0)) {
+                return a->prompt.n_tokens() == 0;
+            }
+            return a->t_last_used < b->t_last_used;
+        });
+
+        free_slots.resize(std::min(free_slots.size(), n_slots_needed));
+
         return free_slots;
     }
 
@@ -3393,9 +3405,7 @@ private:
 
                     const int id_task = task.id;
 
-                    const auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task));
-
-                    server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
+                    server_slot * slot = get_available_slot(task);
 
                     //
                     // slot scheduling logic
@@ -3415,24 +3425,15 @@ private:
                         break;
                     }
 
-                    std::vector<server_slot *> child_slots;
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
-                        child_slots = get_free_slots(n_child_tasks, slot->id);
+                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                    }
-
-                    // the task is not deferred past this point
-                    if (plan.update_cache && prompt_cache) {
-                        update_prompt_cache(*slot, task);
-                    }
-
-                    if (task.is_parent()) {
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
@@ -4652,6 +4653,13 @@ private:
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
+                            // the first evaluated token attends to the positions > pos_eval - n_swa, so a SWA state
+                            // starting at pos_eval - n_swa + 1 is enough, while a state without SWA must end before pos_eval
+                            const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
+
+                            // a state or a checkpoint is useful when its pos_min is below this threshold
+                            const auto pos_min_thold = std::max(0, n_swa_reuse > 0 ? pos_eval - n_swa_reuse + 2 : pos_eval);
+
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
@@ -4751,13 +4759,6 @@ private:
                                     }
                                 }
 
-                                if (reuse.n_past == 0 && !reuse.ckpt) {
-                                    SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                            "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                }
-
-                                pos_next = reuse.pos_next;
-                                n_past   = reuse.n_past;
                             }
 
                             // CL1: the attention cache must hold every position below the reused prefix. A prompt restored from the

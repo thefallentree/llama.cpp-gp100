@@ -152,6 +152,18 @@ static common_chat_templates_ptr read_templates(const std::string & path) {
     return common_chat_templates_ptr(common_chat_templates_init(/* model= */ nullptr, read_file(path)));
 }
 
+// Inkling 2 stand-in: the real template ships in the GGUF; this keeps only the message blocks,
+// one per content part, and the tokens used for detection
+static const char * INKLING2_MIN_TEMPLATE = R"({%- set role_token = {"user": "<|message_user|>", "assistant": "<|message_model|>", "system": "<|message_system|>"} -%}
+{%- for m in messages -%}
+{%- if m.content is string -%}{{ role_token[m.role] }}<|content_text|>{{ m.content }}<|end_message|>
+{%- else -%}{%- for p in m.content -%}{{ role_token[m.role] }}
+{%- if p.type == 'image' -%}<|content_image|>{%- else -%}<|content_text|>{{ p.text }}{%- endif -%}
+<|end_message|>{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|message_model|>{%- endif -%})";
+
 static std::unique_ptr<llama_grammar> build_grammar(const std::string & grammar_str) {
     return std::unique_ptr<llama_grammar>(
         llama_grammar_init_impl(nullptr, grammar_str.c_str(), "root", false, nullptr, 0, nullptr, 0));

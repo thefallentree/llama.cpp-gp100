@@ -885,6 +885,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
             /* .is_init              = */ false,
             /* .n_nodes              = */ 0,
             /* .preselect_k          = */ 0,
+            /* .preselect_raw        = */ false,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
             /* .t_sample_us          = */ 0,
@@ -896,6 +897,18 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
 void llama_sampler_chain_set_preselect_k(struct llama_sampler * chain, int32_t k) {
     GGML_ASSERT(chain != nullptr && chain->iface == &llama_sampler_chain_i);
     ((llama_sampler_chain *) chain->ctx)->preselect_k = k;
+}
+
+void llama_sampler_chain_set_preselect_raw(struct llama_sampler * chain, bool raw) {
+    GGML_ASSERT(chain != nullptr && chain->iface == &llama_sampler_chain_i);
+    ((llama_sampler_chain *) chain->ctx)->preselect_raw = raw;
+}
+
+bool llama_sampler_chain_get_preselect_raw(const struct llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    return ((const llama_sampler_chain *) chain->ctx)->preselect_raw;
 }
 
 int32_t llama_sampler_chain_get_preselect_k(const struct llama_sampler * chain) {

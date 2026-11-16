@@ -2721,7 +2721,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         // Check if the output token has at least one sequence without a backend sampler.
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
+            const auto it = samplers.find(seq_id);
+            if (it == samplers.end() || llama_sampler_chain_get_preselect_raw(it->second)) {
                 return true;
             }
         }

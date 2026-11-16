@@ -27,6 +27,9 @@ struct llama_sampler_chain {
     // backend keeps the top preselect_k logits of every shard as the candidates the whole chain then samples from
     // on the CPU; 0 = the chain runs on the backend as far as it can
     int32_t preselect_k = 0;
+    // llama_sampler_chain_set_preselect_raw: the raw logits of the row are copied to the host too (a grammar over the
+    // pre-selected candidates falls back to the whole row when too few of them are valid)
+    bool preselect_raw = false;
 
     struct info {
         bool is_backend;

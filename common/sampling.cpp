@@ -116,6 +116,11 @@ struct common_sampler {
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
 
+    // the grammar over the backend's pre-selected candidates (common_sampler_init): the chain runs on the valid
+    // candidates when at least preselect_needed of them are valid, else on the whole row (its raw logits are copied)
+    bool    grammar_preselect = false;
+    int32_t preselect_needed  = 0;
+
     ring_buffer<llama_token> prev;
 
     std::vector<llama_token_data> cur;
@@ -162,6 +167,20 @@ struct common_sampler {
             }
         }
 
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // the whole row from its raw logits (the grammar's fallback when too few pre-selected candidates are valid)
+    void set_logits_raw(struct llama_context * ctx, int idx) {
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        const auto * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr && "the grammar's fallback needs the row's raw logits (preselect_raw)");
+        cur.resize(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+        }
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
@@ -447,7 +466,23 @@ struct common_sampler * common_sampler_init(
     // can leave the top-k but no token outside the top-(k + lowered) can enter it. Otherwise the CPU runs on every
     // logit of the row as before (248K of them: ~1 ms per token).
     static const bool preselect_on = getenv("LLAMA_SAMPLER_PRESELECT") == nullptr || atoi(getenv("LLAMA_SAMPLER_PRESELECT")) != 0;
-    if (preselect_on && params.backend_sampling && params.mirostat == 0 && !grmr && !rbudget) {
+    // GS1: with a grammar the same pre-selection serves, over a wider set (LLAMA_SAMPLER_GRAMMAR_PRESELECT_K, 64): the
+    // grammar masks candidates, the chain runs on the valid ones when enough are left (exact: a valid token outside the
+    // set has a logit below every candidate), else on the whole row, whose raw logits are copied too. The host no
+    // longer builds and filters a 248K-entry candidate array per sampled row (12-15 ms per round for tool-calling
+    // agents, 2026-11-16 finding). LLAMA_SAMPLER_GRAMMAR_PRESELECT=0 keeps the old host path.
+    static const bool    grammar_preselect_on = getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT") == nullptr || atoi(getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT")) != 0;
+    static const int32_t grammar_preselect_k  = getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT_K") != nullptr ? std::max(1, atoi(getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT_K"))) : 64;
+    // fewer valid candidates than the chain's top-k: the valid tokens outside the set are the tail; it is ignored when
+    // the best valid candidate stands at least this many logits above the lowest candidate (the tail's mass is then
+    // below ~k_pre x e^-margin of the best token's), else the whole row is sampled
+    static const float grammar_preselect_margin = getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT_MARGIN") != nullptr ? (float) atof(getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT_MARGIN")) : 8.0f;
+    (void) grammar_preselect_margin;
+    bool    grammar_preselect = false;
+    int32_t preselect_needed  = 0;
+    // (a lazy tool-call grammar comes with the reasoning-budget sampler even without a budget: it joins the same path, a
+    // forced token outside the candidates leaves none valid and the row falls back to the raw logits)
+    if (preselect_on && params.backend_sampling && params.mirostat == 0 && ((!grmr && !rbudget) || grammar_preselect_on)) {
         int32_t k_pre = 0;
         bool    ok    = true;
         for (const auto & b : params.logit_bias) {
@@ -455,8 +490,9 @@ struct common_sampler * common_sampler_init(
         }
         int32_t n_lowered = n_bias;
         if (greedy_only) {
-            // [logit biases, greedy]: the argmax among the candidates not lowered; a bare greedy runs on the backend
-            if (n_bias > 0) {
+            // [logit biases, greedy]: the argmax among the candidates not lowered; a bare greedy runs on the backend,
+            // under a grammar it needs the candidates (the best valid one)
+            if (n_bias > 0 || grmr) {
                 k_pre = 1 + n_bias;
             }
         } else for (const auto & cnstr : params.samplers) {
@@ -486,18 +522,26 @@ struct common_sampler * common_sampler_init(
             ok = false; // another truncation or an unbounded change of the logits before the top-k
             break;
         }
+        if (ok && k_pre > 0 && (grmr || rbudget)) {
+            // the chain needs k_pre valid candidates (greedy: the one best, after the biased ones); the set is wider
+            // so that the grammar's rejections seldom force the whole row
+            preselect_needed  = k_pre;
+            k_pre             = std::max(k_pre, grammar_preselect_k);
+            grammar_preselect = true;
+            llama_sampler_chain_set_preselect_raw(chain, true);
+        }
         if (ok && k_pre > 0) {
             llama_sampler_chain_set_preselect_k(chain, k_pre);
         }
     }
 
-    if (grmr && params.backend_sampling) {
+    if (grmr && params.backend_sampling && !grammar_preselect) {
         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
 
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
+    if (rbudget && params.backend_sampling && !grammar_preselect) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
 
         params.backend_sampling = false;
@@ -508,6 +552,8 @@ struct common_sampler * common_sampler_init(
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
+        /* .grammar_preselect = */ grammar_preselect,
+        /* .preselect_needed  = */ preselect_needed,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
@@ -593,6 +639,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
+        /* .grammar_preselect = */ gsmpl->grammar_preselect,
+        /* .preselect_needed  = */ gsmpl->preselect_needed,
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
@@ -680,6 +728,67 @@ static bool common_sampler_is_greedy(const common_params_sampling & params) {
         params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
         params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f &&
         std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == params.samplers.end();
+}
+
+// GS1: gsmpl->cur_p holds the pre-selected candidates of a row (ids, logits). The grammar masks them; when at least
+// preselect_needed stay valid the chain samples among them (exact: every token outside the pre-selection has a logit
+// at or below the lowest candidate, so none of them can reach the chain's top-k after the lowering samplers), else
+// load_raw() must refill cur_p with the whole row and the grammar and chain run on it. The result is always valid.
+llama_token common_sampler_sample_preselected(struct common_sampler * gsmpl, bool * used_fallback, const std::function<void()> & load_raw) {
+    static const float margin = getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT_MARGIN") != nullptr ? (float) atof(getenv("LLAMA_SAMPLER_GRAMMAR_PRESELECT_MARGIN")) : 8.0f;
+    auto & cur_p = gsmpl->cur_p;
+    // the lowest raw logit of the candidates: every token outside the set is at or below it
+    float lowest = INFINITY;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        lowest = std::min(lowest, cur_p.data[i].logit);
+    }
+    llama_sampler_apply(gsmpl->rbudget, &cur_p);
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(gsmpl->grmr, &cur_p);
+    }
+    int32_t n_valid    = 0;
+    float   best_valid = -INFINITY;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        if (cur_p.data[i].logit != -INFINITY) {
+            n_valid++;
+            best_valid = std::max(best_valid, cur_p.data[i].logit);
+        }
+    }
+    // exact with at least `needed` valid candidates (greedy: one); with fewer, the excluded valid tail is ignored
+    // only when it cannot matter (best_valid far above every excluded token)
+    const int32_t needed   = std::max(1, gsmpl->preselect_needed);
+    const bool    fallback = n_valid == 0 || (n_valid < needed && !(needed == 1 || best_valid - lowest >= margin));
+    if (fallback) {
+        load_raw();
+        llama_sampler_apply(gsmpl->rbudget, &cur_p);
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(gsmpl->grmr, &cur_p);
+        }
+    }
+    if (used_fallback) {
+        *used_fallback = fallback;
+    }
+    llama_sampler_apply(gsmpl->chain, &cur_p);
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+    return cur_p.data[cur_p.selected].id;
+}
+
+void common_sampler_set_candidates(struct common_sampler * gsmpl, const std::vector<llama_token_data> & cands) {
+    gsmpl->cur = cands;
+    gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
+}
+
+void common_sampler_apply_grammar(struct common_sampler * gsmpl, llama_token_data_array * cur_p) {
+    if (gsmpl->grmr) {
+        llama_sampler_apply(gsmpl->grmr, cur_p);
+    }
+}
+
+bool common_sampler_grammar_preselect(const struct common_sampler * gsmpl, int32_t * needed) {
+    if (needed) {
+        *needed = gsmpl->preselect_needed;
+    }
+    return gsmpl->grammar_preselect;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
@@ -822,6 +931,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     gsmpl->set_logits(ctx, idx);
+
+    // GS1: the grammar over the backend's pre-selected candidates (common_sampler_init): applied first, on the few
+    // candidates; the chain runs on them when enough are valid, else on the whole row
+    if (gsmpl->grammar_preselect && llama_get_sampled_candidates_count_ith(ctx, idx) > 0) {
+        bool fallback = false;
+        id = common_sampler_sample_preselected(gsmpl, &fallback, [&]() { gsmpl->set_logits_raw(ctx, idx); });
+        return id;
+    }
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);

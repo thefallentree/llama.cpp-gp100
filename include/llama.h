@@ -1552,6 +1552,9 @@ extern "C" {
     // it can, or on the CPU with every logit.
     LLAMA_API void    llama_sampler_chain_set_preselect_k(      struct llama_sampler * chain, int32_t k);
     LLAMA_API int32_t llama_sampler_chain_get_preselect_k(const struct llama_sampler * chain);
+    // the raw logits of the row are copied to the host next to the candidates (a grammar's full-row fallback)
+    LLAMA_API void    llama_sampler_chain_set_preselect_raw(      struct llama_sampler * chain, bool raw);
+    LLAMA_API bool    llama_sampler_chain_get_preselect_raw(const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);

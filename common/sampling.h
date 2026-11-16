@@ -5,6 +5,7 @@
 #include "common.h"
 #include "reasoning-budget.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,15 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+
+// GS1: sample from the pre-selected candidates in gsmpl->cur_p under the grammar (see common_sampler_init); load_raw()
+// refills cur_p with the whole row when too few candidates are valid. used_fallback (optional) says which happened.
+llama_token common_sampler_sample_preselected(struct common_sampler * gsmpl, bool * used_fallback, const std::function<void()> & load_raw);
+// the candidates of a row (ids and logits) as the sampler's current array, for tests of the path above
+void common_sampler_set_candidates(struct common_sampler * gsmpl, const std::vector<llama_token_data> & cands);
+bool common_sampler_grammar_preselect(const struct common_sampler * gsmpl, int32_t * needed);
+// the sampler's grammar applied to an array (the tokens it rejects get -INFINITY), for tests
+void common_sampler_apply_grammar(struct common_sampler * gsmpl, llama_token_data_array * cur_p);
 
 // generalized version of common_sampler_sample
 //

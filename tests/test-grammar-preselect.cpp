@@ -167,7 +167,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "FAIL %s seq %d step %d kind %d: id %d (valid %d, fallback %d) ref %d\n", c.name, seq, step, kind, id, (int) is_valid, (int) fallback, id_ref);
                     n_fail++;
                 }
-                if (kind == 2 && !fallback) {
+                if (kind == 2 && !fallback && !budget_only) {   // (without a grammar no token is invalid: nothing forces the fallback)
                     fprintf(stderr, "FAIL %s seq %d step %d: the forced fallback did not trigger\n", c.name, seq, step);
                     n_fail++;
                 }

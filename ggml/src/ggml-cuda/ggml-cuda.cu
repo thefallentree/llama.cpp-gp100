@@ -8626,24 +8626,33 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     FN_PROF_ADD("gc.pre", t_gc0);
     FN_PROF_T(t_gc1);
+#ifdef USE_CUDA_GRAPH
     if (use_cuda_graph && cuda_graph_update_required) {
         // a new or changed graph at the VRAM margin runs without a graph (GGML_CUDA_GRAPH_MIN_FREE_MIB, 256; 0 = off):
-        // an image prompt's graphs after a long agent load left ~200 MiB on card 0 and cudaGraphInstantiate failed
+        // an image prompt's graphs after a long agent load left ~200 MiB on card 0 and cudaGraphInstantiate failed.
+        // The graph's executables are dropped then: ggml_cuda_graph_update_required has already stored the changed
+        // node properties, so a kept executable (captured for the old pointers) would be replayed on the next call
+        // with unchanged properties (r22 #2: an illegal memory access in the 64K prefill after the agent load).
         static const size_t min_free = (getenv("GGML_CUDA_GRAPH_MIN_FREE_MIB") != nullptr ? (size_t) std::max(0, atoi(getenv("GGML_CUDA_GRAPH_MIN_FREE_MIB"))) : 256)*1024*1024;
         if (min_free > 0) {
             size_t free_mem = 0, total_mem = 0;
             ggml_cuda_set_device(cuda_ctx->device);
             if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess && free_mem < min_free) {
-                static int n_warn = 0;
-                if (n_warn < 3) {
-                    GGML_LOG_WARN("%s: device %d: %.0f MiB free: this graph runs without a CUDA graph\n", __func__, cuda_ctx->device, free_mem/1024.0/1024.0);
-                    n_warn++;
+                static int n_skip = 0;
+                n_skip++;
+                if (n_skip <= 3 || n_skip % 1000 == 0) {
+                    GGML_LOG_WARN("%s: device %d: %.0f MiB free: this graph runs without a CUDA graph (%d skipped so far, %zu executables dropped)\n", __func__, cuda_ctx->device, free_mem/1024.0/1024.0, n_skip, graph->instances.size());
                 }
+                for (size_t i = 0; i < graph->instances.size(); ++i) {
+                    CUDA_CHECK(cudaGraphExecDestroy(graph->instances[i]));
+                }
+                graph->instances.clear();
                 use_cuda_graph = false;
             }
             (void) cudaGetLastError();
         }
     }
+#endif // USE_CUDA_GRAPH
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {

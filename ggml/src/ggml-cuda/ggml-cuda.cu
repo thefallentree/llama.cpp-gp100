@@ -5486,7 +5486,33 @@ static std::vector<ggml_cuda_graph_cluster> ggml_cuda_graph_get_clusters(cudaGra
 }
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
 
-static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device) {
+// instantiate `cuda_graph` into `exec`. With allow_fail, an out-of-memory failure (the VRAM margin after a long agent
+// load: an image prompt's new graphs) returns false instead of aborting; GGML_CUDA_GRAPH_INSTANTIATE_FAIL=N fails
+// every N-th allowed instantiation on purpose (the gate's test of the fallback).
+static bool ggml_cuda_graph_instantiate(cudaGraphExec_t & exec, cudaGraph_t cuda_graph, bool allow_fail) {
+    static const int fail_every = getenv("GGML_CUDA_GRAPH_INSTANTIATE_FAIL") != nullptr ? atoi(getenv("GGML_CUDA_GRAPH_INSTANTIATE_FAIL")) : 0;
+    static int       n_inst     = 0;
+    exec = nullptr;
+    cudaError_t err;
+    if (allow_fail && fail_every > 0 && ++n_inst % fail_every == 0) {
+        err = cudaErrorMemoryAllocation;
+    } else {
+        err = cudaGraphInstantiate(&exec, cuda_graph, nullptr, nullptr, 0);
+    }
+    if (err == cudaSuccess) {
+        return true;
+    }
+    if (!allow_fail || err != cudaErrorMemoryAllocation) {
+        CUDA_CHECK(err);
+    }
+    (void) cudaGetLastError();
+    exec = nullptr;
+    return false;
+}
+
+// update the executable of `instance` from `cuda_graph`, re-instantiating when the update is not possible; false when
+// a re-instantiation failed with allow_fail (the instance's executable is gone then)
+static bool ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device, bool allow_fail = false) {
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
     std::vector<ggml_cuda_graph_cluster> clusters = ggml_cuda_graph_get_clusters(cuda_graph, device);
     if (instance.clusters != clusters) {
@@ -5494,9 +5520,12 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
             GGML_LOG_DEBUG("%s: cluster dims changed, re-instantiating CUDA graph\n", __func__);
         }
         CUDA_CHECK(cudaGraphExecDestroy(instance));
-        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+        instance.handle = nullptr;
+        if (!ggml_cuda_graph_instantiate(instance.handle, cuda_graph, allow_fail)) {
+            return false;
+        }
         instance.clusters = std::move(clusters);
-        return;
+        return true;
     }
 #else
     GGML_UNUSED(device);
@@ -5521,10 +5550,13 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         instance.handle = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+        if (!ggml_cuda_graph_instantiate(instance.handle, cuda_graph, allow_fail)) {
+            return false;
+        }
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+    return true;
 }
 
 // number of ggml nodes per CUDA graph chunk, 0 captures the whole ggml graph as one CUDA graph
@@ -5541,44 +5573,45 @@ static int ggml_cuda_graph_chunk_size(int device) {
     return ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_VOLTA ? 0 : 512;
 }
 
-// end the capture of chunk `idx`, update or create its executable and launch it. false: the executable could not be
-// instantiated (out of memory at the VRAM margin, r22's vision probe): the captured kernels did not run, the caller
-// runs the chunk's nodes again outside a capture (GGML_CUDA_GRAPH_INSTANTIATE_FAIL=N fails every N-th instantiation on
-// purpose, the test of that path)
-static bool ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx) {
+// end the capture of chunk `idx`, update or create its executable and launch it. With allow_fail, an executable that
+// cannot be instantiated (out of memory at the VRAM margin: r22's and production's vision probes) returns false
+// instead of aborting: the captured kernels never ran, the caller evaluates the graph again without a graph.
+// GGML_CUDA_GRAPH_INSTANTIATE_FAIL=N fails every N-th such instantiation on purpose (the gate's test of that path).
+static bool ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx, bool allow_fail = false) {
     cudaGraph_t cuda_graph = nullptr;
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
 
+    bool ok = true;
     if (idx < graph->instances.size()) {
-        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
+        ok = ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device, allow_fail);
+        if (!ok) {
+            // the instance's executable is gone: drop it and the ones after it, the next capture creates them again
+            for (size_t i = idx + 1; i < graph->instances.size(); ++i) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instances[i]));
+            }
+            graph->instances.resize(idx);
+        }
     } else {
         GGML_ASSERT(idx == graph->instances.size());
-        static const int fail_every = getenv("GGML_CUDA_GRAPH_INSTANTIATE_FAIL") != nullptr ? atoi(getenv("GGML_CUDA_GRAPH_INSTANTIATE_FAIL")) : 0;
-        static int       n_inst     = 0;
-        ++n_inst;
-        cudaGraphExec_t   exec = nullptr;
-        const cudaError_t err  = (fail_every > 0 && n_inst % fail_every == 0) ? cudaErrorMemoryAllocation :
-                                 cudaGraphInstantiate(&exec, cuda_graph, nullptr, nullptr, 0);
-        if (err != cudaSuccess) {
-            if (err != cudaErrorMemoryAllocation) {
-                CUDA_CHECK(err);
-            }
-            (void) cudaGetLastError();
-            static bool warned = false;
-            if (!warned) {
-                GGML_LOG_WARN("%s: device %d: the executable of graph chunk %zu could not be instantiated (out of memory): the chunk runs without a graph\n", __func__, cuda_ctx->device, idx);
-                warned = true;
-            }
-            CUDA_CHECK(cudaGraphDestroy(cuda_graph));
-            return false;
-        }
-        graph->instances.emplace_back();
-        graph->instances[idx].handle = exec;
+        cudaGraphExec_t exec = nullptr;
+        ok = ggml_cuda_graph_instantiate(exec, cuda_graph, allow_fail);
+        if (ok) {
+            graph->instances.emplace_back();
+            graph->instances[idx].handle = exec;
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
-        graph->instances[idx].clusters = ggml_cuda_graph_get_clusters(cuda_graph, cuda_ctx->device);
+            graph->instances[idx].clusters = ggml_cuda_graph_get_clusters(cuda_graph, cuda_ctx->device);
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
+        }
     }
     CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+    if (!ok) {
+        static bool warned = false;
+        if (!warned) {
+            GGML_LOG_WARN("%s: device %d: the executable of a CUDA graph could not be instantiated (out of memory): the graph runs without a graph\n", __func__, cuda_ctx->device);
+            warned = true;
+        }
+        return false;
+    }
 
     // a hot/cold layer registered during the capture: its table goes to the device before the launch
     ggml_cuda_expert_cache_wait(*cuda_ctx);
@@ -7985,6 +8018,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // whenever concurrent stream events are in play.
     bool allow_defer = true;
     bool graph_evaluated_or_captured = false;
+    // false after a failed instantiation of the whole-graph executable: the loop below evaluates the graph again
+    // without a graph (its captured kernels never ran)
+    bool use_cuda_graph_now = use_cuda_graph;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -8000,9 +8036,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     const int         chunk_size = ggml_cuda_graph_chunk_size(cuda_ctx->device);
     int               chunk_end  = chunk_size;
     size_t            n_chunks   = 0;
-    int               chunk_begin = 0;    // the first node of the chunk being captured
-    int               replay_end  = -1;   // >= 0: the nodes [i, replay_end) run again outside a capture (a failed instantiation)
-    bool              final_done  = false; // the last chunk was launched (or replayed) inside the loop
 #endif // USE_CUDA_GRAPH
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
@@ -8027,7 +8060,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
-        if (!use_cuda_graph || cuda_graph_update_required) {
+        if (!use_cuda_graph_now || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
             ggml_cuda_cold_prefetch_start(*cuda_ctx);
@@ -8094,57 +8127,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            for (int i = 0; i <= cgraph->n_nodes; i++) {
-#ifdef USE_CUDA_GRAPH
-                // the replay of a chunk whose executable could not be instantiated ends here: capture on again
-                if (replay_end >= 0 && i >= replay_end) {
-                    replay_end = -1;
-                    if (i >= cgraph->n_nodes) {
-                        break;
-                    }
-                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
-                    ggml_cuda_capturing = true;
-                    chunk_begin = i;
-                    chunk_end   = i + chunk_size;
-                }
-                if (i == cgraph->n_nodes) {
-                    // the last chunk's launch (it lived after the loop) is here, so that a failed instantiation can
-                    // replay its nodes like any other chunk's
-                    if (use_cuda_graph && cuda_graph_update_required && !final_done) {
-                        final_done = true;
-                        if (ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks)) {
-                            n_chunks++;
-                            break;
-                        }
-                        ggml_cuda_capturing = false;
-                        replay_end = i;
-                        i = chunk_begin;
-                    } else {
-                        break;
-                    }
-                }
-#else
-                if (i == cgraph->n_nodes) {
-                    break;
-                }
-#endif // USE_CUDA_GRAPH
+            for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
-                if (use_cuda_graph && replay_end < 0 && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active && !cuda_ctx->cold_pf.started) {
-                    if (ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks)) {
-                        n_chunks++;
-                        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
-                        chunk_begin = i;
-                        chunk_end   = i + chunk_size;
-                    } else {
-                        // the captured kernels did not run: the chunk's nodes run again now, without a capture
-                        ggml_cuda_capturing = false;
-                        replay_end = i;
-                        i = chunk_begin;
-                        node = cgraph->nodes[i];
-                    }
+                if (use_cuda_graph_now && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active && !cuda_ctx->cold_pf.started) {
+                    ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                    chunk_end = i + chunk_size;
                 }
 #endif // USE_CUDA_GRAPH
                 if (is_concurrent_event_active) {
@@ -8314,18 +8305,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
 #ifdef USE_CUDA_GRAPH
-        if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (!final_done && ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks)) {
+        if (use_cuda_graph_now && cuda_graph_update_required) { // End CUDA graph capture
+            // (a whole-graph capture, chunk_size 0, may fail to instantiate at the VRAM margin: its kernels never ran,
+            // the graph is evaluated again without a graph; a chunked capture's earlier chunks already ran, so a
+            // mid-graph failure still aborts)
+            const bool launched = ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks, /*allow_fail =*/ n_chunks == 0);
+            if (launched) {
                 n_chunks++;
+                // drop the chunks left over from a longer graph
+                for (size_t i = n_chunks; i < graph->instances.size(); ++i) {
+                    CUDA_CHECK(cudaGraphExecDestroy(graph->instances[i]));
+                }
+                graph->instances.resize(n_chunks);
+                graph_evaluated_or_captured = true; // CUDA graph has been captured
+            } else {
+                use_cuda_graph_now = false;       // the next pass of the loop evaluates the nodes directly
+                n_chunks = 0;
             }
-
-            // drop the chunks left over from a longer graph
-            for (size_t i = n_chunks; i < graph->instances.size(); ++i) {
-                CUDA_CHECK(cudaGraphExecDestroy(graph->instances[i]));
-            }
-            graph->instances.resize(n_chunks);
             ggml_cuda_capturing = false;
-            graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -8336,7 +8333,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     }
 
-    if (use_cuda_graph && !cuda_graph_update_required) {
+    if (use_cuda_graph_now && !cuda_graph_update_required) {
         // the chunks were launched during capture, otherwise launch them here
         ggml_cuda_expert_cache_wait(*cuda_ctx);
         for (cudaGraphExec_t instance : graph->instances) {
@@ -8629,6 +8626,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     FN_PROF_ADD("gc.pre", t_gc0);
     FN_PROF_T(t_gc1);
+    if (use_cuda_graph && cuda_graph_update_required) {
+        // a new or changed graph at the VRAM margin runs without a graph (GGML_CUDA_GRAPH_MIN_FREE_MIB, 256; 0 = off):
+        // an image prompt's graphs after a long agent load left ~200 MiB on card 0 and cudaGraphInstantiate failed
+        static const size_t min_free = (getenv("GGML_CUDA_GRAPH_MIN_FREE_MIB") != nullptr ? (size_t) std::max(0, atoi(getenv("GGML_CUDA_GRAPH_MIN_FREE_MIB"))) : 256)*1024*1024;
+        if (min_free > 0) {
+            size_t free_mem = 0, total_mem = 0;
+            ggml_cuda_set_device(cuda_ctx->device);
+            if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess && free_mem < min_free) {
+                static int n_warn = 0;
+                if (n_warn < 3) {
+                    GGML_LOG_WARN("%s: device %d: %.0f MiB free: this graph runs without a CUDA graph\n", __func__, cuda_ctx->device, free_mem/1024.0/1024.0);
+                    n_warn++;
+                }
+                use_cuda_graph = false;
+            }
+            (void) cudaGetLastError();
+        }
+    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {

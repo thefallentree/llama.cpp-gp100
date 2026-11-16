@@ -1647,6 +1647,36 @@ struct test_case {
             }
         }
 
+        // GGML_TEST_GRAPH_REPEAT=N: the whole graph computed on backend1 once more and then N more times, each result
+        // compared with the first (a backend's graph replay path: CUDA graphs are captured from the second compute of
+        // the same graph on, GGML_CUDA_GRAPH_INSTANTIATE_FAIL=1 makes every instantiation fail so that the fallback
+        // without a graph runs); meant for ops without in-place writes, e.g. -o ADD, MUL_MAT, SOFT_MAX, GET_ROWS
+        static const int graph_repeat = getenv("GGML_TEST_GRAPH_REPEAT") != nullptr ? atoi(getenv("GGML_TEST_GRAPH_REPEAT")) : 0;
+        if (graph_repeat > 0 && ud.ok && cmp_ok) {
+            if (ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
+                printf("graph repeat: compute failed ");
+                ud.ok = false;
+            }
+            const std::vector<float> ref = ud.ok ? tensor_to_float(out) : std::vector<float>();
+            for (int r = 0; r < graph_repeat && ud.ok; r++) {
+                if (ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
+                    printf("graph repeat %d: compute failed ", r + 1);
+                    ud.ok = false;
+                    break;
+                }
+                const std::vector<float> cur = tensor_to_float(out);
+                bool nan = false;
+                for (size_t i = 0; i < cur.size(); i++) {
+                    nan |= std::isnan(cur[i]);
+                }
+                const double err = nan ? INFINITY : ud.tc->err(ref.data(), cur.data(), ref.size());
+                if (err > ud.tc->max_err(backend1)) {
+                    printf("[%s] graph repeat %d: ERR = %.9f > %.9f ", ggml_op_desc(out), r + 1, err, ud.tc->max_err(backend1));
+                    ud.ok = false;
+                }
+            }
+        }
+
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");

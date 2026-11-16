@@ -79,11 +79,20 @@ int main(int argc, char ** argv) {
     const cfg cfgs[] = {
         { "greedy", 0.0f, 40, 0.95f },
         { "top_k20_temp0.7", 0.7f, 20, 0.8f },
+        { "greedy_budget_nogrammar", 0.0f, 40, 0.95f },   // a reasoning budget (think tags) without a grammar: the budget sampler alone
     };
     int n_fail = 0, n_fallback_total = 0;
     for (const auto & c : cfgs) {
         common_params_sampling params;
-        params.grammar          = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, TOOL_CALL_GRAMMAR);
+        const bool budget_only = std::string(c.name) == "greedy_budget_nogrammar";
+        if (budget_only) {
+            params.reasoning_budget_start  = common_tokenize(vocab, "<think>", false, true);
+            params.reasoning_budget_end    = { common_tokenize(vocab, "</think>", false, true) };
+            params.reasoning_budget_forced = params.reasoning_budget_end[0];
+            params.reasoning_budget_tokens = 0;
+        } else {
+            params.grammar          = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, TOOL_CALL_GRAMMAR);
+        }
         params.backend_sampling = true;
         params.temp             = c.temp;
         params.top_k            = c.top_k;

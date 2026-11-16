@@ -491,8 +491,8 @@ struct common_sampler * common_sampler_init(
         int32_t n_lowered = n_bias;
         if (greedy_only) {
             // [logit biases, greedy]: the argmax among the candidates not lowered; a bare greedy runs on the backend,
-            // under a grammar it needs the candidates (the best valid one)
-            if (n_bias > 0 || grmr) {
+            // under a grammar or a reasoning budget it needs the candidates (the best valid one)
+            if (n_bias > 0 || grmr || rbudget) {
                 k_pre = 1 + n_bias;
             }
         } else for (const auto & cnstr : params.samplers) {

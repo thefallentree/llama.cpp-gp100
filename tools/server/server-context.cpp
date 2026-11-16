@@ -2274,6 +2274,11 @@ private:
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
+            // GS1: a prompt with media keeps the host sampling path (as before GS1): its image batches already bring new
+            // graph shapes, and the sampler nodes would add their own next to them (r22: an OOM in cudaGraphInstantiate
+            // during the vision probe at production's VRAM margin)
+            use_backend_sampling &= !task.tokens.has_media();
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));

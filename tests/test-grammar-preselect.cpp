@@ -81,13 +81,30 @@ int main(int argc, char ** argv) {
         { "top_k20_temp0.7", 0.7f, 20, 0.8f },
         { "greedy_budget_nogrammar", 0.0f, 40, 0.95f },   // a reasoning budget (think tags) without a grammar: the budget sampler alone
         { "lazy_top_k20_temp0.7", 0.7f, 20, 0.8f },       // the lazy tool-call grammar (trigger word "<tool_call>": its tokens open every sequence)
+        { "lazy_budget_top_k20_temp0.7", 0.7f, 20, 0.8f }, // lazy grammar + reasoning budget: <think>, 3 free tokens, the forced </think> (outside the candidates), then the trigger
     };
     int n_fail = 0, n_fallback_total = 0;
     for (const auto & c : cfgs) {
         common_params_sampling params;
         const bool budget_only = std::string(c.name) == "greedy_budget_nogrammar";
-        const bool lazy        = std::string(c.name) == "lazy_top_k20_temp0.7";
+        const bool lazy_budget = std::string(c.name) == "lazy_budget_top_k20_temp0.7";
+        const bool lazy        = std::string(c.name) == "lazy_top_k20_temp0.7" || lazy_budget;
         const std::vector<llama_token> trigger_toks = common_tokenize(vocab, "<tool_call>", false, true);
+        const std::vector<llama_token> think_open   = common_tokenize(vocab, "<think>", false, true);
+        const std::vector<llama_token> think_close  = common_tokenize(vocab, "</think>", false, true);
+        // the scripted opening of a lazy_budget sequence: the start tag (forced by logits), 3 free tokens, the end tag
+        // (the budget sampler must force it: nothing in the logits points at it), then the trigger word (forced by logits)
+        std::vector<std::pair<llama_token, bool>> script;   // (token, forced by logits)
+        if (lazy_budget) {
+            for (auto t : think_open)   { script.push_back({ t, true }); }
+            for (int i = 0; i < 3; ++i) { script.push_back({ LLAMA_TOKEN_NULL, false }); }
+            for (auto t : think_close)  { script.push_back({ t, false }); }
+            for (auto t : trigger_toks) { script.push_back({ t, true }); }
+            params.reasoning_budget_start  = think_open;
+            params.reasoning_budget_end    = { think_close };
+            params.reasoning_budget_forced = think_close;
+            params.reasoning_budget_tokens = 3;
+        }
         if (lazy) {
             params.grammar          = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, TOOL_CALL_GRAMMAR);
             params.grammar_lazy     = true;
@@ -146,8 +163,11 @@ int main(int argc, char ** argv) {
                     logits[rng() % n_vocab] += 6.0f + (rng() % 5);
                 }
                 const int kind = step % 3;   // 0: plain random, 1: valid tokens spiked (the sharp rows of a real model), 2: forced fallback
-                if (lazy && step < (int) trigger_toks.size()) {
+                if (lazy && !lazy_budget && step < (int) trigger_toks.size()) {
                     logits[trigger_toks[step]] = 200.0f;   // the trigger word's tokens open every sequence: the grammar is active after them
+                }
+                if (lazy_budget && step < (int) script.size() && script[step].second) {
+                    logits[script[step].first] = 200.0f;
                 }
                 const std::vector<char> valid = valid_mask(chk, n_vocab);
                 int n_invalid = 0;
@@ -187,6 +207,10 @@ int main(int argc, char ** argv) {
                 const bool must_equal = c.temp == 0.0f || fallback || kind != 1;
                 if (!is_valid || (must_equal && id != id_ref)) {
                     fprintf(stderr, "FAIL %s seq %d step %d kind %d: id %d (valid %d, fallback %d) ref %d\n", c.name, seq, step, kind, id, (int) is_valid, (int) fallback, id_ref);
+                    n_fail++;
+                }
+                if (lazy_budget && step < (int) script.size() && script[step].first != LLAMA_TOKEN_NULL && id != script[step].first) {
+                    fprintf(stderr, "FAIL %s seq %d step %d: id %d, the script expects %d (%s; fallback %d, ref %d)\n", c.name, seq, step, id, script[step].first, script[step].second ? "forced by logits" : "forced by the budget sampler", (int) fallback, id_ref);
                     n_fail++;
                 }
                 if (kind == 2 && !fallback && !budget_only && n_invalid >= k_pre) {   // (without an active grammar no token is invalid: nothing forces the fallback)

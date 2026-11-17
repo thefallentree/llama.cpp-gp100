@@ -1183,6 +1183,10 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // the raw logits of the i-th token even when a backend sampler left its (few) sampled logits for the row, which
+    // llama_get_logits_ith returns first; the row must have been copied (llama_sampler_chain_set_preselect_raw)
+    LLAMA_API float * llama_get_raw_logits_ith(struct llama_context * ctx, int32_t i);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

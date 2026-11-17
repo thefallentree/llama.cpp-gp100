@@ -5693,6 +5693,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     return res;
 }
 
+float * llama_get_raw_logits_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_logits_ith(i);
+}
+
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
 

@@ -170,12 +170,14 @@ struct common_sampler {
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
-    // the whole row from its raw logits (the grammar's fallback when too few pre-selected candidates are valid)
+    // the whole row from its raw logits (the grammar's fallback when too few pre-selected candidates are valid).
+    // llama_get_raw_logits_ith, not llama_get_logits_ith: the latter returns the backend's sampled logits first (the
+    // k_pre candidate logits in candidate order, not a row), and the fallback then ran on a garbage row (r22c).
     void set_logits_raw(struct llama_context * ctx, int idx) {
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const int n_vocab = llama_vocab_n_tokens(vocab);
-        const auto * logits = llama_get_logits_ith(ctx, idx);
+        const auto * logits = llama_get_raw_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr && "the grammar's fallback needs the row's raw logits (preselect_raw)");
         cur.resize(n_vocab);
         for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
@@ -936,7 +938,45 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // candidates; the chain runs on them when enough are valid, else on the whole row
     if (gsmpl->grammar_preselect && llama_get_sampled_candidates_count_ith(ctx, idx) > 0) {
         bool fallback = false;
+        const int32_t n_cand = (int32_t) llama_get_sampled_candidates_count_ith(ctx, idx);
         id = common_sampler_sample_preselected(gsmpl, &fallback, [&]() { gsmpl->set_logits_raw(ctx, idx); });
+        // LLAMA_SAMPLER_PRESELECT_CHECK=1 (a gate's diagnostic, ~1 ms per token): a greedy chain's result is compared
+        // with the host path over the row's raw logits (reasoning budget, grammar, argmax); a mismatch names the row,
+        // the tokens and the sampler states (wrong-row candidates, a stale fallback row, a budget/grammar state skew)
+        static const bool check = getenv("LLAMA_SAMPLER_PRESELECT_CHECK") != nullptr && atoi(getenv("LLAMA_SAMPLER_PRESELECT_CHECK")) != 0;
+        if (check && common_sampler_is_greedy(gsmpl->params)) {
+            const llama_model * model = llama_get_model(ctx);
+            const llama_vocab * vocab = llama_model_get_vocab(model);
+            const int n_vocab = llama_vocab_n_tokens(vocab);
+            const float * raw = llama_get_raw_logits_ith(ctx, idx);
+            if (raw != nullptr) {
+                std::vector<llama_token_data> row(n_vocab);
+                for (llama_token t = 0; t < n_vocab; ++t) {
+                    row[t] = { t, raw[t], 0.0f };
+                }
+                llama_token_data_array arr = { row.data(), row.size(), -1, false };
+                llama_sampler_apply(rbudget, &arr);
+                if (grammar_should_apply(gsmpl)) {
+                    llama_sampler_apply(grmr, &arr);
+                }
+                llama_token ref = LLAMA_TOKEN_NULL;
+                float       best = -INFINITY;
+                for (size_t k = 0; k < arr.size; ++k) {
+                    if (arr.data[k].logit > best) {
+                        best = arr.data[k].logit;
+                        ref  = arr.data[k].id;
+                    }
+                }
+                static int n_mismatch = 0;
+                if (ref != id && n_mismatch < 50) {
+                    n_mismatch++;
+                    const int state = rbudget ? (int) common_reasoning_budget_get_state(rbudget) : -1;
+                    LOG_WRN("%s: PRESELECT MISMATCH #%d row %d: candidate path %d '%s' (%d candidates, fallback %d) vs raw-row path %d '%s' (logit %.3f, candidate logit of %d: %.3f), budget state %d, grammar %d\n",
+                            __func__, n_mismatch, idx, id, common_token_to_piece(vocab, id, true).c_str(), n_cand, (int) fallback,
+                            ref, common_token_to_piece(vocab, ref, true).c_str(), best, id, id >= 0 && id < n_vocab ? raw[id] : -INFINITY, state, (int) (grmr != nullptr));
+                }
+            }
+        }
         return id;
     }
 

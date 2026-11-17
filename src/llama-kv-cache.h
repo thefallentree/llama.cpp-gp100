@@ -345,9 +345,6 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
-    // scratch of seq_rm: the cells of the sequence in the removed range
-    std::vector<uint32_t> seq_rm_hits;
-
     // M2: ghost cells. Every state_write of a sequence records the cells it wrote (a ghost: the blob's id, written into
     // the blob, and its cells). When the sequence is removed those cells keep their data until something writes them,
     // so a state_read of the same blob (the server's prompt cache bringing back the conversation that was switched

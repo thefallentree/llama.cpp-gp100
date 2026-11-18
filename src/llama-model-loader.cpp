@@ -1039,7 +1039,11 @@ bool llama_model_loader::resplit(const std::string & first, const std::string & 
         ta->nb[d] = ta->nb[d - 1]*ta->ne[d - 1];
         tb->nb[d] = tb->nb[d - 1]*tb->ne[d - 1];
     }
-    b.offs = a.offs + (size_t) n_first*slice;
+    b.offs     = a.offs + (size_t) n_first*slice;
+    a.base_offs = a.offs;
+    a.base_idx  = 0;
+    b.base_offs = a.offs;
+    b.base_idx  = n_first;
     return true;
 }
 

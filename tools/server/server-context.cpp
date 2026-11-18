@@ -5117,7 +5117,7 @@ private:
                         // checkpoint already exists within end4_min tokens (avoids a full 48-layer 4-token pass + 112.6 MiB save per agent turn)
                         if (do_checkpoint) {
                             static const int64_t end4_min = getenv("LLAMA_CKPT_END4_MIN") != nullptr ? atoll(getenv("LLAMA_CKPT_END4_MIN")) : 0;
-                            const int64_t n_last_ckpt = slot.prompt.checkpoints.empty() ? -end4_min - 1 : slot.prompt.checkpoints.back().n_tokens;
+                            const int64_t n_last_ckpt = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens;
                             const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -5199,11 +5199,13 @@ private:
                     static const int64_t ckpt_near = getenv("LLAMA_CKPT_NEAR") != nullptr ? atoll(getenv("LLAMA_CKPT_NEAR")) : 256;
                     static const int64_t end4_min  = getenv("LLAMA_CKPT_END4_MIN") != nullptr ? atoll(getenv("LLAMA_CKPT_END4_MIN")) : 0;
                     const int64_t n_to_end = (int64_t) slot.task->n_tokens() - n_tokens_start;
+                    const int64_t n_prev_ckpt = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens;
                     const bool is_end_offset = (n_to_end == 4 + n_ubatch) ||
-                        (n_to_end == 4 && (end4_min <= 0 || slot.prompt.checkpoints.empty() || n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + end4_min));
+                        (n_to_end == 4 && (end4_min <= 0 || n_tokens_start >= n_prev_ckpt + end4_min));
                     do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() || is_end_offset ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + std::max<int64_t>(params_base.checkpoint_min_step, ckpt_near));
+                            (slot.prompt.checkpoints.empty() && (end4_min <= 0 || n_tokens_start >= end4_min)) ||
+                            is_end_offset ||
+                            n_tokens_start > n_prev_ckpt + std::max<int64_t>(params_base.checkpoint_min_step, ckpt_near));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

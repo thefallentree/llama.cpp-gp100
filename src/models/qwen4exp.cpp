@@ -190,7 +190,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // routing of the layers differs (at 240 hot per layer the cold pairs of decode windows ranged from 2% to 21% by
     // layer), and a layer's cold pairs are what the host tier makes the window wait for.
     std::vector<int64_t> n_hot_layer(n_layer, hparams.n_expert_hot > 0 ? (int64_t) hparams.n_expert_hot : 0);
-    if (hparams.n_expert_hot > 0 && !mtp_only && (getenv("LLAMA_EXPERT_HOT") != nullptr || getenv("LLAMA_EXPERT_HOT_LAYERS") != nullptr)) {
+    if (hparams.n_expert_hot > 0 && !mtp_only &&
+        (getenv("LLAMA_EXPERT_HOT") != nullptr || getenv("LLAMA_EXPERT_HOT_LAYERS") != nullptr || getenv("LLAMA_EXPERT_ORDER") != nullptr)) {
         if (getenv("LLAMA_EXPERT_HOT") != nullptr) {
             std::fill(n_hot_layer.begin(), n_hot_layer.end(), std::max(1, atoi(getenv("LLAMA_EXPERT_HOT"))));
         }
@@ -218,22 +219,44 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 il_next = il + 1;
             }
         }
+        std::map<int, std::vector<int64_t>> orders;
+        if (getenv("LLAMA_EXPERT_ORDER") != nullptr) {
+            orders = llama_read_expert_order(getenv("LLAMA_EXPERT_ORDER"), n_expert);
+        }
         static const llm_tensor pairs[3][2] = {
             { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
             { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },
             { LLM_TENSOR_FFN_UP_EXPS,   LLM_TENSOR_FFN_UP_EXPS_COLD   },
         };
-        int64_t total = 0;
+        int64_t total     = 0;
+        int     n_ordered = 0;
         for (int il = 0; il < n_layer; ++il) {
             total += n_hot_layer[il];
-            if (n_hot_layer[il] == (int64_t) hparams.n_expert_hot) {
-                continue;
-            }
-            for (const auto & pair : pairs) {
-                if (!ml.resplit(tn(pair[0], "weight", il).str(), tn(pair[1], "weight", il).str(), n_hot_layer[il], 2)) {
-                    throw std::runtime_error(format("LLAMA_EXPERT_HOT: the hot and cold expert tensors of layer %d are not one array in the file", il));
+            const auto it_order = orders.find(il);
+            const std::vector<int64_t> * order = it_order != orders.end() ? &it_order->second : nullptr;
+            if (n_hot_layer[il] != (int64_t) hparams.n_expert_hot || order != nullptr) {
+                for (const auto & pair : pairs) {
+                    const std::string hot  = tn(pair[0], "weight", il).str();
+                    const std::string cold = tn(pair[1], "weight", il).str();
+                    if (!ml.resplit(hot, cold, n_hot_layer[il], 2)) {
+                        throw std::runtime_error(format("LLAMA_EXPERT_HOT: the hot and cold expert tensors of layer %d are not one array in the file", il));
+                    }
+                    if (order && (!ml.gather_axis(hot, 2, *order) || !ml.gather_axis(cold, 2, *order))) {
+                        throw std::runtime_error(format("LLAMA_EXPERT_ORDER: cannot order the experts of %s", hot.c_str()));
+                    }
+                }
+                if (order) {
+                    const std::string router = tn(LLM_TENSOR_FFN_GATE_INP, "weight", il).str();
+                    if (!ml.gather_axis(router, 1, *order)) {
+                        throw std::runtime_error(format("LLAMA_EXPERT_ORDER: cannot order the rows of %s", router.c_str()));
+                    }
+                    n_ordered++;
                 }
             }
+        }
+        if (!orders.empty()) {
+            LLAMA_LOG_WARN("%s: expert order from %s: %d layers loaded in the hot-first order (%zu layers in the file)\n",
+                    __func__, getenv("LLAMA_EXPERT_ORDER"), n_ordered, orders.size());
         }
         LLAMA_LOG_INFO("%s: %.1f hot experts per layer on average (the file's split: %u)\n", __func__, (double) total/n_layer, hparams.n_expert_hot);
     }

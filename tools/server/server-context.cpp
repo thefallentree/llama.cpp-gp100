@@ -2209,8 +2209,6 @@ private:
             }
         }
 
-        slot.prompt.lora = slot.lora;
-
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;

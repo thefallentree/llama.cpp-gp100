@@ -5113,11 +5113,18 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        // LLAMA_CKPT_END4_MIN: skip splitting 4 tokens before the end on short continuations when a
+                        // checkpoint already exists within end4_min tokens (avoids a full 48-layer 4-token pass + 112.6 MiB save per agent turn)
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            static const int64_t end4_min = getenv("LLAMA_CKPT_END4_MIN") != nullptr ? atoll(getenv("LLAMA_CKPT_END4_MIN")) : 0;
+                            const int64_t n_last_ckpt = slot.prompt.checkpoints.empty() ? -end4_min - 1 : slot.prompt.checkpoints.back().n_tokens;
+                            const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (offset == 4 && end4_min > 0 && (int64_t) slot.task->n_tokens() - 4 < n_last_ckpt + end4_min) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -5190,8 +5197,10 @@ private:
                     // there restores that one and re-processes at most that many tokens; a small agent turn otherwise paid
                     // three 113 MiB saves per request)
                     static const int64_t ckpt_near = getenv("LLAMA_CKPT_NEAR") != nullptr ? atoll(getenv("LLAMA_CKPT_NEAR")) : 256;
+                    static const int64_t end4_min  = getenv("LLAMA_CKPT_END4_MIN") != nullptr ? atoll(getenv("LLAMA_CKPT_END4_MIN")) : 0;
                     const int64_t n_to_end = (int64_t) slot.task->n_tokens() - n_tokens_start;
-                    const bool is_end_offset = n_to_end == 4 || n_to_end == 4 + n_ubatch;
+                    const bool is_end_offset = (n_to_end == 4 + n_ubatch) ||
+                        (n_to_end == 4 && (end4_min <= 0 || slot.prompt.checkpoints.empty() || n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + end4_min));
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() || is_end_offset ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + std::max<int64_t>(params_base.checkpoint_min_step, ckpt_near));

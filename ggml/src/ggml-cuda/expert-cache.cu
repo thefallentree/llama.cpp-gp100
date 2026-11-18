@@ -181,7 +181,7 @@ static __global__ void ec_patch_perm(const ec_patch * __restrict__ patches, cons
 // when a decode follows a prompt (the shares of the prompt's tokens stay, in the decode's units).
 static __global__ void ec_scan(const ec_row * __restrict__ rows, const uint32_t * __restrict__ counts, uint32_t * __restrict__ seen,
                                float * __restrict__ freq, const int32_t * __restrict__ perm, const float decay, const float min_gain,
-                               const float rescale, ec_res * __restrict__ res, ec_cand * __restrict__ more) {
+                               const float rescale, const float prompt_w, ec_res * __restrict__ res, ec_cand * __restrict__ more) {
     __shared__ float    s_freq[EC_MAX_EXPERTS];
     __shared__ uint32_t s_delta[EC_MAX_EXPERTS];
     __shared__ int32_t  s_in[EC_MAX_EXPERTS];   // rank -> expert
@@ -220,14 +220,19 @@ static __global__ void ec_scan(const ec_row * __restrict__ rows, const uint32_t 
         return;
     }
     uint32_t cold = 0, n_in = 0, n_out = 0;
+    // a prompt ubatch (more than a decode window routes) weighs prompt_w (GGML_CUDA_EXPERT_CACHE_PROMPT_W); 0 = it
+    // neither decays nor counts: the decode set survives a prefill (scan resistance)
+    const bool  is_prompt = total > 100;
+    const float w_new     = is_prompt ? prompt_w : 1.0f;
+    const float w_old     = is_prompt && prompt_w == 0.0f ? 1.0f : decay*rescale;
     for (int e = tid; e < r.n_all; e += blockDim.x) {
         const uint32_t d = s_delta[e];
-        const float    f = freq[base + e]*decay*rescale + (float) d;
+        const float    f = freq[base + e]*w_old + w_new*(float) d;
         freq[base + e]  = f;
         seen[base + e] += d;
         s_freq[e] = f;
         const bool hot  = perm[base + e] < r.n_hot;
-        const int  kind = !hot && d != 0 ? 1 : hot && d == 0 ? 2 : 0;
+        const int  kind = w_new == 0.0f ? 0 : !hot && d != 0 ? 1 : hot && d == 0 ? 2 : 0;
         s_kind[e] = (uint8_t) kind;
         cold  += hot ? 0 : d;
         n_in  += kind == 1;
@@ -548,9 +553,10 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     static const float min_gain = getenv("GGML_CUDA_EXPERT_CACHE_GAIN") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_GAIN")) : 2.0f;
     // the update after a prompt ubatch: its counts in the units of a decode window (3 tokens)
     static const bool rescale_on = getenv("GGML_CUDA_EXPERT_CACHE_RESCALE") == nullptr || atoi(getenv("GGML_CUDA_EXPERT_CACHE_RESCALE")) != 0;
-    const float rescale = rescale_on && d.last_prompt_tokens > 3 ? 3.0f/(float) d.last_prompt_tokens : 1.0f;
+    static const float prompt_w  = getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_W") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_W")) : 1.0f;
+    const float rescale = rescale_on && prompt_w != 0.0f && d.last_prompt_tokens > 3 ? 3.0f/(float) d.last_prompt_tokens : 1.0f;
     ec_scan<<<(unsigned int) n_rows, EC_SCAN_TPB, 0, stream>>>(d.rows_dev, d.counts_dev, d.seen_dev, d.freq_dev, d.perm_dev, decay, min_gain,
-        rescale, d.res_dev, d.more_dev);
+        rescale, prompt_w, d.res_dev, d.more_dev);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(d.res_host, d.res_dev, n_rows*sizeof(ec_res), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));

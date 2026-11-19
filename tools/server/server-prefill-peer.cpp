@@ -693,6 +693,7 @@ bool prefill_peer_run(const prefill_peer_config & cfg,
     // the drafter's pending row and deferred rows as they are here, so the last stage's catch-up starts from them
     std::vector<uint8_t> spec_in;
     if (spec) {
+        common_speculative_catchup_join(spec);
         common_speculative_get_state(spec, seq_id, spec_in);
     }
 
@@ -1017,7 +1018,10 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
     const int32_t il_hi = n_st > 1 ? stages[1].layer_begin : -1;
     const bool    last  = n_st == 1;
 
-    // an empty memory, as on the head
+    // an empty memory, as on the head (wait for any background drafter catch-up before clearing/loading state)
+    if (spec) {
+        common_speculative_catchup_join(spec);
+    }
     llama_memory_clear(llama_get_memory(ctx_tgt), true);
     if (ctx_dft) {
         llama_memory_clear(llama_get_memory(ctx_dft), true);
@@ -1157,13 +1161,21 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
             err = "the next stage is gone";
             break;
         }
-        // the last stage: the drafter's catch-up of message i_msg - 1 runs on its thread and reads the other slot; the
-        // one that read this slot (i_msg - n_slots) must be done (WP10, common_speculative_process_async); the
-        // checkpoint snapshot below needs the whole draft context, so every pending job joins first
-        if (last && catchup_async && !common_speculative_catchup_wait(spec, pos0 == n_ckpt && n_ckpt > 0 ? i_msg - 1 : i_msg - n_slots)) {
-            ok = false;
-            err = "drafter catch-up failed";
-            break;
+        // the last stage: the drafter's catch-up of message j_catchup - 1 runs on its thread and reads the other slot;
+        // the one that read this slot (j_catchup - n_slots) must be done (WP10, common_speculative_process_async); the
+        // checkpoint snapshot below needs the whole draft context, so every pending job joins first.
+        // Note: catch-up job indices are monotonic across server lifetime (common_speculative_catchup_next), not
+        // per-prompt i_msg.
+        const int64_t j_catchup = last && catchup_async ? common_speculative_catchup_next(spec) : i_msg;
+        if (last && catchup_async) {
+            const bool ok_wait = (pos0 == n_ckpt && n_ckpt > 0)
+                ? common_speculative_catchup_join(spec)
+                : common_speculative_catchup_wait(spec, j_catchup - n_slots);
+            if (!ok_wait) {
+                ok = false;
+                err = "drafter catch-up failed";
+                break;
+            }
         }
         if (pos0 == n_ckpt && n_ckpt > 0) {
             // the state before this ubatch: what the local path's checkpoint here holds of these layers
@@ -1182,7 +1194,7 @@ void serve_one(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_
         }
         const double tc = now_ms();
         llama_set_hc_input(ctx_tgt, u.h, pos0, n);
-        llama_set_embeddings_nextn_slot(ctx_tgt, (int32_t) (i_msg % n_slots));
+        llama_set_embeddings_nextn_slot(ctx_tgt, (int32_t) (j_catchup % n_slots));
         batch.clear();
         for (int32_t i = 0; i < n; ++i) {
             batch.add(tokens[pos0 + i], pos0 + i, seq_id, false);

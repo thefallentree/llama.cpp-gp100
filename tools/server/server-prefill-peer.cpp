@@ -1733,7 +1733,7 @@ void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t mode
         return;
     }
 
-    const llama_tokens etoks = e->prompt.tokens.get_tokens();
+    const llama_tokens etoks = e->prompt.tokens.get_text_tokens();
     const uint32_t n_segs  = (uint32_t) e->data.segs.size();
     const uint32_t n_ckpts = (uint32_t) e->prompt.checkpoints.size();
 

@@ -914,7 +914,8 @@ static bool scenario_peer_cache_pin(server_prompt_cache & cache, slot & s, int32
     if (s.dft) {
         CHECK(decode_range(s.dft, conv, 0, 128 - LAG));
     }
-    s.prompt.tokens = server_tokens(conv, false);
+    // Simulate --mmproj servers where has_mtmd=true even for text-only prompts (has_media()==false)
+    s.prompt.tokens = server_tokens(conv, /*has_mtmd=*/ true);
     s.prompt.checkpoints.clear();
     for (int i = 1; i <= 5; ++i) {
         common_prompt_checkpoint ck;
@@ -932,6 +933,7 @@ static bool scenario_peer_cache_pin(server_prompt_cache & cache, slot & s, int32
     int lcp = 0;
     server_prompt_cache_state * pinned = cache.pin_best_prefix(conv, 64, &lcp);
     CHECK(pinned == saved && lcp == 128);
+    CHECK(pinned->prompt.tokens.get_text_tokens() == conv);
 
     // 1) Shrinking limit to 1 byte must NOT evict or trim the pinned entry
     cache.limit_size = 1;
@@ -941,7 +943,7 @@ static bool scenario_peer_cache_pin(server_prompt_cache & cache, slot & s, int32
 
     // 2) Restoring the pinned entry into a slot must copy checkpoints instead of moving them out
     cache.limit_size = 64ull << 20;
-    CHECK(cache.load(s.prompt, server_tokens(conv, false), s.tgt, s.dft, nullptr, SEQ, nullptr, &s.origin));
+    CHECK(cache.load(s.prompt, server_tokens(conv, /*has_mtmd=*/ true), s.tgt, s.dft, nullptr, SEQ, nullptr, &s.origin));
     CHECK(s.origin == pinned);
     CHECK(s.prompt.checkpoints.size() == 5);
     CHECK(pinned->prompt.checkpoints.size() == 5);
@@ -995,6 +997,7 @@ static bool scenario_peer_cache_pin(server_prompt_cache & cache, slot & s, int32
     CHECK(cache.count() == 0);
 
     cache.limit_size = orig_limit;
+    s.prompt.tokens.has_mtmd = false;
     return true;
 }
 

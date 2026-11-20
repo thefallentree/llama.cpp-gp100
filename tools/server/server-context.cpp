@@ -2234,7 +2234,7 @@ private:
                                 }
 
                                 bool ok = true;
-                                server_tokens pulled_toks(pcr.tokens, /*has_mtmd=*/ false);
+                                server_tokens pulled_toks(pcr.tokens, /*has_mtmd=*/ mctx != nullptr);
                                 const llama_pos n_e = pulled_toks.pos_next();
                                 for (size_t i = 0; i < pcr.segs.size(); ++i) {
                                     const auto & seg = pcr.segs[i];

@@ -2084,13 +2084,12 @@ server_prompt_cache_state * server_prompt_cache::pin_best_prefix(const llama_tok
         if (st.writing || st.broken || st.prompt.tokens.has_media() || st.data.segs.empty()) {
             continue;
         }
-        const auto & et = st.prompt.tokens.get_tokens();
-        const int n = (int) std::min(et.size(), tokens.size());
+        const int n = (int) std::min(st.prompt.tokens.size(), tokens.size());
         if (n < min_lcp) {
             continue;
         }
         int lcp = 0;
-        while (lcp < n && et[lcp] == tokens[lcp]) {
+        while (lcp < n && st.prompt.tokens[lcp] == tokens[lcp]) {
             ++lcp;
         }
         if (lcp >= min_lcp && lcp >= best_lcp) {

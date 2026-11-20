@@ -110,6 +110,39 @@ struct ec_device {
 
 static ec_device g_ec[GGML_CUDA_MAX_DEVICES];
 
+// C3 diagnostics: GGML_CUDA_EC_TRACE=<prefix> writes <prefix>.dev<N>, a binary trace of every update: the routed
+// counts per layer (sparse), the cold pairs, the exchanges taken, and the residents at the start (runs/mc1/ec_sim.py)
+struct ec_trace {
+    FILE *     f       = nullptr;
+    bool       tried   = false;
+    uint32_t * counts  = nullptr; // pinned [EC_MAX_LAYERS*EC_MAX_EXPERTS] copy of counts_dev
+    std::vector<uint32_t> prev;   // counts at the last record, per row
+    size_t     n_rows_hdr = 0;
+};
+static ec_trace g_ec_trace[GGML_CUDA_MAX_DEVICES];
+
+static ec_trace * ec_trace_get(const int device) {
+    ec_trace & t = g_ec_trace[device];
+    if (!t.tried) {
+        t.tried = true;
+        const char * p = getenv("GGML_CUDA_EC_TRACE");
+        if (p != nullptr && *p != '\0') {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.dev%d", p, device);
+            t.f = fopen(path, "wb");
+            if (t.f != nullptr && cudaMallocHost((void **) &t.counts, (size_t) EC_MAX_LAYERS*EC_MAX_EXPERTS*sizeof(uint32_t)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                fclose(t.f);
+                t.f = nullptr;
+            }
+            t.prev.assign((size_t) EC_MAX_LAYERS*EC_MAX_EXPERTS, 0);
+        }
+    }
+    return t.f != nullptr ? &t : nullptr;
+}
+
+static void ec_trace_u32(FILE * f, uint32_t v) { fwrite(&v, 4, 1, f); }
+
 // GGML_CUDA_EXPERT_CACHE_MIRROR_WRITE=0: DIAGNOSTICS ONLY, the exchanges leave the host tier's copies stale (wrong results
 // for the experts that move): measures what the second write of an evicted slice costs
 static bool ec_mirror_writes() {
@@ -558,6 +591,10 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
     static const float prompt_w  = getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_W") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_PROMPT_W")) : 1.0f;
     static const float floor_top = getenv("GGML_CUDA_EXPERT_CACHE_FLOOR") != nullptr ? (float) atof(getenv("GGML_CUDA_EXPERT_CACHE_FLOOR")) : 0.0f;
     const float rescale = rescale_on && prompt_w != 0.0f && d.last_prompt_tokens > 3 ? 3.0f/(float) d.last_prompt_tokens : 1.0f;
+    ec_trace * trc = ec_trace_get(ctx.device);
+    if (trc != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(trc->counts, d.counts_dev, n_rows*EC_MAX_EXPERTS*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    }
     ec_scan<<<(unsigned int) n_rows, EC_SCAN_TPB, 0, stream>>>(d.rows_dev, d.counts_dev, d.seen_dev, d.freq_dev, d.perm_dev, decay, min_gain,
         rescale, prompt_w, floor_top, d.res_dev, d.more_dev);
     CUDA_CHECK(cudaGetLastError());
@@ -617,6 +654,40 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
                     (unsigned long long) (d.n_pairs - pairs_last), (unsigned long long) (d.n_swaps - swaps_last));
             pairs_last = d.n_pairs; cold_last = d.n_pairs_cold; swaps_last = d.n_swaps;
         }
+    }
+    if (trc != nullptr) {
+        FILE * f = trc->f;
+        if (trc->n_rows_hdr != n_rows) {
+            // 'HEAD': the rows, their capacity and residents (perm: expert -> position, hot below n_hot)
+            ec_trace_u32(f, 0x44414548u); ec_trace_u32(f, (uint32_t) n_rows);
+            for (size_t row = 0; row < n_rows; ++row) {
+                const ec_layer & l = d.layers[row];
+                ec_trace_u32(f, (uint32_t) l.n_hot); ec_trace_u32(f, (uint32_t) l.n_expert); ec_trace_u32(f, (uint32_t) l.perm.size());
+                fwrite(l.perm.data(), 4, l.perm.size(), f);
+            }
+            trc->n_rows_hdr = n_rows;
+        }
+        // 'UPDT': per row total, cold, nnz, then nnz x (u16 expert, u16 count)
+        ec_trace_u32(f, 0x54445055u); ec_trace_u32(f, (uint32_t) n_rows); ec_trace_u32(f, (uint32_t) d.last_prompt_tokens);
+        std::vector<uint32_t> pairs;
+        for (size_t row = 0; row < n_rows; ++row) {
+            const ec_res & r = d.res_host[row];
+            pairs.clear();
+            if (r.total != 0) {
+                const size_t base = row*EC_MAX_EXPERTS;
+                const int n_all = d.layers[row].n_expert;
+                for (int e = 0; e < n_all; ++e) {
+                    const uint32_t c = trc->counts[base + e] - trc->prev[base + e];
+                    trc->prev[base + e] = trc->counts[base + e];
+                    if (c != 0) {
+                        pairs.push_back((uint32_t) e | (std::min<uint32_t>(c, 65535u) << 16));
+                    }
+                }
+            }
+            ec_trace_u32(f, r.total); ec_trace_u32(f, r.cold); ec_trace_u32(f, (uint32_t) pairs.size());
+            fwrite(pairs.data(), 4, pairs.size(), f);
+        }
+        fflush(f);
     }
     // after a prompt every cold expert it routed to comes in; in a decode the best of the last window.
     // GGML_CUDA_EXPERT_CACHE_PROMPT_SWAPS=1 does that after every prompt ubatch (the behaviour up to qp8); the default
@@ -710,6 +781,16 @@ void ggml_cuda_expert_cache_update(ggml_backend_cuda_context & ctx) {
         return;
     }
     d.n_swaps += n_taken;
+    if (trc != nullptr) {
+        // 'SWAP': n, then n x (u32 row, u16 e_in, u16 e_out)
+        ec_trace_u32(trc->f, 0x50415753u); ec_trace_u32(trc->f, (uint32_t) n_taken);
+        for (int i = 0; i < n_taken; ++i) {
+            const ec_patch & p = patches[i];
+            ec_trace_u32(trc->f, (uint32_t) (p.idx_in / EC_MAX_EXPERTS));
+            ec_trace_u32(trc->f, (uint32_t) (p.idx_in % EC_MAX_EXPERTS) | ((uint32_t) (p.idx_out % EC_MAX_EXPERTS) << 16));
+        }
+        fflush(trc->f);
+    }
     // The slices and the positions, on a stream of their own: what the caller copies from the device next (the
     // results of the window) does not wait for megabytes over PCIe. The next graph does (ggml_cuda_expert_cache_wait).
     cudaStream_t xs = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);

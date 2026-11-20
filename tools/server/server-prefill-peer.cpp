@@ -1521,10 +1521,15 @@ void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_d
 namespace {
 
 void set_sock_timeouts(int fd, int timeout_ms) {
-    const int ms = std::max(100, timeout_ms);
     struct timeval tv;
-    tv.tv_sec  = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
+    if (timeout_ms <= 0) {
+        tv.tv_sec  = 0;
+        tv.tv_usec = 0;
+    } else {
+        const int ms = std::max(100, timeout_ms);
+        tv.tv_sec  = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+    }
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
@@ -1678,11 +1683,16 @@ bool prefill_peer_is_cache_pull(int fd) {
     set_sock_timeouts(fd, 2000);
     pollfd pfd = { fd, POLLIN, 0 };
     if (::poll(&pfd, 1, 2000) <= 0 || !(pfd.revents & POLLIN)) {
+        set_sock_timeouts(fd, 0);
         return false;
     }
     uint32_t magic = 0;
     const ssize_t k = ::recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL);
-    return k == (ssize_t) sizeof(magic) && magic == MSG_CACHE_PULL;
+    const bool is_pull = k == (ssize_t) sizeof(magic) && magic == MSG_CACHE_PULL;
+    if (!is_pull) {
+        set_sock_timeouts(fd, 0);
+    }
+    return is_pull;
 }
 
 void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t model_sig, const std::atomic<bool> * stop) {

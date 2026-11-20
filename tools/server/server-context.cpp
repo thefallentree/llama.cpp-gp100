@@ -4202,6 +4202,10 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
+        if (batch.size() == 0 && spec_ahead.active) {
+            spec_ahead_discard();
+        }
+
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
             auto & alora_scale       = batch.alora_scale;
@@ -4597,6 +4601,9 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
+                    if (spec_ahead.active) {
+                        spec_ahead_discard();
+                    }
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);

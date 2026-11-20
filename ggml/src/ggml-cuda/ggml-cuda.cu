@@ -5088,10 +5088,14 @@ static void ggml_cuda_in_fire(ggml_backend_cuda_context & ctx) {
 
 // The staged inputs go to the device, on the context's stream: before anything else is put on it that may read them.
 static void ggml_cuda_in_flush(ggml_backend_cuda_context & ctx) {
+    if (ctx.in_gated_capture) {
+        // the staged inputs are what the gate of the window being captured scatters when fired
+        return;
+    }
     // the inputs go to the stream now: a fire armed for a window launch has nothing left to fire
     ctx.in_fire_armed = false;
-    if (ctx.in_n == 0 || ctx.in_gated_capture) {
-        // nothing staged, or the staged inputs are what the gate of the window being captured scatters when fired
+    if (ctx.in_n == 0) {
+        // nothing staged
         return;
     }
     // a window waits for its inputs ahead of anything put on the stream now: the copy would never run

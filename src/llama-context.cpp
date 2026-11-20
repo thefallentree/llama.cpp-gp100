@@ -862,15 +862,16 @@ void llama_context::draft_chain_init() {
         return;
     }
 
+    static const bool chain_q4 = getenv("LLAMA_DRAFT_CHAIN_Q4") == nullptr || atoi(getenv("LLAMA_DRAFT_CHAIN_Q4")) != 0;
     // a table of the draft vocabulary's rows in a type the device gathers from: the model's own when it is one of
-    // them, Q8_0 for the others (a K-quant)
+    // them, Q4_0 (or Q8_0 when LLAMA_DRAFT_CHAIN_Q4=0) for the others (a K-quant)
     ggml_type type_table = model.tok_embd->type;
     switch (type_table) {
         case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
             break;
         default:
-            type_table = GGML_TYPE_Q8_0;
+            type_table = chain_q4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
     }
 
     // a head sharded over the vocabulary: the shards' first rows, for the merge of their best rows on the device
@@ -879,15 +880,19 @@ void llama_context::draft_chain_init() {
             ggml_backend_meta_tensor_shards(layer.nextn.shared_head_head, shard_ne, 16) : 0;
 
     ggml_init_params ip = {
-        /*.mem_size   =*/ 6*ggml_tensor_overhead(),
+        /*.mem_size   =*/ 8*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     draft_chain.ctx.reset(ggml_init(ip));
-    draft_chain.tok = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_I32, 1);
-    ggml_set_name(draft_chain.tok, "draft_chain_tok");
-    draft_chain.h   = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
-    ggml_set_name(draft_chain.h, "draft_chain_h");
+    draft_chain.tok[0] = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_name(draft_chain.tok[0], "draft_chain_tok0");
+    draft_chain.tok[1] = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_name(draft_chain.tok[1], "draft_chain_tok1");
+    draft_chain.h[0]   = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
+    ggml_set_name(draft_chain.h[0], "draft_chain_h0");
+    draft_chain.h[1]   = ggml_new_tensor_1d(draft_chain.ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
+    ggml_set_name(draft_chain.h[1], "draft_chain_h1");
     if (host_table) {
         draft_chain.tok_embd = ggml_new_tensor_2d(draft_chain.ctx.get(), type_table, n_embd, n_vocab_dr);
         ggml_set_name(draft_chain.tok_embd, "draft_chain_tok_embd");
@@ -901,7 +906,9 @@ void llama_context::draft_chain_init() {
     draft_chain.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_chain.ctx.get(), buft));
     if (draft_chain.buf == nullptr) {
         LLAMA_LOG_WARN("%s: draft chain unavailable: could not allocate its buffer\n", __func__);
-        draft_chain.tok = draft_chain.h = draft_chain.tok_embd = draft_chain.eye = draft_chain.off = nullptr;
+        draft_chain.tok[0] = draft_chain.tok[1] = nullptr;
+        draft_chain.h[0]   = draft_chain.h[1]   = nullptr;
+        draft_chain.tok_embd = draft_chain.eye = draft_chain.off = nullptr;
         draft_chain.ctx.reset();
         return;
     }
@@ -2913,7 +2920,7 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
         ub_small_eff : cparams.n_ubatch;
 
     // the draft chain: the last n_chain rows each in a ubatch of their own (llama_set_draft_chain, this decode only)
-    const uint32_t n_chain = draft_chain.tok != nullptr && !prepare && draft_chain.n > 0 && (uint32_t) draft_chain.n < n_tokens_all ? draft_chain.n : 0;
+    const uint32_t n_chain = draft_chain.tok[0] != nullptr && !prepare && draft_chain.n > 0 && (uint32_t) draft_chain.n < n_tokens_all ? draft_chain.n : 0;
     draft_chain.n = 0;
     balloc->set_n_chain(n_chain);
 
@@ -3073,15 +3080,24 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
 
         ggml_status status;
 
-        // a chain ubatch reads the chain tensors, the ubatch before one writes them
+        // a chain ubatch reads the chain tensors, the ubatch before one writes them (ping-ponged across slots 0/1)
         draft_chain.cur_in  = n_chain > 0 && n_tokens_prev >= (int64_t) (n_tokens_all - n_chain);
         draft_chain.cur_out = n_chain > 0 && n_tokens_prev + ubatch.n_tokens >= n_tokens_all - n_chain && n_tokens_prev + ubatch.n_tokens < n_tokens_all;
         if (draft_chain.cur_in) {
             GGML_ASSERT(ubatch.n_tokens == 1 && "a chain row is a ubatch of its own");
+            const int chain_step = (int) (n_tokens_prev - (n_tokens_all - n_chain));
+            draft_chain.cur_in_idx  = chain_step & 1;
+            draft_chain.cur_out_idx = (chain_step + 1) & 1;
+        } else {
+            draft_chain.cur_in_idx  = 0;
+            draft_chain.cur_out_idx = 0;
         }
         if (draft_chain.cur_out && n_outputs != 1) {
             LLAMA_LOG_ERROR("%s: the ubatch before a chain row must have one output, it has %d\n", __func__, (int) n_outputs);
-            draft_chain.cur_in = draft_chain.cur_out = false;
+            draft_chain.cur_in      = false;
+            draft_chain.cur_out     = false;
+            draft_chain.cur_in_idx  = 0;
+            draft_chain.cur_out_idx = 0;
             return -1;
         }
 
@@ -3093,8 +3109,10 @@ int llama_context::decode_impl(const llama_batch_ext & batch_inp, bool prepare) 
             }
         }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-        draft_chain.cur_in  = false;
-        draft_chain.cur_out = false;
+        draft_chain.cur_in      = false;
+        draft_chain.cur_out     = false;
+        draft_chain.cur_in_idx  = 0;
+        draft_chain.cur_out_idx = 0;
         if (prepare) {
             ggml_backend_sched_set_deferred_inputs(sched.get(), false);
             for (auto & slot : gf_slots) {
@@ -4054,8 +4072,10 @@ llm_graph_params llama_context::graph_params(
     params.hc_in          = &hc_in;
     params.chain.in       = draft_chain.cur_in;
     params.chain.out      = draft_chain.cur_out;
-    params.chain.tok      = draft_chain.tok;
-    params.chain.h        = draft_chain.h;
+    params.chain.tok_in   = draft_chain.tok[draft_chain.cur_in_idx];
+    params.chain.h_in     = draft_chain.h[draft_chain.cur_in_idx];
+    params.chain.tok_out  = draft_chain.tok[draft_chain.cur_out_idx];
+    params.chain.h_out    = draft_chain.h[draft_chain.cur_out_idx];
     params.chain.tok_embd = draft_chain.tok_embd;
     params.chain.eye      = draft_chain.eye;
     params.chain.off      = draft_chain.off;

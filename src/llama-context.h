@@ -582,17 +582,19 @@ private:
     struct draft_chain_t {
         ggml_context_ptr        ctx;
         ggml_backend_buffer_ptr buf;
-        ggml_tensor * tok      = nullptr; // I32 [1]: the argmax of the draft logits of the output row
-        ggml_tensor * h        = nullptr; // F32 [n_embd_out]: its h_nextn row
-        ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft]: the token embeddings of the draft vocabulary (null: model.tok_embd)
+        ggml_tensor * tok[2]      = {};      // I32 [1]: ping-pong argmax of the draft logits of the output row
+        ggml_tensor * h[2]        = {};      // F32 [n_embd_out]: ping-pong h_nextn row
+        ggml_tensor * tok_embd    = nullptr; // [n_embd, n_vocab_draft]: the token embeddings of the draft vocabulary (null: model.tok_embd)
         // a draft head sharded over the vocabulary: the shards' best rows meet through an AllReduce of a one-hot
         // placement (see llama_model_qwen4exp::graph_mtp); eye [n_dev, n_dev] is the identity split by rows, off
         // [n_dev] the first row of every shard, each device holding its own row of them
-        ggml_tensor * eye      = nullptr;
-        ggml_tensor * off      = nullptr;
-        int32_t       n        = 0;       // the chain rows of the next decode
-        bool          cur_in   = false;   // the ubatch being built reads the chain tensors
-        bool          cur_out  = false;   // ... writes them
+        ggml_tensor * eye         = nullptr;
+        ggml_tensor * off         = nullptr;
+        int32_t       n           = 0;       // the chain rows of the next decode
+        bool          cur_in      = false;   // the ubatch being built reads the chain tensors
+        bool          cur_out     = false;   // ... writes them
+        int           cur_in_idx  = 0;       // ping-pong slot read when cur_in
+        int           cur_out_idx = 0;       // ping-pong slot written when cur_out
     } draft_chain;
 
     // the residual rows of the ubatches that start past layer 0 (llama_set_hc_input)
@@ -601,8 +603,8 @@ private:
     void draft_chain_init();
 
 public:
-    bool draft_chain_available() const { return draft_chain.tok != nullptr; }
-    void set_draft_chain(int32_t n_chain) { draft_chain.n = draft_chain.tok != nullptr ? std::max(0, n_chain) : 0; }
+    bool draft_chain_available() const { return draft_chain.tok[0] != nullptr; }
+    void set_draft_chain(int32_t n_chain) { draft_chain.n = draft_chain.tok[0] != nullptr ? std::max(0, n_chain) : 0; }
 
 private:
 

@@ -777,10 +777,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     if (params.chain.in) {
         // a chain row (llama_set_draft_chain): its token is the argmax the ubatch before left on the device, its
         // embedding a row of the draft vocabulary's table there, its h the output row the ubatch before left
-        GGML_ASSERT(n_tokens == 1 && params.chain.tok != nullptr && params.chain.h != nullptr);
+        GGML_ASSERT(n_tokens == 1 && params.chain.tok_in != nullptr && params.chain.h_in != nullptr);
         ggml_tensor * table = params.chain.tok_embd != nullptr ? params.chain.tok_embd : model.tok_embd;
-        tok_embd = ggml_get_rows(ctx0, table, params.chain.tok);
-        h        = ggml_reshape_2d(ctx0, params.chain.h, hparams.n_embd_out(), 1);
+        tok_embd = ggml_get_rows(ctx0, table, params.chain.tok_in);
+        h        = ggml_reshape_2d(ctx0, params.chain.h_in, hparams.n_embd_out(), 1);
     } else {
         auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd_out());
 
@@ -877,10 +877,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
 
     if (layer.nextn.shared_head_head) {
         cur = build_lora_mm(layer.nextn.shared_head_head, cur);
+        bool vocab_sharded = false;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+            vocab_sharded |= dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+        }
         if (params.chain.out) {
             // the next ubatch is a chain row: leave it the argmax of these logits (an id of the draft vocabulary, as
             // its table is) and the output row's h
-            GGML_ASSERT(params.chain.tok != nullptr && params.chain.h != nullptr);
+            GGML_ASSERT(params.chain.tok_out != nullptr && params.chain.h_out != nullptr);
+            GGML_ASSERT((!params.chain.in || (params.chain.tok_in != params.chain.tok_out && params.chain.h_in != params.chain.h_out)) &&
+                    "ping-pong draft chain requires distinct input and output tensors");
             GGML_ASSERT(cur->ne[1] == 1 && flat_out->ne[1] == 1 && "the ubatch before a chain row has one output");
             ggml_tensor * chain_tok = nullptr;
             if (params.chain.eye != nullptr) {
@@ -903,18 +910,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
                 chain_tok = ggml_argmax(ctx0, cur);
             }
             cb(chain_tok, "draft_chain_tok", il);
-            res->t_draft_tok = chain_tok;
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, chain_tok, params.chain.tok));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_1d(ctx0, flat_out, flat_out->ne[0]), params.chain.h));
+            if (vocab_sharded || !model.d2t) {
+                res->t_draft_tok = chain_tok;
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, chain_tok, params.chain.tok_out));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_1d(ctx0, flat_out, flat_out->ne[0]), params.chain.h_out));
         }
         // a reduced draft vocabulary (d2t): on a tensor-split model the logits stay in the draft vocabulary (they are
         // sharded, a scatter cannot be expressed; the backend sampler's argmax is a draft id that the drafter maps);
         // on one device they are scattered to their target token ids, the rest -inf, so that any sampler works
-        bool vocab_sharded = false;
-        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
-            vocab_sharded |= dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
-        }
         if (model.d2t && !vocab_sharded) {
             const int64_t n_vocab_draft = cur->ne[0];
             const int64_t n_outputs     = cur->ne[1];

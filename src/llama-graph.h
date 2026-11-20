@@ -971,8 +971,10 @@ struct llm_graph_params {
     struct {
         bool          in       = false;
         bool          out      = false;
-        ggml_tensor * tok      = nullptr; // I32 [1]
-        ggml_tensor * h        = nullptr; // F32 [n_embd_out]
+        ggml_tensor * tok_in   = nullptr; // I32 [1]
+        ggml_tensor * h_in     = nullptr; // F32 [n_embd_out]
+        ggml_tensor * tok_out  = nullptr; // I32 [1]
+        ggml_tensor * h_out    = nullptr; // F32 [n_embd_out]
         ggml_tensor * tok_embd = nullptr; // [n_embd, n_vocab_draft], null: the model's own table
         ggml_tensor * eye      = nullptr; // F32 [n_dev, n_dev], a head sharded over the vocabulary: the shards' best rows meet through it
         ggml_tensor * off      = nullptr; // F32 [n_dev]: the first row of every shard
@@ -1026,7 +1028,9 @@ struct llm_graph_params {
             return false;
         }
 
-        if (chain.in != other.chain.in || chain.out != other.chain.out) {
+        if (chain.in != other.chain.in || chain.out != other.chain.out ||
+                (chain.in  && (chain.tok_in  != other.chain.tok_in  || chain.h_in  != other.chain.h_in)) ||
+                (chain.out && (chain.tok_out != other.chain.tok_out || chain.h_out != other.chain.h_out))) {
             return false;
         }
 

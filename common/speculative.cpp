@@ -2161,12 +2161,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (auto * chain : backend_chains) {
                 on_backend = on_backend && chain != nullptr;
             }
-            // greedy drafting on the backend without a probability cutoff: the rows need nothing from the host
-            // (one chain row for now: a chain ubatch that both reads and writes the chain tensors, as the middle
-            // ones of a longer chain do, crashed with an illegal memory access on the Meta backend; n_max 3 lost
-            // anyway on the 1K bench: 31.6 ms per round for +0.04 tokens)
+            // greedy drafting on the backend without a probability cutoff: the rows need nothing from the host;
+            // ping-ponging tok[2]/h[2] keeps middle steps' reads and writes on disjoint device tensors for n_max >= 2
             chain_ok = on_backend && !this->params.probabilistic && this->params.p_min <= 0.0f && !eval &&
-                       !is_mem_shared && n_mtp_layers == 1 && this->params.n_max == 2 &&
+                       !is_mem_shared && n_mtp_layers == 1 && this->params.n_max >= 2 &&
                        llama_draft_chain_supported(ctx_dft) &&
                        (getenv("LLAMA_SPEC_CHAIN") == nullptr || atoi(getenv("LLAMA_SPEC_CHAIN")) != 0);
             SPC_TRC("- draft chain: %s\n", chain_ok ? "on" : "off");
@@ -2545,6 +2543,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
+        int active_n_max = params.n_max;
         std::vector<bool> drafting(n_seq);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2555,6 +2554,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             n_drafting++;
+            active_n_max = dp.n_max;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
@@ -2586,7 +2586,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // the draft chain: with one sequence drafting, the rows of the steps after the first follow the row of
         // id_last, their ids and h placeholders the device fills in (llama_set_draft_chain)
-        const int n_chain = chain_ok && n_drafting == 1 ? params.n_max - 1 : 0;
+        const int n_chain = chain_ok && n_drafting == 1 ? std::max(0, std::min(params.n_max, active_n_max) - 1) : 0;
         if (n_chain > 0) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {

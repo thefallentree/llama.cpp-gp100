@@ -1,6 +1,9 @@
 #include "server-prefill-peer.h"
 #include "server-context.h"
 #include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
@@ -47,6 +50,62 @@ static int cache_fork_tol() {
 static int cache_switch_min() {
     static const int v = getenv("LLAMA_CACHE_SWITCH_MIN") != nullptr ? atoi(getenv("LLAMA_CACHE_SWITCH_MIN")) : 256;
     return v < 1 ? 1 : v;
+}
+
+static bool peer_cache_enabled() {
+    static const bool v = getenv("LLAMA_PEER_CACHE_PULL") != nullptr && atoi(getenv("LLAMA_PEER_CACHE_PULL")) != 0;
+    return v;
+}
+
+static int peer_cache_min_tokens() {
+    static const int v = getenv("LLAMA_PEER_CACHE_MIN_TOK") != nullptr ? std::max(256, atoi(getenv("LLAMA_PEER_CACHE_MIN_TOK"))) : 2048;
+    return v;
+}
+
+static int peer_cache_timeout_ms() {
+    static const int v = getenv("LLAMA_PEER_CACHE_TIMEOUT_MS") != nullptr ? std::max(200, atoi(getenv("LLAMA_PEER_CACHE_TIMEOUT_MS"))) : 5000;
+    return v;
+}
+
+// S4: strict allowlist for X-Llama-Cache-From (configured PEER host:port, 172.16.25.<1..254>:port, or 127.0.0.1:port)
+static bool peer_cache_allowed(const std::string & addr, const prefill_peer_config & peer_cfg) {
+    const size_t colon = addr.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= addr.size()) {
+        return false;
+    }
+    const std::string host = addr.substr(0, colon);
+    const char * port_s = addr.c_str() + colon + 1;
+    for (const char * q = port_s; *q != '\0'; ++q) {
+        if (*q < '0' || *q > '9') {
+            return false;
+        }
+    }
+    const long port = std::strtol(port_s, nullptr, 10);
+    if (port <= 0 || port > 65535) {
+        return false;
+    }
+    for (const auto & p : peer_cfg.peers) {
+        if (p.host == host && p.port == (int) port) {
+            return true;
+        }
+    }
+    if (host == "127.0.0.1") {
+        return true;
+    }
+    if (host.rfind("172.16.25.", 0) == 0) {
+        const char * last = host.c_str() + 10;
+        if (*last == '\0') {
+            return false;
+        }
+        for (const char * q = last; *q != '\0'; ++q) {
+            if (*q < '0' || *q > '9') {
+                return false;
+            }
+        }
+        const long oct = std::strtol(last, nullptr, 10);
+        return oct >= 1 && oct <= 254;
+    }
+    return false;
 }
 
 #include <algorithm>
@@ -1155,6 +1214,11 @@ private:
 
     // pipelined prefill with a peer server (server-prefill-peer.h)
     prefill_peer_config peer_cfg;
+    int               peer_listen_fd   = -1;
+    std::thread       peer_listener;
+    std::atomic<int>  peer_cache_workers { 0 };
+    std::atomic<bool> peer_cache_stop    { false };
+    uint64_t          peer_cache_sig     = 0;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1222,6 +1286,18 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        peer_cache_stop.store(true);
+        if (peer_listen_fd >= 0) {
+            prefill_peer_shutdown_close(peer_listen_fd);
+            peer_listen_fd = -1;
+        }
+        if (peer_listener.joinable()) {
+            peer_listener.join();
+        }
+        for (int waited = 0; peer_cache_workers.load() > 0 && waited < 2000; waited += 5) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1562,18 +1638,40 @@ private:
         }
 
         peer_cfg = prefill_peer_config::from_env(model_tgt);
+        peer_cache_stop.store(false);
+        peer_cache_sig = prefill_peer_cache_model_sig(model_tgt, ctx_tgt, ctx_dft);
 
         // also a peer of other servers' long prompts while idle (server-prefill-peer.h)
         if (const char * port = getenv("LLAMA_PREFILL_PEER_SERVE")) {
-            const int lfd = prefill_peer_listen(atoi(port));
-            if (lfd < 0) {
+            peer_listen_fd = prefill_peer_listen(atoi(port));
+            if (peer_listen_fd < 0) {
                 SRV_ERR("prefill-peer: cannot listen on port %s\n", port);
             } else {
                 SRV_WRN("prefill-peer: a peer on port %s while idle\n", port);
-                std::thread([this, lfd]() {
-                    while (true) {
-                        const int fd = prefill_peer_accept(lfd);
+                peer_listener = std::thread([this]() {
+                    while (!peer_cache_stop.load()) {
+                        const int fd = prefill_peer_accept(peer_listen_fd);
                         if (fd < 0) {
+                            if (peer_cache_stop.load()) {
+                                break;
+                            }
+                            continue;
+                        }
+                        if (prefill_peer_is_cache_pull(fd)) {
+                            if (peer_cache_stop.load() || !prompt_cache) {
+                                prefill_peer_refuse(fd);
+                                continue;
+                            }
+                            if (peer_cache_workers.fetch_add(1) >= 4 || peer_cache_stop.load() || !prompt_cache) {
+                                peer_cache_workers.fetch_sub(1);
+                                prefill_peer_refuse(fd);
+                                continue;
+                            }
+                            std::thread([this, fd]() {
+                                prefill_peer_cache_serve(fd, prompt_cache.get(), peer_cache_sig);
+                                prefill_peer_close(fd);
+                                peer_cache_workers.fetch_sub(1);
+                            }).detach();
                             continue;
                         }
                         // M3: a head's task loop is inside its own prefill-peer run and would answer only after it
@@ -1587,7 +1685,7 @@ private:
                         task.slot_action.id_slot = fd;
                         queue_tasks.post(std::move(task), /*front*/ true);
                     }
-                }).detach();
+                });
             }
         }
 
@@ -2059,10 +2157,8 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
-
-            // cache prompts only for the tasks that reuse them
-            update_cache = update_cache && !task.is_stateless();
+            const bool can_cache = prompt_cache && !task.is_stateless();
+            update_cache = update_cache && can_cache;
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -2083,8 +2179,105 @@ private:
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
                 if (srv_timing()) {
                     SRV_WRN("timing slot switch: save+load %.1f update %.1f ms (cache %zu prompts, %.1f MiB)\n",
-                            (t_upd - t_start) / 1e3, (ggml_time_us() - t_upd) / 1e3, prompt_cache->states.size(),
+                            (t_upd - t_start) / 1e3, (ggml_time_us() - t_upd) / 1e3, prompt_cache->count(),
                             prompt_cache->size() / (1024.0 * 1024.0));
+                }
+            }
+
+            // S4: if local match covers < 50% of a long prompt and proxy supplied X-Llama-Cache-From, pull from peer RAM over RoCE
+            if (can_cache && peer_cache_enabled() && !task.tokens.has_media() && !task.params.peer_cache_from.empty() &&
+                    (int) task.tokens.size() >= peer_cache_min_tokens()) {
+                if (!peer_cache_allowed(task.params.peer_cache_from, peer_cfg)) {
+                    SRV_WRN("peer-cache: ignoring disallowed peer '%s'\n", task.params.peer_cache_from.c_str());
+                } else {
+                    const int local_lcp = (int) ret->prompt.tokens.get_common_prefix(task.tokens);
+                    if (local_lcp < (int) task.tokens.size() / 2) {
+                        const int min_peer_lcp = std::max(local_lcp + 1024, 1024);
+                        if (min_peer_lcp <= (int) task.tokens.size()) {
+                            prefill_peer_cache_res pcr;
+                            if (prefill_peer_cache_pull(task.params.peer_cache_from, task.tokens.get_text_tokens(), min_peer_lcp,
+                                    peer_cache_sig, peer_cache_timeout_ms(), pcr) && pcr.lcp > local_lcp) {
+                                if (!update_cache && ret->prompt.n_tokens() > 0) {
+                                    if (ret->prompt_save(*prompt_cache, /*move_checkpoints=*/ true)) {
+                                        prompt_cache->update();
+                                    }
+                                } else if (ret->prompt_origin != nullptr && !ret->prompt.checkpoints.empty()) {
+                                    prompt_cache->put_checkpoints(ret->prompt_origin, ret->prompt.checkpoints);
+                                }
+                                prompt_cache->release(ret->prompt_origin);
+                                ret->prompt_origin = nullptr;
+                                ret->prompt.clear();
+
+                                llama_memory_seq_rm(llama_get_memory(ctx_tgt), ret->id, -1, -1);
+                                if (ctx_dft) {
+                                    llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, -1, -1);
+                                }
+
+                                bool ok = true;
+                                server_tokens pulled_toks(pcr.tokens, /*has_mtmd=*/ false);
+                                const llama_pos n_e = pulled_toks.pos_next();
+                                for (size_t i = 0; i < pcr.segs.size(); ++i) {
+                                    const auto & seg = pcr.segs[i];
+                                    if (!seg.main.empty() && llama_state_seq_set_data_range(ctx_tgt, seg.main.data(), seg.main.size(), ret->id) != seg.main.size()) {
+                                        ok = false;
+                                        break;
+                                    }
+                                    if (!seg.drft.empty()) {
+                                        if (!ctx_dft || llama_state_seq_set_data_range(ctx_dft, seg.drft.data(), seg.drft.size(), ret->id) != seg.drft.size()) {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    const bool has_next = i + 1 < pcr.segs.size();
+                                    const llama_pos next_p0 = has_next ? pcr.segs[i + 1].p0 : n_e;
+                                    const llama_pos next_d0 = has_next ? pcr.segs[i + 1].d0 : n_e;
+                                    if (seg.p1 > next_p0) {
+                                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), ret->id, next_p0, -1);
+                                    }
+                                    if (ctx_dft && seg.p1 > next_d0) {
+                                        llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, next_d0, -1);
+                                    }
+                                }
+                                if (ok) {
+                                    const llama_pos gap = server_tokens_pos_gap(ctx_tgt, ret->id, 0, pulled_toks);
+                                    if (gap >= 0 && gap < n_e) {
+                                        SRV_WRN("peer-cache: pulled entry of %d tokens covers only up to pos %d: dropped\n", n_e, gap);
+                                        ok = false;
+                                    }
+                                }
+                                if (ok && !pcr.recr.empty() &&
+                                        llama_state_seq_set_data_ext(ctx_tgt, pcr.recr.data(), pcr.recr.size(), ret->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != pcr.recr.size()) {
+                                    ok = false;
+                                }
+                                if (!ok) {
+                                    ret->prompt_clear();
+                                    if (ctx_dft) {
+                                        llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, -1, -1);
+                                    }
+                                } else {
+                                    if (spec) {
+                                        common_speculative_set_state(spec.get(), ret->id, pcr.spec);
+                                    }
+                                    ret->prompt.tokens = std::move(pulled_toks);
+                                    ret->prompt.checkpoints.clear();
+                                    ret->prompt.checkpoints.reserve(pcr.ckpts.size());
+                                    for (auto & src_ck : pcr.ckpts) {
+                                        common_prompt_checkpoint dst_ck;
+                                        dst_ck.n_tokens  = src_ck.n_tokens;
+                                        dst_ck.pos_min   = src_ck.pos_min;
+                                        dst_ck.pos_max   = src_ck.pos_max;
+                                        dst_ck.data_tgt  = std::move(src_ck.data_tgt);
+                                        dst_ck.data_dft  = std::move(src_ck.data_dft);
+                                        dst_ck.data_spec = std::move(src_ck.data_spec);
+                                        ret->prompt.checkpoints.push_back(std::move(dst_ck));
+                                    }
+                                    SRV_INF("peer-cache: pulled %d/%zu tokens (%zu segs, %zu ckpts, %.1f MiB) from %s in %.1f ms (local_lcp=%d)\n",
+                                            pcr.lcp, ret->prompt.tokens.size(), pcr.segs.size(), ret->prompt.checkpoints.size(),
+                                            pcr.total_bytes / (1024.0 * 1024.0), task.params.peer_cache_from.c_str(), pcr.ms, local_lcp);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -6103,6 +6296,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+        std::string peer_cache_from;
+        for (const auto & kv : req.headers) {
+            if (kv.first.size() == 17) {
+                std::string low = kv.first;
+                for (char & c : low) {
+                    c = (char) std::tolower((unsigned char) c);
+                }
+                if (low == "x-llama-cache-from") {
+                    peer_cache_from = kv.second;
+                    break;
+                }
+            }
+        }
 
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
@@ -6115,6 +6321,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+            task.params.peer_cache_from = peer_cache_from;
 
             task.apply_chat_session(chat_session);
 

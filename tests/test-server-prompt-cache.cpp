@@ -899,6 +899,105 @@ static bool scenario_stress(server_prompt_cache &, slot &, int32_t n_vocab) {
 static std::atomic<int64_t> g_deadline_us{0};
 static std::atomic<const char *> g_scenario{""};
 
+// S4: a pinned entry survives eviction, checkpoint trimming, delta save, and load copies checkpoints until unpinned
+static bool scenario_peer_cache_pin(server_prompt_cache & cache, slot & s, int32_t n_vocab) {
+    cache.states.clear();
+    const size_t orig_limit = cache.limit_size;
+    cache.limit_size = 64ull << 20;
+
+    llama_tokens conv;
+    for (llama_pos p = 0; p < 128; ++p) {
+        conv.push_back(conv_token(n_vocab, p));
+    }
+
+    CHECK(decode_range(s.tgt, conv, 0, 128));
+    if (s.dft) {
+        CHECK(decode_range(s.dft, conv, 0, 128 - LAG));
+    }
+    s.prompt.tokens = server_tokens(conv, false);
+    s.prompt.checkpoints.clear();
+    for (int i = 1; i <= 5; ++i) {
+        common_prompt_checkpoint ck;
+        ck.n_tokens = i * 20;
+        ck.pos_min  = 0;
+        ck.pos_max  = ck.n_tokens - 1;
+        ck.data_tgt.assign(1024, (uint8_t) i);
+        s.prompt.checkpoints.push_back(std::move(ck));
+    }
+
+    auto * saved = cache.save(s.prompt, s.tgt, s.dft, nullptr, SEQ, &s.origin, true);
+    CHECK(saved != nullptr);
+    s.clear();
+
+    int lcp = 0;
+    server_prompt_cache_state * pinned = cache.pin_best_prefix(conv, 64, &lcp);
+    CHECK(pinned == saved && lcp == 128);
+
+    // 1) Shrinking limit to 1 byte must NOT evict or trim the pinned entry
+    cache.limit_size = 1;
+    cache.update();
+    CHECK(cache.count() == 1);
+    CHECK(pinned->prompt.checkpoints.size() == 5);
+
+    // 2) Restoring the pinned entry into a slot must copy checkpoints instead of moving them out
+    cache.limit_size = 64ull << 20;
+    CHECK(cache.load(s.prompt, server_tokens(conv, false), s.tgt, s.dft, nullptr, SEQ, nullptr, &s.origin));
+    CHECK(s.origin == pinned);
+    CHECK(s.prompt.checkpoints.size() == 5);
+    CHECK(pinned->prompt.checkpoints.size() == 5);
+
+    // 3) Saving new tokens from that slot must NOT mutate the pinned entry
+    llama_tokens ext = conv;
+    for (llama_pos p = 128; p < 136; ++p) {
+        ext.push_back(conv_token(n_vocab, p));
+    }
+    CHECK(decode_range(s.tgt, ext, 128, 136));
+    if (s.dft) {
+        CHECK(decode_range(s.dft, ext, 128 - LAG, 136 - LAG));
+    }
+    for (int t = 128; t < 136; ++t) {
+        s.prompt.tokens.push_back(ext[t]);
+    }
+    auto * saved2 = cache.save(s.prompt, s.tgt, s.dft, nullptr, SEQ, &s.origin, true);
+    CHECK(saved2 != nullptr && saved2 != pinned);
+    CHECK(pinned->prompt.n_tokens() == 128);
+    CHECK(pinned->prompt.checkpoints.size() == 5);
+    s.clear();
+
+    // 4) Concurrent pin/unpin reader + cache.update() pressure
+    std::atomic<bool> stop       { false };
+    std::atomic<bool> reader_bad { false };
+    std::thread reader([&]() {
+        while (!stop.load()) {
+            int rlcp = 0;
+            auto * e = cache.pin_best_prefix(conv, 64, &rlcp);
+            if (e != nullptr) {
+                if (rlcp < 64 || e->prompt.n_tokens() < 128 || e->data.segs.empty()) {
+                    reader_bad.store(true);
+                }
+                cache.unpin(e);
+            }
+        }
+    });
+    for (int i = 0; i < 8; ++i) {
+        cache.limit_size = 1;
+        cache.update();
+    }
+    stop.store(true);
+    reader.join();
+    CHECK(!reader_bad.load());
+
+    // Pinned entry survived until unpin, then unpin + update evicts both entries
+    CHECK(cache.count() >= 1);
+    cache.unpin(pinned);
+    cache.limit_size = 1;
+    cache.update();
+    CHECK(cache.count() == 0);
+
+    cache.limit_size = orig_limit;
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string only; // --only CDGH: run only the table scenarios with these letters (A and B always run)
@@ -1013,6 +1112,7 @@ int main(int argc, char ** argv) {
         {"J: the task loop watchdog sees a stuck task (HC3)", scenario_queue_watchdog},
         {"K: an over-limit delta save leaves the slot's entry whole (TF1)", scenario_over_limit_keeps_origin},
         {"L: three slots under a tiny limit and a capped pool: nothing in use is freed (TF1)", scenario_stress},
+        {"M: pinned entry survives eviction/trim/save/load until unpinned (S4)", scenario_peer_cache_pin},
     };
     for (const auto & sc : hc1) {
         if (!only.empty() && only.find(sc.name[0]) == std::string::npos) {

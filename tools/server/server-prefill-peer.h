@@ -32,6 +32,37 @@
 #include <vector>
 
 struct common_speculative;
+struct server_prompt_cache;
+
+// S4: prompt-cache segment and checkpoint payloads pulled over RoCE on session migration
+struct prefill_peer_cache_seg {
+    llama_pos p0 = 0;
+    llama_pos p1 = 0;
+    llama_pos d0 = 0;
+    llama_pos d1 = 0x7fffffff;
+    std::vector<uint8_t> main;
+    std::vector<uint8_t> drft;
+};
+
+struct prefill_peer_cache_ckpt {
+    int64_t   n_tokens = 0;
+    llama_pos pos_min  = 0;
+    llama_pos pos_max  = 0;
+    std::vector<uint8_t> data_tgt;
+    std::vector<uint8_t> data_dft;
+    std::vector<uint8_t> data_spec;
+};
+
+struct prefill_peer_cache_res {
+    int32_t lcp = 0;
+    llama_tokens tokens;
+    std::vector<prefill_peer_cache_seg> segs;
+    std::vector<uint8_t> recr;
+    std::vector<uint8_t> spec;
+    std::vector<prefill_peer_cache_ckpt> ckpts;
+    double ms          = 0.0;
+    size_t total_bytes = 0;
+};
 
 // the context checkpoint at n_tokens the head assembles from the stages' snapshots (empty data_tgt: none)
 struct prefill_peer_ckpt {
@@ -109,3 +140,24 @@ void prefill_peer_serve_conn(int fd, llama_context * ctx_tgt, llama_context * ct
 void prefill_peer_refuse(int fd);
 // true while this server is a head (prefill_peer_run): the listener refuses hellos itself then (M3: two heads deadlocked)
 bool prefill_peer_head_active();
+
+// S4: compute model + context compatibility signature for RoCE cache pulls
+uint64_t prefill_peer_cache_model_sig(const llama_model * model, const llama_context * ctx_tgt, const llama_context * ctx_dft);
+
+// S4: OS-agnostic socket close / shutdown helpers for listener & pull workers
+void prefill_peer_close(int fd);
+void prefill_peer_shutdown_close(int fd);
+
+// S4: peek accepted :9555 socket (bounded wait) to distinguish cache-pull requests from prefill hellos
+bool prefill_peer_is_cache_pull(int fd);
+
+// S4: serve a single peer cache pull directly from server_prompt_cache in RAM (never touches ctx_tgt/slots)
+void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t model_sig);
+
+// S4: pull matching cached prompt state from peer_addr ("host:port")
+bool prefill_peer_cache_pull(const std::string & peer_addr,
+                             const llama_tokens & tokens,
+                             int min_lcp,
+                             uint64_t model_sig,
+                             int timeout_ms,
+                             prefill_peer_cache_res & out);

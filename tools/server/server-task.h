@@ -6,6 +6,7 @@
 
 #include <string>
 #include <unordered_set>
+#include <atomic>
 #include <list>
 #include <map>
 #include <mutex>
@@ -105,6 +106,9 @@ struct task_params {
     int64_t t_deadline_us = -1; // the deadline in ggml_time_us(), -1 = none
 
     bool loop_guard = false; // cut a degenerate repetition (server_loop_guard)
+
+    // S4: optional RoCE peer cache pull endpoint ("host:port") set by proxy on session move
+    std::string peer_cache_from;
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
@@ -850,7 +854,12 @@ struct server_prompt_cache_state {
 
     // the slot whose prompt this entry is (loaded into it, or saved from it and still held): its next save appends
     // the new cells only; an owned entry is neither evicted nor loaded into another slot
-    int32_t owner = -1;
+    std::atomic<int32_t> owner { -1 };
+
+    // S4: readers pinning this entry while serving a peer cache pull; guarded by server_prompt_cache::mtx
+    int32_t pin_count = 0;
+    bool    writing   = false;
+    bool    broken    = false;
 
     size_t size() const {
         size_t res = data.size();
@@ -886,9 +895,12 @@ struct server_prompt_cache {
     // the pool outlives the entries (declared first: destroyed last), their buffers go back to it
     server_state_pool pool;
 
+    mutable std::mutex mtx;
+
     std::list<server_prompt_cache_state> states;
 
     ~server_prompt_cache() {
+        std::lock_guard<std::mutex> lk(mtx);
         states.clear();
     }
 
@@ -901,6 +913,8 @@ struct server_prompt_cache {
     size_t size() const;
 
     size_t n_tokens() const;
+
+    size_t count() const;
 
     // save the slot's prompt: onto the entry it owns (*origin: the new cells only, the recurrent state refreshed), else
     // as a new entry. The slot's checkpoints move into the entry (move_checkpoints) or are copied. Returns the entry
@@ -916,6 +930,15 @@ struct server_prompt_cache {
     // the slot no longer holds the entry's cells (prompt_clear)
     void release(server_prompt_cache_state * e);
 
+    // S4: pin the best un-broken entry matching at least min_lcp text tokens for a concurrent peer pull
+    server_prompt_cache_state * pin_best_prefix(const llama_tokens & tokens, int min_lcp, int * lcp_out);
+
+    // S4: release a peer-pull pin (and erase broken unowned entries once the last pin drops)
+    void unpin(server_prompt_cache_state * e);
+
+    // S4: return checkpoints moved out by load() if a subsequent peer pull replaces the slot's prompt before eviction
+    void put_checkpoints(server_prompt_cache_state * e, std::vector<common_prompt_checkpoint> & ckpts);
+
     // HC1: the entry load() would restore for tokens_new instead of the slot's prompt, when its common prefix with
     // tokens_new is at least min_gain tokens longer than the slot's; nullptr = none (the slot keeps its prompt)
     const server_prompt_cache_state * find_better(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int min_gain);
@@ -927,18 +950,26 @@ struct server_prompt_cache {
     void update();
 
 private:
+    size_t size_locked() const;
+    size_t n_tokens_locked() const;
+    void   touch_locked(server_prompt_cache_state * e);
+
     // the oldest entry no slot owns, states.end() when every entry is owned
     std::list<server_prompt_cache_state>::iterator evictable();
+    std::list<server_prompt_cache_state>::iterator evictable_locked();
 
     // the entry load() restores for tokens_new (most similar, keeps the most context), states.end() = the slot's prompt
     std::list<server_prompt_cache_state>::iterator best_entry(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int * lcp_out);
+    std::list<server_prompt_cache_state>::iterator best_entry_locked(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int * lcp_out);
 
     // HC1: an entry no slot owns, oldest first, sheds its older checkpoints down to the newest LLAMA_CACHE_TRIM_CKPTS
     // (default 3; < 0 = never); the bytes freed, 0 = nothing left to trim
     size_t trim_checkpoints_one();
+    size_t trim_checkpoints_one_locked();
 
     // until size() + need fits the limit: trim checkpoints of unowned entries first, then evict the oldest
     void make_room(size_t need, const char * why);
+    void make_room_locked(size_t need, const char * why);
 };
 
 // used exclusively by router mode

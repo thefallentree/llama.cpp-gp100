@@ -3,10 +3,12 @@
 #include "common.h"
 #include "ggml-backend.h"
 #include "log.h"
+#include "server-task.h"
 #include "speculative.h"
 #include "../../src/llama-ext.h" // staging API: layer range, hc input, layer-filtered state
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -15,8 +17,10 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
+#include <climits>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -26,12 +30,20 @@
 
 namespace {
 
-constexpr uint32_t MSG_HELLO  = 0x31504650; // "PFP1"
-constexpr uint32_t MSG_OK     = 0x4b4f4650; // "PFOK"
-constexpr uint32_t MSG_UBATCH = 0x42554650; // "PFUB"
-constexpr uint32_t MSG_END    = 0x4e454650; // "PFEN"
-constexpr uint32_t MSG_RESULT = 0x53524650; // "PFRS"
-constexpr uint32_t MSG_ERROR  = 0x52454650; // "PFER"
+constexpr uint32_t MSG_HELLO      = 0x31504650; // "PFP1"
+constexpr uint32_t MSG_OK         = 0x4b4f4650; // "PFOK"
+constexpr uint32_t MSG_UBATCH     = 0x42554650; // "PFUB"
+constexpr uint32_t MSG_END        = 0x4e454650; // "PFEN"
+constexpr uint32_t MSG_RESULT     = 0x53524650; // "PFRS"
+constexpr uint32_t MSG_ERROR      = 0x52454650; // "PFER"
+constexpr uint32_t MSG_CACHE_PULL = 0x50434650; // "PFCP"
+constexpr uint32_t MSG_CACHE_MISS = 0x4d434650; // "PFCM"
+
+constexpr uint32_t CACHE_PROTO_VERSION    = 1;
+constexpr uint64_t MAX_CACHE_TOKENS       = 512ull * 1024;
+constexpr uint64_t MAX_CACHE_SEGS         = 4096;
+constexpr uint64_t MAX_CACHE_CKPTS        = 128;
+constexpr size_t   MAX_CACHE_TOTAL_BYTES  = 8ull << 30;
 
 // protocol 3: the hello carries the head's result endpoint and a token; every stage returns its state directly to the
 // head on its own connection (the chain only passes an OK / error status back), the residual rows are sent from the
@@ -1504,4 +1516,342 @@ void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_d
         serve_one(fd, ctx_tgt, ctx_dft, spec);
         ::close(fd);
     }
+}
+
+namespace {
+
+void set_sock_timeouts(int fd, int timeout_ms) {
+    const int ms = std::max(100, timeout_ms);
+    struct timeval tv;
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+int connect_to_timeout(const std::string & host, int port, int timeout_ms) {
+    addrinfo hints = {};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo * res = nullptr;
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || res == nullptr) {
+        return -1;
+    }
+    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd >= 0) {
+        const int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+        int rc = ::connect(fd, res->ai_addr, res->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            pollfd pfd = { fd, POLLOUT, 0 };
+            const int conn_ms = std::min(std::max(200, timeout_ms), 1500);
+            rc = ::poll(&pfd, 1, conn_ms);
+            if (rc > 0 && (pfd.revents & POLLOUT)) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+                    rc = -1;
+                } else {
+                    rc = 0;
+                }
+            } else {
+                rc = -1;
+            }
+        }
+        if (rc != 0) {
+            ::close(fd);
+            fd = -1;
+        } else {
+            if (flags >= 0) {
+                fcntl(fd, F_SETFL, flags);
+            }
+            tune_socket(fd);
+            set_sock_timeouts(fd, timeout_ms);
+        }
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+bool send_raw_blob(int fd, const void * data, uint64_t n) {
+    return send_val(fd, n) && (n == 0 || send_all(fd, data, n));
+}
+
+bool recv_blob_capped(int fd, std::vector<uint8_t> & b, size_t max_bytes, size_t & total_bytes) {
+    uint64_t n = 0;
+    if (!recv_val(fd, n) || n > max_bytes || n > MAX_CACHE_TOTAL_BYTES - total_bytes) {
+        return false;
+    }
+    total_bytes += (size_t) n;
+    b.resize((size_t) n);
+    return n == 0 || recv_all(fd, b.data(), (size_t) n);
+}
+
+bool send_tokens_vec(int fd, const llama_tokens & toks) {
+    const uint64_t n = toks.size();
+    return send_val(fd, n) && (n == 0 || send_all(fd, toks.data(), n * sizeof(llama_token)));
+}
+
+bool recv_tokens_vec(int fd, llama_tokens & toks) {
+    uint64_t n = 0;
+    if (!recv_val(fd, n) || n > MAX_CACHE_TOKENS) {
+        return false;
+    }
+    toks.resize((size_t) n);
+    return n == 0 || recv_all(fd, toks.data(), (size_t) n * sizeof(llama_token));
+}
+
+bool parse_host_port(const std::string & addr, std::string & host, int & port) {
+    const size_t colon = addr.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= addr.size()) {
+        return false;
+    }
+    host = addr.substr(0, colon);
+    if (host.front() == '[' && host.back() == ']' && host.size() > 2) {
+        host = host.substr(1, host.size() - 2);
+    }
+    char * end = nullptr;
+    const long p = std::strtol(addr.c_str() + colon + 1, &end, 10);
+    if (end == nullptr || *end != '\0' || p <= 0 || p > 65535) {
+        return false;
+    }
+    port = (int) p;
+    return true;
+}
+
+uint64_t fnv1a_mix(uint64_t h, const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+template <typename T> uint64_t fnv1a_val(uint64_t h, const T & v) {
+    return fnv1a_mix(h, &v, sizeof(v));
+}
+
+} // namespace
+
+void prefill_peer_close(int fd) {
+    if (fd >= 0) {
+        ::close(fd);
+    }
+}
+
+void prefill_peer_shutdown_close(int fd) {
+    if (fd >= 0) {
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+    }
+}
+
+uint64_t prefill_peer_cache_model_sig(const llama_model * model, const llama_context * ctx_tgt, const llama_context * ctx_dft) {
+    uint64_t h = 14695981039346656037ull;
+    if (model != nullptr) {
+        char desc[256] = {};
+        const int32_t dlen = llama_model_desc(model, desc, sizeof(desc));
+        if (dlen > 0) {
+            h = fnv1a_mix(h, desc, std::min<size_t>((size_t) dlen, sizeof(desc) - 1));
+        }
+        const int32_t n_layer = llama_model_n_layer(model);
+        const int32_t n_embd  = llama_model_n_embd(model);
+        const auto * vocab    = llama_model_get_vocab(model);
+        const int32_t n_vocab = vocab ? llama_vocab_n_tokens(vocab) : 0;
+        h = fnv1a_val(h, n_layer);
+        h = fnv1a_val(h, n_embd);
+        h = fnv1a_val(h, n_vocab);
+    }
+    const uint32_t n_ctx_tgt = ctx_tgt ? llama_n_ctx(ctx_tgt) : 0;
+    const uint8_t  has_dft   = ctx_dft != nullptr ? 1 : 0;
+    h = fnv1a_val(h, n_ctx_tgt);
+    h = fnv1a_val(h, has_dft);
+    return h;
+}
+
+bool prefill_peer_is_cache_pull(int fd) {
+    if (fd < 0) {
+        return false;
+    }
+    pollfd pfd = { fd, POLLIN, 0 };
+    if (::poll(&pfd, 1, 2000) <= 0 || !(pfd.revents & POLLIN)) {
+        return false;
+    }
+    uint32_t magic = 0;
+    const ssize_t k = ::recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL);
+    return k == (ssize_t) sizeof(magic) && magic == MSG_CACHE_PULL;
+}
+
+void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t model_sig) {
+    const double t0 = now_ms();
+    tune_socket(fd);
+    set_sock_timeouts(fd, 5000);
+
+    uint32_t magic = 0;
+    uint32_t ver   = 0;
+    uint64_t sig   = 0;
+    int32_t  min_lcp = 0;
+    llama_tokens req_toks;
+    if (!recv_val(fd, magic) || magic != MSG_CACHE_PULL ||
+        !recv_val(fd, ver) || !recv_val(fd, sig) || !recv_val(fd, min_lcp) ||
+        !recv_tokens_vec(fd, req_toks)) {
+        return;
+    }
+
+    if (cache == nullptr || ver != CACHE_PROTO_VERSION || sig != model_sig || min_lcp < 1 || req_toks.empty()) {
+        send_val(fd, MSG_CACHE_MISS);
+        return;
+    }
+
+    int lcp = 0;
+    server_prompt_cache_state * e = cache->pin_best_prefix(req_toks, min_lcp, &lcp);
+    struct pin_guard {
+        server_prompt_cache       * c;
+        server_prompt_cache_state * e;
+        ~pin_guard() {
+            if (c != nullptr && e != nullptr) {
+                c->unpin(e);
+            }
+        }
+    } guard { cache, e };
+
+    if (e == nullptr) {
+        send_val(fd, MSG_CACHE_MISS);
+        return;
+    }
+
+    const llama_tokens etoks = e->prompt.tokens.get_tokens();
+    const uint32_t n_segs  = (uint32_t) e->data.segs.size();
+    const uint32_t n_ckpts = (uint32_t) e->prompt.checkpoints.size();
+
+    if (!send_val(fd, MSG_OK) ||
+        !send_val(fd, (int32_t) lcp) ||
+        !send_tokens_vec(fd, etoks) ||
+        !send_val(fd, n_segs)) {
+        return;
+    }
+
+    size_t sent_bytes = 0;
+    for (const auto & seg : e->data.segs) {
+        if (!send_val(fd, seg.p0) || !send_val(fd, seg.p1) ||
+            !send_val(fd, seg.d0) || !send_val(fd, seg.d1) ||
+            !send_raw_blob(fd, seg.main.data(), seg.main.size()) ||
+            !send_raw_blob(fd, seg.drft.data(), seg.drft.size())) {
+            return;
+        }
+        sent_bytes += seg.size();
+    }
+
+    if (!send_raw_blob(fd, e->data.recr.data(), e->data.recr.size()) ||
+        !send_blob(fd, e->data.spec) ||
+        !send_val(fd, n_ckpts)) {
+        return;
+    }
+    sent_bytes += e->data.recr.size() + e->data.spec.size();
+
+    for (const auto & ck : e->prompt.checkpoints) {
+        if (!send_val(fd, (int64_t) ck.n_tokens) ||
+            !send_val(fd, ck.pos_min) ||
+            !send_val(fd, ck.pos_max) ||
+            !send_blob(fd, ck.data_tgt) ||
+            !send_blob(fd, ck.data_dft) ||
+            !send_blob(fd, ck.data_spec)) {
+            return;
+        }
+        sent_bytes += ck.data_tgt.size() + ck.data_dft.size() + ck.data_spec.size();
+    }
+
+    LOG_DBG("peer-cache: served lcp=%d/%zu (%u segs, %u ckpts, %.1f MiB) in %.1f ms\n",
+            lcp, etoks.size(), n_segs, n_ckpts, sent_bytes / (1024.0 * 1024.0), now_ms() - t0);
+}
+
+bool prefill_peer_cache_pull(const std::string & peer_addr,
+                             const llama_tokens & tokens,
+                             int min_lcp,
+                             uint64_t model_sig,
+                             int timeout_ms,
+                             prefill_peer_cache_res & out) {
+    out = {};
+    if (tokens.empty() || tokens.size() > MAX_CACHE_TOKENS || min_lcp < 1) {
+        return false;
+    }
+    std::string host;
+    int port = 0;
+    if (!parse_host_port(peer_addr, host, port)) {
+        return false;
+    }
+
+    const double t0 = now_ms();
+    const int fd = connect_to_timeout(host, port, timeout_ms);
+    if (fd < 0) {
+        return false;
+    }
+    struct fd_guard {
+        int fd;
+        ~fd_guard() { if (fd >= 0) { ::close(fd); } }
+    } fdg { fd };
+
+    if (!send_val(fd, MSG_CACHE_PULL) ||
+        !send_val(fd, CACHE_PROTO_VERSION) ||
+        !send_val(fd, model_sig) ||
+        !send_val(fd, (int32_t) min_lcp) ||
+        !send_tokens_vec(fd, tokens)) {
+        return false;
+    }
+
+    uint32_t status = 0;
+    if (!recv_val(fd, status) || status != MSG_OK) {
+        return false;
+    }
+
+    uint32_t n_segs = 0;
+    if (!recv_val(fd, out.lcp) || out.lcp < min_lcp ||
+        !recv_tokens_vec(fd, out.tokens) || out.tokens.empty() ||
+        out.lcp > (int32_t) out.tokens.size() || out.lcp > (int32_t) tokens.size() ||
+        !recv_val(fd, n_segs) || n_segs == 0 || n_segs > MAX_CACHE_SEGS) {
+        out = {};
+        return false;
+    }
+
+    size_t total_bytes = 0;
+    out.segs.resize(n_segs);
+    for (uint32_t i = 0; i < n_segs; ++i) {
+        auto & seg = out.segs[i];
+        if (!recv_val(fd, seg.p0) || !recv_val(fd, seg.p1) ||
+            !recv_val(fd, seg.d0) || !recv_val(fd, seg.d1) ||
+            seg.p0 < 0 || seg.p1 <= seg.p0 || seg.d0 < 0 ||
+            !recv_blob_capped(fd, seg.main, 2ull << 30, total_bytes) ||
+            !recv_blob_capped(fd, seg.drft, 512ull << 20, total_bytes)) {
+            out = {};
+            return false;
+        }
+    }
+
+    uint32_t n_ckpts = 0;
+    if (!recv_blob_capped(fd, out.recr, 512ull << 20, total_bytes) ||
+        !recv_blob_capped(fd, out.spec, 64ull << 20, total_bytes) ||
+        !recv_val(fd, n_ckpts) || n_ckpts > MAX_CACHE_CKPTS) {
+        out = {};
+        return false;
+    }
+
+    out.ckpts.resize(n_ckpts);
+    for (uint32_t i = 0; i < n_ckpts; ++i) {
+        auto & ck = out.ckpts[i];
+        if (!recv_val(fd, ck.n_tokens) || !recv_val(fd, ck.pos_min) || !recv_val(fd, ck.pos_max) ||
+            ck.n_tokens < 0 ||
+            !recv_blob_capped(fd, ck.data_tgt, 512ull << 20, total_bytes) ||
+            !recv_blob_capped(fd, ck.data_dft, 128ull << 20, total_bytes) ||
+            !recv_blob_capped(fd, ck.data_spec, 64ull << 20, total_bytes)) {
+            out = {};
+            return false;
+        }
+    }
+
+    out.ms          = now_ms() - t0;
+    out.total_bytes = total_bytes;
+    return true;
 }

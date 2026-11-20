@@ -2014,7 +2014,7 @@ void server_state_buf::release() {
     n    = cap = 0;
 }
 
-size_t server_prompt_cache::size() const {
+size_t server_prompt_cache::size_locked() const {
     size_t res = 0;
 
     for (const auto & state : states) {
@@ -2024,7 +2024,12 @@ size_t server_prompt_cache::size() const {
     return res;
 }
 
-size_t server_prompt_cache::n_tokens() const {
+size_t server_prompt_cache::size() const {
+    std::lock_guard<std::mutex> lk(mtx);
+    return size_locked();
+}
+
+size_t server_prompt_cache::n_tokens_locked() const {
     size_t res = 0;
 
     for (const auto & state : states) {
@@ -2034,18 +2039,116 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-std::list<server_prompt_cache_state>::iterator server_prompt_cache::evictable() {
+size_t server_prompt_cache::n_tokens() const {
+    std::lock_guard<std::mutex> lk(mtx);
+    return n_tokens_locked();
+}
+
+size_t server_prompt_cache::count() const {
+    std::lock_guard<std::mutex> lk(mtx);
+    return states.size();
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::evictable_locked() {
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (it->owner < 0) {
+        if (it->broken && it->owner < 0 && it->pin_count == 0 && !it->writing) {
+            return it;
+        }
+    }
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->owner < 0 && it->pin_count == 0 && !it->writing) {
             return it;
         }
     }
     return states.end();
 }
 
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::evictable() {
+    return evictable_locked();
+}
+
 void server_prompt_cache::release(server_prompt_cache_state * e) {
     if (e != nullptr) {
+        std::lock_guard<std::mutex> lk(mtx);
         e->owner = -1;
+        if (e->broken && e->pin_count == 0) {
+            for (auto it = states.begin(); it != states.end(); ++it) {
+                if (&*it == e) {
+                    states.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+server_prompt_cache_state * server_prompt_cache::pin_best_prefix(const llama_tokens & tokens, int min_lcp, int * lcp_out) {
+    std::lock_guard<std::mutex> lk(mtx);
+
+    int best_lcp = min_lcp - 1;
+    server_prompt_cache_state * best = nullptr;
+
+    for (auto & st : states) {
+        if (st.writing || st.broken || st.prompt.tokens.has_media() || st.data.segs.empty()) {
+            continue;
+        }
+        const auto & et = st.prompt.tokens.get_tokens();
+        const int n = (int) std::min(et.size(), tokens.size());
+        if (n < min_lcp) {
+            continue;
+        }
+        int lcp = 0;
+        while (lcp < n && et[lcp] == tokens[lcp]) {
+            ++lcp;
+        }
+        if (lcp >= min_lcp && lcp >= best_lcp) {
+            best_lcp = lcp;
+            best = &st;
+        }
+    }
+
+    if (best != nullptr) {
+        best->pin_count++;
+        if (lcp_out != nullptr) {
+            *lcp_out = best_lcp;
+        }
+    } else if (lcp_out != nullptr) {
+        *lcp_out = 0;
+    }
+
+    return best;
+}
+
+void server_prompt_cache::unpin(server_prompt_cache_state * e) {
+    if (e == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(mtx);
+    GGML_ASSERT(e->pin_count > 0);
+    e->pin_count--;
+    if (e->pin_count == 0 && e->broken && e->owner < 0) {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (&*it == e) {
+                states.erase(it);
+                break;
+            }
+        }
+    }
+}
+
+void server_prompt_cache::put_checkpoints(server_prompt_cache_state * e, std::vector<common_prompt_checkpoint> & ckpts) {
+    if (e == nullptr || ckpts.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(mtx);
+    for (auto & st : states) {
+        if (&st == e) {
+            if (st.pin_count == 0 && !st.writing && !st.broken && st.prompt.checkpoints.empty()) {
+                st.prompt.checkpoints = std::move(ckpts);
+                ckpts.clear();
+            }
+            break;
+        }
     }
 }
 
@@ -2055,7 +2158,7 @@ static bool cache_lru_on() {
     return on;
 }
 
-void server_prompt_cache::touch(server_prompt_cache_state * e) {
+void server_prompt_cache::touch_locked(server_prompt_cache_state * e) {
     if (e == nullptr || !cache_lru_on()) {
         return;
     }
@@ -2068,7 +2171,12 @@ void server_prompt_cache::touch(server_prompt_cache_state * e) {
     }
 }
 
-std::list<server_prompt_cache_state>::iterator server_prompt_cache::best_entry(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int * lcp_out) {
+void server_prompt_cache::touch(server_prompt_cache_state * e) {
+    std::lock_guard<std::mutex> lk(mtx);
+    touch_locked(e);
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::best_entry_locked(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int * lcp_out) {
     int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2080,6 +2188,9 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::best_entry(c
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->writing || it->broken) {
+            continue;
+        }
         // an entry another slot holds is in use there
         if (it->owner >= 0 && it->owner != id_slot) {
             continue;
@@ -2112,9 +2223,14 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::best_entry(c
     return it_best;
 }
 
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::best_entry(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int * lcp_out) {
+    return best_entry_locked(prompt, tokens_new, id_slot, lcp_out);
+}
+
 const server_prompt_cache_state * server_prompt_cache::find_better(const server_prompt & prompt, const server_tokens & tokens_new, int32_t id_slot, int min_gain) {
+    std::lock_guard<std::mutex> lk(mtx);
     int lcp_best = 0;
-    auto it = best_entry(prompt, tokens_new, id_slot, &lcp_best);
+    auto it = best_entry_locked(prompt, tokens_new, id_slot, &lcp_best);
     if (it == states.end()) {
         return nullptr;
     }
@@ -2122,13 +2238,13 @@ const server_prompt_cache_state * server_prompt_cache::find_better(const server_
     return lcp_best - lcp_slot >= min_gain ? &*it : nullptr;
 }
 
-size_t server_prompt_cache::trim_checkpoints_one() {
+size_t server_prompt_cache::trim_checkpoints_one_locked() {
     static const int keep = getenv("LLAMA_CACHE_TRIM_CKPTS") != nullptr ? atoi(getenv("LLAMA_CACHE_TRIM_CKPTS")) : 3;
     if (keep < 0) {
         return 0;
     }
     for (auto & st : states) {
-        if (st.owner >= 0 || st.prompt.checkpoints.size() <= (size_t) keep) {
+        if (st.owner >= 0 || st.pin_count > 0 || st.writing || st.prompt.checkpoints.size() <= (size_t) keep) {
             continue;
         }
         size_t freed = 0;
@@ -2154,21 +2270,31 @@ size_t server_prompt_cache::trim_checkpoints_one() {
     return 0;
 }
 
-void server_prompt_cache::make_room(size_t need, const char * why) {
+size_t server_prompt_cache::trim_checkpoints_one() {
+    std::lock_guard<std::mutex> lk(mtx);
+    return trim_checkpoints_one_locked();
+}
+
+void server_prompt_cache::make_room_locked(size_t need, const char * why) {
     if (limit_size == 0) {
         return;
     }
-    while (size() + need > limit_size) {
-        if (trim_checkpoints_one() > 0) {
+    while (size_locked() + need > limit_size) {
+        if (trim_checkpoints_one_locked() > 0) {
             continue;
         }
-        auto it = evictable();
+        auto it = evictable_locked();
         if (it == states.end()) {
             break;
         }
         SRV_WRN(" - %s, removing oldest entry (size = %.3f MiB, %d tokens)\n", why, it->size() / (1024.0 * 1024.0), it->prompt.n_tokens());
         states.erase(it);
     }
+}
+
+void server_prompt_cache::make_room(size_t need, const char * why) {
+    std::lock_guard<std::mutex> lk(mtx);
+    make_room_locked(need, why);
 }
 
 // LLAMA_CACHE_DELTA=0: every save is a new full entry (measurement switch)
@@ -2186,7 +2312,14 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     static const int32_t seg_max = getenv("LLAMA_CACHE_SEG")     != nullptr ? std::max(1024, atoi(getenv("LLAMA_CACHE_SEG")))    : 32768;
     static const int32_t seg_min = getenv("LLAMA_CACHE_SEG_MIN") != nullptr ? std::max(0,    atoi(getenv("LLAMA_CACHE_SEG_MIN"))) : 4096;
 
-    server_prompt_cache_state * e = (*origin != nullptr && (*origin)->owner == id_slot) ? *origin : nullptr;
+    std::unique_lock<std::mutex> lk(mtx);
+
+    server_prompt_cache_state * old_origin = *origin;
+    const bool origin_pinned = old_origin != nullptr && old_origin->owner == id_slot && old_origin->pin_count > 0;
+    server_prompt_cache_state * e = (old_origin != nullptr && old_origin->owner == id_slot && !origin_pinned && !old_origin->broken && !old_origin->writing) ? old_origin : nullptr;
+    if (origin_pinned) {
+        old_origin->owner = -1;
+    }
     if (!cache_delta_on() && e != nullptr) {
         // the old behaviour: the previous entry of the conversation goes, a full one is made
         for (auto it = states.begin(); it != states.end(); ++it) {
@@ -2228,13 +2361,13 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             e->prompt.checkpoints = prompt.checkpoints;
         }
         SRV_DBG("prompt cache: entry of slot %d unchanged (%d tokens), checkpoints back\n", id_slot, n);
-        touch(e);
+        touch_locked(e);
         return e;
     }
 
     // first check if the current state is contained fully in another entry of the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (&*it == e) {
+        if (&*it == e || it->writing || it->broken) {
             continue;
         }
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -2332,6 +2465,16 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     // where the new drafter part starts: the kept drafter cells reach only d1 of the last kept segment
     const llama_pos keep_end_dft = has_kept ? std::min<llama_pos>(keep_end, e->data.segs[n_keep - 1].d1) : 0;
 
+    size_t size_kept = 0;
+    for (size_t i = 0; has_kept && i < n_keep; ++i) {
+        size_kept += e->data.segs[i].size();
+    }
+
+    if (e != nullptr) {
+        e->writing = true;
+    }
+    lk.unlock();
+
     // the new segments: [keep_end, n) in chunks of seg_max, the last one open-ended (cells past n go with it)
     struct chunk { llama_pos a, b, ad; size_t sz_tgt, sz_dft; };
     std::vector<chunk> chunks;
@@ -2364,11 +2507,6 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     }
     state_size_new += checkpoints_size;
 
-    size_t size_kept = 0;
-    for (size_t i = 0; has_kept && i < n_keep; ++i) {
-        size_kept += e->data.segs[i].size();
-    }
-
     const int64_t t1 = ggml_time_us();
 
     // skip over-limit entries to avoid disturbing the cache
@@ -2376,11 +2514,15 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 (state_size_new + size_kept) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         if (e != nullptr) {
+            std::lock_guard<std::mutex> g(mtx);
+            e->writing = false;
             e->owner = -1;
             *origin = nullptr;
         }
         return nullptr;
     }
+
+    lk.lock();
 
     // the save goes on: the kept segments leave the entry while it is rebuilt, the stale ones past them go
     std::vector<server_state_seg> kept;
@@ -2395,7 +2537,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (&*it != e && it->owner < 0 && len == (int) it->prompt.tokens.size()) {
+        if (&*it != e && it->owner < 0 && it->pin_count == 0 && !it->writing && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -2407,41 +2549,49 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     // make room before allocating the new buffers to avoid breaching the limit (HC1: older checkpoints of unowned
     // entries go first, then whole entries, least recently used first)
     // (HC3: the kept segments are out of the entry while it is rebuilt: size() misses them, so they count as needed)
-    make_room(state_size_new + size_kept, "making room for prompt cache entry");
+    make_room_locked(state_size_new + size_kept, "making room for prompt cache entry");
 
     if (e == nullptr) {
         states.push_back({});
         e = &states.back();
+        e->writing = true;
     }
     e->owner = id_slot;
-    touch(e);
+    touch_locked(e);
     e->data.segs = std::move(kept);
+    lk.unlock();
 
     auto fail = [&]() {
-        for (auto it = states.begin(); it != states.end(); ++it) {
-            if (&*it == e) {
-                states.erase(it);
-                break;
+        bool do_update = false;
+        {
+            std::lock_guard<std::mutex> flk(mtx);
+            for (auto it = states.begin(); it != states.end(); ++it) {
+                if (&*it == e) {
+                    states.erase(it);
+                    break;
+                }
             }
+            *origin = nullptr;
+
+            // HC3: the pool refused to grow past its cap (no free block fits, nothing left to evict): this entry is skipped,
+            // the cache and its limit stay as they are and serving goes on
+            if (pool.cap_refused) {
+                SRV_WRN("prompt cache: the state of slot %d (%d tokens, %.1f MiB) does not fit the pool, entry skipped\n",
+                        id_slot, n, (state_size_new + size_kept) / (1024.0 * 1024.0));
+                pool.cap_refused = false;
+                return (server_prompt_cache_state *) nullptr;
+            }
+
+            SRV_ERR("%s", "failed to allocate memory for prompt cache state\n");
+
+            limit_size = std::max<size_t>(1, 0.4*size_locked());
+
+            SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
+            do_update = true;
         }
-        *origin = nullptr;
-
-        // HC3: the pool refused to grow past its cap (no free block fits, nothing left to evict): this entry is skipped,
-        // the cache and its limit stay as they are and serving goes on
-        if (pool.cap_refused) {
-            SRV_WRN("prompt cache: the state of slot %d (%d tokens, %.1f MiB) does not fit the pool, entry skipped\n",
-                    id_slot, n, (state_size_new + size_kept) / (1024.0 * 1024.0));
-            pool.cap_refused = false;
-            return (server_prompt_cache_state *) nullptr;
+        if (do_update) {
+            update();
         }
-
-        SRV_ERR("%s", "failed to allocate memory for prompt cache state\n");
-
-        limit_size = std::max<size_t>(1, 0.4*size());
-
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
 
         return (server_prompt_cache_state *) nullptr;
     };
@@ -2453,7 +2603,8 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
             if (!pool.cap_refused) {
                 return false;
             }
-            auto it = evictable();
+            std::lock_guard<std::mutex> g(mtx);
+            auto it = evictable_locked();
             if (it == states.end()) {
                 return false;
             }
@@ -2517,13 +2668,23 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     } else {
         e->prompt.checkpoints = prompt.checkpoints;
     }
-    *origin = e;
+    size_t n_states_log = 0;
+    size_t n_bytes_log  = 0;
+    {
+        std::lock_guard<std::mutex> flk(mtx);
+        e->writing = false;
+        *origin = e;
+        if (srv_cache_timing()) {
+            n_states_log = states.size();
+            n_bytes_log  = size_locked();
+        }
+    }
 
     if (srv_cache_timing()) {
         SRV_WRN("timing cache save: slot %d n_tokens %d lcp %d kept %zu segs (to %d) new %zu segs: sizes %.1f alloc %.1f segs %.1f (%.1f MiB) recr %.1f (%.1f MiB) rest %.1f ms (cache %zu prompts, %.1f MiB, pool %.1f MiB)\n",
                 id_slot, n, lcp, e->data.segs.size() - chunks.size(), keep_end, chunks.size(), (t1 - t0) / 1e3, (t2 - t1) / 1e3,
                 (t3 - t2) / 1e3, n_saved / (1024.0 * 1024.0), (t4 - t3) / 1e3, sz_recr / (1024.0 * 1024.0), (ggml_time_us() - t4) / 1e3,
-                states.size(), size() / (1024.0 * 1024.0), pool.capacity() / (1024.0 * 1024.0));
+                n_states_log, n_bytes_log / (1024.0 * 1024.0), pool.capacity() / (1024.0 * 1024.0));
     }
 
     return e;
@@ -2531,19 +2692,24 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, server_prompt_cache_state * saved, server_prompt_cache_state ** origin) {
     const int64_t t_load = ggml_time_us();
+    std::unique_lock<std::mutex> lk(mtx);
     int lcp_best = 0;
-    auto it_best = best_entry(prompt, tokens_new, id_slot, &lcp_best);
+    auto it_best = best_entry_locked(prompt, tokens_new, id_slot, &lcp_best);
 
     if (it_best == states.end()) {
         if (saved != nullptr) {
             // the slot keeps its prompt and cells: the checkpoints save() moved into the entry come back (the prompt
             // reuse erases the ones past the common prefix; a recurrent model needs the earlier ones); the entry stays
             // the slot's, so the next save is a delta again
-            prompt.checkpoints = std::move(saved->prompt.checkpoints);
-            saved->prompt.checkpoints.clear();
+            if (saved->pin_count > 0) {
+                prompt.checkpoints = saved->prompt.checkpoints;
+            } else {
+                prompt.checkpoints = std::move(saved->prompt.checkpoints);
+                saved->prompt.checkpoints.clear();
+            }
             saved->owner = id_slot;
             *origin = saved;
-            touch(saved);
+            touch_locked(saved);
             SRV_DBG("prompt cache: the slot keeps its prompt (%d of %d tokens shared), %zu checkpoints back\n",
                     lcp_best, (int) prompt.tokens.size(), prompt.checkpoints.size());
         }
@@ -2551,12 +2717,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     auto & e = *it_best;
+    e.pin_count++;
+    const size_t n_e_tokens = e.prompt.tokens.size();
+    const size_t n_e_segs   = e.data.segs.size();
+    const size_t e_sz_bytes = e.size();
+    lk.unlock();
+
     SRV_TRC(" - found better prompt with lcp = %d\n", lcp_best);
 
     SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
 
     // the whole cached prompt is a prefix of the new one
-    if (lcp_best == (int) it_best->prompt.tokens.size()) {
+    if (lcp_best == (int) n_e_tokens) {
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
     }
 
@@ -2566,11 +2738,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
         }
+        std::lock_guard<std::mutex> flk(mtx);
         if (saved != nullptr && saved != &e) {
             saved->owner = -1;
         }
-
-        states.erase(it_best);
+        GGML_ASSERT(e.pin_count > 0);
+        e.pin_count--;
+        if (e.pin_count == 0) {
+            states.erase(it_best);
+        } else {
+            e.owner  = -1;
+            e.broken = true;
+        }
         *origin = nullptr;
         return false;
     };
@@ -2586,7 +2765,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     const int32_t n_e = e.prompt.tokens.pos_next(); // positions (VS1: an image's tokens take fewer positions)
     for (size_t i = 0; i < e.data.segs.size(); ++i) {
-        auto & seg = e.data.segs[i];
+        const auto & seg = e.data.segs[i];
 
         if (!seg.main.empty() && llama_state_seq_set_data_range(ctx_tgt, seg.main.data(), seg.main.size(), id_slot) != seg.main.size()) {
             return fail("target segment");
@@ -2613,7 +2792,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     {
         const llama_pos gap = server_tokens_pos_gap(ctx_tgt, id_slot, 0, e.prompt.tokens);
         if (gap >= 0 && gap < n_e) {
-            SRV_WRN("prompt cache: entry of %d tokens restores only up to pos %d (%zu segments): dropped\n", n_e, gap, e.data.segs.size());
+            SRV_WRN("prompt cache: entry of %d tokens restores only up to pos %d (%zu segments): dropped\n", n_e, gap, n_e_segs);
             return fail("segments do not cover the prompt");
         }
     }
@@ -2628,37 +2807,48 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         common_speculative_set_state(spec, id_slot, e.data.spec);
     }
 
-    prompt.tokens      = e.prompt.tokens.clone();
-    prompt.checkpoints = std::move(e.prompt.checkpoints);
-    e.prompt.checkpoints.clear();
+    prompt.tokens = e.prompt.tokens.clone();
 
-    if (saved != nullptr && saved != &e) {
-        saved->owner = -1;
+    {
+        std::lock_guard<std::mutex> flk(mtx);
+        GGML_ASSERT(e.pin_count > 0);
+        e.pin_count--;
+        if (e.pin_count > 0) {
+            prompt.checkpoints = e.prompt.checkpoints;
+        } else {
+            prompt.checkpoints = std::move(e.prompt.checkpoints);
+            e.prompt.checkpoints.clear();
+        }
+
+        if (saved != nullptr && saved != &e) {
+            saved->owner = -1;
+        }
+        e.owner = id_slot;
+        *origin = &e;
+        touch_locked(&e);
     }
-    e.owner = id_slot;
-    *origin = &e;
-    touch(&e);
 
     if (srv_cache_timing()) {
         SRV_WRN("timing cache load: slot %d n_tokens %d: lcp search %.1f segs %zu %.1f recr %.1f ms (%.1f MiB)\n", id_slot, n_e,
-                (t_set - t_load) / 1e3, e.data.segs.size(), (t_recr - t_set) / 1e3, (ggml_time_us() - t_recr) / 1e3, e.size() / (1024.0 * 1024.0));
+                (t_set - t_load) / 1e3, n_e_segs, (t_recr - t_set) / 1e3, (ggml_time_us() - t_recr) / 1e3, e_sz_bytes / (1024.0 * 1024.0));
     }
 
     return true;
 }
 
 void server_prompt_cache::update() {
-    make_room(0, "cache size limit reached");
+    std::lock_guard<std::mutex> lk(mtx);
+    make_room_locked(0, "cache size limit reached");
 
     // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    const float size_per_token = std::max<float>(1.0f, float(size_locked()) / (std::max<size_t>(1, n_tokens_locked())));
 
     // dynamically increase the token limit if it can fit in the memory limit
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (n_tokens() > limit_tokens_cur) {
-            auto it = evictable();
+        while (n_tokens_locked() > limit_tokens_cur) {
+            auto it = evictable_locked();
             if (it == states.end()) {
                 break;
             }
@@ -2670,7 +2860,7 @@ void server_prompt_cache::update() {
     }
 
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+            states.size(), size_locked() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",

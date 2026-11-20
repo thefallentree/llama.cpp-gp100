@@ -4916,7 +4916,10 @@ private:
                         // before those last n_ubatch tokens is assembled from the stages' snapshots at that position
                         const int32_t n_prompt = slot.task->n_tokens();
                         const int32_t n_split  = n_prompt - 4;
-                        const int32_t n_ckpt   = n_prompt - (4 + n_ubatch);
+                        static const int32_t peer_med_ub  = getenv("LLAMA_PREFILL_PEER_MED_UB")  ? atoi(getenv("LLAMA_PREFILL_PEER_MED_UB"))  : 0;
+                        static const int32_t peer_med_max = getenv("LLAMA_PREFILL_PEER_MED_MAX") ? atoi(getenv("LLAMA_PREFILL_PEER_MED_MAX")) : 10240;
+                        const int32_t peer_ub  = (peer_med_ub > 0 && n_split < peer_med_max) ? std::min(n_ubatch, peer_med_ub) : n_ubatch;
+                        const int32_t n_ckpt   = n_prompt - (4 + peer_ub);
                         // LLAMA_PREFILL_PEER_CKPT=0: no assembled checkpoint (DeepSeek-V4.1: its partial state holds the raw window
                         // and the compressor states at the end of the prompt, the stages' snapshots cannot be put back into it)
                         static const bool peer_ckpt = getenv("LLAMA_PREFILL_PEER_CKPT") == nullptr || atoi(getenv("LLAMA_PREFILL_PEER_CKPT")) != 0;
@@ -4925,7 +4928,7 @@ private:
                                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                                 n_swa > 0);
                         // without the assembled checkpoint the pipeline stops at n_ckpt and the local path decodes the last
-                        // n_ubatch + 4 tokens itself, so that it makes the checkpoint before them as usual (a prompt that
+                        // peer_ub + 4 tokens itself, so that it makes the checkpoint before them as usual (a prompt that
                         // differs from a cached one in its last ~1500 tokens restores from it instead of a full re-prefill);
                         // the peers learn the real prompt end from the negative n_ckpt (their layer-skip tail).
                         // LLAMA_PREFILL_PEER_CUT=0: the whole prompt but 4 tokens through the pipeline, no checkpoint
@@ -4933,7 +4936,7 @@ private:
                         const bool    cut    = !want_ckpt && peer_cut && params_base.n_ctx_checkpoints > 0;
                         const int32_t n_send = cut ? n_ckpt : n_split;
                         const int32_t ck_arg = cut ? -(n_prompt - n_ckpt) : (want_ckpt ? n_ckpt : -1);
-                        if (n_ckpt >= 2*n_ubatch) {
+                        if (peer_ub > 0 && n_ckpt >= 2*peer_ub) {
                             std::vector<llama_token> toks(n_send);
                             for (int32_t i = 0; i < n_send; ++i) {
                                 toks[i] = input_tokens[i];
@@ -4941,7 +4944,7 @@ private:
                             prefill_peer_stats pst;
                             prefill_peer_ckpt  pck;
                             common_speculative_catchup_join(spec.get());
-                            if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_send, n_ubatch,
+                            if (prefill_peer_run(peer_cfg, ctx_tgt, ctx_dft, spec.get(), slot.id, toks.data(), n_send, peer_ub,
                                                  ck_arg, &pck, pst, slot.prompt_skip_from)) {
                                 for (int32_t i = 0; i < n_send; ++i) {
                                     slot.prompt.tokens.push_back(toks[i]);

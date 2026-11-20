@@ -4224,6 +4224,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ggml_cuda_moe_host_active(ctx, dst)) {
             if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
                 ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
+            } else if (ggml_cuda_moe_host_partitions((int) dst->ne[2])) {
+                ggml_cuda_moe_host_part((int) dst->ne[2], &ctx.mmid_part_h, &ctx.mmid_part_k);
+                ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                ctx.mmid_part_h = ctx.mmid_part_k = 0;
             } else {
                 ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
             }

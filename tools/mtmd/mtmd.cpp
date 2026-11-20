@@ -828,6 +828,13 @@ struct mtmd_context {
     std::unique_ptr<mtmd_subcontext> ctx_a; // audio
     std::vector<float> out_embd; // image embedding vector
 
+    bool                               on_demand_gpu = false;
+    ggml_backend_dev_t                 on_demand_explicit_dev = nullptr;
+    int                                on_demand_max_nodes = 0;
+    mtmd_flash_attn_type               on_demand_flash_attn = MTMD_FLASH_ATTN_TYPE_AUTO;
+    ggml_backend_sched_eval_callback   on_demand_cb_eval = nullptr;
+    void *                             on_demand_cb_eval_user_data = nullptr;
+
     // generation context
     std::unique_ptr<mtmd_subcontext> ctx_gen_a; // audio
 
@@ -933,7 +940,16 @@ struct mtmd_context {
             }
         }
 
-        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        const char * env_od = std::getenv("LLAMA_MMPROJ_ON_DEMAND");
+        const bool defer_vision_gpu = env_od != nullptr && std::atoi(env_od) != 0 && ctx_params.use_gpu && !no_alloc;
+        ggml_backend_dev_t device = defer_vision_gpu ? nullptr : mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        if (defer_vision_gpu) {
+            on_demand_gpu               = true;
+            on_demand_explicit_dev      = ctx_params.device;
+            on_demand_flash_attn        = mtmd_to_flash_attn_type(ctx_params.flash_attn_type);
+            on_demand_cb_eval           = ctx_params.cb_eval;
+            on_demand_cb_eval_user_data = ctx_params.cb_eval_user_data;
+        }
 
         mtmd_model_params model_params;
         model_params.image_min_tokens            = ctx_params.image_min_tokens;
@@ -951,6 +967,9 @@ struct mtmd_context {
         if (!models.v && !models.a && !models.gen_a) {
             throw std::runtime_error(mtmd_format("Failed to load mmproj model from %s\n", mmproj_fname));
         }
+        if (defer_vision_gpu && !models.v) {
+            on_demand_gpu = false;
+        }
 
         int max_nodes = 0;
         for (const auto * m : { models.v.get(), models.a.get(), models.gen_a.get() }) {
@@ -958,6 +977,7 @@ struct mtmd_context {
                 max_nodes = std::max(max_nodes, m->max_nodes);
             }
         }
+        on_demand_max_nodes = max_nodes;
 
         // no_alloc only measures memory, nothing is computed
         backends = std::make_unique<mtmd_backends>(device, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
@@ -966,8 +986,12 @@ struct mtmd_context {
         // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
         mtmd_subctx_params sctx_params {
             /* flash_attn_type   */ mtmd_to_flash_attn_type(ctx_params.flash_attn_type),
-            /* warmup            */ ctx_params.warmup,
+            /* warmup            */ defer_vision_gpu ? false : ctx_params.warmup,
         };
+        if (on_demand_gpu && models.v && models.v->buf) {
+            LOG_INF("%s: LLAMA_MMPROJ_ON_DEMAND enabled: keeping %.1f MiB vision weights in host RAM until image encode\n",
+                    __func__, ggml_backend_buffer_get_size(models.v->buf.get()) / 1048576.0);
+        }
         if (models.v) {
             ctx_v = std::make_unique<mtmd_subcontext>(*models.v, *backends, sctx_params);
         }
@@ -2618,6 +2642,141 @@ int32_t mtmd_tokenize_from_parts(const mtmd_context * ctx,
     }
 }
 
+static ggml_backend_dev_t mtmd_select_most_free_gpu() {
+    ggml_backend_dev_t best_gpu   = nullptr;
+    size_t             best_free  = 0;
+    ggml_backend_dev_t best_igpu  = nullptr;
+    size_t             best_ifree = 0;
+    const size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto dtype = ggml_backend_dev_type(dev);
+        if (dtype != GGML_BACKEND_DEVICE_TYPE_GPU && dtype != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            if (best_gpu == nullptr || free_mem > best_free) {
+                best_gpu  = dev;
+                best_free = free_mem;
+            }
+        } else {
+            if (best_igpu == nullptr || free_mem > best_ifree) {
+                best_igpu  = dev;
+                best_ifree = free_mem;
+            }
+        }
+    }
+    return best_gpu ? best_gpu : best_igpu;
+}
+
+struct mtmd_on_demand_gpu_guard {
+    struct tensor_snap {
+        ggml_tensor *         t;
+        ggml_backend_buffer_t buf;
+        void *                data;
+    };
+
+    mtmd_model &                     model;
+    std::vector<tensor_snap>         snaps;
+    ggml_backend_buffer_ptr          gpu_buf;
+    std::unique_ptr<mtmd_backends>   gpu_backends;
+    std::unique_ptr<mtmd_subcontext> gpu_sctx;
+    bool                             active = false;
+
+    mtmd_on_demand_gpu_guard(mtmd_context * ctx, ggml_backend_dev_t dev, size_t free_mem, size_t margin_bytes)
+            : model(*ctx->models.v) {
+        if (!dev || !model.ctx_data || !model.buf) {
+            return;
+        }
+        const size_t weights_bytes = ggml_backend_buffer_get_size(model.buf.get());
+        if (free_mem < weights_bytes + margin_bytes) {
+            LOG_WRN("%s: skipping GPU staging on %s (free %.1f MiB < need %.1f MiB), using CPU\n",
+                    __func__, ggml_backend_dev_name(dev),
+                    free_mem / 1048576.0, (weights_bytes + margin_bytes) / 1048576.0);
+            return;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(model.ctx_data.get()); t != nullptr;
+             t = ggml_get_next_tensor(model.ctx_data.get(), t)) {
+            snaps.push_back({t, t->buffer, t->data});
+        }
+        try {
+            for (const auto & s : snaps) {
+                s.t->buffer = nullptr;
+                s.t->data   = nullptr;
+            }
+            ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(dev);
+            gpu_buf.reset(gpu_buft ? ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), gpu_buft) : nullptr);
+            if (!gpu_buf) {
+                restore();
+                LOG_WRN("%s: failed to allocate %.1f MiB on %s, falling back to CPU\n",
+                        __func__, weights_bytes / 1048576.0, ggml_backend_dev_name(dev));
+                return;
+            }
+            ggml_backend_buffer_set_usage(gpu_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (const auto & s : snaps) {
+                if (s.t->view_src == nullptr && s.data != nullptr) {
+                    ggml_backend_tensor_set(s.t, s.data, 0, ggml_nbytes(s.t));
+                }
+            }
+            gpu_backends = std::make_unique<mtmd_backends>(
+                dev, ctx->n_threads, ctx->on_demand_max_nodes,
+                ctx->on_demand_cb_eval, ctx->on_demand_cb_eval_user_data);
+            mtmd_subctx_params sctx_params {
+                /* flash_attn_type */ ctx->on_demand_flash_attn,
+                /* warmup          */ false,
+            };
+            gpu_sctx = std::make_unique<mtmd_subcontext>(model, *gpu_backends, sctx_params);
+            if (ctx->ctx_v) {
+                gpu_sctx->debug_output_embeddings = ctx->ctx_v->debug_output_embeddings;
+            }
+            active = true;
+        } catch (...) {
+            restore();
+            throw;
+        }
+    }
+
+    void restore() {
+        gpu_sctx.reset();
+        gpu_backends.reset();
+        for (const auto & s : snaps) {
+            s.t->buffer = s.buf;
+            s.t->data   = s.data;
+        }
+        gpu_buf.reset();
+        snaps.clear();
+        active = false;
+    }
+
+    ~mtmd_on_demand_gpu_guard() {
+        restore();
+    }
+};
+
+static int32_t mtmd_encode_run_v(mtmd_subcontext * sctx, int n_threads, int n_embd_out,
+                                 const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
+    if (image_tokens->pos == MTMD_POS_TYPE_CANVAS) {
+        size_t offset = 0;
+        for (const auto & entry : image_tokens->batch_f32.entries) {
+            mtmd_image_f32_batch one;
+            one.entries.push_back(entry);
+            std::vector<float> embd((size_t) n_embd_out * sctx->model.n_output_tokens(&entry));
+            if (!sctx->encode_batch(n_threads, &one, embd)) {
+                return 1;
+            }
+            GGML_ASSERT(offset + embd.size() <= out_embd.size());
+            std::copy(embd.begin(), embd.end(), out_embd.begin() + offset);
+            offset += embd.size();
+        }
+        GGML_ASSERT(offset == out_embd.size());
+        return 0;
+    }
+
+    return sctx->encode_batch(n_threads, &image_tokens->batch_f32, out_embd) ? 0 : 1;
+}
+
 static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
     mtmd_subcontext * sctx = ctx->ctx_v.get();
     if (!sctx) {
@@ -2634,29 +2793,29 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
         return 1;
     }
 
-    if (image_tokens->pos == MTMD_POS_TYPE_CANVAS) {
-        // the tiles differ in size, encode them one by one
-        size_t offset = 0;
-        for (const auto & entry : image_tokens->batch_f32.entries) {
-            mtmd_image_f32_batch one;
-            one.entries.push_back(entry);
-            std::vector<float> embd((size_t) n_embd_out * sctx->model.n_output_tokens(&entry));
-            if (!sctx->encode_batch(ctx->n_threads, &one, embd)) {
-                return 1;
+    if (ctx->on_demand_gpu && ctx->models.v) {
+        ggml_backend_dev_t dev = ctx->on_demand_explicit_dev ? ctx->on_demand_explicit_dev : mtmd_select_most_free_gpu();
+        if (dev != nullptr) {
+            size_t free_mem = 0, total_mem = 0;
+            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+            const char * env_m = std::getenv("LLAMA_MMPROJ_ON_DEMAND_MARGIN_MB");
+            const size_t margin_mb = env_m && std::atoi(env_m) >= 0 ? (size_t) std::atoi(env_m) : 384u;
+            try {
+                mtmd_on_demand_gpu_guard guard(ctx, dev, free_mem, margin_mb * 1048576u);
+                if (guard.active) {
+                    if (mtmd_encode_run_v(guard.gpu_sctx.get(), ctx->n_threads, n_embd_out, image_tokens, out_embd) == 0) {
+                        return 0;
+                    }
+                    LOG_WRN("%s: on-demand GPU vision encode failed on %s, falling back to CPU\n",
+                            __func__, ggml_backend_dev_name(dev));
+                }
+            } catch (const std::exception & e) {
+                LOG_WRN("%s: on-demand GPU vision encode threw (%s), falling back to CPU\n", __func__, e.what());
             }
-            GGML_ASSERT(offset + embd.size() <= out_embd.size());
-            std::copy(embd.begin(), embd.end(), out_embd.begin() + offset);
-            offset += embd.size();
         }
-        GGML_ASSERT(offset == out_embd.size());
-        return 0;
     }
 
-    bool ok = sctx->encode_batch(ctx->n_threads,
-        &image_tokens->batch_f32,
-        out_embd);
-
-    return ok ? 0 : 1;
+    return mtmd_encode_run_v(sctx, ctx->n_threads, n_embd_out, image_tokens, out_embd);
 }
 
 static int32_t cbx_ref_encode(mtmd_context * ctx, const mtmd_audio_tokens * audio_tokens, std::vector<float> & out_embd);

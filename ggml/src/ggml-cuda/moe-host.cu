@@ -570,7 +570,7 @@ static bool ggml_cuda_moe_host_init(ggml_backend_cuda_context & ctx, const int n
     const char * env = getenv("GGML_CUDA_MOE_HOST_MAX_TOK");
     int part_h = 0, part_k = 0, part_max = 0;
     mh_part_env(part_h, part_k, part_max);
-    const int cap_tok   = std::max(MH_SMALL_TOK, env ? atoi(env) : std::max(512, part_k != 0 ? part_max : 0));
+    const int cap_tok   = std::max(MH_SMALL_TOK, std::max(env ? atoi(env) : 512, part_k != 0 ? part_max : 0));
     const int cap_pairs = cap_tok*n_used;
     const size_t size   = mh_mailbox_layout(nullptr, cap_tok, cap_pairs, n_embd);
 

@@ -672,9 +672,10 @@ bool ggml_cuda_moe_host_takes_prompt(const int n_tokens) {
 
 // GGML_CUDA_MOE_HOST_PART=h/k: the host/GPU share of the cold experts of a shared prompt batch (0/0 = off)
 static void mh_part_env(int & h, int & k, int & max_tok) {
-    static int sh = -1, sk = 0, smax = 1536;
-    if (sh < 0) {
-        sh = 0;
+    static bool init = false;
+    static int sh = 0, sk = 0, smax = 1536;
+    if (!init) {
+        init = true;
         const char * e = getenv("GGML_CUDA_MOE_HOST_PART");
         const char * m = getenv("GGML_CUDA_MOE_HOST_PART_MAX_TOK");
         if (e != nullptr && strcmp(e, "auto") == 0) {

@@ -4191,11 +4191,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 return;
             }
             // a shared prompt batch: the host tier has its share of the cold experts (the triple is open), the GEMM
-            // stages the routed others per op and skips the host's tiles; the collect writes the host's rows
+            // uses the prefetched GPU stripes from the ring (or stages the routed others per op) and skips the host's tiles;
+            // the collect writes the host's rows
             if (ggml_cuda_moe_host_active(ctx, dst) && !ggml_cuda_mmid_allgpu() && ggml_cuda_mmid_iq_prompt(dst) &&
                 ggml_cuda_moe_host_partitions((int) dst->ne[2])) {
                 ggml_cuda_moe_host_part((int) dst->ne[2], &ctx.mmid_part_h, &ctx.mmid_part_k);
-                ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                if (!ggml_cuda_cold_prefetch_run(ctx, dst)) {
+                    ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                }
                 ctx.mmid_part_h = ctx.mmid_part_k = 0;
                 return;
             }
@@ -4226,7 +4229,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 ggml_cuda_mmid_vec_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);
             } else if (ggml_cuda_moe_host_partitions((int) dst->ne[2])) {
                 ggml_cuda_moe_host_part((int) dst->ne[2], &ctx.mmid_part_h, &ctx.mmid_part_k);
-                ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                if (!ggml_cuda_cold_prefetch_run(ctx, dst)) {
+                    ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst);
+                }
                 ctx.mmid_part_h = ctx.mmid_part_k = 0;
             } else {
                 ggml_cuda_mmid_f16_sm60(ctx, src0, src1, ids, dst, /*skip_cold =*/ true);

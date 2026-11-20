@@ -1424,9 +1424,16 @@ struct ggml_cuda_moe_host_triple {
 // while the current ops compute, through a ring of slots that runs on across the graphs of a ubatch (mmid-f16-sm60.cu)
 struct ggml_cuda_cold_prefetch {
     // a piece = the cold experts of one op: its host data and size identify it across ubatches
-    struct piece { const char * host; size_t bytes; };
+    struct piece {
+        const char * host   = nullptr;
+        size_t       bytes  = 0;
+        size_t       nb02   = 0;
+        int          n_cold = 0;
+        int          part_h = 0;
+        int          part_k = 0;
+    };
     struct slot {
-        piece   key        = { nullptr, 0 };
+        piece   key        = {};
         bool    filled     = false;        // a copy of `key` is issued (in this graph or an earlier one) and not yet consumed
         int64_t issued_in  = -1;           // the graph (serial) whose capture issued the copy: its ready event is waited on
         int64_t freed_in   = -1;           // the graph whose GEMM consumed it last: its freed event gates a copy in the same graph

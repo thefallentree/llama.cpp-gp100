@@ -1606,15 +1606,28 @@ static bool cold_check_enabled() {
     return f;
 }
 
+// GGML_CUDA_COLD_PREFETCH_PART_MIN_TOK=n: minimum tokens of a HOST_PART shared prompt batch to use the prefetch ring
+// (default 512; <= 0 disables the prefetch ring on HOST_PART batches)
+static int64_t cold_prefetch_part_min_tok() {
+    static const int64_t n = getenv("GGML_CUDA_COLD_PREFETCH_PART_MIN_TOK") != nullptr ? atoll(getenv("GGML_CUDA_COLD_PREFETCH_PART_MIN_TOK")) : 512;
+    return n;
+}
+
 static ggml_cuda_cold_prefetch::piece cold_piece_of(const ggml_tensor * op) {
     const char * host = nullptr;
     int n_cold = 0;
     ggml_cuda_mmid_cold(op, &host, &n_cold);
-    return { host, (size_t) n_cold*op->src[0]->nb[2] };
+    const int ntok = (int) op->src[2]->ne[1];
+    int ph = 0, pk = 0;
+    if (ggml_cuda_moe_host_partitions(ntok)) {
+        ggml_cuda_moe_host_part(ntok, &ph, &pk);
+    }
+    return { host, (size_t) n_cold*op->src[0]->nb[2], op->src[0]->nb[2], n_cold, ph, pk };
 }
 
 static bool operator==(const ggml_cuda_cold_prefetch::piece & a, const ggml_cuda_cold_prefetch::piece & b) {
-    return a.host == b.host && a.bytes == b.bytes;
+    return a.host == b.host && a.bytes == b.bytes && a.nb02 == b.nb02 &&
+           a.n_cold == b.n_cold && a.part_h == b.part_h && a.part_k == b.part_k;
 }
 
 // every 64th 16-byte word of a slot against the host piece (pinned, read over PCIe): a stale or torn slot counts
@@ -1649,9 +1662,25 @@ static void cold_issue_next(ggml_cuda_cold_prefetch & pf) {
     if (s.freed_in == pf.graph_no) {
         CUDA_CHECK(cudaStreamWaitEvent(pf.copy, s.freed, 0));
     }
-    const size_t chunk = cold_chunk_bytes() > 0 ? cold_chunk_bytes() : pc.bytes;
-    for (size_t off = 0; off < pc.bytes; off += chunk) {
-        CUDA_CHECK(cudaMemcpyAsync(s.buf + off, pc.host + off, std::min(chunk, pc.bytes - off), cudaMemcpyHostToDevice, pf.copy));
+    const size_t chunk = cold_chunk_bytes();
+    if (pc.part_k > 0 && pc.part_h > 0 && pc.part_h < pc.part_k) {
+        for (int c0 = 0; c0 < pc.n_cold; c0 += pc.part_k) {
+            const int lo = c0 + pc.part_h;
+            const int hi = std::min(c0 + pc.part_k, pc.n_cold);
+            if (lo < hi) {
+                const size_t base = (size_t) lo*pc.nb02;
+                const size_t len  = (size_t) (hi - lo)*pc.nb02;
+                const size_t step = chunk > 0 ? chunk : len;
+                for (size_t off = 0; off < len; off += step) {
+                    CUDA_CHECK(cudaMemcpyAsync(s.buf + base + off, pc.host + base + off, std::min(step, len - off), cudaMemcpyHostToDevice, pf.copy));
+                }
+            }
+        }
+    } else {
+        const size_t step = chunk > 0 ? chunk : pc.bytes;
+        for (size_t off = 0; off < pc.bytes; off += step) {
+            CUDA_CHECK(cudaMemcpyAsync(s.buf + off, pc.host + off, std::min(step, pc.bytes - off), cudaMemcpyHostToDevice, pf.copy));
+        }
     }
     CUDA_CHECK(cudaEventRecord(s.ready, pf.copy));
     s.key       = pc;
@@ -1687,12 +1716,16 @@ bool ggml_cuda_cold_prefetch_prepare(ggml_backend_cuda_context & ctx, const ggml
         // a batch below GGML_CUDA_COLD_PREFETCH_MIN_TOK tokens (default 1024) stages only the cold experts it routes to
         // (mmid16_stage_cold_experts) instead of copying every cold expert of the op: 269-616-token prompt batches took
         // 14-18% less that way on Qwen3.8 (the prefetch wins at 1536 tokens, where nearly every expert is routed to)
-        if (ggml_cuda_mmid_cold_prompt(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-            !ggml_cuda_moe_host_takes_prompt((int) n->src[2]->ne[1]) && !ggml_cuda_moe_host_partitions((int) n->src[2]->ne[1]) &&
-            n->src[2]->ne[1] >= cold_prefetch_min_tok &&
-            ggml_cuda_mmid_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)) {
-            pf.ops.push_back(n);
-            need = std::max(need, cold_piece_of(n).bytes);
+        // for HOST_PART shared prompt batches, only GPU-owned cold stripes are prefetched when ntok >= GGML_CUDA_COLD_PREFETCH_PART_MIN_TOK (default 512)
+        if (ggml_cuda_mmid_cold_prompt(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            const int ntok = (int) n->src[2]->ne[1];
+            const bool is_part = ggml_cuda_moe_host_partitions(ntok);
+            const int64_t p_min = is_part ? cold_prefetch_part_min_tok() : cold_prefetch_min_tok;
+            if (!ggml_cuda_moe_host_takes_prompt(ntok) && p_min > 0 && ntok >= p_min &&
+                ggml_cuda_mmid_f16_sm60_supported(n->src[0], n->src[1], n->src[2], n)) {
+                pf.ops.push_back(n);
+                need = std::max(need, cold_piece_of(n).bytes);
+            }
         }
     }
     if (pf.ops.empty() && (!pf.in_ubatch || pf.seq_issued >= (int) pf.seq.size() || pf.cap == 0)) {
@@ -1900,6 +1933,22 @@ bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     }
     ggml_cuda_cold_prefetch::slot & s = pf.slots[pf.head];
+    if (pc.part_h != ctx.mmid_part_h || pc.part_k != ctx.mmid_part_k) {
+        // defensive: if moe-host did not partition this op at runtime (e.g. ALLGPU or failed open), do not read a stripe-only slot
+        s.filled = false;
+        pf.head  = (pf.head + 1) % (int) pf.slots.size();
+        pf.n_filled--;
+        pf.seq_pos++;
+        pf.next = j + 1;
+        const int own_end = pf.seq_pos + (int) pf.ops.size() - pf.next;
+        while (pf.seq_issued < own_end && pf.n_filled < (int) pf.slots.size()) {
+            cold_issue_next(pf);
+        }
+        if (pf.seq_issued >= own_end) {
+            cold_issue_ahead(pf);
+        }
+        return false;
+    }
     mmid16_gemm_plan p(ctx);
     // the cold experts come from the prefetched slot: the setup must not stage them again (it did in qp1-qp3:
     // a second copy of every op's cold experts through UVA loads, +22% prefill time and +228 MiB of pool)
@@ -1909,8 +1958,25 @@ bool ggml_cuda_cold_prefetch_run(ggml_backend_cuda_context & ctx, ggml_tensor * 
         CUDA_CHECK(cudaStreamWaitEvent(stream, s.ready, 0));
     }
     if (pf.check != nullptr) {
-        const size_t n16 = pc.bytes/16;
-        cold_check_kernel<<<(unsigned) ((n16/64 + 255)/256), 256, 0, stream>>>((const uint4 *) s.buf, (const uint4 *) pc.host, n16, pf.check);
+        if (pc.part_k > 0 && pc.part_h > 0 && pc.part_h < pc.part_k) {
+            for (int c0 = 0; c0 < pc.n_cold; c0 += pc.part_k) {
+                const int lo = c0 + pc.part_h;
+                const int hi = std::min(c0 + pc.part_k, pc.n_cold);
+                if (lo < hi) {
+                    const size_t base = (size_t) lo*pc.nb02;
+                    const size_t n16  = ((size_t) (hi - lo)*pc.nb02)/16;
+                    if (n16 > 0) {
+                        cold_check_kernel<<<(unsigned) (((n16 + 63)/64 + 255)/256), 256, 0, stream>>>(
+                            (const uint4 *) (s.buf + base), (const uint4 *) (pc.host + base), n16, pf.check);
+                    }
+                }
+            }
+        } else {
+            const size_t n16 = pc.bytes/16;
+            if (n16 > 0) {
+                cold_check_kernel<<<(unsigned) (((n16 + 63)/64 + 255)/256), 256, 0, stream>>>((const uint4 *) s.buf, (const uint4 *) pc.host, n16, pf.check);
+            }
+        }
         CUDA_CHECK(cudaGetLastError());
         pf.n_checked++;
     }

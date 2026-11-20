@@ -55,7 +55,7 @@ struct prefill_peer_cache_ckpt {
 
 struct prefill_peer_cache_res {
     int32_t lcp = 0;
-    llama_tokens tokens;
+    std::vector<llama_token> tokens;
     std::vector<prefill_peer_cache_seg> segs;
     std::vector<uint8_t> recr;
     std::vector<uint8_t> spec;
@@ -156,7 +156,7 @@ void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t mode
 
 // S4: pull matching cached prompt state from peer_addr ("host:port")
 bool prefill_peer_cache_pull(const std::string & peer_addr,
-                             const llama_tokens & tokens,
+                             const std::vector<llama_token> & tokens,
                              int min_lcp,
                              uint64_t model_sig,
                              int timeout_ms,

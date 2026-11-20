@@ -2261,7 +2261,6 @@ private:
                                     }
                                     ret->prompt.tokens = std::move(pulled_toks);
                                     ret->prompt.checkpoints.clear();
-                                    ret->prompt.checkpoints.reserve(pcr.ckpts.size());
                                     for (auto & src_ck : pcr.ckpts) {
                                         common_prompt_checkpoint dst_ck;
                                         dst_ck.n_tokens  = src_ck.n_tokens;

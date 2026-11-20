@@ -937,7 +937,7 @@ struct server_prompt_cache {
     void unpin(server_prompt_cache_state * e);
 
     // S4: return checkpoints moved out by load() if a subsequent peer pull replaces the slot's prompt before eviction
-    void put_checkpoints(server_prompt_cache_state * e, std::vector<common_prompt_checkpoint> & ckpts);
+    void put_checkpoints(server_prompt_cache_state * e, std::list<common_prompt_checkpoint> & ckpts);
 
     // HC1: the entry load() would restore for tokens_new instead of the slot's prompt, when its common prefix with
     // tokens_new is at least min_gain tokens longer than the slot's; nullptr = none (the slot keeps its prompt)

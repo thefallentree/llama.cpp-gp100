@@ -2136,7 +2136,7 @@ void server_prompt_cache::unpin(server_prompt_cache_state * e) {
     }
 }
 
-void server_prompt_cache::put_checkpoints(server_prompt_cache_state * e, std::vector<common_prompt_checkpoint> & ckpts) {
+void server_prompt_cache::put_checkpoints(server_prompt_cache_state * e, std::list<common_prompt_checkpoint> & ckpts) {
     if (e == nullptr || ckpts.empty()) {
         return;
     }
@@ -2552,7 +2552,7 @@ server_prompt_cache_state * server_prompt_cache::save(server_prompt & prompt, ll
     make_room_locked(state_size_new + size_kept, "making room for prompt cache entry");
 
     if (e == nullptr) {
-        states.push_back({});
+        states.emplace_back();
         e = &states.back();
         e->writing = true;
     }

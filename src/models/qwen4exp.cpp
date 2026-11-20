@@ -265,7 +265,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // reads stay what they are). The tensors are N slices longer than the file holds (ggml-cuda/expert-cache.cu).
     int64_t n_spare = 0;
     if (hparams.n_expert_hot > 0 && !mtp_only) {
-        n_spare = getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4;
+        const bool ec_off = getenv("GGML_CUDA_EXPERT_CACHE") != nullptr && atoi(getenv("GGML_CUDA_EXPERT_CACHE")) == 0;
+        n_spare = ec_off ? 0 : (getenv("LLAMA_EXPERT_SPARE") != nullptr ? std::max(0, atoi(getenv("LLAMA_EXPERT_SPARE"))) : 4);
         static const llm_tensor exps[3][2] = {
             { LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_DOWN_EXPS_COLD },
             { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_GATE_EXPS_COLD },

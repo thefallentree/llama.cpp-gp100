@@ -1647,10 +1647,11 @@ private:
             if (peer_listen_fd < 0) {
                 SRV_ERR("prefill-peer: cannot listen on port %s\n", port);
             } else {
+                const int lfd = peer_listen_fd;
                 SRV_WRN("prefill-peer: a peer on port %s while idle\n", port);
-                peer_listener = std::thread([this]() {
+                peer_listener = std::thread([this, lfd]() {
                     while (!peer_cache_stop.load()) {
-                        const int fd = prefill_peer_accept(peer_listen_fd);
+                        const int fd = prefill_peer_accept(lfd);
                         if (fd < 0) {
                             if (peer_cache_stop.load()) {
                                 break;
@@ -6304,8 +6305,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
         std::string peer_cache_from;
+        static constexpr size_t hdr_len = sizeof("x-llama-cache-from") - 1;
         for (const auto & kv : req.headers) {
-            if (kv.first.size() == 17) {
+            if (kv.first.size() == hdr_len) {
                 std::string low = kv.first;
                 for (char & c : low) {
                     c = (char) std::tolower((unsigned char) c);

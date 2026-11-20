@@ -25,15 +25,59 @@
 //        (LLAMA_PREFILL_PEER=a:p,b:p LLAMA_PREFILL_PEER_SPLIT=16,32): each forwards its residual to the next
 // peer:  LLAMA_PREFILL_PEER_LISTEN=port (the server runs only this loop, no tasks)
 
+#include "ggml-backend.h"
 #include "llama.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct common_speculative;
 struct server_prompt_cache;
+
+// Pinned host memory buffer (GPU host buffer type / cudaMallocHost with CPU fallback); no zero-fill on resize,
+// keeps allocated capacity across clear() for fault-free reuse.
+struct prefill_peer_hbuf {
+    uint8_t * p   = nullptr;
+    size_t    n   = 0;
+    size_t    cap = 0;
+    ggml_backend_buffer_t buf = nullptr;
+
+    prefill_peer_hbuf() = default;
+    prefill_peer_hbuf(const prefill_peer_hbuf &) = delete;
+    prefill_peer_hbuf & operator=(const prefill_peer_hbuf &) = delete;
+    prefill_peer_hbuf(prefill_peer_hbuf && o) noexcept { *this = std::move(o); }
+    prefill_peer_hbuf & operator=(prefill_peer_hbuf && o) noexcept {
+        if (this != &o) {
+            release();
+            p = o.p; n = o.n; cap = o.cap; buf = o.buf;
+            o.p = nullptr; o.n = o.cap = 0; o.buf = nullptr;
+        }
+        return *this;
+    }
+    ~prefill_peer_hbuf() { release(); }
+
+    uint8_t *       data()           { return p; }
+    const uint8_t * data()     const { return p; }
+    size_t          size()     const { return n; }
+    size_t          capacity() const { return cap; }
+    bool            empty()    const { return n == 0; }
+    void            clear()          { n = 0; }
+
+    void reserve(size_t c);
+    void resize(size_t m) {
+        reserve(m);
+        n = m;
+    }
+    void release();
+
+    std::vector<uint8_t> to_vector() const {
+        return std::vector<uint8_t>(p, p + n);
+    }
+};
 
 // S4: prompt-cache segment and checkpoint payloads pulled over RoCE on session migration
 struct prefill_peer_cache_seg {
@@ -41,8 +85,8 @@ struct prefill_peer_cache_seg {
     llama_pos p1 = 0;
     llama_pos d0 = 0;
     llama_pos d1 = 0x7fffffff;
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    prefill_peer_hbuf main;
+    prefill_peer_hbuf drft;
 };
 
 struct prefill_peer_cache_ckpt {
@@ -58,11 +102,17 @@ struct prefill_peer_cache_res {
     int32_t lcp = 0;
     std::vector<llama_token> tokens;
     std::vector<prefill_peer_cache_seg> segs;
-    std::vector<uint8_t> recr;
+    prefill_peer_hbuf recr;
     std::vector<uint8_t> spec;
     std::vector<prefill_peer_cache_ckpt> ckpts;
     double ms          = 0.0;
     size_t total_bytes = 0;
+    std::vector<prefill_peer_cache_seg> seg_pool; // retained between pulls to preserve pinned capacities
+
+    void   clear_keep_cap();
+    size_t pinned_bytes() const;
+    void   trim_pinned(size_t cap_bytes);
+    void   release();
 };
 
 // the context checkpoint at n_tokens the head assembles from the stages' snapshots (empty data_tgt: none)
@@ -131,6 +181,8 @@ void prefill_peer_serve(int port, llama_context * ctx_tgt, llama_context * ctx_d
 // slots, so the first prompt after a start pays no graph build, buffer growth or pinned allocation (~1.2 s once).
 // cfg may be null (a peer with no LLAMA_PREFILL_PEER of its own: default ranges).
 void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cfg);
+// Pre-fault the drafter's receive and own state buffers once ctx_dft is initialized.
+void prefill_peer_warmup_dft(llama_context * ctx_dft, const prefill_peer_config * cfg);
 
 // A serving server that is also a peer (LLAMA_PREFILL_PEER_SERVE=port): a thread accepts the heads' connections
 // (prefill_peer_listen, prefill_peer_accept) and hands each to the task loop, which serves it when the server is
@@ -162,3 +214,6 @@ bool prefill_peer_cache_pull(const std::string & peer_addr,
                              uint64_t model_sig,
                              int timeout_ms,
                              prefill_peer_cache_res & out);
+
+// S4: clear active pull payload while preserving pinned buffer capacities up to LLAMA_PEER_CACHE_PIN_CAP_MB
+void prefill_peer_cache_trim(prefill_peer_cache_res & res);

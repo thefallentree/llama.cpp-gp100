@@ -106,79 +106,8 @@ bool recv_blob(int fd, std::vector<uint8_t> & b) {
     return n == 0 || recv_all(fd, b.data(), n);
 }
 
-// a state buffer in pinned host memory (the GPU's host buffer type, cudaMallocHost; plain memory without a GPU): the
-// state get/set of the CUDA backend issues one cudaMemcpyAsync per layer chunk, which is a DMA from pinned memory and a
-// synchronous staged copy from pageable memory (1.3-1.7 GB/s measured for the state parts); no zero-fill on resize
-struct hbuf {
-    uint8_t * p   = nullptr;
-    size_t    n   = 0;
-    size_t    cap = 0;
-    ggml_backend_buffer_t buf = nullptr;
-
-    hbuf() = default;
-    hbuf(const hbuf &) = delete;
-    hbuf & operator=(const hbuf &) = delete;
-    hbuf(hbuf && o) noexcept { *this = std::move(o); }
-    hbuf & operator=(hbuf && o) noexcept {
-        if (this != &o) {
-            release();
-            p = o.p; n = o.n; cap = o.cap; buf = o.buf;
-            o.p = nullptr; o.n = o.cap = 0; o.buf = nullptr;
-        }
-        return *this;
-    }
-    ~hbuf() { release(); }
-
-    uint8_t *       data()           { return p; }
-    const uint8_t * data()     const { return p; }
-    size_t          size()     const { return n; }
-    size_t          capacity() const { return cap; }
-    bool            empty()    const { return n == 0; }
-    void            clear()          { n = 0; }
-
-    void reserve(size_t c) {
-        if (c <= cap) {
-            return;
-        }
-        ggml_backend_buffer_t nb = nullptr;
-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-        ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
-        if (buft) {
-            nb = ggml_backend_buft_alloc_buffer(buft, c);
-        }
-        if (nb == nullptr) {
-            nb = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), c);
-        }
-        GGML_ASSERT(nb != nullptr && "prefill-peer: no host memory for a state buffer");
-        uint8_t * np = (uint8_t *) ggml_backend_buffer_get_base(nb);
-        if (n > 0) {
-            memcpy(np, p, n);
-        }
-        release();
-        buf = nb;
-        p   = np;
-        cap = c;
-    }
-
-    void resize(size_t m) {
-        reserve(m);
-        n = m;
-    }
-
-    void release() {
-        if (buf) {
-            ggml_backend_buffer_free(buf);
-        }
-        buf = nullptr;
-        p   = nullptr;
-        n   = 0;
-        cap = 0;
-    }
-
-    std::vector<uint8_t> to_vector() const {
-        return std::vector<uint8_t>(p, p + n);
-    }
-};
+// a state buffer in pinned host memory (prefill_peer_hbuf in server-prefill-peer.h)
+using hbuf = prefill_peer_hbuf;
 
 bool send_blob(int fd, const hbuf & b) {
     const uint64_t n = b.size();
@@ -1471,6 +1400,54 @@ void prefill_peer_warmup(llama_context * ctx_tgt, const prefill_peer_config * cf
     LOG_WRN("prefill-peer: warm-up done in %.0f ms\n", now_ms() - t0);
 }
 
+void prefill_peer_warmup_dft(llama_context * ctx_dft, const prefill_peer_config * cfg) {
+    if (ctx_dft == nullptr || llama_get_memory(ctx_dft) == nullptr) {
+        return;
+    }
+
+    const double t0 = now_ms();
+    const llama_model * model = llama_get_model(ctx_dft);
+    const llama_token tok = llama_vocab_bos(llama_model_get_vocab(model)) >= 0 ? llama_vocab_bos(llama_model_get_vocab(model)) : 0;
+    const int32_t n_warm = std::max<int32_t>(1, std::min<int32_t>((int32_t) llama_n_ubatch(ctx_dft), (int32_t) llama_n_ctx(ctx_dft)));
+
+    common_batch batch(ctx_dft);
+    const size_t n_embd_state = (size_t) std::max<int32_t>(0, llama_model_n_embd_out(model));
+    std::vector<float> zeros(n_embd_state, 0.0f);
+    for (int32_t i = 0; i < n_warm; ++i) {
+        const int32_t idx = batch.add(tok, i, 0, false);
+        if (n_embd_state > 0) {
+            batch.set_embd_state(idx, { zeros.data(), 1, n_embd_state });
+        }
+    }
+
+    const int rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    llama_synchronize(ctx_dft);
+
+    size_t est = 0;
+    if (rc == 0 && rxbuf_on()) {
+        const size_t s_all = llama_state_seq_get_size_ext(ctx_dft, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t s_rs  = llama_state_seq_get_size_ext(ctx_dft, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        est = (size_t) (state_estimate(ctx_dft, s_all, s_rs, n_warm) * 1.1);
+    }
+    llama_memory_clear(llama_get_memory(ctx_dft), true);
+
+    if (est > 0) {
+        const double t1 = now_ms();
+        auto & results = head_results();
+        if (cfg && cfg->enabled()) {
+            if (results.size() < cfg->split_all.size()) {
+                results.resize(cfg->split_all.size());
+            }
+            if (!results.empty()) {
+                prefault(results.back().st_dft, est);
+            }
+        }
+        prefault(own_result().st_dft, est);
+        LOG_WRN("prefill-peer: drafter state buffers pre-faulted (%d tokens): %zu receive buffers + own %.0f MiB in %.0f ms (total %.0f ms)\n",
+                n_warm, cfg && cfg->enabled() ? results.size() : 0, est/1048576.0, now_ms() - t1, now_ms() - t0);
+    }
+}
+
 void prefill_peer_serve_conn(int fd, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec) {
     tune_socket(fd);
     serve_one(fd, ctx_tgt, ctx_dft, spec);
@@ -1584,7 +1561,8 @@ bool send_raw_blob(int fd, const void * data, uint64_t n) {
     return send_val(fd, n) && (n == 0 || send_all(fd, data, n));
 }
 
-bool recv_blob_capped(int fd, std::vector<uint8_t> & b, size_t max_bytes, size_t & total_bytes) {
+template <typename Buf>
+bool recv_blob_capped(int fd, Buf & b, size_t max_bytes, size_t & total_bytes) {
     uint64_t n = 0;
     if (!recv_val(fd, n) || n > max_bytes || n > MAX_CACHE_TOTAL_BYTES - total_bytes) {
         return false;
@@ -1639,7 +1617,138 @@ template <typename T> uint64_t fnv1a_val(uint64_t h, const T & v) {
     return fnv1a_mix(h, &v, sizeof(v));
 }
 
+int peer_cache_max_ckpts() {
+    const char * v = getenv("LLAMA_PEER_CACHE_MAX_CKPTS");
+    return (v != nullptr && *v != '\0') ? atoi(v) : 1;
+}
+
+bool peer_cache_exact_no_ckpts() {
+    const char * v = getenv("LLAMA_PEER_CACHE_EXACT_NO_CKPTS");
+    return v == nullptr || *v == '\0' || atoi(v) != 0;
+}
+
+size_t peer_cache_pin_cap_bytes() {
+    const char * v = getenv("LLAMA_PEER_CACHE_PIN_CAP_MB");
+    const int mb = (v != nullptr && *v != '\0') ? atoi(v) : 1024;
+    return mb <= 0 ? 0 : ((size_t) mb << 20);
+}
+
 } // namespace
+
+void prefill_peer_hbuf::reserve(size_t c) {
+    if (c <= cap) {
+        return;
+    }
+    ggml_backend_buffer_t nb = nullptr;
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (buft) {
+        nb = ggml_backend_buft_alloc_buffer(buft, c);
+    }
+    if (nb == nullptr) {
+        nb = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), c);
+    }
+    GGML_ASSERT(nb != nullptr && "prefill-peer: no host memory for a state buffer");
+    uint8_t * np = (uint8_t *) ggml_backend_buffer_get_base(nb);
+    const size_t prev_n = n;
+    if (prev_n > 0) {
+        memcpy(np, p, prev_n);
+    }
+    release();
+    buf = nb;
+    p   = np;
+    n   = prev_n;
+    cap = c;
+}
+
+void prefill_peer_hbuf::release() {
+    if (buf) {
+        ggml_backend_buffer_free(buf);
+    }
+    buf = nullptr;
+    p   = nullptr;
+    n   = 0;
+    cap = 0;
+}
+
+void prefill_peer_cache_res::clear_keep_cap() {
+    lcp         = 0;
+    ms          = 0.0;
+    total_bytes = 0;
+    tokens.clear();
+    spec.clear();
+    ckpts.clear();
+    recr.clear();
+    // Push in reverse order so seg_pool.back() restores segs[0] (typically the largest base segment) first
+    for (size_t i = segs.size(); i-- > 0; ) {
+        auto & seg = segs[i];
+        seg.p0 = 0;
+        seg.p1 = 0;
+        seg.d0 = 0;
+        seg.d1 = 0x7fffffff;
+        seg.main.clear();
+        seg.drft.clear();
+        seg_pool.push_back(std::move(seg));
+    }
+    segs.clear();
+}
+
+size_t prefill_peer_cache_res::pinned_bytes() const {
+    size_t total = recr.capacity();
+    for (const auto & seg : segs) {
+        total += seg.main.capacity() + seg.drft.capacity();
+    }
+    for (const auto & seg : seg_pool) {
+        total += seg.main.capacity() + seg.drft.capacity();
+    }
+    return total;
+}
+
+void prefill_peer_cache_res::trim_pinned(size_t cap_bytes) {
+    size_t total = pinned_bytes();
+    while (total > cap_bytes && !seg_pool.empty()) {
+        auto & seg = seg_pool.front();
+        if (seg.drft.empty() && seg.drft.capacity() > 0) {
+            total -= seg.drft.capacity();
+            seg.drft.release();
+        }
+        if (total > cap_bytes && seg.main.empty() && seg.main.capacity() > 0) {
+            total -= seg.main.capacity();
+            seg.main.release();
+        }
+        if (seg.drft.capacity() == 0 && seg.main.capacity() == 0) {
+            seg_pool.erase(seg_pool.begin());
+        } else {
+            break;
+        }
+    }
+    for (size_t i = segs.size(); i-- > 0 && total > cap_bytes; ) {
+        auto & seg = segs[i];
+        if (seg.drft.empty() && seg.drft.capacity() > 0) {
+            total -= seg.drft.capacity();
+            seg.drft.release();
+        }
+        if (total > cap_bytes && seg.main.empty() && seg.main.capacity() > 0) {
+            total -= seg.main.capacity();
+            seg.main.release();
+        }
+    }
+    if (total > cap_bytes && recr.empty() && recr.capacity() > 0) {
+        recr.release();
+    }
+}
+
+void prefill_peer_cache_res::release() {
+    lcp         = 0;
+    ms          = 0.0;
+    total_bytes = 0;
+    tokens.clear();
+    spec.clear();
+    ckpts.clear();
+    segs.clear();
+    seg_pool.clear();
+    recr.release();
+}
 
 void prefill_peer_shutdown(int fd) {
     if (fd >= 0) {
@@ -1735,7 +1844,29 @@ void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t mode
 
     const llama_tokens etoks = e->prompt.tokens.get_text_tokens();
     const uint32_t n_segs  = (uint32_t) e->data.segs.size();
-    const uint32_t n_ckpts = (uint32_t) e->prompt.checkpoints.size();
+
+    std::vector<const common_prompt_checkpoint *> send_ckpts;
+    const int max_ckpts = peer_cache_max_ckpts();
+    if (!(lcp == (int) etoks.size() && peer_cache_exact_no_ckpts()) && max_ckpts != 0) {
+        if (max_ckpts > 0) {
+            for (const auto & ck : e->prompt.checkpoints) {
+                if (ck.n_tokens <= lcp) {
+                    send_ckpts.push_back(&ck);
+                }
+            }
+            if ((int) send_ckpts.size() > max_ckpts) {
+                send_ckpts.erase(send_ckpts.begin(), send_ckpts.end() - max_ckpts);
+            }
+        } else {
+            send_ckpts.reserve(e->prompt.checkpoints.size());
+            for (const auto & ck : e->prompt.checkpoints) {
+                if (ck.n_tokens <= lcp) {
+                    send_ckpts.push_back(&ck);
+                }
+            }
+        }
+    }
+    const uint32_t n_ckpts = (uint32_t) send_ckpts.size();
 
     if (!send_val(fd, MSG_OK) ||
         !send_val(fd, (int32_t) lcp) ||
@@ -1763,16 +1894,16 @@ void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t mode
     }
     sent_bytes += e->data.recr.size() + e->data.spec.size();
 
-    for (const auto & ck : e->prompt.checkpoints) {
-        if (!send_val(fd, (int64_t) ck.n_tokens) ||
-            !send_val(fd, ck.pos_min) ||
-            !send_val(fd, ck.pos_max) ||
-            !send_blob(fd, ck.data_tgt) ||
-            !send_blob(fd, ck.data_dft) ||
-            !send_blob(fd, ck.data_spec)) {
+    for (const auto * ck : send_ckpts) {
+        if (!send_val(fd, (int64_t) ck->n_tokens) ||
+            !send_val(fd, ck->pos_min) ||
+            !send_val(fd, ck->pos_max) ||
+            !send_blob(fd, ck->data_tgt) ||
+            !send_blob(fd, ck->data_dft) ||
+            !send_blob(fd, ck->data_spec)) {
             return;
         }
-        sent_bytes += ck.data_tgt.size() + ck.data_dft.size() + ck.data_spec.size();
+        sent_bytes += ck->data_tgt.size() + ck->data_dft.size() + ck->data_spec.size();
     }
 
     LOG_DBG("peer-cache: served lcp=%d/%zu (%u segs, %u ckpts, %.1f MiB) in %.1f ms\n",
@@ -1785,7 +1916,11 @@ bool prefill_peer_cache_pull(const std::string & peer_addr,
                              uint64_t model_sig,
                              int timeout_ms,
                              prefill_peer_cache_res & out) {
-    out = {};
+    auto reset_out = [&]() {
+        out.clear_keep_cap();
+        out.trim_pinned(peer_cache_pin_cap_bytes());
+    };
+    reset_out();
     if (tokens.empty() || tokens.size() > MAX_CACHE_TOKENS || min_lcp < 1) {
         return false;
     }
@@ -1824,20 +1959,26 @@ bool prefill_peer_cache_pull(const std::string & peer_addr,
         out.lcp > (int32_t) out.tokens.size() || out.lcp > (int32_t) tokens.size() ||
         !std::equal(tokens.begin(), tokens.begin() + out.lcp, out.tokens.begin()) ||
         !recv_val(fd, n_segs) || n_segs == 0 || n_segs > MAX_CACHE_SEGS) {
-        out = {};
+        reset_out();
         return false;
     }
 
     size_t total_bytes = 0;
-    out.segs.resize(n_segs);
+    out.segs.reserve(n_segs);
     for (uint32_t i = 0; i < n_segs; ++i) {
-        auto & seg = out.segs[i];
+        if (!out.seg_pool.empty()) {
+            out.segs.push_back(std::move(out.seg_pool.back()));
+            out.seg_pool.pop_back();
+        } else {
+            out.segs.emplace_back();
+        }
+        auto & seg = out.segs.back();
         if (!recv_val(fd, seg.p0) || !recv_val(fd, seg.p1) ||
             !recv_val(fd, seg.d0) || !recv_val(fd, seg.d1) ||
             seg.p0 < 0 || seg.p1 <= seg.p0 || seg.d0 < 0 ||
             !recv_blob_capped(fd, seg.main, 2ull << 30, total_bytes) ||
             !recv_blob_capped(fd, seg.drft, 512ull << 20, total_bytes)) {
-            out = {};
+            reset_out();
             return false;
         }
     }
@@ -1846,7 +1987,7 @@ bool prefill_peer_cache_pull(const std::string & peer_addr,
     if (!recv_blob_capped(fd, out.recr, 512ull << 20, total_bytes) ||
         !recv_blob_capped(fd, out.spec, 64ull << 20, total_bytes) ||
         !recv_val(fd, n_ckpts) || n_ckpts > MAX_CACHE_CKPTS) {
-        out = {};
+        reset_out();
         return false;
     }
 
@@ -1858,12 +1999,18 @@ bool prefill_peer_cache_pull(const std::string & peer_addr,
             !recv_blob_capped(fd, ck.data_tgt, 512ull << 20, total_bytes) ||
             !recv_blob_capped(fd, ck.data_dft, 128ull << 20, total_bytes) ||
             !recv_blob_capped(fd, ck.data_spec, 64ull << 20, total_bytes)) {
-            out = {};
+            reset_out();
             return false;
         }
     }
 
+    out.trim_pinned(peer_cache_pin_cap_bytes());
     out.ms          = now_ms() - t0;
     out.total_bytes = total_bytes;
     return true;
+}
+
+void prefill_peer_cache_trim(prefill_peer_cache_res & res) {
+    res.clear_keep_cap();
+    res.trim_pinned(peer_cache_pin_cap_bytes());
 }

@@ -26,11 +26,15 @@
 
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-prefill-peer.h"
 #include "llama.h"
 #include "log.h"
 #include "../src/llama-ext.h" // llama_memory_seq_pos_gap
 #include "../ggml/src/ggml-backend-impl.h" // a slow host buffer type (pinning takes 0.4 s per 512 MiB on the nodes)
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1001,6 +1005,168 @@ static bool scenario_peer_cache_pin(server_prompt_cache & cache, slot & s, int32
     return true;
 }
 
+// S6-C: peer cache pull trims checkpoints (0 on exact match, <= max_ckpts with n_tokens <= lcp on partial) and reuses
+// prefill_peer_hbuf pinned buffers across consecutive pulls bounded by LLAMA_PEER_CACHE_PIN_CAP_MB
+static bool scenario_peer_cache_trim_and_pin(server_prompt_cache & cache, slot & s, int32_t n_vocab) {
+    // 1) prefill_peer_hbuf API, capacity retention across clear(), move semantics, and release()
+    {
+        prefill_peer_hbuf hb;
+        CHECK(hb.empty() && hb.size() == 0 && hb.data() == nullptr);
+        hb.resize(128);
+        CHECK(!hb.empty() && hb.size() == 128 && hb.capacity() >= 128 && hb.data() != nullptr);
+        hb.data()[0] = 0x5a;
+        hb.reserve(256);
+        CHECK(hb.size() == 128 && hb.capacity() >= 256 && hb.data()[0] == 0x5a);
+        const uint8_t * ptr = hb.data();
+        hb.clear();
+        CHECK(hb.empty() && hb.size() == 0 && hb.capacity() >= 256 && hb.data() == ptr);
+        prefill_peer_hbuf hb2(std::move(hb));
+        CHECK(hb.data() == nullptr && hb.capacity() == 0);
+        CHECK(hb2.data() == ptr && hb2.capacity() >= 256);
+        hb2.release();
+        CHECK(hb2.data() == nullptr && hb2.capacity() == 0 && hb2.size() == 0);
+    }
+
+    struct env_guard {
+        ~env_guard() {
+            unsetenv("LLAMA_PEER_CACHE_MAX_CKPTS");
+            unsetenv("LLAMA_PEER_CACHE_EXACT_NO_CKPTS");
+            unsetenv("LLAMA_PEER_CACHE_PIN_CAP_MB");
+        }
+    } eg;
+    unsetenv("LLAMA_PEER_CACHE_MAX_CKPTS");
+    unsetenv("LLAMA_PEER_CACHE_EXACT_NO_CKPTS");
+    unsetenv("LLAMA_PEER_CACHE_PIN_CAP_MB");
+
+    cache.states.clear();
+    const size_t orig_limit = cache.limit_size;
+    cache.limit_size = 64ull << 20;
+
+    llama_tokens conv;
+    for (llama_pos p = 0; p < 128; ++p) {
+        conv.push_back(conv_token(n_vocab, p));
+    }
+    CHECK(decode_range(s.tgt, conv, 0, 128));
+    if (s.dft) {
+        CHECK(decode_range(s.dft, conv, 0, 128 - LAG));
+    }
+    s.prompt.tokens = server_tokens(conv, /*has_mtmd=*/ true);
+    s.prompt.checkpoints.clear();
+    for (int i = 1; i <= 5; ++i) {
+        common_prompt_checkpoint ck;
+        ck.n_tokens = i * 20;
+        ck.pos_min  = 0;
+        ck.pos_max  = ck.n_tokens - 1;
+        ck.data_tgt.assign(1024, (uint8_t) i);
+        s.prompt.checkpoints.push_back(std::move(ck));
+    }
+    auto * saved = cache.save(s.prompt, s.tgt, s.dft, nullptr, SEQ, &s.origin, true);
+    CHECK(saved != nullptr);
+    s.clear();
+
+    const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(lfd >= 0);
+    sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    if (::bind(lfd, (sockaddr *) &addr, sizeof(addr)) != 0 || ::listen(lfd, 8) != 0) {
+        prefill_peer_close(lfd);
+        return false;
+    }
+    socklen_t alen = sizeof(addr);
+    if (::getsockname(lfd, (sockaddr *) &addr, &alen) != 0) {
+        prefill_peer_close(lfd);
+        return false;
+    }
+    const std::string peer_addr = "127.0.0.1:" + std::to_string(ntohs(addr.sin_port));
+    const uint64_t sig = prefill_peer_cache_model_sig(llama_get_model(s.tgt), s.tgt, s.dft);
+
+    std::atomic<bool> stop_srv{false};
+    std::thread srv([&]() {
+        while (!stop_srv.load()) {
+            const int cfd = ::accept(lfd, nullptr, nullptr);
+            if (cfd < 0) {
+                break;
+            }
+            if (!stop_srv.load()) {
+                prefill_peer_cache_serve(cfd, &cache, sig, &stop_srv);
+            }
+            prefill_peer_close(cfd);
+        }
+    });
+    struct srv_guard {
+        int lfd;
+        std::atomic<bool> & stop;
+        std::thread & th;
+        ~srv_guard() {
+            stop.store(true);
+            prefill_peer_shutdown(lfd);
+            prefill_peer_close(lfd);
+            if (th.joinable()) {
+                th.join();
+            }
+        }
+    } sg { lfd, stop_srv, srv };
+
+    prefill_peer_cache_res res;
+
+    // 2) Exact match (lcp == etoks.size()) skips all checkpoints by default
+    CHECK(prefill_peer_cache_pull(peer_addr, conv, 64, sig, 2000, res));
+    CHECK(res.lcp == 128);
+    CHECK(res.tokens == conv);
+    CHECK(!res.segs.empty());
+    CHECK(!res.recr.empty());
+    CHECK(res.ckpts.empty());
+    const uint8_t * p_recr = res.recr.data();
+    const uint8_t * p_main = res.segs[0].main.data();
+    const uint8_t * p_drft = res.segs[0].drft.data();
+    const size_t cap_recr  = res.recr.capacity();
+    const size_t cap_main  = res.segs[0].main.capacity();
+
+    // 3) Partial match (lcp = 70 < 128) sends <= 1 checkpoint with n_tokens <= 70 (newest valid = 60) and reuses buffers
+    llama_tokens conv_div = conv;
+    for (int i = 70; i < 128; ++i) {
+        conv_div[i] = (llama_token) (((uint32_t) conv[i] + 1u) % (uint32_t) n_vocab);
+    }
+    CHECK(prefill_peer_cache_pull(peer_addr, conv_div, 64, sig, 2000, res));
+    CHECK(res.lcp == 70);
+    CHECK(res.ckpts.size() == 1);
+    CHECK(res.ckpts[0].n_tokens == 60);
+    CHECK(res.recr.data() == p_recr && res.recr.capacity() == cap_recr);
+    CHECK(res.segs[0].main.data() == p_main && res.segs[0].main.capacity() == cap_main);
+    CHECK(res.segs[0].drft.data() == p_drft);
+
+    // 4) LLAMA_PEER_CACHE_MAX_CKPTS=2 preserves ascending order of the newest 2 valid checkpoints
+    setenv("LLAMA_PEER_CACHE_MAX_CKPTS", "2", 1);
+    CHECK(prefill_peer_cache_pull(peer_addr, conv_div, 64, sig, 2000, res));
+    CHECK(res.lcp == 70);
+    CHECK(res.ckpts.size() == 2);
+    CHECK(res.ckpts[0].n_tokens == 40 && res.ckpts[1].n_tokens == 60);
+
+    // 5) LLAMA_PEER_CACHE_MAX_CKPTS=0 sends none; EXACT_NO_CKPTS=0 + MAX_CKPTS=-1 sends all 5
+    setenv("LLAMA_PEER_CACHE_MAX_CKPTS", "0", 1);
+    CHECK(prefill_peer_cache_pull(peer_addr, conv_div, 64, sig, 2000, res));
+    CHECK(res.ckpts.empty());
+
+    setenv("LLAMA_PEER_CACHE_EXACT_NO_CKPTS", "0", 1);
+    setenv("LLAMA_PEER_CACHE_MAX_CKPTS", "-1", 1);
+    CHECK(prefill_peer_cache_pull(peer_addr, conv, 64, sig, 2000, res));
+    CHECK(res.ckpts.size() == 5);
+    CHECK(res.ckpts.front().n_tokens == 20 && res.ckpts.back().n_tokens == 100);
+
+    // 6) LLAMA_PEER_CACHE_PIN_CAP_MB=0 releases retained pinned capacity on trim
+    CHECK(res.pinned_bytes() > 0);
+    setenv("LLAMA_PEER_CACHE_PIN_CAP_MB", "0", 1);
+    prefill_peer_cache_trim(res);
+    CHECK(res.pinned_bytes() == 0 && res.segs.empty() && res.seg_pool.empty() && res.recr.data() == nullptr);
+
+    cache.states.clear();
+    cache.limit_size = orig_limit;
+    s.prompt.tokens.has_mtmd = false;
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string only; // --only CDGH: run only the table scenarios with these letters (A and B always run)
@@ -1116,6 +1282,7 @@ int main(int argc, char ** argv) {
         {"K: an over-limit delta save leaves the slot's entry whole (TF1)", scenario_over_limit_keeps_origin},
         {"L: three slots under a tiny limit and a capped pool: nothing in use is freed (TF1)", scenario_stress},
         {"M: pinned entry survives eviction/trim/save/load until unpinned (S4)", scenario_peer_cache_pin},
+        {"N: peer cache pull trims checkpoints and reuses pinned buffers (S6-C)", scenario_peer_cache_trim_and_pin},
     };
     for (const auto & sc : hc1) {
         if (!only.empty() && only.find(sc.name[0]) == std::string::npos) {

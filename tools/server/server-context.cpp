@@ -67,6 +67,12 @@ static int peer_cache_timeout_ms() {
     return v;
 }
 
+static bool peer_warm_enabled(const prefill_peer_config & peer_cfg) {
+    const char * w = getenv("LLAMA_PREFILL_PEER_WARM");
+    return w != nullptr && strcmp(w, "0") != 0 && *w != '\0' &&
+        (getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN") || peer_cfg.enabled());
+}
+
 // S4: strict allowlist for X-Llama-Cache-From (configured PEER host:port, 172.16.25.<1..254>:port, or 127.0.0.1:port)
 static bool peer_cache_allowed(const std::string & addr, const prefill_peer_config & peer_cfg) {
     const size_t colon = addr.rfind(':');
@@ -1223,6 +1229,7 @@ private:
     std::atomic<bool>   peer_cache_stop    { false };
     uint64_t            peer_cache_sig     = 0;
     std::atomic<server_prompt_cache *> peer_cache_ptr { nullptr };
+    prefill_peer_cache_res peer_cache_res; // task-loop thread only (get_available_slot)
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1310,6 +1317,7 @@ private:
             SRV_WRN("peer-cache: %d worker(s) still active at destroy\n", peer_cache_workers.load());
         }
 
+        peer_cache_res.release();
         spec.reset();
         spec_init.reset();
 
@@ -1707,8 +1715,7 @@ private:
         // a head or a peer: the graph shapes of the layer ranges and the pinned buffers before the first prompt. Opt-in
         // (LLAMA_PREFILL_PEER_WARM=1 or lo:hi,...): the first prompt after a start pays ~1.2 s once without it, and with
         // the cold-expert prefetch ring the warm-up's graphs left the decode 17 ms/step slower (PP7_PROGRESS.md)
-        if (const char * w = getenv("LLAMA_PREFILL_PEER_WARM"); w != nullptr && strcmp(w, "0") != 0 &&
-            (getenv("LLAMA_PREFILL_PEER_SERVE") || getenv("LLAMA_PREFILL_PEER_LISTEN") || peer_cfg.enabled())) {
+        if (peer_warm_enabled(peer_cfg)) {
             prefill_peer_warmup(ctx_tgt, peer_cfg.enabled() ? &peer_cfg : nullptr);
         }
 
@@ -1754,6 +1761,10 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        if (ctx_dft != nullptr && peer_warm_enabled(peer_cfg)) {
+            prefill_peer_warmup_dft(ctx_dft, peer_cfg.enabled() ? &peer_cfg : nullptr);
         }
 
         if (!spec && params_base.speculative.has_synth()) {
@@ -2211,7 +2222,7 @@ private:
                     if (local_lcp < (int) task.tokens.size() / 2) {
                         const int min_peer_lcp = std::max(local_lcp + 1024, 1024);
                         if (min_peer_lcp <= (int) task.tokens.size()) {
-                            prefill_peer_cache_res pcr;
+                            prefill_peer_cache_res & pcr = peer_cache_res;
                             if (prefill_peer_cache_pull(task.params.peer_cache_from, task.tokens.get_text_tokens(), min_peer_lcp,
                                     peer_cache_sig, peer_cache_timeout_ms(), pcr) && pcr.lcp > local_lcp) {
                                 if (!update_cache && ret->prompt.n_tokens() > 0) {
@@ -2295,6 +2306,7 @@ private:
                                             pcr.total_bytes / (1024.0 * 1024.0), task.params.peer_cache_from.c_str(), pcr.ms, local_lcp);
                                 }
                             }
+                            prefill_peer_cache_trim(pcr);
                         }
                     }
                 }

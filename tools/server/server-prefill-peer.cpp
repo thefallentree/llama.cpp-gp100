@@ -1636,15 +1636,14 @@ template <typename T> uint64_t fnv1a_val(uint64_t h, const T & v) {
 
 } // namespace
 
-void prefill_peer_close(int fd) {
+void prefill_peer_shutdown(int fd) {
     if (fd >= 0) {
-        ::close(fd);
+        ::shutdown(fd, SHUT_RDWR);
     }
 }
 
-void prefill_peer_shutdown_close(int fd) {
+void prefill_peer_close(int fd) {
     if (fd >= 0) {
-        ::shutdown(fd, SHUT_RDWR);
         ::close(fd);
     }
 }
@@ -1676,6 +1675,7 @@ bool prefill_peer_is_cache_pull(int fd) {
     if (fd < 0) {
         return false;
     }
+    set_sock_timeouts(fd, 2000);
     pollfd pfd = { fd, POLLIN, 0 };
     if (::poll(&pfd, 1, 2000) <= 0 || !(pfd.revents & POLLIN)) {
         return false;
@@ -1685,7 +1685,7 @@ bool prefill_peer_is_cache_pull(int fd) {
     return k == (ssize_t) sizeof(magic) && magic == MSG_CACHE_PULL;
 }
 
-void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t model_sig) {
+void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t model_sig, const std::atomic<bool> * stop) {
     const double t0 = now_ms();
     tune_socket(fd);
     set_sock_timeouts(fd, 5000);
@@ -1701,7 +1701,7 @@ void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t mode
         return;
     }
 
-    if (cache == nullptr || ver != CACHE_PROTO_VERSION || sig != model_sig || min_lcp < 1 || req_toks.empty()) {
+    if ((stop != nullptr && stop->load()) || cache == nullptr || ver != CACHE_PROTO_VERSION || sig != model_sig || min_lcp < 1 || req_toks.empty()) {
         send_val(fd, MSG_CACHE_MISS);
         return;
     }
@@ -1718,7 +1718,7 @@ void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t mode
         }
     } guard { cache, e };
 
-    if (e == nullptr) {
+    if (e == nullptr || (stop != nullptr && stop->load())) {
         send_val(fd, MSG_CACHE_MISS);
         return;
     }
@@ -1736,7 +1736,8 @@ void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t mode
 
     size_t sent_bytes = 0;
     for (const auto & seg : e->data.segs) {
-        if (!send_val(fd, seg.p0) || !send_val(fd, seg.p1) ||
+        if ((stop != nullptr && stop->load()) ||
+            !send_val(fd, seg.p0) || !send_val(fd, seg.p1) ||
             !send_val(fd, seg.d0) || !send_val(fd, seg.d1) ||
             !send_raw_blob(fd, seg.main.data(), seg.main.size()) ||
             !send_raw_blob(fd, seg.drft.data(), seg.drft.size())) {
@@ -1811,6 +1812,7 @@ bool prefill_peer_cache_pull(const std::string & peer_addr,
     if (!recv_val(fd, out.lcp) || out.lcp < min_lcp ||
         !recv_tokens_vec(fd, out.tokens) || out.tokens.empty() ||
         out.lcp > (int32_t) out.tokens.size() || out.lcp > (int32_t) tokens.size() ||
+        !std::equal(tokens.begin(), tokens.begin() + out.lcp, out.tokens.begin()) ||
         !recv_val(fd, n_segs) || n_segs == 0 || n_segs > MAX_CACHE_SEGS) {
         out = {};
         return false;

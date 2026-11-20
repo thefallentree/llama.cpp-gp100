@@ -27,6 +27,7 @@
 
 #include "llama.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -145,14 +146,14 @@ bool prefill_peer_head_active();
 uint64_t prefill_peer_cache_model_sig(const llama_model * model, const llama_context * ctx_tgt, const llama_context * ctx_dft);
 
 // S4: OS-agnostic socket close / shutdown helpers for listener & pull workers
+void prefill_peer_shutdown(int fd);
 void prefill_peer_close(int fd);
-void prefill_peer_shutdown_close(int fd);
 
 // S4: peek accepted :9555 socket (bounded wait) to distinguish cache-pull requests from prefill hellos
 bool prefill_peer_is_cache_pull(int fd);
 
 // S4: serve a single peer cache pull directly from server_prompt_cache in RAM (never touches ctx_tgt/slots)
-void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t model_sig);
+void prefill_peer_cache_serve(int fd, server_prompt_cache * cache, uint64_t model_sig, const std::atomic<bool> * stop = nullptr);
 
 // S4: pull matching cached prompt state from peer_addr ("host:port")
 bool prefill_peer_cache_pull(const std::string & peer_addr,

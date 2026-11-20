@@ -75,13 +75,16 @@ static bool peer_cache_allowed(const std::string & addr, const prefill_peer_conf
     }
     const std::string host = addr.substr(0, colon);
     const char * port_s = addr.c_str() + colon + 1;
+    if (*port_s == '\0' || (*port_s == '0' && port_s[1] != '\0')) {
+        return false;
+    }
     for (const char * q = port_s; *q != '\0'; ++q) {
         if (*q < '0' || *q > '9') {
             return false;
         }
     }
     const long port = std::strtol(port_s, nullptr, 10);
-    if (port <= 0 || port > 65535) {
+    if (port < 1024 || port > 65535) {
         return false;
     }
     for (const auto & p : peer_cfg.peers) {
@@ -94,7 +97,7 @@ static bool peer_cache_allowed(const std::string & addr, const prefill_peer_conf
     }
     if (host.rfind("172.16.25.", 0) == 0) {
         const char * last = host.c_str() + 10;
-        if (*last == '\0') {
+        if (*last == '\0' || (last[0] == '0' && last[1] != '\0')) {
             return false;
         }
         for (const char * q = last; *q != '\0'; ++q) {
@@ -1214,11 +1217,12 @@ private:
 
     // pipelined prefill with a peer server (server-prefill-peer.h)
     prefill_peer_config peer_cfg;
-    int               peer_listen_fd   = -1;
-    std::thread       peer_listener;
-    std::atomic<int>  peer_cache_workers { 0 };
-    std::atomic<bool> peer_cache_stop    { false };
-    uint64_t          peer_cache_sig     = 0;
+    int                 peer_listen_fd   = -1;
+    std::thread         peer_listener;
+    std::atomic<int>    peer_cache_workers { 0 };
+    std::atomic<bool>   peer_cache_stop    { false };
+    uint64_t            peer_cache_sig     = 0;
+    std::atomic<server_prompt_cache *> peer_cache_ptr { nullptr };
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1286,16 +1290,24 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        peer_cache_ptr.store(nullptr, std::memory_order_release);
         peer_cache_stop.store(true);
-        if (peer_listen_fd >= 0) {
-            prefill_peer_shutdown_close(peer_listen_fd);
-            peer_listen_fd = -1;
+        const int lfd = peer_listen_fd;
+        if (lfd >= 0) {
+            prefill_peer_shutdown(lfd);
         }
         if (peer_listener.joinable()) {
             peer_listener.join();
         }
-        for (int waited = 0; peer_cache_workers.load() > 0 && waited < 2000; waited += 5) {
+        if (lfd >= 0) {
+            prefill_peer_close(lfd);
+            peer_listen_fd = -1;
+        }
+        for (int waited = 0; peer_cache_workers.load() > 0 && waited < 15000; waited += 5) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (peer_cache_workers.load() > 0) {
+            SRV_WRN("peer-cache: %d worker(s) still active at destroy\n", peer_cache_workers.load());
         }
 
         spec.reset();
@@ -1659,17 +1671,19 @@ private:
                             continue;
                         }
                         if (prefill_peer_is_cache_pull(fd)) {
-                            if (peer_cache_stop.load() || !prompt_cache) {
+                            server_prompt_cache * pc = peer_cache_ptr.load(std::memory_order_acquire);
+                            if (peer_cache_stop.load() || pc == nullptr) {
                                 prefill_peer_refuse(fd);
                                 continue;
                             }
-                            if (peer_cache_workers.fetch_add(1) >= 4 || peer_cache_stop.load() || !prompt_cache) {
+                            if (peer_cache_workers.fetch_add(1) >= 4 || peer_cache_stop.load() ||
+                                    (pc = peer_cache_ptr.load(std::memory_order_acquire)) == nullptr) {
                                 peer_cache_workers.fetch_sub(1);
                                 prefill_peer_refuse(fd);
                                 continue;
                             }
-                            std::thread([this, fd]() {
-                                prefill_peer_cache_serve(fd, prompt_cache.get(), peer_cache_sig);
+                            std::thread([this, fd, pc]() {
+                                prefill_peer_cache_serve(fd, pc, peer_cache_sig, &peer_cache_stop);
                                 prefill_peer_close(fd);
                                 peer_cache_workers.fetch_sub(1);
                             }).detach();
@@ -1843,7 +1857,9 @@ private:
                 host_buft = nullptr;
             }
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, host_buft);
+            peer_cache_ptr.store(prompt_cache.get(), std::memory_order_release);
         } else {
+            peer_cache_ptr.store(nullptr, std::memory_order_release);
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
@@ -2211,6 +2227,9 @@ private:
 
                                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), ret->id, -1, -1);
                                 if (ctx_dft) {
+                                    if (spec) {
+                                        common_speculative_catchup_join(spec.get());
+                                    }
                                     llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, -1, -1);
                                 }
 

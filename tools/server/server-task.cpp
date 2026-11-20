@@ -2071,14 +2071,6 @@ void server_prompt_cache::release(server_prompt_cache_state * e) {
     if (e != nullptr) {
         std::lock_guard<std::mutex> lk(mtx);
         e->owner = -1;
-        if (e->broken && e->pin_count == 0) {
-            for (auto it = states.begin(); it != states.end(); ++it) {
-                if (&*it == e) {
-                    states.erase(it);
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -2125,15 +2117,8 @@ void server_prompt_cache::unpin(server_prompt_cache_state * e) {
     }
     std::lock_guard<std::mutex> lk(mtx);
     GGML_ASSERT(e->pin_count > 0);
+    // Defer any broken-entry erasure to main-thread make_room()/update() so server_state_pool is never freed off-thread.
     e->pin_count--;
-    if (e->pin_count == 0 && e->broken && e->owner < 0) {
-        for (auto it = states.begin(); it != states.end(); ++it) {
-            if (&*it == e) {
-                states.erase(it);
-                break;
-            }
-        }
-    }
 }
 
 void server_prompt_cache::put_checkpoints(server_prompt_cache_state * e, std::list<common_prompt_checkpoint> & ckpts) {
@@ -2276,6 +2261,13 @@ size_t server_prompt_cache::trim_checkpoints_one() {
 }
 
 void server_prompt_cache::make_room_locked(size_t need, const char * why) {
+    for (auto it = states.begin(); it != states.end();) {
+        if (it->broken && it->owner < 0 && it->pin_count == 0 && !it->writing) {
+            it = states.erase(it);
+        } else {
+            ++it;
+        }
+    }
     if (limit_size == 0) {
         return;
     }

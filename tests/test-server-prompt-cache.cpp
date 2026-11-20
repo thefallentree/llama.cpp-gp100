@@ -549,7 +549,7 @@ static bool scenario_over_limit_keeps_origin(server_prompt_cache & cache, slot &
     cache.limit_size = size_e; // the kept part + the new cells do not fit
     auto * r = cache.save(s.prompt, s.tgt, s.dft, nullptr, SEQ, &s.origin, true);
     fprintf(stderr, "  over-limit delta save: %s; entry: %zu segments, %d tokens, owner %d\n", r ? "saved" : "skipped",
-            e->data.segs.size(), e->prompt.n_tokens(), e->owner);
+            e->data.segs.size(), e->prompt.n_tokens(), e->owner.load());
     CHECK(r == nullptr);
     CHECK(s.origin == nullptr);
     CHECK(cache.states.size() == 1 && &cache.states.front() == e);
@@ -614,7 +614,7 @@ static bool probe_entry(const server_prompt_cache_state & st, int step) {
     llama_memory_seq_rm(mem, SEQ_PROBE, -1, -1);
     if (gap >= 0 && gap < n_e) {
         fprintf(stderr, "FAIL step %d: entry of %d tokens (owner %d, %zu segments) restores only up to pos %d\n", step, st.prompt.n_tokens(),
-                st.owner, segs.size(), gap);
+                st.owner.load(), segs.size(), gap);
         return false;
     }
     return true;
